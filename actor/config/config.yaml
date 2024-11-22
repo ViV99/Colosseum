@@ -1,0 +1,3 @@
+arena_url: "http://localhost:1488"
+max_environments: 228
+player_idleness_timeout: 5
