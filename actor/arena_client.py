@@ -16,15 +16,17 @@ class ArenaClient:
     def add_environment(self):
         requests.post(self._url + "/api/environments", data={"id": self._actor_id})
 
-    def delete_game(self):
+    def delete_environment(self):
         requests.delete(self._url + "/api/environments", data={"id": self._actor_id})
 
 
 _arena_client: Optional[ArenaClient] = None
 
+
 def init_arena_client(url: str, actor_id: uuid.UUID):
     global _arena_client
-    _arena_client = ArenaClient(url, actor_id)
+    if _arena_client is None:
+        _arena_client = ArenaClient(url, actor_id)
 
 
 def get_arena_client() -> ArenaClient:

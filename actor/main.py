@@ -64,9 +64,9 @@ def ping():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Actor web server")
     parser.add_argument(
-        "host", type=str, help="Host address of web server", default="localhost"
+        "--host", type=str, help="Host address of web server", default="localhost", required=False
     )
-    parser.add_argument("port", type=int, help="Port of web server", default=8000)
+    parser.add_argument("--port", type=int, help="Port of web server", default=8000, required=False)
     args = parser.parse_args()
 
     get_arena_client().register_actor(config["max_environments"])

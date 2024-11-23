@@ -110,4 +110,4 @@ class Actor:
             self._player_last_request_time.pop(player)
             self._environment_by_player.pop(player)
         self._running_environments -= 1
-        get_arena_client().delete_game()
+        get_arena_client().delete_environment()
