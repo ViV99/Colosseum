@@ -1,29 +1,33 @@
 import requests
-import uuid
 from typing import Optional
 
 
 class ArenaClient:
-    def __init__(self, url: str, actor_id: uuid.UUID):
+    def __init__(self, url: str, actor_id: str):
         self._url = url
         self._actor_id = actor_id
 
-    def register_actor(self, max_environments: int):
+    def register_actor(self, max_environments: int, max_environment_players: int):
         requests.post(
-            self._url + "/api/actors", data={"id": self._actor_id, "max_environments": max_environments}
+            self._url + "/api/actors", json={
+                "actor_id": self._actor_id,
+                "max_environments": max_environments,
+                "max_environment_players": max_environment_players,
+            }
         )
 
-    def add_environment(self):
-        requests.post(self._url + "/api/environments", data={"id": self._actor_id})
-
-    def delete_environment(self):
-        requests.delete(self._url + "/api/environments", data={"id": self._actor_id})
+    def delete_environment(self, environment_id: str):
+        requests.delete(
+            self._url + "/api/environments", json={
+                "actor_id": self._actor_id, "environment_id": environment_id
+            }
+        )
 
 
 _arena_client: Optional[ArenaClient] = None
 
 
-def init_arena_client(url: str, actor_id: uuid.UUID):
+def init_arena_client(url: str, actor_id: str):
     global _arena_client
     if _arena_client is None:
         _arena_client = ArenaClient(url, actor_id)

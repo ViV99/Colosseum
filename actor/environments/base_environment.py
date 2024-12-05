@@ -3,10 +3,11 @@ from typing import Any
 
 
 class IEnvironment(ABC):
-    def __init__(self, players_ids: list[str]):
+    def __init__(self, id: str, players_ids: list[str]):
         if len(set(players_ids)) != len(players_ids):
             raise ValueError("All players ids should be unique")
 
+        self.id = id
         self._players_ids = players_ids
 
     @property

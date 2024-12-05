@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: actor-service
+spec:
+  serviceName: actor-service
+  replicas: 3
+  selector:
+    matchLabels:
+      app: actor
+  template:
+    metadata:
+      labels:
+        app: actor
+    spec:
+      containers:
+      - name: actor
+        image: actor:1.0
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: common-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: actor-service
+spec:
+  selector:
+    app: actor
+  ports:
+  - port: 8000
+    targetPort: 8000
+  clusterIP: None

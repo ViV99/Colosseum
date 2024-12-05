@@ -4,13 +4,13 @@ from actor.environments import IEnvironment
 class TicTacToeEnvironment(IEnvironment):
     _WIN_MASKS = [7, 56, 448, 73, 146, 292, 273, 96]
 
-    def __init__(self, players_ids: list[str]):
+    def __init__(self, id: str, players_ids: list[str]):
         if len(players_ids) != 2:
             raise ValueError("Only two players can play tic tac toe")
 
         self._players_masks = [0, 0]
 
-        super().__init__(players_ids)
+        super().__init__(id, players_ids)
 
     @classmethod
     def get_players_count(cls) -> int:

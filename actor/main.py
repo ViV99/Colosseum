@@ -1,4 +1,4 @@
-import argparse
+import os
 import logging
 import pathlib
 from uuid import uuid4
@@ -14,7 +14,7 @@ from actor.environments import TicTacToeEnvironment
 from actor.error import ActorError
 
 
-ID = uuid4()
+ID = str(uuid4())
 
 logger = logging.getLogger(__name__)
 
@@ -23,18 +23,18 @@ app = FastAPI()
 with open(pathlib.Path(__file__).parent.resolve() / "config" / "config.yaml") as f:
     config = yaml.safe_load(f)
 
+
 actor = Actor(TicTacToeEnvironment, config["player_idleness_timeout"], config["max_environments"])
-init_arena_client(config["arena_url"], ID)
+init_arena_client(os.getenv("ARENA_URL", "http://arena-service:8000"), ID)
 
 
-@app.post("/api/environments/join")
-def join_game(player_id: str = Body()):
-    logger.info("Player %s want to join new game", player_id)
+@app.post("/api/environments/create")
+def create_environment(player_ids: list[str] = Body()):
+    logger.info("Matchmaker wants to create new env %s for players %s", id, player_ids)
     try:
-        actor.join_game(player_id)
+        return Response(status_code=201, content={"environment_id": actor.create_environment(player_ids)})
     except ActorError as e:
         raise HTTPException(status_code=e.code, detail=e.type)
-    return Response(status_code=204)
 
 
 @app.get("/api/environments/state")
@@ -47,10 +47,10 @@ def get_state(player_id: str):
 
 
 @app.post("/api/environments/turn")
-def turn(player_id: str = Body(), position: int = Body()):
-    logger.info("Player %s want to make turn to position %s", player_id, position)
+def turn(player_id: str = Body(), turn_info: dict = Body()):
+    logger.info("Player %s wants to make turn: %s", player_id, turn_info)
     try:
-        actor.turn(player_id, position)
+        actor.turn(player_id, **turn_info)
     except ActorError as e:
         raise HTTPException(status_code=e.code, detail=e.type)
     return Response(status_code=204)
@@ -62,13 +62,6 @@ def ping():
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Actor web server")
-    parser.add_argument(
-        "--host", type=str, help="Host address of web server", default="localhost", required=False
-    )
-    parser.add_argument("--port", type=int, help="Port of web server", default=8000, required=False)
-    args = parser.parse_args()
+    get_arena_client().register_actor(actor.max_environments, actor.max_environment_players)
 
-    get_arena_client().register_actor(config["max_environments"])
-
-    uvicorn.run("main:app", host=args.host, port=args.port, reload=True)
+    uvicorn.run("main:app", host=config["host"], port=config["port"])

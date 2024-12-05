@@ -13,6 +13,9 @@ pyyaml = "^6.0.2"
 requests = "^2.32.3"
 argparse = "^1.4.0"
 
+#[tool.poetry.group.learner.dependencies]
+
+
 
 [build-system]
 requires = ["poetry-core"]

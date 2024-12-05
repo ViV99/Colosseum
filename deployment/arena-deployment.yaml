@@ -1,0 +1,35 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: arena-service
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: arena
+  template:
+    metadata:
+      labels:
+        app: arena
+    spec:
+      containers:
+      - name: arena
+        image: arena:1.0
+        ports:
+        - containerPort: 8000
+        envFrom:
+        - configMapRef:
+            name: common-config
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: arena-service
+spec:
+  selector:
+    app: arena
+  ports:
+    - protocol: TCP
+      port: 8000
+      targetPort: 8000
+  type: ClusterIP

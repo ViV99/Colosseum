@@ -1,10 +1,8 @@
-import logging
 import pathlib
-import uuid
+import logging
 
-import uvicorn
 import yaml
-
+import uvicorn
 from fastapi import FastAPI, Body, Response, Request
 
 from arena.arena_instance import Arena
@@ -16,39 +14,40 @@ app = FastAPI()
 
 arena = Arena()
 
-LOCAL_URLS = ["localhost", "127.0.0.1"]
-
-
 with open(pathlib.Path(__file__).parent.resolve() / "config" / "config.yaml") as f:
     config = yaml.safe_load(f)
 
 
 @app.post("/api/actors")
-def register_actor(request: Request, id: uuid.UUID = Body(), max_environments: int = Body()):
+def register_actor(
+    request: Request,
+    actor_id: str = Body(),
+    max_environments: int = Body(),
+    max_environment_players: int = Body()
+):
     host = request.client.host
-    if host in LOCAL_URLS:
-        host = config["host"]
-
-    arena.register_actor(id, host, max_environments)
-    return Response(status_code=204)
-
-
-@app.post("/api/environments")
-def add_environment(id: uuid.UUID = Body()):
-    arena.add_environment(id)
+    logger.info(
+        "Actor from %s has registered with id (%s), max_environments (%s), max_environment_players (%s)",
+        host,
+        actor_id,
+        max_environments,
+        max_environment_players
+    )
+    arena.register_actor(actor_id, host, max_environments, max_environment_players)
     return Response(status_code=204)
 
 
 @app.delete("/api/environments")
-def add_environment(id: uuid.UUID = Body()):
-    arena.delete_environment(id)
+def delete_environment(actor_id: str = Body(), environment_id: str = Body()):
+    logger.info("Actor %s reports of environment %s end", actor_id, environment_id)
+    arena.delete_environment(actor_id, environment_id)
     return Response(status_code=204)
 
 
-@app.get("/api/actors")
-def get_environment_url(learner_id: str, player_id: str):
-    return {"url": arena.get_actor_url(learner_id, player_id)}
+@app.get("/api/environments")
+def get_environment(learner_id: str = Body(), player_id: str = Body()):
+    return {"url": arena.get_environment(learner_id, player_id)}
 
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=config["host"], port=config["port"], reload=True)
+    uvicorn.run("main:app", host=config["host"], port=config["port"])
