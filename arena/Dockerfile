@@ -16,7 +16,7 @@ WORKDIR /app
 
 COPY pyproject.toml poetry.lock ./
 
-RUN poetry install --no-ansi --no-interaction --no-root && rm -rf $POETRY_CACHE_DIR
+RUN poetry install --no-ansi --no-interaction --no-root --without learner && rm -rf $POETRY_CACHE_DIR
 
 COPY ./arena/ ./arena
 

@@ -6,7 +6,7 @@ from uuid import uuid4
 import uvicorn
 import yaml
 
-from fastapi import FastAPI, Body, HTTPException, Response
+from fastapi import FastAPI, Body, HTTPException, Response, Query
 
 from actor.actor_instance import Actor
 from actor.arena_client import get_arena_client, init_arena_client
@@ -38,7 +38,7 @@ def create_environment(player_ids: list[str] = Body()):
 
 
 @app.get("/api/environments/state")
-def get_state(player_id: str):
+def get_state(player_id: str = Query()):
     logger.info("Player %s requested his state", player_id)
     try:
         return actor.get_state(player_id)

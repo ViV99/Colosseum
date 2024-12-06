@@ -1,4 +1,5 @@
 from actor.environments import IEnvironment
+from actor.error import ActorError
 
 
 class TicTacToeEnvironment(IEnvironment):
@@ -6,7 +7,7 @@ class TicTacToeEnvironment(IEnvironment):
 
     def __init__(self, id: str, players_ids: list[str]):
         if len(players_ids) != 2:
-            raise ValueError("Only two players can play tic tac toe")
+            raise ActorError(type="BAD_PLAYERS_COUNT", code=400)
 
         self._players_masks = [0, 0]
 
@@ -16,21 +17,19 @@ class TicTacToeEnvironment(IEnvironment):
     def get_players_count(cls) -> int:
         return 2
 
-    def turn(self, player_id: str, position: int) -> None:
+    def is_turn_available(self, player_id: str) -> bool:
+        full_mask = self._players_masks[0] | self._players_masks[1]
+
+        return self._players_ids[full_mask.bit_count() % 2] == player_id
+
+    def _turn(self, player_id: str, position: int) -> None:
         full_mask = self._players_masks[0] | self._players_masks[1]
         if (full_mask & (1 << position)) != 0:
-            raise ValueError(f"Position {position} already occupied")
-
-        if self._players_ids[full_mask.bit_count() % 2] != player_id:
-            raise ValueError(f"It is not turn of {player_id} now")
-
-        for _, score in self.get_scores().items():
-            if score > 0:
-                raise ValueError("Game over")
+            raise ActorError(type="POSITION_ALREADY_OCCUPIED", code=400)
 
         self._players_masks[full_mask.bit_count() % 2] |= 1 << position
 
-    def get_state(self, player_id: str) -> list[str]:
+    def _get_state(self, player_id: str) -> list[str]:
         rows = []
         for i in range(3):
             rows.append("".join([self._get_symbol_by_position(i, j) for j in range(3)]))
