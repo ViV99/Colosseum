@@ -3,7 +3,7 @@ import logging
 
 import yaml
 import uvicorn
-from fastapi import FastAPI, Body, Response, Request
+from fastapi import FastAPI, Body, Response, Request, Query
 
 from arena.arena_instance import Arena
 
@@ -45,7 +45,7 @@ def delete_environment(actor_id: str = Body(), environment_id: str = Body()):
 
 
 @app.get("/api/environments")
-def get_environment(learner_id: str = Body(), player_id: str = Body()):
+def get_environment(learner_id: str = Query(), player_id: str = Query()):
     return {"url": arena.get_environment(learner_id, player_id)}
 
 
