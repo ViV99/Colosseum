@@ -1,9 +1,9 @@
 from uuid import uuid4
 from pathlib import Path
+from typing import NamedTuple
 from abc import ABC, abstractmethod
 
 import torch
-from typing import NamedTuple
 
 from learner.replay import InferenceReplay, TrainReplay, ReplayEndReason
 
@@ -38,6 +38,18 @@ class IModel(ABC):
     def calc_rewards(
         self, states: list[dict], end_reason: ReplayEndReason, final_scores: dict[str, float]
     ) -> list[float]:
+        pass
+
+    @abstractmethod
+    def to(self, device: str):
+        pass
+
+    @abstractmethod
+    def eval(self):
+        pass
+
+    @abstractmethod
+    def train(self):
         pass
 
     @abstractmethod

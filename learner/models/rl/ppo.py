@@ -46,6 +46,12 @@ class PPO:
         self.policy.to(device)
         self.policy_old.to(device)
 
+    def eval(self):
+        self.policy.eval()
+
+    def train(self):
+        self.policy.train()
+
     @staticmethod
     def pad_sequence(
         sequence: torch.Tensor, out_len: int, pad_side: str = "right"

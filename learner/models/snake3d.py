@@ -1,9 +1,6 @@
-from uuid import uuid4
 from pathlib import Path
-from abc import ABC, abstractmethod
 
 import torch
-from typing import NamedTuple
 
 from rl import PPO
 from learner.replay import InferenceReplay, TrainReplay, ReplayEndReason
@@ -14,6 +11,7 @@ class Snake3d(IModel):
     def __init__(self, algorithm: PPO):
         super().__init__()
         self.algorithm = algorithm
+        self.id = None
 
     def act(self, replay: InferenceReplay) -> ActResult:
         """
@@ -44,18 +42,89 @@ class Snake3d(IModel):
         is_terminals = torch.cat(is_terminals)
         state_values = torch.cat(state_values)
         logprobs = torch.cat(logprobs)
-        self.algorithm.update(states, actions, rewards, is_terminals, state_values, logprobs)
+        self.algorithm.update(states, [actions], rewards, is_terminals, state_values, [logprobs])
 
     def state_to_tensor(self, state: dict):
-        pass
+        self.id = state["snakes"][0]["id"]
+        snake_head = torch.tensor(state["snakes"][0]["geometry"][0])
+        board_size = 80
+        tensor = torch.zeros((4, board_size, board_size, board_size), dtype=torch.float32)
+
+        def get_local_coordinates(coords: torch.Tensor):
+            loc = coords - snake_head + (board_size // 2)
+            if torch.any(loc < 0).item() or torch.any(loc >= board_size).item():
+                return None
+            return tuple(loc)
+
+        for ally in state["snakes"][0]:
+            if ally["reviveRemainMs"] != 0:
+                continue
+            for segment in ally["geometry"]:
+                local_coords = get_local_coordinates(torch.tensor(segment))
+                if local_coords:
+                    tensor[0][local_coords] = 1  # Первый канал: свои змейки
+
+        # Учёт врагов
+        for enemy in state["enemies"]:
+            if enemy["status"] == "dead":
+                continue
+            for segment in enemy["geometry"]:
+                local_coords = get_local_coordinates(torch.tensor(segment))
+                if local_coords:
+                    tensor[1][local_coords] = 1  # Второй канал: враги
+
+        # Учёт препятствий
+        for fence in state["fences"]:
+            local_coords = get_local_coordinates(torch.tensor(fence))
+            if local_coords:
+                tensor[2][local_coords] = 1  # Третий канал: препятствия
+
+        # Учёт мандаринов
+        for food in state["food"]:
+            local_coords = get_local_coordinates(torch.tensor(food))
+            if local_coords:
+                tensor[3][local_coords] = food["points"]  # Четвёртый канал: мандарины
+
+        # Учёт специальной еды
+        for golden_food in state["specialFood"]["golden"]:
+            local_coords = get_local_coordinates(torch.tensor(golden_food))
+            if local_coords:
+                tensor[3][local_coords] *= 10  # Special golden food
+
+        for suspicious_food in state["specialFood"]["suspicious"]:
+            local_coords = get_local_coordinates(torch.tensor(suspicious_food))
+            if local_coords:
+                tensor[3][local_coords] -= 1  # Special suspicious food
+
+        return tensor
 
     def action_to_dict(self, action: torch.Tensor) -> dict:
-        pass
+        actions = [
+            [1, 0, 0],
+            [-1, 0, 0],
+            [0, 1, 0],
+            [0, -1, 0],
+            [0, 0, 1],
+            [0, 0, -1],
+        ]
+        return {
+            "id": self.id,
+            "direction": actions[action.item()]
+        }
 
     def calc_rewards(
         self, states: list[dict], end_reason: ReplayEndReason, final_scores: dict[str, float]
     ) -> list[float]:
         pass
+
+    def to(self, device: str):
+        self.algorithm.to(device)
+
+    def eval(self):
+        self.algorithm.eval()
+
+    def train(self):
+        self.algorithm.train()
 
     def save(self, checkpoint_dir: Path):
         checkpoint_dir.mkdir(exist_ok=True)
@@ -75,8 +144,13 @@ class Snake3d(IModel):
     def share_memory(self):
         self.algorithm.share_memory()
 
+
 if __name__ == "__main__":
-    a = torch.randn(5)
-    b = torch.randn(3)
-    c = torch.randn(1)
-    print(torch.cat((a, b, c)).shape)
+    snake_head = torch.tensor([40, 40, 40])
+    board_size = 80
+    def get_local_coordinates(coords: torch.Tensor):
+        loc = coords - snake_head + (board_size // 2)
+        if torch.any(loc < 0).item() or torch.any(loc >= board_size).item():
+            return None
+        return tuple(loc)
+    print(get_local_coordinates(torch.tensor([-1, 20, 79])))

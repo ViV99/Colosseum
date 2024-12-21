@@ -1,0 +1,2 @@
+action_dim: 6
+hidden_dim: 64

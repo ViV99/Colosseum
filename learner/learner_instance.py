@@ -2,6 +2,7 @@ import uuid
 from time import sleep
 from dataclasses import dataclass
 
+import torch
 import torch.multiprocessing as mp
 from tensordict import TensorDict
 from multiprocessing.connection import Connection
@@ -23,14 +24,16 @@ class Learner:
         self,
         inference_proc_count: int,
         batch_size: int,
-        model_type: type[IModel],
+        model: IModel,
         inference_idle: float = 0.1,
-        train_idle: float = 0.1
+        train_idle: float = 0.1,
+        device: str = "cpu"
     ):
         self.inference_idle = inference_idle
         self.train_idle = train_idle
         self.id = str(uuid.uuid4())
-        self.model = model_type()
+        self.model = model
+        self.model.to(device)
         self.batch_size = batch_size
         self._storage: list[TrainReplay] = list()
         self._queue = mp.Queue()
@@ -38,12 +41,12 @@ class Learner:
 
         self._init_inference_runners(inference_proc_count, model_type)
 
-    def _init_inference_runners(self, inference_proc_count: int, model_type: type[IModel]):
+    def _init_inference_runners(self, inference_proc_count: int):
         mp.set_start_method("spawn")
         for _ in range(inference_proc_count):
             recv_conn, send_conn = mp.Pipe(False)
             process = mp.Process(
-                target=Learner._inference_proc, args=(self.id, model_type, recv_conn, self._queue, self.inference_idle)
+                target=Learner._inference_proc, args=(self.id, self.model, recv_conn, self._queue, self.inference_idle)
             )
             self._inference_runners.append(InferenceRunner(process, send_conn))
 
@@ -57,11 +60,11 @@ class Learner:
 
     @staticmethod
     def _inference_proc(
-        learner_id: str, model_type: type[IModel], model_pipe: Connection, output_queue: mp.Queue, idle: float
+        learner_id: str, model: IModel, model_pipe: Connection, output_queue: mp.Queue, idle: float
     ):
         replay = None
         actor_client = None
-        model = model_type()
+        model.to("cpu")
         while True:
             Learner._update_model_state_dict(model, model_pipe)
 
