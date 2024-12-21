@@ -10,7 +10,7 @@ from fastapi import FastAPI, Body, HTTPException, Response, Query
 
 from actor.actor_instance import Actor
 from actor.arena_client import get_arena_client, init_arena_client
-from actor.environments import TicTacToeEnvironment
+from actor.environments import Snake3DEnvironment
 from actor.error import ActorError
 
 
@@ -24,7 +24,7 @@ with open(pathlib.Path(__file__).parent.resolve() / "config" / "config.yaml") as
     config = yaml.safe_load(f)
 
 
-actor = Actor(TicTacToeEnvironment, config["player_idleness_timeout"], config["max_environments"])
+actor = Actor(Snake3DEnvironment, config["player_idleness_timeout"], config["max_environments"])
 init_arena_client(os.getenv("ARENA_URL", "http://arena-service:8000"), ID)
 
 
