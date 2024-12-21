@@ -7,10 +7,11 @@ import uvicorn
 import yaml
 
 from fastapi import FastAPI, Body, HTTPException, Response, Query
+from fastapi.responses import JSONResponse
 
 from actor.actor_instance import Actor
 from actor.arena_client import get_arena_client, init_arena_client
-from actor.environments import TicTacToeEnvironment
+from actor.environments import Snake3DEnvironment
 from actor.error import ActorError
 
 
@@ -24,7 +25,7 @@ with open(pathlib.Path(__file__).parent.resolve() / "config" / "config.yaml") as
     config = yaml.safe_load(f)
 
 
-actor = Actor(TicTacToeEnvironment, config["player_idleness_timeout"], config["max_environments"])
+actor = Actor(Snake3DEnvironment, config["player_idleness_timeout"], config["max_environments"])
 init_arena_client(os.getenv("ARENA_URL", "http://arena-service:8000"), ID)
 
 
@@ -32,7 +33,7 @@ init_arena_client(os.getenv("ARENA_URL", "http://arena-service:8000"), ID)
 def create_environment(player_ids: list[str] = Body()):
     logger.info("Matchmaker wants to create new env %s for players %s", id, player_ids)
     try:
-        return Response(status_code=201, content={"environment_id": actor.create_environment(player_ids)})
+        return JSONResponse(status_code=201, content={"environment_id": actor.create_environment(player_ids)})
     except ActorError as e:
         raise HTTPException(status_code=e.code, detail=e.type)
 

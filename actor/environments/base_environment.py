@@ -42,7 +42,7 @@ class IEnvironment(ABC):
         return self._get_state(player_id)
 
     @abstractmethod
-    def _get_state(self, player_id) -> Any:
+    def _get_state(self, player_id: str) -> Any:
         pass
 
     @abstractmethod
