@@ -1,5 +1,7 @@
 import uuid
-from dataclasses import dataclass, field
+
+from collections import defaultdict
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from random import randint
 from typing import Any
@@ -22,15 +24,22 @@ class Snake:
     direction: Point = field(default=Point(0, 0, 0))
     id: uuid.UUID = field(default_factory=uuid.uuid4)
 
-    def move(self, remove_tail: bool = True):
-        new_point = self.body[-1]
+    def next_point(self) -> Point:
+        new_point = replace(self.body[-1])
         new_point.x += self.direction.x
         new_point.y += self.direction.y
         new_point.z += self.direction.z
+        return new_point
+
+    def move(self, remove_tail: bool = True):
+        new_point = self.next_point()
         self.body.append(new_point)
 
         if remove_tail:
             self.body.pop(0)
+
+    def speed(self) -> int:
+        return abs(self.direction.x) + abs(self.direction.y) + abs(self.direction.z)
 
 
 class TangerineType(Enum):
@@ -75,6 +84,7 @@ class Snake3DEnvironment(IEnvironment):
         self.players_snakes = {player: [self._generate_snake() for _ in range(3)] for player in players_ids}
         self.scores = {player: 0.0 for player in players_ids}
 
+        self.locked = False
         self.tic = 0
         self.players_chosen_directions = dict()
         self.snake_death_tic = dict()
@@ -84,12 +94,23 @@ class Snake3DEnvironment(IEnvironment):
             snake["id"]: Point(snake["direction"][0], snake["direction"][1], snake["direction"][2]) for snake in snakes
         }
         if len(self.players_chosen_directions) == self._PLAYERS_COUNT:
+            self.locked = True
+
+            for player, snakes in self.players_snakes.items():
+                for snake in snakes:
+                    snake.direction = self.players_chosen_directions[player][snake.id]
+
             self._process_tic()
             self.tic += 1
             self.players_chosen_directions.clear()
+            self.snake_death_tic = {
+                dead_snake: death_tic for dead_snake, death_tic in self.snake_death_tic.items() if death_tic + self._SNAKE_REVIVE_DELAY_TICS > self.tic
+            }
+
+            self.locked = False
 
     def is_turn_available(self, player_id: str) -> bool:
-        return player_id not in self.players_chosen_directions
+        return not self.locked and player_id not in self.players_chosen_directions
 
     def _get_state(self, player_id: str) -> Any:
         obstacles = (
@@ -119,7 +140,13 @@ class Snake3DEnvironment(IEnvironment):
                     "reviveRemainMs": self._SNAKE_REVIVE_DELAY_TICS - (self.tic - self.snake_death_tic[snake.id]) if snake.id in self.snake_death_tic else 0,
                 } for snake in self.players_snakes[player_id]
             ],
-            "enemies": [],  # TODO
+            "enemies": [
+                {
+                    "geometry": [point.to_list() for point in reversed(snake.body)],
+                    "status": "dead" if snake.id in self.snake_death_tic else "alive",
+                    "kills": 0,  # just to keep format
+                } for snake in self._get_visible_snakes(player_id)
+            ],
             "food": [
                 {
                     "c": tangerine.point.to_list(), "points": tangerine.get_visible_score()
@@ -154,6 +181,25 @@ class Snake3DEnvironment(IEnvironment):
 
     def _get_visible_tangerines(self, snake: Snake) -> set[Tangerine]:
         return {tangerine for tangerine in self.tangerines if self._is_point_visible(snake.body[-1], tangerine.point)}
+
+    def _get_visible_snakes(self, player_id: str) -> list[Snake]:
+        snakes = []
+        for player, snakes in self.players_snakes.items():
+            if player == player_id:
+                continue
+            for enemy_snake in snakes:
+                body = []
+                for point in reversed(enemy_snake.body):
+                    if (
+                        self._is_point_visible(self.players_snakes[player_id][0].body[-1], point) or
+                        self._is_point_visible(self.players_snakes[player_id][1].body[-1], point) or
+                        self._is_point_visible(self.players_snakes[player_id][2].body[-1], point)
+                    ):
+                        body.append(point)
+                if len(body) != 0:
+                    snakes.append(Snake(body, enemy_snake.direction, enemy_snake.id))
+
+        return snakes
 
     @staticmethod
     def _is_point_visible(viewer: Point, point_to_view: Point) -> bool:
@@ -199,4 +245,63 @@ class Snake3DEnvironment(IEnvironment):
         return Snake([self._generate_point()])
 
     def _process_tic(self):
-        raise NotImplementedError
+        players_by_tangerine_pos = {tangerine.point: set() for tangerine in self.tangerines}
+        score_by_tangerine_pos = {tangerine.point: tangerine.score for tangerine in self.tangerines}
+
+        # move snakes
+        for player, snakes in self.players_snakes.items():
+            for snake in snakes:
+                next_point = snake.next_point()
+                if next_point in players_by_tangerine_pos:
+                    players_by_tangerine_pos[next_point].add(player)
+                else:
+                    self.occupied_points.remove(snake.body[0])
+
+                snake.move(next_point not in players_by_tangerine_pos)
+
+        # recalculate scores
+        eaten_tangerines_count = 0
+        for tangerine_pos, players in players_by_tangerine_pos.items():
+            if len(players) > 0:
+                eaten_tangerines_count += 1
+                for player in players:
+                    self.scores[player] += score_by_tangerine_pos[tangerine_pos] / len(players)
+
+        # process collisions
+        snakes_heads_by_pos: dict[Point, set[Snake]] = defaultdict(set)
+        for snakes in self.players_snakes.values():
+            for snake in snakes:
+                snakes_heads_by_pos[snake.body[-1]].add(snake)
+
+        for pos, snakes in snakes_heads_by_pos.items():
+            # collision with other snakes heads
+            if len(snakes) > 1:
+                self._kill_snakes(snakes)
+
+            # collision with snake body
+            for other_snakes in self.players_snakes.values():
+                for other_snake in other_snakes:
+                    for other_snake_body_point in other_snake.body[:-1]:
+                        if pos == other_snake_body_point:
+                            self._kill_snakes(snakes)
+                            break
+
+            # collision with obstacle
+            if pos in self.obstacles:
+                self._kill_snakes(snakes)
+                self.obstacles.remove(pos)
+
+            # collision with map end
+            if min(pos.x, pos.y, pos.z) < 0 or pos.x > self.map_size.x or pos.y > self.map_size.y or pos.z > self.map_size.z:
+                self._kill_snakes(snakes)
+
+        # spawn new tangerines
+        for _ in range(eaten_tangerines_count):
+            self.tangerines.add(self._generate_tangerine())
+
+    def _kill_snakes(self, snakes: set[Snake]):
+        for snake in snakes:
+            self.snake_death_tic[snake.id] = self.tic
+            for body_point in snake.body:
+                if body_point in self.occupied_points:
+                    self.occupied_points.remove(body_point)
