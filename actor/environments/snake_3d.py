@@ -8,11 +8,11 @@ from typing import Any
 
 from .base_environment import IEnvironment
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class Point:
-    x: int
-    y: int
-    z: int
+    x: int = field(default=0)
+    y: int = field(default=0)
+    z: int = field(default=0)
 
     def to_list(self) -> list[int]:
         return [self.x, self.y, self.z]
@@ -21,7 +21,7 @@ class Point:
 @dataclass
 class Snake:
     body: list[Point]
-    direction: Point = field(default=Point(0, 0, 0))
+    direction: Point = field(default_factory=Point)
     id: uuid.UUID = field(default_factory=uuid.uuid4)
 
     def next_point(self) -> Point:
@@ -41,6 +41,9 @@ class Snake:
     def speed(self) -> int:
         return abs(self.direction.x) + abs(self.direction.y) + abs(self.direction.z)
 
+    def __hash__(self):
+        return hash(self.id)
+
 
 class TangerineType(Enum):
     usual = "USUAL"
@@ -48,7 +51,7 @@ class TangerineType(Enum):
     strange = "STRANGE"
 
 
-@dataclass
+@dataclass(unsafe_hash=True)
 class Tangerine:
     point: Point
     type: TangerineType
@@ -66,7 +69,7 @@ class Snake3DEnvironment(IEnvironment):
     _MAX_MAP_SIZE = 500
     _MAX_OBSTACLES_COUNT = 20
     _MAX_TANGERINES_COUNT = 20
-    _PLAYERS_COUNT = 20
+    _PLAYERS_COUNT = 1
     _TICS_COUNT = 1000
     _SNAKE_REVIVE_DELAY_TICS = 10
 
@@ -80,13 +83,14 @@ class Snake3DEnvironment(IEnvironment):
             randint(self._MIN_MAP_SIZE, self._MAX_MAP_SIZE)
         )
 
+        self.locked = False
+        self.tic = 0
+
         self.obstacles = {self._generate_point() for _ in range(randint(0, self._MAX_OBSTACLES_COUNT))}
         self.tangerines = {self._generate_tangerine() for _ in range(randint(0, self._MAX_TANGERINES_COUNT))}
         self.players_snakes = {player: [self._generate_snake() for _ in range(self._SNAKES_COUNT_FOR_PLAYER)] for player in players_ids}
         self.scores = {player: 0.0 for player in players_ids}
 
-        self.locked = False
-        self.tic = 0
         self.players_chosen_directions = dict()
         self.snake_death_tic = dict()
 
@@ -99,7 +103,7 @@ class Snake3DEnvironment(IEnvironment):
 
             for player, snakes in self.players_snakes.items():
                 for snake in snakes:
-                    snake.direction = self.players_chosen_directions[player][snake.id]
+                    snake.direction = self.players_chosen_directions[player][str(snake.id)]
 
             self._process_tic()
             self.tic += 1
@@ -165,7 +169,7 @@ class Snake3DEnvironment(IEnvironment):
         return self.scores
 
     def is_ended(self) -> bool:
-        return self.tic < self._TICS_COUNT
+        return self.tic > self._TICS_COUNT
 
     @classmethod
     def get_players_count(cls) -> int:
