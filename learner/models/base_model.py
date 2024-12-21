@@ -5,7 +5,7 @@ from abc import ABC, abstractmethod
 import torch
 from typing import NamedTuple
 
-from learner.replay import Replay, ReplayEndReason
+from learner.replay import InferenceReplay, TrainReplay, ReplayEndReason
 
 
 class ActResult(NamedTuple):
@@ -19,11 +19,11 @@ class IModel(ABC):
         self.id = uuid4()
 
     @abstractmethod
-    def act(self, state_tensor: torch.Tensor) -> ActResult:
+    def act(self, replay: InferenceReplay) -> ActResult:
         pass
 
     @abstractmethod
-    def update(self, replays: list[Replay]):
+    def update(self, replays: list[TrainReplay]):
         pass
 
     @abstractmethod
@@ -35,11 +35,17 @@ class IModel(ABC):
         pass
 
     @abstractmethod
-    def calc_rewards(self, states: list[dict], end_reason: ReplayEndReason) -> list[float]:
+    def calc_rewards(
+        self, states: list[dict], end_reason: ReplayEndReason, final_scores: dict[str, float]
+    ) -> list[float]:
         pass
 
     @abstractmethod
     def save(self, checkpoint_dir: Path):
+        pass
+
+    @abstractmethod
+    def state_dict(self) -> dict[str, ...]:
         pass
 
     @abstractmethod
@@ -48,5 +54,9 @@ class IModel(ABC):
 
     @abstractmethod
     def load_state_dict(self, state_dict: dict[str, ...]):
+        pass
+
+    @abstractmethod
+    def share_memory(self):
         pass
 

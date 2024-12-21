@@ -105,7 +105,7 @@ class PPO:
                  state values ([1,])
         """
         with torch.no_grad():
-            actions, action_logprobs, state_values = self.policy_old.act(
+            actions, action_logprobs, state_values = self.policy.act(
                 torch.stack(states[-self.max_seq_len:]).unsqueeze(0).to(self.device)
             )
             return actions, action_logprobs, state_values
@@ -192,3 +192,6 @@ class PPO:
         self.policy.load_state_dict(state_dict["policy"])
         self.policy_old = copy.deepcopy(self.policy)
         self.optimizer.load_state_dict(state_dict["optimizer"])
+
+    def share_memory(self):
+        self.policy.share_memory()

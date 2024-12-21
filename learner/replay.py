@@ -1,5 +1,5 @@
 from enum import Enum
-from typing import Optional, Callable
+from typing import Optional, Callable, Self
 
 import torch
 from tensordict import TensorDict
@@ -10,8 +10,33 @@ class ReplayEndReason(Enum):
     WRONG_MOVE = "WRONG_MOVE"
 
 
-class Replay:
-    def __init__(self, id: str, calc_rewards: Callable[[list, ReplayEndReason], list]):
+class TrainReplay:
+    def __init__(
+        self,
+        states: torch.Tensor,
+        logprobs: torch.Tensor,
+        actions: torch.Tensor,
+        rewards: torch.Tensor,
+        state_values: torch.Tensor,
+    ):
+        self.states = states
+        self.logprobs = logprobs
+        self.actions = actions
+        self.rewards = rewards
+        self.state_values = state_values
+
+    @staticmethod
+    def from_tensordict(replay_dict: TensorDict) -> Self:
+        replay = TrainReplay(**replay_dict)
+        return replay
+
+
+class InferenceReplay:
+    def __init__(
+        self,
+        id: str,
+        calc_rewards: Callable[[list[dict], ReplayEndReason, Optional[dict[str, float]]], list[float]]
+    ):
         self.id = id
         self.calc_rewards = calc_rewards
         self.is_ended = False
@@ -44,7 +69,7 @@ class Replay:
         self.is_ended = True
         self.end_reason = end_reason.value
         self.state_dicts.append(state_dict)
-        self.rewards = self.calc_rewards(self.state_dicts, end_reason)
+        self.rewards = self.calc_rewards(self.state_dicts, end_reason, scores)
         self.final_scores = scores
         final_dict = TensorDict({
             "states": torch.stack(self.states),
@@ -52,7 +77,5 @@ class Replay:
             "actions": torch.stack(self.actions),
             "rewards": torch.tensor(self.rewards),
             "state_values": torch.stack(self.state_values),
-            "final_scores": self.final_scores,
-            "end_reason": self.end_reason
         }).share_memory_()
         return final_dict
