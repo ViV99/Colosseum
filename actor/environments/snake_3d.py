@@ -61,6 +61,7 @@ class Tangerine:
 
 
 class Snake3DEnvironment(IEnvironment):
+    _SNAKES_COUNT_FOR_PLAYER = 3
     _MIN_MAP_SIZE = 20
     _MAX_MAP_SIZE = 500
     _MAX_OBSTACLES_COUNT = 20
@@ -81,7 +82,7 @@ class Snake3DEnvironment(IEnvironment):
 
         self.obstacles = {self._generate_point() for _ in range(randint(0, self._MAX_OBSTACLES_COUNT))}
         self.tangerines = {self._generate_tangerine() for _ in range(randint(0, self._MAX_TANGERINES_COUNT))}
-        self.players_snakes = {player: [self._generate_snake() for _ in range(3)] for player in players_ids}
+        self.players_snakes = {player: [self._generate_snake() for _ in range(self._SNAKES_COUNT_FOR_PLAYER)] for player in players_ids}
         self.scores = {player: 0.0 for player in players_ids}
 
         self.locked = False
@@ -103,9 +104,7 @@ class Snake3DEnvironment(IEnvironment):
             self._process_tic()
             self.tic += 1
             self.players_chosen_directions.clear()
-            self.snake_death_tic = {
-                dead_snake: death_tic for dead_snake, death_tic in self.snake_death_tic.items() if death_tic + self._SNAKE_REVIVE_DELAY_TICS > self.tic
-            }
+            self._revive_snakes()
 
             self.locked = False
 
@@ -113,16 +112,12 @@ class Snake3DEnvironment(IEnvironment):
         return not self.locked and player_id not in self.players_chosen_directions
 
     def _get_state(self, player_id: str) -> Any:
-        obstacles = (
-            self._get_visible_obstacles(self.players_snakes[player_id][0]) |
-            self._get_visible_obstacles(self.players_snakes[player_id][1]) |
-            self._get_visible_obstacles(self.players_snakes[player_id][2])
-        )
-        tangerines = (
-            self._get_visible_tangerines(self.players_snakes[player_id][0]) |
-            self._get_visible_tangerines(self.players_snakes[player_id][1]) |
-            self._get_visible_tangerines(self.players_snakes[player_id][2])
-        )
+        obstacles = set()
+        tangerines = set()
+
+        for snake in self.players_snakes[player_id]:
+            obstacles |= self._get_visible_obstacles(snake)
+            tangerines |= self._get_visible_tangerines(snake)
 
         return {
             "mapSize": [self.map_size.x, self.map_size.y, self.map_size.z],
@@ -190,11 +185,11 @@ class Snake3DEnvironment(IEnvironment):
             for enemy_snake in snakes:
                 body = []
                 for point in reversed(enemy_snake.body):
-                    if (
-                        self._is_point_visible(self.players_snakes[player_id][0].body[-1], point) or
-                        self._is_point_visible(self.players_snakes[player_id][1].body[-1], point) or
-                        self._is_point_visible(self.players_snakes[player_id][2].body[-1], point)
-                    ):
+                    is_point_visible = False
+                    for player_snake in self.players_snakes[player_id]:
+                        if self._is_point_visible(player_snake.body[-1], point):
+                            is_point_visible = True
+                    if is_point_visible:
                         body.append(point)
                 if len(body) != 0:
                     snakes.append(Snake(body, enemy_snake.direction, enemy_snake.id))
@@ -305,3 +300,16 @@ class Snake3DEnvironment(IEnvironment):
             for body_point in snake.body:
                 if body_point in self.occupied_points:
                     self.occupied_points.remove(body_point)
+
+    def _revive_snakes(self):
+        revived_snakes_ids = {dead_snake for dead_snake, death_tic in self.snake_death_tic.items() if death_tic + self._SNAKE_REVIVE_DELAY_TICS == self.tic}
+        for snakes in self.players_snakes.values():
+            for snake in snakes:
+                if snake.id in revived_snakes_ids:
+                    snake.direction = Point(0, 0, 0)
+                    snake.body = [self._generate_point()]
+
+        self.snake_death_tic = {
+            dead_snake: death_tic for dead_snake, death_tic in self.snake_death_tic.items() if
+            death_tic + self._SNAKE_REVIVE_DELAY_TICS > self.tic
+        }
