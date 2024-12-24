@@ -38,8 +38,7 @@ class InferenceReplay:
         calc_rewards: Callable[[list[dict], ReplayEndReason, Optional[dict[str, float]]], list[float]]
     ):
         self.id = id
-        self.calc_rewards = calc_rewards
-        self.is_ended = False
+        self._calc_rewards = calc_rewards
         self.end_reason = None
         self.state_dicts = list()
         self.states = list()
@@ -66,10 +65,9 @@ class InferenceReplay:
     def finalize(
         self, state_dict: dict, end_reason: ReplayEndReason, scores: Optional[dict[str, float]] = None
     ) -> TensorDict:
-        self.is_ended = True
         self.end_reason = end_reason.value
         self.state_dicts.append(state_dict)
-        self.rewards = self.calc_rewards(self.state_dicts, end_reason, scores)
+        self.rewards = self._calc_rewards(self.state_dicts, end_reason, scores)
         self.final_scores = scores
         final_dict = TensorDict({
             "states": torch.stack(self.states),
