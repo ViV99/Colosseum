@@ -19,7 +19,8 @@ from colosseum.algorithms.vtrace import compute_vtrace
 from colosseum.bc.kickstart import KickstartLoss
 from colosseum.core.config import AlgorithmConfig, LRSchedule
 from colosseum.core.types import TrajectoryChunk
-from colosseum.networks.actor_critic import ActorCriticNetwork
+from colosseum.networks.model import PolicyModel
+from colosseum.networks.state import cat_batch, state_to
 
 
 class APPO(BaseAlgorithm):
@@ -27,13 +28,13 @@ class APPO(BaseAlgorithm):
 
     def __init__(
         self,
-        network: ActorCriticNetwork,
+        model: PolicyModel,
         config: AlgorithmConfig,
         device: str | torch.device = "cpu",
-        kickstart: KickstartLoss | None = None,
         pin_memory: bool = False,
+        kickstart: KickstartLoss | None = None,
     ):
-        self._network = network.to(device)
+        self._model = model.to(device)
         self._config = config
         self._device = device
         self._policy_version = 0
@@ -45,7 +46,7 @@ class APPO(BaseAlgorithm):
         self._amp_dtype = getattr(torch, config.amp_dtype, torch.float16)
         self._scaler = torch.amp.GradScaler("cuda") if self._use_amp else None
 
-        self._optimizer = torch.optim.Adam(network.parameters(), lr=config.learning_rate)
+        self._optimizer = torch.optim.Adam(self._model.parameters(), lr=config.learning_rate)
         self._zero_loss = torch.tensor(0.0, device=device)
 
         # Optionally compile V-trace for faster execution
@@ -71,8 +72,8 @@ class APPO(BaseAlgorithm):
         # CONSTANT: no scheduler needed
 
     @property
-    def network(self) -> ActorCriticNetwork:
-        return self._network
+    def model(self) -> PolicyModel:
+        return self._model
 
     @property
     def policy_version(self) -> int:
@@ -113,15 +114,43 @@ class APPO(BaseAlgorithm):
             }
         else:
             batch = {k: v.to(device) for k, v in batch_cpu.items()}
+        # Model state before each chunk's first transition: leaves [1, ...] -> [B, ...].
+        batch["initial_state"] = state_to(cat_batch([c.initial_state for c in chunks]), device)
         return batch
+
+    def _evaluate(self, batch: dict) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Unroll the model over the batch: (log_probs, values, entropy), each ``[T, B]``."""
+        T, B = batch["rewards"].shape
+        out = self._model.unroll(
+            batch["observations"],
+            batch["initial_state"],
+            batch["dones"].bool(),
+            batch.get("action_masks"),
+        )
+        actions = batch["actions"].reshape(T * B, *batch["actions"].shape[2:])
+        log_probs = out.dist.log_prob(actions).reshape(T, B)
+        values = out.value.reshape(T, B)
+        entropy = out.dist.entropy().reshape(T, B)
+        return log_probs, values, entropy
+
+    @torch.no_grad()
+    def evaluate_chunks(self, chunks: list[TrajectoryChunk]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Current model's log-probs of the recorded actions and its values.
+
+        Returns two ``[T*B]`` tensors in time-major order (index ``t*B + b`` is
+        step ``t`` of ``chunks[b]``), computed exactly as in training:
+        ``model.unroll`` from ``cat_batch(chunk.initial_state ...)``.
+        """
+        log_probs, values, _ = self._evaluate(self._prepare_batch(chunks))
+        return log_probs.reshape(-1), values.reshape(-1)
 
     def compute_loss(self, chunks: list[TrajectoryChunk]) -> dict[str, torch.Tensor]:
         """Compute APPO loss from a batch of trajectory chunks.
 
         Steps:
         1. Stack chunks into [T, B, ...] tensors
-        2. Forward pass: get current log_probs, values, entropy
-           (recurrent path uses evaluate_actions_recurrent for sequence processing)
+        2. Forward pass: ``model.unroll`` from the chunks' initial states gives
+           current log_probs, values, entropy (one path for every model)
         3. Compute V-trace targets + advantages
         4. PPO clipped surrogate with V-trace advantages
         5. Value loss: MSE(values, vtrace_targets)
@@ -132,61 +161,14 @@ class APPO(BaseAlgorithm):
 
         T, B = batch["rewards"].shape
         obs_shape = batch["observations"].shape[2:]
-        act_shape = batch["actions"].shape[2:]
-
-        # Flattened observations [T*B, *obs_shape] — used by the stateless path
-        # and by the kickstart KL term (defined here so both the recurrent and
-        # stateless branches can reference it).
+        # Flattened observations [T*B, *obs_shape] for the kickstart KL term.
         flat_obs = batch["observations"].reshape(T * B, *obs_shape)
 
-        # Determine if we should use the recurrent training path
-        has_recurrent = (
-            self._network.is_recurrent
-            and chunks[0].lstm_hidden is not None
-        )
-
-        # Forward pass through current network (optionally with AMP)
         amp_ctx = torch.autocast(
             device_type="cuda", dtype=self._amp_dtype, enabled=self._use_amp,
         )
-
-        if has_recurrent:
-            # Recurrent path: process [T, B, ...] sequences through RNN
-            # Stack hidden inits: each chunk.lstm_hidden is (h, c) with shape
-            # [num_layers, hidden_size].  Need [num_layers, B, hidden_size].
-            h_init = torch.stack(
-                [c.lstm_hidden[0] for c in chunks], dim=1,
-            ).to(self._device)
-            c_init = torch.stack(
-                [c.lstm_hidden[1] for c in chunks], dim=1,
-            ).to(self._device)
-            action_mask_seq = batch.get("action_masks")
-
-            with amp_ctx:
-                target_log_probs, new_values, entropy = (
-                    self._network.evaluate_actions_recurrent(
-                        batch["observations"], batch["actions"],
-                        (h_init, c_init),
-                        action_mask_seq=action_mask_seq,
-                        dones_seq=batch["dones"],
-                    )
-                )
-        else:
-            # Stateless path: flatten T*B for feedforward evaluation
-            flat_actions = batch["actions"].reshape(T * B, *act_shape)
-
-            flat_masks = None
-            if "action_masks" in batch:
-                mask_shape = batch["action_masks"].shape[2:]
-                flat_masks = batch["action_masks"].reshape(T * B, *mask_shape)
-
-            with amp_ctx:
-                target_log_probs, new_values, entropy = self._network.evaluate_actions(
-                    flat_obs, flat_actions, action_mask=flat_masks,
-                )
-            target_log_probs = target_log_probs.reshape(T, B)
-            new_values = new_values.reshape(T, B)
-            entropy = entropy.reshape(T, B)
+        with amp_ctx:
+            target_log_probs, new_values, entropy = self._evaluate(batch)
 
         # V-trace targets and advantages
         with torch.no_grad():
@@ -227,7 +209,7 @@ class APPO(BaseAlgorithm):
         # Kickstart loss (KL to teacher policy)
         kickstart_loss = self._zero_loss
         if self._kickstart is not None and self._kickstart.current_lambda > 0:
-            kickstart_loss = self._kickstart.compute(self._network, flat_obs)
+            kickstart_loss = self._kickstart.compute(self._model, flat_obs)
             total_loss = total_loss + kickstart_loss
 
         # Metrics for logging
@@ -286,13 +268,13 @@ class APPO(BaseAlgorithm):
                     self._scaler.scale(total_loss).backward()
                     if cfg.max_grad_norm > 0:
                         self._scaler.unscale_(self._optimizer)
-                        torch.nn.utils.clip_grad_norm_(self._network.parameters(), cfg.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self._model.parameters(), cfg.max_grad_norm)
                     self._scaler.step(self._optimizer)
                     self._scaler.update()
                 else:
                     total_loss.backward()
                     if cfg.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self._network.parameters(), cfg.max_grad_norm)
+                        torch.nn.utils.clip_grad_norm_(self._model.parameters(), cfg.max_grad_norm)
                     self._optimizer.step()
 
                 # Accumulate metrics

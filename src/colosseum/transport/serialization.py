@@ -43,9 +43,8 @@ def serialize_chunk(chunk: TrajectoryChunk, compress: bool = True) -> tuple[byte
         "values": chunk.values,
         "bootstrap_value": chunk.bootstrap_value,
     }
-    if chunk.lstm_hidden is not None:
-        tensor_dict["lstm_h"] = chunk.lstm_hidden[0]
-        tensor_dict["lstm_c"] = chunk.lstm_hidden[1]
+    if chunk.initial_state is not None:
+        tensor_dict["initial_state"] = chunk.initial_state  # dict/tuple of tensors: weights_only-safe
     if chunk.action_masks is not None:
         tensor_dict["action_masks"] = chunk.action_masks
 
@@ -69,10 +68,6 @@ def deserialize_chunk(
     buf = io.BytesIO(data)
     td = torch.load(buf, weights_only=True)
 
-    lstm_hidden = None
-    if "lstm_h" in td and "lstm_c" in td:
-        lstm_hidden = (td["lstm_h"], td["lstm_c"])
-
     return TrajectoryChunk(
         agent_id=agent_id,
         observations=td["observations"],
@@ -83,6 +78,6 @@ def deserialize_chunk(
         values=td["values"],
         bootstrap_value=td["bootstrap_value"],
         behavior_policy_version=behavior_policy_version,
-        lstm_hidden=lstm_hidden,
+        initial_state=td.get("initial_state"),
         action_masks=td.get("action_masks"),
     )

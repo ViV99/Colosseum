@@ -6,13 +6,12 @@ import torch
 
 from colosseum.bc.kickstart import KickstartLoss
 from colosseum.bc.offline_bc import OfflineBCTrainer
-from colosseum.networks.actor_critic import ActorCriticNetwork
+from helpers import make_ttt_model
 
 
 def _make_network():
-    """Create a small TicTacToe-like network for testing."""
-    from examples.tic_tac_toe.networks import TicTacToeEncoder, TicTacToePolicy, TicTacToeValue
-    return ActorCriticNetwork(TicTacToeEncoder(), TicTacToePolicy(), TicTacToeValue())
+    """Create a small TicTacToe model for testing."""
+    return make_ttt_model()
 
 
 def _make_expert_data(n=200):

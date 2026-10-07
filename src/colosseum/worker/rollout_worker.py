@@ -15,6 +15,7 @@ from typing import Any
 
 from colosseum.core.types import MatchResult, TrajectoryChunk
 from colosseum.envs.base_env import BaseEnv
+from colosseum.networks.model import PolicyModel
 from colosseum.worker.rollout_loop import LATEST_NETWORK_ID, LoopIO, RolloutLoop
 
 __all__ = ["LATEST_NETWORK_ID", "rollout_worker_process"]
@@ -41,7 +42,7 @@ def rollout_worker_process(
     num_envs: int,
     chunk_length: int,
     agent_ids: list[str],
-    network_factories: dict[str, Callable[[], Any]],
+    model_factories: dict[str, Callable[[], PolicyModel]],
     trajectory_queues: dict[str, mp.Queue],
     weight_queues: dict[str, mp.Queue],
     stop_event: mp.Event,
@@ -95,7 +96,7 @@ def rollout_worker_process(
         num_envs=num_envs,
         chunk_length=chunk_length,
         agent_ids=agent_ids,
-        model_factories=network_factories,
+        model_factories=model_factories,
         io=io,
         weight_sync_interval=weight_sync_interval,
         slot_agent_map=slot_agent_map,

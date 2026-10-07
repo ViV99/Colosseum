@@ -22,12 +22,13 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import torch
-import torch.nn as nn
 
 from colosseum.core.action_spec import ActionSpec
 from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
 from colosseum.envs.base_env import BaseEnv
 from colosseum.envs.vec_env import VectorEnv
+from colosseum.networks.model import PolicyModel, act
+from colosseum.networks.state import State, cat_batch, slice_batch, tree_map
 
 logger = logging.getLogger(__name__)
 
@@ -57,8 +58,7 @@ class RolloutBuffer:
     _action_masks: np.ndarray | None = field(init=False, default=None, repr=False)
     _cursor: int = field(init=False, default=0)
     _has_masks: bool = field(init=False, default=False)
-    _lstm_h_init: torch.Tensor | None = field(init=False, default=None, repr=False)
-    _lstm_c_init: torch.Tensor | None = field(init=False, default=None, repr=False)
+    initial_state: State = field(init=False, default=None, repr=False)
 
     def __post_init__(self):
         T = self.chunk_length
@@ -96,16 +96,19 @@ class RolloutBuffer:
     def has_masks(self) -> bool:
         return self._has_masks
 
-    def set_lstm_init(self, h: torch.Tensor, c: torch.Tensor):
-        """Save initial LSTM hidden state for the current chunk."""
-        self._lstm_h_init = h.clone()
-        self._lstm_c_init = c.clone()
+    def set_initial_state(self, state: State) -> None:
+        """Record the model state before the chunk's first transition (leaves [1, ...]).
+
+        The leaves are cloned: a slot's state is a row view into its inference
+        group's batched state, and a view would carry (and serialize) the whole
+        batch storage.
+        """
+        self.initial_state = tree_map(torch.clone, state)
 
     def reset(self):
         self._cursor = 0
         self._has_masks = False
-        self._lstm_h_init = None
-        self._lstm_c_init = None
+        self.initial_state = None
 
 
 @dataclass
@@ -120,64 +123,53 @@ class LoopIO:
 
 
 def _run_inference_group(
-    net,
+    model: PolicyModel,
     indices: list[tuple],
     obs_flat: np.ndarray,
     all_masks: np.ndarray | None,
-    hidden_states: dict,
+    slot_states: dict[tuple[int, int], State],
     out_actions: np.ndarray,
     out_log_probs: np.ndarray,
     out_values: np.ndarray,
 ) -> None:
-    """Batched inference for one (agent, network) group; writes into output arrays."""
+    """Batched inference for one (agent, network) group; writes into output arrays.
+
+    The per-slot states of the group are concatenated into one batch state and
+    the new state is sliced back per slot (each slot keeps leaves ``[1, ...]``).
+    """
     idx_list = [i[0] for i in indices]
     obs_batch = torch.from_numpy(np.ascontiguousarray(obs_flat[idx_list])).float()
     mask_batch = None
     if all_masks is not None:
         mask_batch = torch.from_numpy(np.ascontiguousarray(all_masks[idx_list])).bool()
 
-    hidden_batch = None
-    if net.is_recurrent:
-        h_list, c_list = [], []
-        for _, env_idx, p in indices:
-            h, c = hidden_states.get((env_idx, p), net.initial_hidden(1))
-            h_list.append(h)
-            c_list.append(c)
-        hidden_batch = (torch.cat(h_list, dim=1), torch.cat(c_list, dim=1))
-
-    with torch.no_grad():
-        actions, log_probs, values, new_hidden = net.act(
-            obs_batch, action_mask=mask_batch, hidden=hidden_batch,
-        )
-
-    if net.is_recurrent and new_hidden is not None:
+    state = cat_batch([slot_states[(env_idx, p)] for _, env_idx, p in indices])
+    out = act(model, obs_batch, state, mask_batch)
+    if out.state is not None:
         for j, (_, env_idx, p) in enumerate(indices):
-            hidden_states[(env_idx, p)] = (
-                new_hidden[0][:, j:j + 1, :].clone(),
-                new_hidden[1][:, j:j + 1, :].clone(),
-            )
+            slot_states[(env_idx, p)] = slice_batch(out.state, j)
 
     idx_arr = np.asarray(idx_list, dtype=np.intp)
-    out_actions[idx_arr] = actions.numpy()
-    out_log_probs[idx_arr] = log_probs.numpy().astype(np.float32, copy=False)
-    out_values[idx_arr] = values.numpy().astype(np.float32, copy=False)
+    out_actions[idx_arr] = out.actions.numpy()
+    out_log_probs[idx_arr] = out.log_probs.numpy().astype(np.float32, copy=False)
+    out_values[idx_arr] = out.values.numpy().astype(np.float32, copy=False)
 
 
-def _apply_command(cmd, networks_by_agent, network_factories, pending) -> None:
+def _apply_command(cmd, models_by_agent, model_factories, pending) -> None:
     """Load any new checkpoints into the pool and stash the new slot maps.
 
     The slot maps are applied per-env at the next episode boundary (so a match
     keeps a consistent assignment for its whole episode).
     """
     for aid, ckpts in cmd.new_checkpoints.items():
-        if aid not in networks_by_agent:
+        if aid not in models_by_agent:
             continue
         for ckpt_id, sd in ckpts.items():
-            if ckpt_id not in networks_by_agent[aid]:
-                net = network_factories[aid]()
-                net.load_state_dict(sd)
-                net.eval()
-                networks_by_agent[aid][ckpt_id] = net
+            if ckpt_id not in models_by_agent[aid]:
+                model = model_factories[aid]()
+                model.load_state_dict(sd)
+                model.eval()
+                models_by_agent[aid][ckpt_id] = model
     if cmd.slot_agent_map:
         pending["slot_agent_map"] = cmd.slot_agent_map
         pending["slot_network_map"] = cmd.slot_network_map
@@ -196,11 +188,10 @@ def _build_chunk(buffer: RolloutBuffer, agent_id, bootstrap_value, policy_versio
         values=torch.from_numpy(buffer._values.copy()),
         bootstrap_value=torch.tensor(bootstrap_value, dtype=torch.float32),
         behavior_policy_version=policy_version,
+        initial_state=buffer.initial_state,
     )
     if buffer._has_masks and buffer._action_masks is not None:
         chunk.action_masks = torch.from_numpy(buffer._action_masks.copy())
-    if buffer._lstm_h_init is not None:
-        chunk.lstm_hidden = (buffer._lstm_h_init, buffer._lstm_c_init)
     return chunk
 
 
@@ -302,7 +293,7 @@ class RolloutLoop:
         num_envs: int,
         chunk_length: int,
         agent_ids: list[str],
-        model_factories: dict[str, Callable[[], nn.Module]],
+        model_factories: dict[str, Callable[[], PolicyModel]],
         io: LoopIO,
         gamma: float = 0.99,
         weight_sync_interval: float = 5.0,
@@ -339,12 +330,12 @@ class RolloutLoop:
         num_players = self._vec_env.num_players
         self.num_players = num_players
 
-        # Per-agent network pools: "latest" receives weight updates; checkpoint
-        # networks are frozen opponents.
-        self._networks: dict[str, dict[str, nn.Module]] = {}
+        # Per-agent model pools: "latest" receives weight updates; checkpoint
+        # models are frozen opponents.
+        self._networks: dict[str, dict[str, PolicyModel]] = {}
         self._policy_versions: dict[str, int] = {}
         for aid in self.agent_ids:
-            nets: dict[str, nn.Module] = {}
+            nets: dict[str, PolicyModel] = {}
             nets[LATEST_NETWORK_ID] = model_factories[aid]()
             nets[LATEST_NETWORK_ID].eval()
             self._policy_versions[aid] = 0
@@ -363,8 +354,6 @@ class RolloutLoop:
 
         # Initial weights for every agent's latest network.
         self.sync_weights()
-
-        self._any_recurrent = self._compute_any_recurrent()
 
         # Default slot assignment: every slot is the first agent's latest network.
         if slot_agent_map is None:
@@ -403,14 +392,12 @@ class RolloutLoop:
 
         self._obs, self._infos = self._vec_env.reset_all(seed=seed)
 
-        self._hidden_states: dict[tuple[int, int], tuple[torch.Tensor, torch.Tensor]] = {}
-        if self._any_recurrent:
-            for env_idx in range(num_envs):
-                for p in range(num_players):
-                    aid = self._slot_agent_map[env_idx][p]
-                    net = self._networks[aid][LATEST_NETWORK_ID]
-                    if net.is_recurrent:
-                        self._hidden_states[(env_idx, p)] = net.initial_hidden(1)
+        # Model state of every (env, slot); None for stateless models.
+        self._slot_states: dict[tuple[int, int], State] = {
+            (env_idx, p): self._initial_slot_state(env_idx, p)
+            for env_idx in range(num_envs)
+            for p in range(num_players)
+        }
 
         self._action_spec = ActionSpec.from_space(self._vec_env.action_space)
         obs_shape = self._obs.shape[2:]
@@ -484,17 +471,13 @@ class RolloutLoop:
         cmd = self._io.poll_command() if self._io.poll_command is not None else None
         if cmd is not None:
             _apply_command(cmd, self._networks, self._model_factories, self._pending)
-            self._any_recurrent = self._compute_any_recurrent()
 
-        # Save the recurrent state at chunk start (before inference).
-        if self._any_recurrent:
-            for env_idx in range(num_envs):
-                for p in range(num_players):
-                    buf = self._buffers[env_idx][p]
-                    if (self._collect_mask[env_idx][p] and buf.steps == 0
-                            and (env_idx, p) in self._hidden_states):
-                        h, c = self._hidden_states[(env_idx, p)]
-                        buf.set_lstm_init(h, c)
+        # Record the model state at chunk start (before inference).
+        for env_idx in range(num_envs):
+            for p in range(num_players):
+                buf = self._buffers[env_idx][p]
+                if self._collect_mask[env_idx][p] and buf.steps == 0:
+                    buf.set_initial_state(self._slot_states[(env_idx, p)])
 
         # Group slots by (agent_id, network_id) for batched inference.
         net_groups: dict[tuple[str, str], list[tuple]] = defaultdict(list)
@@ -518,7 +501,7 @@ class RolloutLoop:
             agent_nets = self._networks[aid]
             net = agent_nets.get(net_id, agent_nets[LATEST_NETWORK_ID])
             _run_inference_group(
-                net, indices, obs_flat, all_masks, self._hidden_states,
+                net, indices, obs_flat, all_masks, self._slot_states,
                 self._all_actions, self._all_log_probs, self._all_values,
             )
 
@@ -563,12 +546,10 @@ class RolloutLoop:
                         next_obs_t = torch.tensor(
                             next_obs[env_idx, player_idx], dtype=torch.float32,
                         ).unsqueeze(0)
-                        bootstrap_hidden = self._hidden_states.get((env_idx, player_idx))
-                        with torch.no_grad():
-                            _, _, bootstrap_val, _ = bootstrap_net.act(
-                                next_obs_t, hidden=bootstrap_hidden,
-                            )
-                        bootstrap_val = 0.0 if done else bootstrap_val.item()
+                        bootstrap_out = act(
+                            bootstrap_net, next_obs_t, self._slot_states[(env_idx, player_idx)],
+                        )
+                        bootstrap_val = 0.0 if done else bootstrap_out.values.item()
 
                         chunk = _build_chunk(
                             buf, slot_aid, bootstrap_val, self._policy_versions[slot_aid],
@@ -594,13 +575,8 @@ class RolloutLoop:
                 self._ep_rewards[env_idx] = 0.0
                 self._ep_lengths[env_idx] = 0
                 self._apply_pending_assignment(env_idx)
-
-                if self._any_recurrent:
-                    for p in range(num_players):
-                        if (env_idx, p) in self._hidden_states:
-                            aid = self._slot_agent_map[env_idx][p]
-                            net = self._networks[aid][LATEST_NETWORK_ID]
-                            self._hidden_states[(env_idx, p)] = net.initial_hidden(1)
+                for p in range(num_players):
+                    self._slot_states[(env_idx, p)] = self._initial_slot_state(env_idx, p)
 
         self._obs = next_obs
         self._infos = infos
@@ -617,10 +593,10 @@ class RolloutLoop:
     # Internals
     # ------------------------------------------------------------------
 
-    def _compute_any_recurrent(self) -> bool:
-        return any(
-            nets[LATEST_NETWORK_ID].is_recurrent for nets in self._networks.values()
-        )
+    def _initial_slot_state(self, env_idx: int, p: int) -> State:
+        """Episode-start state for the model currently assigned to slot (env_idx, p)."""
+        aid = self._slot_agent_map[env_idx][p]
+        return self._networks[aid][LATEST_NETWORK_ID].initial_state(1)
 
     def _apply_pending_assignment(self, env_idx: int) -> None:
         """Apply a staged match re-assignment to one env at its episode boundary."""

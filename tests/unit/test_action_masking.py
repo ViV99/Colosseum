@@ -146,8 +146,8 @@ def test_trajectory_chunk_with_masks():
     assert chunk.action_masks is not None
     assert chunk.action_masks.shape == (16, 3)
 
-    # to_device should preserve masks
-    chunk2 = chunk.to_device("cpu")
+    # to() should preserve masks
+    chunk2 = chunk.to("cpu")
     assert chunk2.action_masks is not None
     assert chunk2.action_masks.shape == (16, 3)
 
@@ -166,7 +166,7 @@ def test_trajectory_chunk_without_masks():
         behavior_policy_version=1,
     )
     assert chunk.action_masks is None
-    chunk2 = chunk.to_device("cpu")
+    chunk2 = chunk.to("cpu")
     assert chunk2.action_masks is None
 
 
@@ -178,8 +178,9 @@ def test_appo_with_action_masks():
     """APPO should handle chunks with action_masks."""
     from colosseum.algorithms.appo import APPO
     from colosseum.core.config import AlgorithmConfig
+    from helpers import make_simple_model
 
-    net = _make_network(obs_dim=4, num_actions=3)
+    net = make_simple_model(obs_dim=4, hidden_dim=32, num_actions=3)
     config = AlgorithmConfig(name="appo", num_epochs=1, minibatch_chunks=0)
     appo = APPO(net, config, device="cpu")
 

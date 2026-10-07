@@ -93,6 +93,22 @@ def test_slice_batch_sequence_and_tensor_index():
     assert sub_mask["h"].shape[0] == 2
 
 
+def test_slice_batch_integral_and_0dim_tensor_index_keep_batch_dim():
+    s = _nested(3)
+    for idx in (np.int64(2), torch.tensor(2), torch.tensor(2, dtype=torch.int32)):
+        row = slice_batch(s, idx)
+        assert row["h"].shape == (1, 2, 4)
+        assert torch.equal(row["h"][0], s["h"][2])
+        assert row["pair"].b[0].shape == (1,)
+
+
+def test_slice_batch_rejects_bool_index():
+    s = _nested(3)
+    for idx in (True, False, torch.tensor(True)):
+        with pytest.raises(TypeError, match="bool"):
+            slice_batch(s, idx)
+
+
 def test_cat_batch_roundtrip_of_rows():
     s = _nested(4)
     rows = [slice_batch(s, i) for i in range(4)]
@@ -108,6 +124,28 @@ def test_cat_batch_none_and_mismatch():
         cat_batch([{"h": torch.zeros(1, 2)}, {"c": torch.zeros(1, 2)}])
     with pytest.raises(ValueError):
         cat_batch([])
+
+
+def test_cat_batch_requires_identical_node_types():
+    a = torch.zeros(1, 2)
+    with pytest.raises(ValueError, match="node types"):
+        cat_batch([Pair(a, a), (a, a)])
+    with pytest.raises(ValueError, match="node types"):
+        cat_batch([(a, a), Pair(a, a)])
+    Other = namedtuple("Other", ["a", "b"])
+    with pytest.raises(ValueError, match="node types"):
+        cat_batch([Pair(a, a), Other(a, a)])
+    with pytest.raises(ValueError, match="node types"):
+        cat_batch([[a], (a,)])
+
+
+def test_where_done_validates_done_shape():
+    state = {"h": torch.ones(3, 2)}
+    reset = {"h": torch.zeros(3, 2)}
+    for bad in (torch.tensor([True, False]), torch.zeros(3, 1, dtype=torch.bool),
+                torch.tensor(True)):
+        with pytest.raises(ValueError, match="done"):
+            where_done(bad, reset, state)
 
 
 def test_where_done_replaces_only_done_rows():

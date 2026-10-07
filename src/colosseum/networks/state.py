@@ -8,6 +8,7 @@ slices, concatenates, resets, moves and serializes it with the helpers below.
 
 from __future__ import annotations
 
+import numbers
 from collections.abc import Callable, Sequence
 from typing import Any
 
@@ -78,9 +79,19 @@ def batch_size_of(state: State) -> int | None:
 
 
 def slice_batch(state: State, idx: int | Sequence[int] | Tensor) -> State:
-    """Select batch rows. An ``int`` index keeps the batch dim (result has batch 1)."""
-    if isinstance(idx, int):
-        return tree_map(lambda t: t[idx].unsqueeze(0), state)
+    """Select batch rows.
+
+    A single integer index (any ``numbers.Integral``, e.g. ``np.int64``, or a
+    0-dim integer tensor) keeps the batch dim: the result has batch 1. A
+    sequence of indices, an index tensor or a bool mask selects several rows.
+    A single ``bool`` is rejected (it would silently mean index 0 or 1).
+    """
+    if isinstance(idx, bool) or (isinstance(idx, Tensor) and idx.dim() == 0
+                                 and idx.dtype == torch.bool):
+        raise TypeError("slice_batch: a single bool is not a valid batch index")
+    if isinstance(idx, numbers.Integral) or (isinstance(idx, Tensor) and idx.dim() == 0):
+        i = int(idx)
+        return tree_map(lambda t: t[i].unsqueeze(0), state)
     if isinstance(idx, Tensor):
         index = idx if idx.dtype == torch.bool else idx.long()
     else:
@@ -102,17 +113,21 @@ def cat_batch(states: Sequence[State]) -> State:
         if not all(isinstance(s, Tensor) for s in states):
             raise ValueError("State structures differ: expected tensors")
         return torch.cat(states, dim=0)
+    if isinstance(first, tuple | list | dict):
+        if not all(type(s) is type(first) for s in states):
+            names = sorted({type(s).__name__ for s in states})
+            raise ValueError(f"State structures differ: node types {names}")
     if isinstance(first, tuple):
-        if not all(isinstance(s, tuple) and len(s) == len(first) for s in states):
-            raise ValueError("State structures differ: tuple length/type mismatch")
+        if not all(len(s) == len(first) for s in states):
+            raise ValueError("State structures differ: tuple length mismatch")
         parts = [cat_batch([s[i] for s in states]) for i in range(len(first))]
         return type(first)(*parts) if _is_namedtuple(first) else tuple(parts)
     if isinstance(first, list):
-        if not all(isinstance(s, list) and len(s) == len(first) for s in states):
-            raise ValueError("State structures differ: list length/type mismatch")
+        if not all(len(s) == len(first) for s in states):
+            raise ValueError("State structures differ: list length mismatch")
         return [cat_batch([s[i] for s in states]) for i in range(len(first))]
     if isinstance(first, dict):
-        if not all(isinstance(s, dict) and s.keys() == first.keys() for s in states):
+        if not all(s.keys() == first.keys() for s in states):
             raise ValueError("State structures differ: dict keys mismatch")
         return {k: cat_batch([s[k] for s in states]) for k in first}
     raise TypeError(f"Unsupported state node type: {type(first).__name__}")
@@ -123,6 +138,9 @@ def where_done(done: Tensor, reset: State, state: State) -> State:
 
     ``done`` is a ``[B]`` bool tensor; ``reset`` and ``state`` share structure and batch size.
     """
+    batch = batch_size_of(state)
+    if batch is not None and tuple(done.shape) != (batch,):
+        raise ValueError(f"where_done: done must have shape ({batch},), got {tuple(done.shape)}")
     def _select(r: Tensor, s: Tensor) -> Tensor:
         mask = done.to(device=s.device, dtype=torch.bool).view(-1, *([1] * (s.dim() - 1)))
         return torch.where(mask, r.to(dtype=s.dtype, device=s.device), s)

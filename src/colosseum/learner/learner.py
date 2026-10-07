@@ -62,7 +62,7 @@ def learner_process(
     # Resume from checkpoint if provided
     train_step = 0
     if resume_state is not None:
-        algorithm.network.load_state_dict(resume_state["state_dict"])
+        algorithm.model.load_state_dict(resume_state["state_dict"])
         if "optimizer_state" in resume_state and hasattr(algorithm, "_optimizer"):
             algorithm._optimizer.load_state_dict(resume_state["optimizer_state"])
         train_step = resume_state.get("policy_version", 0)
@@ -122,7 +122,7 @@ def learner_process(
                 and pv % checkpoint_interval == 0):
             state_dict_cpu = {
                 k: v.cpu().clone()
-                for k, v in algorithm.network.state_dict().items()
+                for k, v in algorithm.model.state_dict().items()
             }
             optimizer_state = algorithm.optimizer_state_dict
             try:
@@ -197,7 +197,7 @@ def _push_weights(
     weight_queues: list[mp.Queue],
 ) -> None:
     """Push current model weights to all worker weight queues."""
-    state_dict = {k: v.cpu().clone() for k, v in algorithm.network.state_dict().items()}
+    state_dict = {k: v.cpu().clone() for k, v in algorithm.model.state_dict().items()}
     payload = WeightPayload(
         agent_id=agent_id,
         policy_version=algorithm.policy_version,

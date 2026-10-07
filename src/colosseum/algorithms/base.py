@@ -7,7 +7,7 @@ import torch
 
 if TYPE_CHECKING:
     from colosseum.core.types import TrajectoryChunk
-    from colosseum.networks.actor_critic import ActorCriticNetwork
+    from colosseum.networks.model import PolicyModel
 
 
 class BaseAlgorithm(ABC):
@@ -17,7 +17,7 @@ class BaseAlgorithm(ABC):
     chunks. Off-policy algorithms (R2D2, DQN) add chunks to a replay buffer
     and sample from it for training.
 
-    Subclasses must implement: compute_loss, train_step, network, policy_version.
+    Subclasses must implement: compute_loss, train_step, model, policy_version.
     Off-policy subclasses should also override is_off_policy and create_replay_buffer.
     """
 
@@ -40,8 +40,8 @@ class BaseAlgorithm(ABC):
 
     @property
     @abstractmethod
-    def network(self) -> ActorCriticNetwork:
-        """The neural network being trained."""
+    def model(self) -> PolicyModel:
+        """The PolicyModel being trained."""
         ...
 
     @property

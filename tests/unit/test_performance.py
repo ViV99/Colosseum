@@ -138,9 +138,9 @@ def test_pin_memory_cpu_noop():
     """pin_memory=True on CPU doesn't crash, produces valid results."""
     from colosseum.algorithms.appo import APPO
     from colosseum.core.config import AlgorithmConfig
-    from helpers import make_simple_network
+    from helpers import make_simple_model
 
-    net = make_simple_network(obs_dim=4, hidden_dim=32, num_actions=3)
+    net = make_simple_model(obs_dim=4, hidden_dim=32, num_actions=3)
     config = AlgorithmConfig(name="appo", num_epochs=1, minibatch_chunks=0)
     appo = APPO(net, config, device="cpu", pin_memory=True)
 
@@ -204,9 +204,9 @@ def test_appo_torch_compile():
         pytest.skip("torch.compile backend unavailable")
     from colosseum.algorithms.appo import APPO
     from colosseum.core.config import AlgorithmConfig
-    from helpers import make_simple_network
+    from helpers import make_simple_model
 
-    net = make_simple_network(obs_dim=4, hidden_dim=32, num_actions=3)
+    net = make_simple_model(obs_dim=4, hidden_dim=32, num_actions=3)
     config = AlgorithmConfig(
         name="appo", num_epochs=1, minibatch_chunks=0, use_torch_compile=True,
     )

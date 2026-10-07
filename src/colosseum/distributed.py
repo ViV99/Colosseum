@@ -128,7 +128,7 @@ def run_distributed_learner(
     trains with the configured algorithm, and pushes weights to the WeightStore
     at ``weight_store_address``.
     """
-    from colosseum.core.registry import build_network, import_class
+    from colosseum.core.registry import build_model, import_class
     from colosseum.learner.learner import learner_process
     from colosseum.transport.grpc_transport import serve_trajectory_receiver
     from colosseum.weight_store.grpc_store import GRPCWeightStore
@@ -171,11 +171,11 @@ def run_distributed_learner(
     teacher_path = acfg.training.kickstart_teacher
 
     def algorithm_factory():
-        net = build_network(acfg)
+        model = build_model(acfg)
         kickstart = None
         if teacher_path:
             from colosseum.bc.kickstart import KickstartLoss
-            teacher = build_network(acfg)
+            teacher = build_model(acfg)
             teacher.load_state_dict(torch.load(teacher_path, weights_only=True, map_location=device))
             teacher.to(device)
             kickstart = KickstartLoss(
@@ -186,7 +186,7 @@ def run_distributed_learner(
         kwargs = {"device": device, "pin_memory": acfg.learner.pin_memory}
         if kickstart is not None:
             kwargs["kickstart"] = kickstart
-        return algo_cls(net, acfg.algorithm, **kwargs)
+        return algo_cls(model, acfg.algorithm, **kwargs)
 
     env_steps_per_train_step = config.rollout.chunk_length * acfg.learner.batch_chunks
     total_train_steps = max(1, config.training.total_timesteps // env_steps_per_train_step)
@@ -257,7 +257,7 @@ def _dist_worker_target(
     import sys
     sys.path.insert(0, ".")
 
-    from colosseum.core.registry import build_network
+    from colosseum.core.registry import build_model
     from colosseum.transport.grpc_transport import GRPCTransport
     from colosseum.weight_store.grpc_store import GRPCWeightStore
     from colosseum.worker.rollout_worker import rollout_worker_process
@@ -271,8 +271,8 @@ def _dist_worker_target(
     }
     trajectory_queues = {aid: GRPCTrajectorySink(transports[aid], aid) for aid in agent_ids}
     weight_queues = {aid: GRPCWeightSource(store, aid) for aid in agent_ids}
-    network_factories = {
-        aid: partial(build_network, agent_configs[aid]) for aid in agent_ids
+    model_factories = {
+        aid: partial(build_model, agent_configs[aid]) for aid in agent_ids
     }
 
     env_class_path = config.env.env_class
@@ -294,7 +294,7 @@ def _dist_worker_target(
         total_timesteps=total_timesteps,
         seed=worker_seed,
         agent_ids=agent_ids,
-        network_factories=network_factories,
+        model_factories=model_factories,
         trajectory_queues=trajectory_queues,
         weight_queues=weight_queues,
         slot_agent_map=slot_agent_map,

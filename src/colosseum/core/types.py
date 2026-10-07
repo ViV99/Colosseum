@@ -11,6 +11,8 @@ from typing import Any
 
 import torch
 
+from colosseum.networks.state import State, tree_map
+
 
 @dataclass
 class TrajectoryChunk:
@@ -28,18 +30,20 @@ class TrajectoryChunk:
         action_log_probs: Log-probabilities of the chosen actions under the
             behavior policy, shape ``[T]``.
         rewards: Scalar rewards received after each action, shape ``[T]``.
-        dones: Boolean episode-termination flags, shape ``[T]``.
+        dones: Episode-termination flags, shape ``[T]`` (transition t is the
+            last of its episode).
         values: Value estimates from the behavior policy, shape ``[T]``.
-        bootstrap_value: Value estimate at step ``T`` used for GAE / V-trace
-            bootstrapping (scalar tensor).
+        bootstrap_value: Value estimate after the last transition (scalar),
+            0 when the last transition is terminal.
         behavior_policy_version: Version counter of the policy that was used
-            to collect this chunk.  The learner uses this, together with its
-            current policy version, to compute importance-sampling ratios for
-            V-trace correction.
-        lstm_hidden: Optional LSTM hidden state ``(h, c)`` at the *start* of
-            the chunk, each of shape ``[num_layers, hidden_size]``.  Required
-            when training recurrent policies so that the learner can reproduce
-            the correct hidden-state trajectory.
+            to collect this chunk.
+        initial_state: Model state (a ``State`` pytree, see
+            ``colosseum.networks.state``) before the chunk's first transition;
+            every tensor leaf has batch dim 1 (``[1, ...]``). ``None`` for
+            stateless models. The learner concatenates these along dim 0 and
+            unrolls the model from them.
+        action_masks: Optional ``[T, mask_size]`` bool masks the behavior
+            policy acted under.
     """
 
     agent_id: str
@@ -51,8 +55,8 @@ class TrajectoryChunk:
     values: torch.Tensor  # [T]
     bootstrap_value: torch.Tensor  # scalar
     behavior_policy_version: int
-    lstm_hidden: tuple[torch.Tensor, torch.Tensor] | None = None
-    action_masks: torch.Tensor | None = None  # [T, num_actions]
+    initial_state: State = None  # leaves [1, ...]; None for stateless models
+    action_masks: torch.Tensor | None = None  # [T, mask_size]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -64,7 +68,7 @@ class TrajectoryChunk:
         return self.observations.shape[0]
 
     def _apply_to_tensors(self, fn) -> TrajectoryChunk:
-        """Return a copy with *fn* applied to every tensor field."""
+        """Return a copy with *fn* applied to every tensor (including state leaves)."""
         return TrajectoryChunk(
             agent_id=self.agent_id,
             observations=fn(self.observations),
@@ -75,20 +79,12 @@ class TrajectoryChunk:
             values=fn(self.values),
             bootstrap_value=fn(self.bootstrap_value),
             behavior_policy_version=self.behavior_policy_version,
-            lstm_hidden=(
-                (fn(self.lstm_hidden[0]), fn(self.lstm_hidden[1]))
-                if self.lstm_hidden is not None
-                else None
-            ),
-            action_masks=(
-                fn(self.action_masks)
-                if self.action_masks is not None
-                else None
-            ),
+            initial_state=tree_map(fn, self.initial_state),
+            action_masks=fn(self.action_masks) if self.action_masks is not None else None,
         )
 
-    def to_device(self, device: str | torch.device) -> TrajectoryChunk:
-        """Return a shallow copy with all tensors moved to *device*."""
+    def to(self, device: str | torch.device) -> TrajectoryChunk:
+        """Return a copy with all tensors moved to *device*."""
         return self._apply_to_tensors(lambda t: t.to(device))
 
     def pin_memory(self) -> TrajectoryChunk:

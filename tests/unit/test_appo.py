@@ -5,12 +5,11 @@ import torch
 from colosseum.algorithms.appo import APPO
 from colosseum.core.config import AlgorithmConfig
 from colosseum.core.types import TrajectoryChunk
-from colosseum.networks.actor_critic import ActorCriticNetwork
-from examples.tic_tac_toe.networks import TicTacToeEncoder, TicTacToePolicy, TicTacToeValue
+from helpers import make_ttt_model
 
 
 def _make_network():
-    return ActorCriticNetwork(TicTacToeEncoder(), TicTacToePolicy(), TicTacToeValue())
+    return make_ttt_model()
 
 
 def _make_chunks(n=4, T=8):

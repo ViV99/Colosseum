@@ -437,8 +437,9 @@ def test_appo_composite_train_step():
     from colosseum.algorithms.appo import APPO
     from colosseum.core.config import AlgorithmConfig
     from colosseum.core.types import TrajectoryChunk
-    from colosseum.networks.actor_critic import ActorCriticNetwork
     from colosseum.networks.base import BaseEncoder, BasePolicy, BaseValue
+    from colosseum.networks.composed import ComposedModel
+    from colosseum.networks.cores import NoCore
 
     FLAT_SIZE = 3  # direction(1) + speed(2)
     OBS_DIM = 4
@@ -480,7 +481,7 @@ def test_appo_composite_train_step():
         def forward(self, latent):
             return self.fc(latent).squeeze(-1)
 
-    net = ActorCriticNetwork(Enc(), Pol(), Val())
+    net = ComposedModel(Enc(), NoCore(LATENT), Pol(), Val())
     config = AlgorithmConfig(name="appo", num_epochs=1, minibatch_chunks=0)
     appo = APPO(net, config, device="cpu")
 

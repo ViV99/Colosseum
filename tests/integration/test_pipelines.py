@@ -169,3 +169,21 @@ def test_subprocess_vec_env_pipeline(tmp_path):
     )
     Launcher(config).launch()
     assert CheckpointManager(str(tmp_path / "checkpoints")).list_checkpoints("agent_0")
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(900)
+def test_full_pipeline_lstm_core(tmp_path):
+    """Recurrent end-to-end run (R1-01): worker chunks with LSTM state train in the learner."""
+    from colosseum.launcher import Launcher
+
+    config = _config(
+        "tic_tac_toe.yaml", tmp_path,
+        training={"total_timesteps": 3000},
+        rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
+        learner={"batch_chunks": 2, "queue_size": 16},
+    )
+    data = config.model_dump()
+    data["networks"]["core"] = {"class": "colosseum.networks.cores.LSTMCore", "kwargs": {"hidden_size": 32}}
+    Launcher(ColosseumConfig(**data)).launch()
+    assert CheckpointManager(str(tmp_path / "checkpoints")).list_checkpoints("agent_0")

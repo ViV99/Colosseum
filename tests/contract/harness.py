@@ -9,15 +9,15 @@ from typing import Any
 
 from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
 from colosseum.worker.rollout_loop import LoopIO, RolloutLoop
-from helpers import CountingEnv, make_simple_network
+from helpers import CountingEnv, make_simple_model
 
 OBS_DIM = 4
 NUM_ACTIONS = 3
 
 
-def simple_factory() -> Any:
-    """Model factory used by the contract tests (small MLP actor-critic)."""
-    return make_simple_network(obs_dim=OBS_DIM, hidden_dim=16, num_actions=NUM_ACTIONS)
+def simple_factory(core: str = "none") -> Any:
+    """Model factory used by the contract tests: SimpleEncoder -> core -> heads."""
+    return make_simple_model(obs_dim=OBS_DIM, hidden_dim=16, num_actions=NUM_ACTIONS, core=core)
 
 
 def counting_env_fn(num_players: int = 2, episode_length: int = 5) -> Callable[[], CountingEnv]:

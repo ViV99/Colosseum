@@ -48,10 +48,10 @@ def _create_env(env_class_path: str, kwargs: dict):
     return cls(**kwargs)
 
 
-def _create_network(config: ColosseumConfig):
-    """Create ActorCriticNetwork inside a worker/learner process."""
-    from colosseum.core.registry import build_network
-    return build_network(config)
+def _create_model(config: ColosseumConfig):
+    """Create the agent's PolicyModel inside a worker/learner process."""
+    from colosseum.core.registry import build_model
+    return build_model(config)
 
 
 def _worker_target(
@@ -72,7 +72,7 @@ def _worker_target(
 ) -> None:
     """Worker process entry point.
 
-    Builds per-agent network factories INSIDE the process to avoid
+    Builds per-agent model factories INSIDE the process to avoid
     pickling lambdas across the spawn boundary.
     """
     import sys
@@ -88,12 +88,12 @@ def _worker_target(
     if config.training.seed is not None:
         worker_seed = config.training.seed + worker_id * 1000
 
-    # Build per-agent network factories inside this process (pickling safe)
-    network_factories = {}
+    # Build per-agent model factories inside this process (pickling safe)
+    model_factories = {}
     for aid in agent_ids:
         acfg = agent_configs[aid]
         # Default-arg capture ensures each lambda gets its own config
-        network_factories[aid] = lambda _cfg=acfg: _create_network(_cfg)
+        model_factories[aid] = lambda _cfg=acfg: _create_model(_cfg)
 
     rollout_worker_process(
         worker_id=worker_id,
@@ -109,7 +109,7 @@ def _worker_target(
         seed=worker_seed,
         # Multi-agent params
         agent_ids=agent_ids,
-        network_factories=network_factories,
+        model_factories=model_factories,
         trajectory_queues=trajectory_queues,
         weight_queues=weight_queues,
         checkpoint_state_dicts_by_agent=checkpoint_state_dicts_by_agent,
@@ -158,11 +158,11 @@ def _learner_target(
     teacher_path = config.training.kickstart_teacher
 
     def algorithm_factory():
-        net = _create_network(config)
+        model = _create_model(config)
         kickstart = None
         if teacher_path:
             from colosseum.bc.kickstart import KickstartLoss
-            teacher = _create_network(config)
+            teacher = _create_model(config)
             teacher_sd = torch.load(teacher_path, weights_only=True, map_location=device)
             teacher.load_state_dict(teacher_sd)
             teacher.to(device)
@@ -175,7 +175,7 @@ def _learner_target(
         kwargs = {"device": device, "pin_memory": config.learner.pin_memory}
         if kickstart is not None:
             kwargs["kickstart"] = kickstart
-        return algo_cls(net, config.algorithm, **kwargs)
+        return algo_cls(model, config.algorithm, **kwargs)
 
     learner_process(
         agent_id=agent_id,
