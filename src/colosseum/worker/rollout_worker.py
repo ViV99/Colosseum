@@ -109,16 +109,18 @@ def rollout_worker_process(
     try:
         loop.run(should_stop=stop_event.is_set, max_env_steps=total_timesteps)
     finally:
-        loop.close()
-        # Detach feeder threads for queues this worker produced to, so undrained
-        # data (e.g. chunks a stopped learner never consumed) can't block exit.
-        for tq in trajectory_queues.values():
-            try:
-                tq.cancel_join_thread()
-            except AttributeError:
-                pass
-        if results_queue is not None:
-            results_queue.cancel_join_thread()
+        try:
+            loop.close()
+        finally:
+            # Detach feeder threads for queues this worker produced to, so undrained
+            # data (e.g. chunks a stopped learner never consumed) can't block exit.
+            for tq in trajectory_queues.values():
+                try:
+                    tq.cancel_join_thread()
+                except AttributeError:
+                    pass
+            if results_queue is not None:
+                results_queue.cancel_join_thread()
     stats = loop.stats
     logger.info(
         f"Worker {worker_id}: finished. Steps={stats['env_steps']}, chunks_sent={stats['chunks_sent']}"

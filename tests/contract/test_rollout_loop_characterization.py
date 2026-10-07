@@ -93,6 +93,9 @@ def test_non_collecting_checkpoint_slot_produces_no_chunks():
 
     assert len(rec.chunks) == 4
     assert all(player_index(c) == {0} for c in rec.chunks)
+    # The checkpoint network really occupies seat 1 (results key it separately).
+    assert len(rec.results) == 2
+    assert all(set(r.player_outcomes) == {"agent_0:latest", "agent_0:ckpt_v1"} for r in rec.results)
 
 
 def test_episode_results_are_reported_per_env():
@@ -130,25 +133,49 @@ def test_initial_and_periodic_weight_sync_set_policy_version():
 
 
 def test_command_reassignment_applies_at_episode_boundary():
+    # Both envs run in lockstep: episodes end on steps 5, 10, 15, 20, ...
     torch.manual_seed(0)
-    loop, rec = make_loop(num_envs=2, chunk_length=4)
-    run_steps(loop, 10)  # two full episodes in each env
+    loop, rec = make_loop(
+        agent_ids=["a", "b"], num_envs=2, chunk_length=4,
+        slot_agent_map=[["a", "a"], ["a", "a"]],
+    )
+    run_steps(loop, 10)  # two full episodes per env; every buffer now holds 2/4 transitions
+    chunks_warm, results_warm = len(rec.chunks), len(rec.results)
+    assert (chunks_warm, results_warm) == (8, 4)
+
+    # Env 0 seat 1 switches to agent "b"; env 1 seat 1 stops collecting.
     rec.pending_commands.append(WorkerCommand(
-        slot_agent_map=[["agent_0", "agent_0"], ["agent_0", "agent_0"]],
+        slot_agent_map=[["a", "b"], ["a", "a"]],
         slot_network_map=[["latest", "latest"], ["latest", "latest"]],
-        collect_mask=[[True, False], [True, False]],
+        collect_mask=[[True, True], [True, False]],
         new_checkpoints={},
     ))
-    sent_before_boundary = None
-    for i in range(25):
-        loop.step()
-        if i == 4:  # the 3rd episode ends on this step; the command applies here
-            sent_before_boundary = len(rec.chunks)
+    run_steps(loop, 5)  # steps 11..15: command polled on step 11, 3rd episode ends on step 15
+    chunks_boundary, results_boundary = len(rec.chunks), len(rec.results)
+    run_steps(loop, 20)  # steps 16..35
     loop.close()
 
-    after = rec.chunks[sent_before_boundary:]
-    assert after, "player 0 must keep producing chunks"
-    assert all(player_index(c) == {0} for c in after)
+    # Until the boundary the OLD assignment holds: step 12 seals one agent-"a" chunk per slot.
+    before = rec.chunks[chunks_warm:chunks_boundary]
+    assert sorted((c.agent_id, *player_index(c)) for c in before) == [("a", 0), ("a", 0), ("a", 1), ("a", 1)]
+    boundary_results = rec.results[results_warm:results_boundary]
+    assert len(boundary_results) == 2
+    assert all(set(r.player_outcomes) == {"a:latest"} for r in boundary_results)
+    # Env 0's next episode is played under the new assignment.
+    assert set(rec.results[results_boundary].player_outcomes) == {"a:latest", "b:latest"}
+
+    after = rec.chunks[chunks_boundary:]
+    a_after = [c for c in after if c.agent_id == "a"]
+    b_after = [c for c in after if c.agent_id == "b"]
+    assert len(a_after) + len(b_after) == len(after)
+    # Seat 0 keeps collecting in both envs (its buffers are untouched): 2 x 5 chunks.
+    assert len(a_after) == 10 and all(player_index(c) == {0} for c in a_after)
+    # Agent "b" starts from an empty buffer at the episode start (no stale agent-"a"
+    # transitions), and env 1 seat 1 no longer produces chunks at all.
+    assert all(player_index(c) == {1} for c in b_after)
+    assert [step_index(c, EPISODE) for c in b_after] == [
+        [0, 1, 2, 3], [4, 0, 1, 2], [3, 4, 0, 1], [2, 3, 4, 0], [1, 2, 3, 4],
+    ]
 
 
 def test_run_respects_max_env_steps_and_stop():
