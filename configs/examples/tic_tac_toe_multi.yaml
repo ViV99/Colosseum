@@ -5,6 +5,7 @@ env:
 
 networks:
   encoder_class: "examples.tic_tac_toe.networks.TicTacToeEncoder"
+  core: null              # e.g. {class: colosseum.networks.cores.LSTMCore, kwargs: {hidden_size: 128}}
   policy_class: "examples.tic_tac_toe.networks.TicTacToePolicy"
   value_class: "examples.tic_tac_toe.networks.TicTacToeValue"
   kwargs: {}

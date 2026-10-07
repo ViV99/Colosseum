@@ -7,6 +7,7 @@ env:
 
 networks:
   encoder_class: "examples.space_miners.networks.SpaceMinersEncoder"
+  core: null              # e.g. {class: colosseum.networks.cores.LSTMCore, kwargs: {hidden_size: 128}}
   policy_class: "examples.space_miners.networks.SpaceMinersPolicy"
   value_class: "examples.space_miners.networks.SpaceMinersValue"
   kwargs: {}

@@ -65,9 +65,13 @@ class PolicyModel(nn.Module, ABC):
         every step, which is correct for any model. Stateless models are
         evaluated in one batched ``step`` (equivalent, faster). Distributions
         are concatenated with ``Distribution.cat``.
+
+        Raises ``ValueError`` for an empty sequence (``T == 0``) and for a
+        stateful model called with ``state0=None``.
         """
         T, B = obs.shape[0], obs.shape[1]
-        if state0 is None and not self.is_stateful:
+        self._check_unroll_args(T, state0)
+        if state0 is None:
             flat_mask = None if action_mask is None else action_mask.reshape(T * B, *action_mask.shape[2:])
             out = self.step(obs.reshape(T * B, *obs.shape[2:]), None, flat_mask)
             return UnrollOutput(dist=out.dist, value=out.value)
@@ -82,11 +86,24 @@ class PolicyModel(nn.Module, ABC):
             state = self.reset_state(out.state, dones[t])
         return UnrollOutput(dist=type(dists[0]).cat(dists), value=torch.cat(values, dim=0))
 
+    def _check_unroll_args(self, num_steps: int, state0: State) -> None:
+        """Clear errors for inputs ``unroll`` cannot handle."""
+        if num_steps < 1:
+            raise ValueError(f"unroll needs a sequence with T >= 1 steps, got T={num_steps}")
+        if state0 is None and self.is_stateful:
+            raise ValueError(
+                f"unroll: state0 is None but {type(self).__name__} is stateful; "
+                f"pass initial_state(B) or the stored state of the sequence start"
+            )
+
     def reset_state(self, state: State, done: Tensor) -> State:
-        """Replace the rows of ``state`` where ``done`` ([B] bool) with initial-state rows."""
-        if state is None:
-            return None
+        """Replace the rows of ``state`` where ``done`` ([B] bool) with initial-state rows.
+
+        A state without tensor leaves (``None``, empty containers) is returned unchanged.
+        """
         batch = batch_size_of(state)
+        if batch is None:
+            return state
         device = tree_leaves(state)[0].device
         return where_done(done, self.initial_state(batch, device), state)
 

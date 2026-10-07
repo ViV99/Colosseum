@@ -161,3 +161,5 @@ def test_window_attention_rejects_bad_sizes():
         WindowAttentionCore(IN, d_model=10, num_heads=4)
     with pytest.raises(ValueError):
         WindowAttentionCore(IN, window=0)
+    with pytest.raises(ValueError, match="num_layers"):
+        WindowAttentionCore(IN, num_layers=0)

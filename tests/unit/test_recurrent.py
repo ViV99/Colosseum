@@ -358,64 +358,46 @@ def test_trajectory_chunk_no_lstm_hidden():
 # ---------------------------------------------------------------
 
 
-def test_build_network_with_lstm():
-    """build_network should create LSTM trunk when recurrent_type='lstm'."""
+def _legacy_cfg(core=None):
     from colosseum.core.config import ColosseumConfig, EnvConfig, NetworkConfig
-    from colosseum.core.registry import build_network
 
     net_cfg = NetworkConfig(
         encoder_class="helpers.SimpleEncoder",
+        core=core,
         policy_class="helpers.SimplePolicy",
         value_class="helpers.SimpleValue",
-        recurrent_type="lstm",
-        recurrent_hidden_size=HIDDEN_SIZE,
-        recurrent_num_layers=NUM_LAYERS,
     )
-    env_cfg = EnvConfig(env_class="examples.tic_tac_toe.env.TicTacToeEnv")
-    config = ColosseumConfig(env=env_cfg, networks=net_cfg)
+    return ColosseumConfig(env=EnvConfig(env_class="examples.tic_tac_toe.env.TicTacToeEnv"), networks=net_cfg)
 
-    net = build_network(config)
+
+def test_build_network_with_lstm():
+    """Transitional build_network maps an LSTMCore config to an nn.LSTM trunk."""
+    from colosseum.core.registry import build_network
+
+    net = build_network(_legacy_cfg({"class": "colosseum.networks.cores.LSTMCore",
+                                     "kwargs": {"hidden_size": 24, "num_layers": NUM_LAYERS}}))
     assert net.is_recurrent
     assert isinstance(net.recurrent, nn.LSTM)
-    assert net.recurrent_hidden_size == HIDDEN_SIZE
+    assert net.recurrent_hidden_size == 24
     assert net.recurrent_num_layers == NUM_LAYERS
+    assert net.policy.fc.in_features == 24  # in_dim passed to the head
 
 
 def test_build_network_with_gru():
-    """build_network should create GRU trunk when recurrent_type='gru'."""
-    from colosseum.core.config import ColosseumConfig, EnvConfig, NetworkConfig
+    """Transitional build_network maps a GRUCore config to an nn.GRU trunk."""
     from colosseum.core.registry import build_network
 
-    net_cfg = NetworkConfig(
-        encoder_class="helpers.SimpleEncoder",
-        policy_class="helpers.SimplePolicy",
-        value_class="helpers.SimpleValue",
-        recurrent_type="gru",
-        recurrent_hidden_size=HIDDEN_SIZE,
-        recurrent_num_layers=1,
-    )
-    env_cfg = EnvConfig(env_class="examples.tic_tac_toe.env.TicTacToeEnv")
-    config = ColosseumConfig(env=env_cfg, networks=net_cfg)
-
-    net = build_network(config)
+    net = build_network(_legacy_cfg({"class": "colosseum.networks.cores.GRUCore",
+                                     "kwargs": {"hidden_size": 24}}))
     assert net.is_recurrent
     assert isinstance(net.recurrent, nn.GRU)
 
 
 def test_build_network_feedforward_default():
-    """build_network with no recurrent_type should create feedforward net."""
-    from colosseum.core.config import ColosseumConfig, EnvConfig, NetworkConfig
+    """Transitional build_network without a core builds a feedforward net."""
     from colosseum.core.registry import build_network
 
-    net_cfg = NetworkConfig(
-        encoder_class="helpers.SimpleEncoder",
-        policy_class="helpers.SimplePolicy",
-        value_class="helpers.SimpleValue",
-    )
-    env_cfg = EnvConfig(env_class="examples.tic_tac_toe.env.TicTacToeEnv")
-    config = ColosseumConfig(env=env_cfg, networks=net_cfg)
-
-    net = build_network(config)
+    net = build_network(_legacy_cfg())
     assert not net.is_recurrent
     assert net.recurrent is None
 

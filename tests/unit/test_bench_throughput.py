@@ -62,3 +62,12 @@ def test_partial_batches_mean_worker_bound():
     r = bench.compute_rates(samples, START, END, num_players=2)
     assert r["chunks_per_update"] == pytest.approx(3.0)
     assert r["bound"] == "worker"
+
+
+def test_benchmark_config_builds_and_validates(tmp_path):
+    """Guard: the pinned benchmark config follows the current config schema."""
+    from colosseum.core.registry import validate_config
+
+    cfg = bench._make_config(1, str(tmp_path))
+    assert cfg.networks.core is None
+    validate_config(cfg)

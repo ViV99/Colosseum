@@ -33,9 +33,9 @@ class TicTacToeEncoder(BaseEncoder):
 class TicTacToePolicy(BasePolicy):
     """Discrete policy head for 9 board positions."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, in_dim: int = 64, **kwargs) -> None:
         super().__init__()
-        self.net = nn.Linear(64, 9)
+        self.net = nn.Linear(in_dim, 9)
 
     def forward(self, latent: torch.Tensor) -> CategoricalDist:
         logits = self.net(latent)
@@ -45,10 +45,10 @@ class TicTacToePolicy(BasePolicy):
 class TicTacToeValue(BaseValue):
     """Scalar value head."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, in_dim: int = 64, **kwargs) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(64, 32),
+            nn.Linear(in_dim, 32),
             nn.ReLU(),
             nn.Linear(32, 1),
         )

@@ -37,10 +37,10 @@ class ChaseEncoder(BaseEncoder):
 class ChasePolicy(BasePolicy):
     """Composite policy: direction (Discrete(4)) + speed (Box(1))."""
 
-    def __init__(self):
+    def __init__(self, in_dim: int = _LATENT):
         super().__init__()
-        self.dir_head = nn.Linear(_LATENT, 4)
-        self.speed_mean = nn.Linear(_LATENT, 1)
+        self.dir_head = nn.Linear(in_dim, 4)
+        self.speed_mean = nn.Linear(in_dim, 1)
         self.speed_logstd = nn.Parameter(torch.zeros(1))
 
     def forward(self, latent):
@@ -54,10 +54,10 @@ class ChasePolicy(BasePolicy):
 
 
 class ChaseValue(BaseValue):
-    def __init__(self):
+    def __init__(self, in_dim: int = _LATENT):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(_LATENT, 16),
+            nn.Linear(in_dim, 16),
             nn.ReLU(),
             nn.Linear(16, 1),
         )

@@ -165,8 +165,8 @@ def test_pfsp_uses_win_rates():
 
 def _make_recurrent_net(obs_dim=4, hidden=8, num_actions=3):
     enc = SimpleEncoder(obs_dim=obs_dim, hidden_dim=hidden)
-    pol = SimplePolicy(hidden_dim=hidden, num_actions=num_actions)
-    val = SimpleValue(hidden_dim=hidden)
+    pol = SimplePolicy(in_dim=hidden, num_actions=num_actions)
+    val = SimpleValue(in_dim=hidden)
     rnn = nn.LSTM(hidden, hidden, 1, batch_first=False)
     net = ActorCriticNetwork(enc, pol, val, recurrent=rnn)
     net.eval()

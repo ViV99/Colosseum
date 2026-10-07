@@ -100,7 +100,7 @@ def _make_config(num_workers: int, checkpoint_dir: str):
             "policy_class": "examples.tic_tac_toe.networks.TicTacToePolicy",
             "value_class": "examples.tic_tac_toe.networks.TicTacToeValue",
             "kwargs": {},
-            "recurrent_type": None,
+            "core": None,
         },
         algorithm={
             "algorithm_class": "colosseum.algorithms.appo.APPO",

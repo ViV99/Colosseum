@@ -5,6 +5,7 @@ env:
 
 networks:
   encoder_class: "examples.composite_action.networks.ChaseEncoder"
+  core: null              # e.g. {class: colosseum.networks.cores.LSTMCore, kwargs: {hidden_size: 128}}
   policy_class: "examples.composite_action.networks.ChasePolicy"
   value_class: "examples.composite_action.networks.ChaseValue"
   kwargs: {}

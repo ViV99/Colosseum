@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, model_validator
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -98,22 +98,64 @@ class EnvConfig(BaseModel):
     kwargs: dict[str, Any] = Field(default_factory=dict, description="Extra kwargs forwarded to the env constructor.")
 
 
-class NetworkConfig(BaseModel):
-    """Neural network architecture specification."""
+class CoreConfig(BaseModel):
+    """Core (trunk) between encoder and heads: ``{class: <dotted path>, kwargs: {...}}``."""
 
-    encoder_class: str = Field(..., description="Dotted path to the encoder class.")
-    policy_class: str = Field(..., description="Dotted path to the policy head class.")
-    value_class: str = Field(..., description="Dotted path to the value head class.")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+    class_path: str = Field(
+        ..., alias="class",
+        description="Dotted path to a colosseum.networks.cores.Core subclass "
+                    "(e.g. 'colosseum.networks.cores.LSTMCore').",
+    )
     kwargs: dict[str, Any] = Field(
         default_factory=dict,
-        description="Extra kwargs forwarded to network constructors.",
+        description="Extra kwargs for the core constructor (input_dim is passed automatically).",
     )
-    recurrent_type: str | None = Field(
+
+
+class NetworkConfig(BaseModel):
+    """Model specification: a monolithic ``model_class`` or encoder + core + heads."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    model_class: str | None = Field(
         default=None,
-        description="Recurrent trunk type: 'lstm', 'gru', or None (feedforward).",
+        description="Dotted path to a PolicyModel subclass. When set, encoder/core/heads must be omitted.",
     )
-    recurrent_hidden_size: int = Field(default=128, ge=1, description="Hidden size for recurrent trunk.")
-    recurrent_num_layers: int = Field(default=1, ge=1, description="Number of recurrent layers.")
+    encoder_class: str | None = Field(default=None, description="Dotted path to the encoder class.")
+    core: CoreConfig | None = Field(
+        default=None, description="Optional core between encoder and heads (null = stateless NoCore).",
+    )
+    policy_class: str | None = Field(default=None, description="Dotted path to the policy head class.")
+    value_class: str | None = Field(default=None, description="Dotted path to the value head class.")
+    kwargs: dict[str, Any] = Field(
+        default_factory=dict,
+        description="Extra kwargs forwarded to the model (or encoder and head) constructors.",
+    )
+
+    @model_validator(mode="after")
+    def _check_model_spec(self) -> NetworkConfig:
+        parts = {
+            "encoder_class": self.encoder_class,
+            "core": self.core,
+            "policy_class": self.policy_class,
+            "value_class": self.value_class,
+        }
+        if self.model_class:
+            extra = [name for name, value in parts.items() if value is not None]
+            if extra:
+                raise ValueError(
+                    f"networks.model_class is set, so {', '.join(extra)} must be omitted"
+                )
+            return self
+        missing = [n for n in ("encoder_class", "policy_class", "value_class") if not parts[n]]
+        if missing:
+            raise ValueError(
+                "networks: set either model_class, or all of encoder_class, policy_class, "
+                f"value_class (missing: {', '.join(missing)})"
+            )
+        return self
 
 
 class RolloutConfig(BaseModel):

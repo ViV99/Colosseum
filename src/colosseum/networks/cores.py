@@ -140,6 +140,8 @@ class WindowAttentionCore(Core):
             raise ValueError(f"window must be >= 1, got {window}")
         if d_model % num_heads != 0:
             raise ValueError(f"d_model={d_model} must be divisible by num_heads={num_heads}")
+        if num_layers < 1:
+            raise ValueError(f"num_layers must be >= 1, got {num_layers}")
         self.input_dim = input_dim
         self.output_dim = d_model
         self.d_model = d_model

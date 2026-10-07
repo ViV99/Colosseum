@@ -163,3 +163,22 @@ def test_masked_categorical_cat_keeps_mask():
     cc = CategoricalDist.cat([d, d])
     assert torch.isinf(cc.logits[0, 1]) and torch.isinf(cc.logits[2, 1])
     assert torch.isfinite(cc.entropy()).all()
+
+
+@pytest.mark.parametrize("empty", [{}, (), [], {"a": None}])
+def test_reset_state_without_tensor_leaves_returns_state_unchanged(empty):
+    out = CounterModel().reset_state(empty, torch.tensor([True, False]))
+    assert out is empty
+
+
+def test_unroll_of_stateful_model_requires_state0():
+    model = CounterModel()
+    with pytest.raises(ValueError, match="state0 is None"):
+        model.unroll(torch.zeros(2, 2, OBS), None, torch.zeros(2, 2, dtype=torch.bool))
+
+
+@pytest.mark.parametrize("model_cls", [CounterModel, StatelessModel])
+def test_unroll_rejects_empty_sequence(model_cls):
+    model = model_cls()
+    with pytest.raises(ValueError, match="T >= 1"):
+        model.unroll(torch.zeros(0, 2, OBS), model.initial_state(2), torch.zeros(0, 2, dtype=torch.bool))
