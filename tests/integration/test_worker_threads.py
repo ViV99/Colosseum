@@ -62,7 +62,8 @@ def _run_probe_worker(torch_threads: int, vec_env_kind: str) -> np.ndarray:
 
 def test_spawned_worker_uses_rollout_torch_threads():
     obs = _run_probe_worker(torch_threads=2, vec_env_kind="sync")
-    assert set(obs[:, 0].tolist()) == {2.0}
+    assert set(obs[:, 0].tolist()) == {2.0}   # intra-op threads in the worker
+    assert set(obs[:, 2].tolist()) == {1.0}   # inter-op threads in the worker
 
 
 def test_subprocess_env_children_use_one_thread():

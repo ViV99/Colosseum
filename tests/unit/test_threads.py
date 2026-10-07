@@ -45,6 +45,40 @@ def test_configure_torch_threads_sets_intra_op_threads():
         torch.set_num_threads(before)
 
 
+def test_configure_torch_threads_warns_when_interop_limit_is_lost(monkeypatch, caplog):
+    import colosseum.core.threads as threads_mod
+
+    def too_late(n):
+        raise RuntimeError("cannot set number of interop threads after parallel work has started")
+
+    monkeypatch.setattr(threads_mod.torch, "set_num_interop_threads", too_late)
+    monkeypatch.setattr(threads_mod.torch, "get_num_interop_threads", lambda: 8)
+    before = torch.get_num_threads()
+    try:
+        with caplog.at_level("WARNING", logger="colosseum.core.threads"):
+            configure_torch_threads(1)
+    finally:
+        torch.set_num_threads(before)
+    messages = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(messages) == 1
+    assert "8" in messages[0] and "requested 1" in messages[0]
+    assert "must run before any torch work" in messages[0]
+
+
+def test_configure_torch_threads_is_silent_when_interop_matches(monkeypatch, caplog):
+    import colosseum.core.threads as threads_mod
+
+    monkeypatch.setattr(threads_mod.torch, "set_num_interop_threads", lambda n: None)
+    monkeypatch.setattr(threads_mod.torch, "get_num_interop_threads", lambda: 1)
+    before = torch.get_num_threads()
+    try:
+        with caplog.at_level("WARNING", logger="colosseum.core.threads"):
+            configure_torch_threads(1)
+    finally:
+        torch.set_num_threads(before)
+    assert not [r for r in caplog.records if r.levelname == "WARNING"]
+
+
 # ---------------------------------------------------------------------------
 # Learner process entry: explicit thread call and device resolution
 # ---------------------------------------------------------------------------
@@ -97,11 +131,14 @@ def test_learner_target_sets_explicit_torch_threads(monkeypatch):
 
 
 def test_learner_target_auto_threads_and_auto_device_resolve_to_cpu(monkeypatch):
+    import colosseum.core.threads as threads_mod
+
     monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
+    monkeypatch.setattr(threads_mod.os, "cpu_count", lambda: 8)  # 3 != the default 1 on any runner
     config = _ttt_config(learner={"device": "auto", "torch_threads": None},
                          rollout={"num_workers": 2, "torch_threads": 1})
     threads, algorithm = _run_learner_target(monkeypatch, config, num_learners=2)
-    assert threads == resolve_learner_threads(None, "cpu", 2, 1, 2)
+    assert threads == 3  # (8 - 2 workers * 1 thread) // 2 learners
     assert next(algorithm.model.parameters()).device.type == "cpu"
 
 

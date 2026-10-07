@@ -62,14 +62,16 @@ class _Base(BaseEnv):
 class ThreadProbeEnv(_Base):
     """1-player env whose observation reports the process's thread settings.
 
-    obs = [torch.get_num_threads(), OMP_NUM_THREADS (or -1), ep, t]; 4 steps per episode.
+    obs = [torch.get_num_threads(), OMP_NUM_THREADS (or -1), torch.get_num_interop_threads(), t];
+    4 steps per episode.
     """
 
     NUM_PLAYERS = 1
 
     def _probe(self) -> dict[int, np.ndarray]:
         omp = float(os.environ.get("OMP_NUM_THREADS", "-1"))
-        return {0: np.array([torch.get_num_threads(), omp, self.ep, self.t], np.float32)}
+        return {0: np.array([torch.get_num_threads(), omp, torch.get_num_interop_threads(), self.t],
+                            np.float32)}
 
     def reset(self, seed=None):
         self.ep += 1
