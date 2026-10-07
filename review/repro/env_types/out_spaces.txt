@@ -1,0 +1,82 @@
+
+======================================================================
+DICT OBSERVATIONS: VectorEnv / validate_config
+======================================================================
+VectorEnv obs dtype/shape: object (2, 2)
+ERROR: TypeError can't convert np.ndarray of type numpy.object_. The only supported types are: float64, float32, float16, complex64, complex128, int64, int32, int16, int8, uint64, uint32, uint16, uint8, and bool.
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/worker/rollout_worker.py", line 476, in rollout_worker_process
+    _run_inference_group(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/worker/rollout_worker.py", line 134, in _run_inference_group
+    obs_batch = torch.from_numpy(np.ascontiguousarray(obs_flat[idx_list])).float()
+                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: can't convert np.ndarray of type numpy.object_. The only supported types are: float64, float32, float16, complex64, complex128, int64, int32, int16, int8, uint64, uint32, uint16, uint8, and bool.
+ERROR: TypeError can't convert np.ndarray of type numpy.object_. The only supported types are: float64, float32, float16, complex64, complex128, int64, int32, int16, int8, uint64, uint32, uint16, uint8, and bool.
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/0db917f9-6d82-45c2-8cea-f3910287244a/scratchpad/env_types/exp_spaces.py", line 43, in <module>
+    validate_config(ColosseumConfig(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/core/registry.py", line 128, in validate_config
+    obs = torch.as_tensor(np.asarray(sample), dtype=torch.float32).unsqueeze(0)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+TypeError: can't convert np.ndarray of type numpy.object_. The only supported types are: float64, float32, float16, complex64, complex128, int64, int32, int16, int8, uint64, uint32, uint16, uint8, and bool.
+
+======================================================================
+PER-UNIT ACTIONS: MultiDiscrete([A]*K) + CompositeDist + per-unit mask
+======================================================================
+chunk actions shape/dtype: (8, 8) torch.float32 masks: (8, 32)
+APPO metrics: {'total_loss': 0.2061, 'policy_loss': 0.1804, 'value_loss': 0.1737, 'entropy': 6.1125, 'approx_kl': 0.3027, 'clip_fraction': 0.8281, 'policy_version': 1.0, 'learning_rate': 0.0003}
+
+======================================================================
+PER-UNIT: dead units with all-False mask row
+======================================================================
+ERROR: ValueError Expected parameter logits (Tensor of shape (2, 4)) of distribution Categorical(logits: torch.Size([2, 4])) to satisfy the constraint IndependentConstraint(Real(), 1), but found invalid values:
+tensor([[nan, nan, nan, nan],
+        [nan, nan, nan, nan]])
+    super().__init__(batch_shape, validate_args=validate_args)
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/distributions/distribution.py", line 77, in __init__
+    raise ValueError(
+ValueError: Expected parameter logits (Tensor of shape (2, 4)) of distribution Categorical(logits: torch.Size([2, 4])) to satisfy the constraint IndependentConstraint(Real(), 1), but found invalid values:
+tensor([[nan, nan, nan, nan],
+        [nan, nan, nan, nan]])
+
+======================================================================
+PER-UNIT: GridNet-style 2-D MultiDiscrete nvec
+======================================================================
+ERROR: TypeError only 0-dimensional arrays can be converted to Python scalars
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/0db917f9-6d82-45c2-8cea-f3910287244a/scratchpad/env_types/exp_spaces.py", line 79, in <module>
+    ActionSpec.from_space(gymnasium.spaces.MultiDiscrete(np.full((2, 4), 4)))
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/core/action_spec.py", line 111, in from_space
+    named = {str(i): gymnasium.spaces.Discrete(int(n))
+                                               ^^^^^^
+TypeError: only 0-dimensional arrays can be converted to Python scalars
+
+======================================================================
+PER-UNIT: Box action of shape (K, D)
+======================================================================
+Box(3,2) action_shape: (3, 2) composite: False
+
+======================================================================
+PER-UNIT: unit ordering for K>10 (MultiDiscrete -> sorted string keys)
+======================================================================
+component names in flat order: ['0', '1', '10', '11', '2', '3', '4', '5', '6', '7', '8', '9']
+env receives (index=unit, value=head that produced it): [0, 1, 10, 11, 2, 3, 4, 5, 6, 7, 8, 9]
+units whose action came from a DIFFERENT head: [2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+head '10' after applying env's per-unit mask -> allowed action: 2 (it got the mask row of env unit 2 )
+
+======================================================================
+PER-UNIT: joint log-prob ratio scaling with K (same per-unit policy change)
+======================================================================
+ K=   1: std(log_ratio)=0.037  PPO clip_fraction(eps=0.2)=0.00  frac rho truncated at 1=0.50  mean c_t=0.982
+ K=   8: std(log_ratio)=0.293  PPO clip_fraction(eps=0.2)=0.51  frac rho truncated at 1=0.42  mean c_t=0.880
+ K=  32: std(log_ratio)=0.689  PPO clip_fraction(eps=0.2)=0.79  frac rho truncated at 1=0.35  mean c_t=0.723
+ K= 128: std(log_ratio)=1.453  PPO clip_fraction(eps=0.2)=0.91  frac rho truncated at 1=0.24  mean c_t=0.470
+
+======================================================================
+RECURRENT (partial observability) in eval
+======================================================================
+ERROR: RuntimeError mat1 and mat2 shapes cannot be multiplied (2x32 and 16x4)
+    return forward_call(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/nn/modules/linear.py", line 134, in forward
+    return F.linear(input, self.weight, self.bias)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: mat1 and mat2 shapes cannot be multiplied (2x32 and 16x4)
+latent_dim == hidden_size case: eval path (hidden=None) silently skips LSTM; max |logit diff| vs proper path = 0.22909319400787354

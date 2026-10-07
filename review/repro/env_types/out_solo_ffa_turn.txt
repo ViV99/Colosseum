@@ -1,0 +1,59 @@
+
+======================================================================
+SOLO: 1-player env through worker -> APPO -> coordinator -> eval
+======================================================================
+chunks: 40 results: 40
+first result: MatchResult(match_id='w0_e0_18', player_outcomes={'a:latest': 0.5}, total_rewards={'a:latest': 1.0}, episode_length=np.int64(10))
+APPO metrics finite: True {'total_loss': 0.2849, 'policy_loss': 0.0178, 'value_loss': 0.5614, 'entropy': 1.3635, 'approx_kl': 0.0304, 'clip_fraction': 0.4, 'policy_version': 1.0, 'learning_rate': 0.0003}
+coordinator ratings after solo results: {'elo': {'a': 1200.0}, 'win_rates': {'a': {'a': 0.5}}}
+mean total reward in results (never logged anywhere): 2.15
+eval results for solo agent: {} 
+summary:
+Agent A vs Agent B | Matches | Win A | Win B | Draw | WR A (95% CI)
+-------------------------------------------------------------------
+
+======================================================================
+FFA-3 elimination, mode=per_player_term (eliminated player terminated=True)
+======================================================================
+episode lengths reported: [np.int64(2)] (true game length is 6)
+outcomes of first result: {'a:latest': 1.0}
+
+======================================================================
+FFA-3 elimination, mode=active (documented convention)
+======================================================================
+episodes=100
+per-episode env reward per seat: seat0=-2 (elim -1 + rank3 -1), seat1=-1 (elim -1 + rank2 0), seat2=+1
+ seat 0: recorded steps=198, sum reward in chunks=-99.0, dones in chunks=0
+ seat 1: recorded steps=396, sum reward in chunks=-99.0, dones in chunks=0
+ seat 2: recorded steps=600, sum reward in chunks=100.0, dones in chunks=100
+result outcomes (rank-based): {'a:latest': 1.0}
+ seat0 chunk rewards: [0.0, -1.0, 0.0, -1.0, 0.0, -1.0] dones: [0.0, 0.0, 0.0, 0.0, 0.0, 0.0] t-feature: [0.0, 0.17, 0.0, 0.17, 0.0, 0.17]
+
+======================================================================
+TURN-BASED (alternating), info['active'] convention
+======================================================================
+episodes=100; env gives seat0 +1 and seat1 -1 per episode
+ seat 0: recorded steps=200, sum reward=0.0, dones=0
+ seat 1: recorded steps=200, sum reward=-100.0, dones=100
+ seat0 chunk rewards: [0.0, 0.0, 0.0, 0.0] dones: [0.0, 0.0, 0.0, 0.0] t: [0.0, 0.5, 0.0, 0.5]
+
+======================================================================
+TURN-BASED without 'active' (every slot recorded, incl. ignored moves)
+======================================================================
+ seat 0: recorded steps=400, sum reward=100.0, dones=100
+ seat 1: recorded steps=400, sum reward=-100.0, dones=100
+ fraction of recorded transitions where the slot's action is ignored by env: 0.50
+
+======================================================================
+TURN-BASED with all-False action mask for the inactive player
+======================================================================
+CRASH: ValueError Expected parameter logits (Tensor of shape (2, 3)) of distribution Categorical(logits: torch.Size([2, 3])) to satisfy the constraint IndependentConstraint(Real(), 1), but found invalid values:
+tensor(
+                 ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/distributions/categorical.py", line 85, in __init__
+    super().__init__(batch_shape, validate_args=validate_args)
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/distributions/distribution.py", line 77, in __init__
+    raise ValueError(
+ValueError: Expected parameter logits (Tensor of shape (2, 3)) of distribution Categorical(logits: torch.Size([2, 3])) to satisfy the constraint IndependentConstraint(Real(), 1), but found invalid values:
+tensor([[-1.0454, -1.2872, -0.9878],
+        [    nan,     nan,     nan]])

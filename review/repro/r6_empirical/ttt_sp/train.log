@@ -1,0 +1,81 @@
+2026-10-07 16:10:02,512 [INFO] colosseum.launcher: Colosseum: Starting training pipeline
+2026-10-07 16:10:02,512 [INFO] colosseum.launcher:   Agents: ['agent_0']
+2026-10-07 16:10:02,512 [INFO] colosseum.launcher:   Algorithm: appo
+2026-10-07 16:10:02,512 [INFO] colosseum.launcher:   Workers: 2
+2026-10-07 16:10:02,512 [INFO] colosseum.launcher:   Envs per worker: 8
+2026-10-07 16:10:02,512 [INFO] colosseum.launcher:   Chunk length: 32
+2026-10-07 16:10:02,554 [INFO] colosseum.coordinator.agent_pool: Registered trainable agent: agent_0
+2026-10-07 16:10:02,557 [INFO] colosseum.launcher: Learner started for agent agent_0
+2026-10-07 16:10:02,557 [INFO] colosseum.coordinator.coordinator: Using SimpleSelfPlayMatchmaker (no checkpoints yet)
+2026-10-07 16:10:02,565 [INFO] colosseum.launcher: Training started. Press Ctrl+C to stop.
+2026-10-07 16:11:59,459 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v50 for agent_0 (pool: 1/10)
+2026-10-07 16:11:59,459 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 1 checkpoints
+2026-10-07 16:11:59,459 [INFO] colosseum.launcher: Saved checkpoint ckpt_v50 for agent_0
+2026-10-07 16:14:33,957 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v100 for agent_0 (pool: 2/10)
+2026-10-07 16:14:33,957 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 2 checkpoints
+2026-10-07 16:14:33,957 [INFO] colosseum.launcher: Saved checkpoint ckpt_v100 for agent_0
+2026-10-07 16:17:06,308 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v150 for agent_0 (pool: 3/10)
+2026-10-07 16:17:06,308 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 3 checkpoints
+2026-10-07 16:17:06,309 [INFO] colosseum.launcher: Saved checkpoint ckpt_v150 for agent_0
+2026-10-07 16:19:34,956 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v200 for agent_0 (pool: 4/10)
+2026-10-07 16:19:34,956 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 4 checkpoints
+2026-10-07 16:19:34,956 [INFO] colosseum.launcher: Saved checkpoint ckpt_v200 for agent_0
+2026-10-07 16:21:25,359 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v250 for agent_0 (pool: 5/10)
+2026-10-07 16:21:25,359 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 5 checkpoints
+2026-10-07 16:21:25,359 [INFO] colosseum.launcher: Saved checkpoint ckpt_v250 for agent_0
+2026-10-07 16:23:39,819 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v300 for agent_0 (pool: 6/10)
+2026-10-07 16:23:39,819 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 6 checkpoints
+2026-10-07 16:23:39,819 [INFO] colosseum.launcher: Saved checkpoint ckpt_v300 for agent_0
+2026-10-07 16:25:30,538 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v350 for agent_0 (pool: 7/10)
+2026-10-07 16:25:30,538 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 7 checkpoints
+2026-10-07 16:25:30,538 [INFO] colosseum.launcher: Saved checkpoint ckpt_v350 for agent_0
+2026-10-07 16:26:35,199 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v400 for agent_0 (pool: 8/10)
+2026-10-07 16:26:35,199 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 8 checkpoints
+2026-10-07 16:26:35,199 [INFO] colosseum.launcher: Saved checkpoint ckpt_v400 for agent_0
+2026-10-07 16:27:59,907 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v450 for agent_0 (pool: 9/10)
+2026-10-07 16:27:59,907 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 9 checkpoints
+2026-10-07 16:27:59,907 [INFO] colosseum.launcher: Saved checkpoint ckpt_v450 for agent_0
+2026-10-07 16:29:21,478 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v500 for agent_0 (pool: 10/10)
+2026-10-07 16:29:21,478 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:29:21,478 [INFO] colosseum.launcher: Saved checkpoint ckpt_v500 for agent_0
+2026-10-07 16:30:23,951 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v550 for agent_0 (pool: 10/10)
+2026-10-07 16:30:23,951 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:30:23,951 [INFO] colosseum.launcher: Saved checkpoint ckpt_v550 for agent_0
+2026-10-07 16:31:43,484 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v600 for agent_0 (pool: 10/10)
+2026-10-07 16:31:43,484 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:31:43,484 [INFO] colosseum.launcher: Saved checkpoint ckpt_v600 for agent_0
+2026-10-07 16:32:50,775 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v650 for agent_0 (pool: 10/10)
+2026-10-07 16:32:50,775 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:32:50,775 [INFO] colosseum.launcher: Saved checkpoint ckpt_v650 for agent_0
+2026-10-07 16:33:51,685 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v700 for agent_0 (pool: 10/10)
+2026-10-07 16:33:51,686 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:33:51,686 [INFO] colosseum.launcher: Saved checkpoint ckpt_v700 for agent_0
+2026-10-07 16:34:42,011 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v750 for agent_0 (pool: 10/10)
+2026-10-07 16:34:42,011 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:34:42,011 [INFO] colosseum.launcher: Saved checkpoint ckpt_v750 for agent_0
+2026-10-07 16:35:31,345 [INFO] colosseum.launcher: All learner processes exited, stopping workers...
+2026-10-07 16:35:32,347 [INFO] colosseum.launcher: All processes stopped
+	Command being timed: "timeout 1700 /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/colosseum train -c configs/examples/tic_tac_toe.yaml --set checkpoint.dir=/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/r6_runs/ttt_sp/ckpts --set training.total_timesteps=200000 --set metrics.use_wandb=false"
+	User time (seconds): 9784.47
+	System time (seconds): 33.97
+	Percent of CPU this job got: 641%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 25:31.45
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 335168
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 247927
+	Voluntary context switches: 317369
+	Involuntary context switches: 1080377
+	Swaps: 0
+	File system inputs: 48
+	File system outputs: 5936
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0
+exit=0

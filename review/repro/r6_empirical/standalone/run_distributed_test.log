@@ -1,0 +1,173 @@
+2026-10-07 15:58:17,788 [INFO] colosseum.weight_store.grpc_store: WeightStore gRPC server started on port 40357
+2026-10-07 15:58:19,332 [INFO] colosseum.transport.grpc_transport: TrajectoryService gRPC server started on port 57595
+2026-10-07 15:58:19,354 [INFO] colosseum.distributed: Distributed learner [agent_0] serving trajectories on :57595, weights -> localhost:40357
+2026-10-07 15:58:19,354 [INFO] colosseum.learner.learner: Learner [agent_0]: starting on device=auto
+Starting distributed workers...
+2026-10-07 15:58:20,097 [INFO] colosseum.distributed: Started 2 distributed workers -> learners {'agent_0': 'localhost:57595'}, weights <- localhost:40357
+2026-10-07 15:58:21,570 [INFO] colosseum.worker.rollout_worker: Worker 0: starting with 4 envs (sync), chunk_length=8, agents=['agent_0']
+2026-10-07 15:58:21,582 [INFO] colosseum.worker.rollout_worker: Worker 1: starting with 4 envs (sync), chunk_length=8, agents=['agent_0']
+2026-10-07 15:58:22,709 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 1
+2026-10-07 15:58:22,711 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v1 for agent_0 (pool: 4/10)
+2026-10-07 15:58:22,721 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 2
+2026-10-07 15:58:22,725 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v2 for agent_0 (pool: 5/10)
+2026-10-07 15:58:22,734 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 3
+2026-10-07 15:58:22,741 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 4
+2026-10-07 15:58:22,744 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v3 for agent_0 (pool: 6/10)
+2026-10-07 15:58:22,746 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v4 for agent_0 (pool: 7/10)
+2026-10-07 15:58:22,768 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 5
+2026-10-07 15:58:22,773 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v5 for agent_0 (pool: 8/10)
+2026-10-07 15:58:23,357 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 6
+2026-10-07 15:58:23,365 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v6 for agent_0 (pool: 9/10)
+2026-10-07 15:58:24,246 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 7
+2026-10-07 15:58:24,250 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v7 for agent_0 (pool: 10/10)
+2026-10-07 15:58:24,362 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 8
+2026-10-07 15:58:24,365 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v8 for agent_0 (pool: 10/10)
+2026-10-07 15:58:24,377 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 9
+2026-10-07 15:58:24,387 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v9 for agent_0 (pool: 10/10)
+2026-10-07 15:58:24,400 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 10
+2026-10-07 15:58:24,400 [INFO] colosseum.learner.learner: Learner [agent_0]: step=10, chunks=18, loss=0.5002
+2026-10-07 15:58:24,406 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v10 for agent_0 (pool: 10/10)
+2026-10-07 15:58:24,411 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 11
+2026-10-07 15:58:24,415 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v11 for agent_0 (pool: 10/10)
+2026-10-07 15:58:24,422 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 12
+2026-10-07 15:58:24,427 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v12 for agent_0 (pool: 10/10)
+2026-10-07 15:58:24,436 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 13
+2026-10-07 15:58:24,441 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v13 for agent_0 (pool: 10/10)
+2026-10-07 15:58:24,452 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 14
+2026-10-07 15:58:24,457 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v14 for agent_0 (pool: 10/10)
+2026-10-07 15:58:24,469 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 15
+2026-10-07 15:58:24,471 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v15 for agent_0 (pool: 10/10)
+2026-10-07 15:58:25,381 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 16
+2026-10-07 15:58:25,386 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v16 for agent_0 (pool: 10/10)
+2026-10-07 15:58:26,124 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 17
+2026-10-07 15:58:26,128 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v17 for agent_0 (pool: 10/10)
+2026-10-07 15:58:26,135 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 18
+2026-10-07 15:58:26,142 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 19
+2026-10-07 15:58:26,147 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v18 for agent_0 (pool: 10/10)
+2026-10-07 15:58:26,154 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v19 for agent_0 (pool: 10/10)
+2026-10-07 15:58:26,168 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 20
+2026-10-07 15:58:26,168 [INFO] colosseum.learner.learner: Learner [agent_0]: step=20, chunks=37, loss=0.3184
+2026-10-07 15:58:26,171 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v20 for agent_0 (pool: 10/10)
+2026-10-07 15:58:26,181 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 21
+2026-10-07 15:58:26,185 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v21 for agent_0 (pool: 10/10)
+2026-10-07 15:58:26,192 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 22
+2026-10-07 15:58:26,196 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v22 for agent_0 (pool: 10/10)
+2026-10-07 15:58:26,872 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 23
+2026-10-07 15:58:26,877 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v23 for agent_0 (pool: 10/10)
+2026-10-07 15:58:27,686 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 24
+2026-10-07 15:58:27,697 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v24 for agent_0 (pool: 10/10)
+2026-10-07 15:58:28,440 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 25
+2026-10-07 15:58:28,448 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v25 for agent_0 (pool: 10/10)
+2026-10-07 15:58:29,316 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 26
+2026-10-07 15:58:29,327 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v26 for agent_0 (pool: 10/10)
+2026-10-07 15:58:29,681 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 27
+2026-10-07 15:58:29,688 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v27 for agent_0 (pool: 10/10)
+2026-10-07 15:58:29,692 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 28
+2026-10-07 15:58:29,699 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v28 for agent_0 (pool: 10/10)
+2026-10-07 15:58:29,705 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 29
+2026-10-07 15:58:29,715 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v29 for agent_0 (pool: 10/10)
+2026-10-07 15:58:29,725 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 30
+2026-10-07 15:58:29,725 [INFO] colosseum.learner.learner: Learner [agent_0]: step=30, chunks=57, loss=0.3902
+2026-10-07 15:58:29,735 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v30 for agent_0 (pool: 10/10)
+2026-10-07 15:58:29,751 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 31
+2026-10-07 15:58:29,763 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v31 for agent_0 (pool: 10/10)
+2026-10-07 15:58:29,766 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 32
+2026-10-07 15:58:29,769 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v32 for agent_0 (pool: 10/10)
+2026-10-07 15:58:29,788 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 33
+2026-10-07 15:58:29,799 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v33 for agent_0 (pool: 10/10)
+2026-10-07 15:58:30,676 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 34
+2026-10-07 15:58:30,688 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v34 for agent_0 (pool: 10/10)
+2026-10-07 15:58:31,478 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 35
+2026-10-07 15:58:31,537 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v35 for agent_0 (pool: 10/10)
+2026-10-07 15:58:32,277 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 36
+2026-10-07 15:58:32,283 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v36 for agent_0 (pool: 10/10)
+2026-10-07 15:58:33,116 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 37
+2026-10-07 15:58:33,127 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v37 for agent_0 (pool: 10/10)
+2026-10-07 15:58:33,715 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 38
+2026-10-07 15:58:33,718 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v38 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,194 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 39
+2026-10-07 15:58:34,207 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v39 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,208 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 40
+2026-10-07 15:58:34,208 [INFO] colosseum.learner.learner: Learner [agent_0]: step=40, chunks=77, loss=0.2437
+2026-10-07 15:58:34,217 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v40 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,220 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 41
+2026-10-07 15:58:34,228 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 42
+2026-10-07 15:58:34,237 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 43
+2026-10-07 15:58:34,245 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 44
+2026-10-07 15:58:34,248 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v41 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,250 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v42 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,252 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v43 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,253 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v44 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,268 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 45
+2026-10-07 15:58:34,275 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 46
+2026-10-07 15:58:34,278 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v45 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,283 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v46 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,288 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 47
+2026-10-07 15:58:34,303 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 48
+2026-10-07 15:58:34,307 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v47 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,309 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v48 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,322 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 49
+2026-10-07 15:58:34,327 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v49 for agent_0 (pool: 10/10)
+2026-10-07 15:58:34,343 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 50
+2026-10-07 15:58:34,343 [INFO] colosseum.learner.learner: Learner [agent_0]: step=50, chunks=97, loss=0.2963
+2026-10-07 15:58:34,355 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v50 for agent_0 (pool: 10/10)
+2026-10-07 15:58:35,156 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 51
+2026-10-07 15:58:35,167 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v51 for agent_0 (pool: 10/10)
+2026-10-07 15:58:36,026 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 52
+2026-10-07 15:58:36,037 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v52 for agent_0 (pool: 10/10)
+2026-10-07 15:58:36,676 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 53
+2026-10-07 15:58:36,696 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v53 for agent_0 (pool: 10/10)
+2026-10-07 15:58:37,517 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 54
+2026-10-07 15:58:37,528 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v54 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,025 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 55
+2026-10-07 15:58:38,035 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 56
+2026-10-07 15:58:38,037 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v55 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,040 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v56 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,047 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 57
+2026-10-07 15:58:38,054 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 58
+2026-10-07 15:58:38,065 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v57 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,070 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 59
+2026-10-07 15:58:38,075 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v58 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,077 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v59 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,091 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 60
+2026-10-07 15:58:38,091 [INFO] colosseum.learner.learner: Learner [agent_0]: step=60, chunks=117, loss=0.3783
+2026-10-07 15:58:38,098 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v60 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,103 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 61
+2026-10-07 15:58:38,108 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v61 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,118 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 62
+2026-10-07 15:58:38,122 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v62 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,132 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 63
+2026-10-07 15:58:38,141 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 64
+2026-10-07 15:58:38,148 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v63 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,150 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v64 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,167 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 65
+2026-10-07 15:58:38,172 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v65 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,183 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 66
+2026-10-07 15:58:38,188 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v66 for agent_0 (pool: 10/10)
+2026-10-07 15:58:38,200 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 67
+2026-10-07 15:58:38,207 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v67 for agent_0 (pool: 10/10)
+2026-10-07 15:58:39,063 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 68
+2026-10-07 15:58:39,067 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v68 for agent_0 (pool: 10/10)
+2026-10-07 15:58:39,718 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 69
+2026-10-07 15:58:39,727 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v69 for agent_0 (pool: 10/10)
+2026-10-07 15:58:39,733 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 70
+2026-10-07 15:58:39,733 [INFO] colosseum.learner.learner: Learner [agent_0]: step=70, chunks=137, loss=0.4436
+2026-10-07 15:58:39,742 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v70 for agent_0 (pool: 10/10)
+2026-10-07 15:58:39,744 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 71
+2026-10-07 15:58:39,747 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v71 for agent_0 (pool: 10/10)
+2026-10-07 15:58:39,759 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 72
+2026-10-07 15:58:39,762 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v72 for agent_0 (pool: 10/10)
+2026-10-07 15:58:39,774 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 73
+2026-10-07 15:58:39,777 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v73 for agent_0 (pool: 10/10)
+2026-10-07 15:58:39,786 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 74
+2026-10-07 15:58:39,794 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v74 for agent_0 (pool: 10/10)
+2026-10-07 15:58:39,807 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 75
+2026-10-07 15:58:39,807 [INFO] colosseum.learner.learner: Learner [agent_0]: finished. Total train_steps=75
+2026-10-07 15:58:39,810 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v75 for agent_0 (pool: 10/10)
+2026-10-07 15:58:39,811 [INFO] colosseum.distributed: Distributed learner [agent_0] stopped.
+2026-10-07 15:58:45,387 [INFO] colosseum.worker.rollout_worker: Worker 0: finished. Steps=600, chunks_sent=144
+2026-10-07 15:58:45,803 [INFO] colosseum.worker.rollout_worker: Worker 1: finished. Steps=600, chunks_sent=144
+2026-10-07 15:58:47,306 [INFO] colosseum.distributed: Distributed workers stopped.
+Workers done.
+Final published policy_version for agent_0: 75
+Distributed gRPC pipeline OK!

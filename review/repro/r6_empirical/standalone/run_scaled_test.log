@@ -1,0 +1,98 @@
+Starting scaled pipeline (4 workers, 50K steps)...
+2026-10-07 15:59:46,700 [INFO] colosseum.launcher: Colosseum: Starting training pipeline
+2026-10-07 15:59:46,701 [INFO] colosseum.launcher:   Agents: ['agent_0']
+2026-10-07 15:59:46,701 [INFO] colosseum.launcher:   Algorithm: appo
+2026-10-07 15:59:46,701 [INFO] colosseum.launcher:   Workers: 4
+2026-10-07 15:59:46,701 [INFO] colosseum.launcher:   Envs per worker: 4
+2026-10-07 15:59:46,701 [INFO] colosseum.launcher:   Chunk length: 16
+2026-10-07 15:59:46,741 [INFO] colosseum.coordinator.agent_pool: Registered trainable agent: agent_0
+2026-10-07 15:59:46,744 [INFO] colosseum.launcher: Learner started for agent agent_0
+2026-10-07 15:59:46,745 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 15:59:46,775 [INFO] colosseum.launcher: Training started. Press Ctrl+C to stop.
+2026-10-07 15:59:48,603 [INFO] colosseum.learner.learner: Learner [agent_0]: starting on device=auto
+2026-10-07 15:59:48,656 [INFO] colosseum.worker.rollout_worker: Worker 1: starting with 4 envs (sync), chunk_length=16, agents=['agent_0']
+2026-10-07 15:59:48,670 [INFO] colosseum.worker.rollout_worker: Worker 1: agent agent_0: loaded 4 checkpoint(s): ['ckpt_v75', 'ckpt_v50', 'ckpt_v73', 'ckpt_v100']
+2026-10-07 15:59:48,681 [INFO] colosseum.worker.rollout_worker: Worker 0: starting with 4 envs (sync), chunk_length=16, agents=['agent_0']
+2026-10-07 15:59:48,696 [INFO] colosseum.worker.rollout_worker: Worker 0: agent agent_0: loaded 4 checkpoint(s): ['ckpt_v50', 'ckpt_v70', 'ckpt_v72', 'ckpt_v68']
+2026-10-07 15:59:48,703 [INFO] colosseum.worker.rollout_worker: Worker 3: starting with 4 envs (sync), chunk_length=16, agents=['agent_0']
+2026-10-07 15:59:48,730 [INFO] colosseum.worker.rollout_worker: Worker 2: starting with 4 envs (sync), chunk_length=16, agents=['agent_0']
+2026-10-07 15:59:48,731 [INFO] colosseum.worker.rollout_worker: Worker 3: agent agent_0: loaded 1 checkpoint(s): ['ckpt_v71']
+2026-10-07 15:59:48,749 [INFO] colosseum.worker.rollout_worker: Worker 2: agent agent_0: loaded 1 checkpoint(s): ['ckpt_v71']
+2026-10-07 16:00:12,461 [INFO] colosseum.learner.learner: Learner [agent_0]: step=10, chunks=66, loss=0.3878
+2026-10-07 16:00:30,317 [INFO] colosseum.learner.learner: Learner [agent_0]: step=20, chunks=133, loss=0.3404
+2026-10-07 16:00:47,588 [INFO] colosseum.learner.learner: Learner [agent_0]: step=30, chunks=209, loss=0.4069
+2026-10-07 16:01:05,176 [INFO] colosseum.learner.learner: Learner [agent_0]: step=40, chunks=275, loss=0.4175
+2026-10-07 16:01:23,805 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 50
+2026-10-07 16:01:23,806 [INFO] colosseum.learner.learner: Learner [agent_0]: step=50, chunks=339, loss=0.4043
+2026-10-07 16:01:24,275 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v50 for agent_0 (pool: 10/10)
+2026-10-07 16:01:24,275 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:01:24,276 [INFO] colosseum.launcher: Saved checkpoint ckpt_v50 for agent_0
+2026-10-07 16:01:41,146 [INFO] colosseum.learner.learner: Learner [agent_0]: step=60, chunks=399, loss=0.3946
+2026-10-07 16:01:58,181 [INFO] colosseum.learner.learner: Learner [agent_0]: step=70, chunks=460, loss=0.4058
+2026-10-07 16:02:15,516 [INFO] colosseum.learner.learner: Learner [agent_0]: step=80, chunks=530, loss=0.4063
+2026-10-07 16:02:32,478 [INFO] colosseum.learner.learner: Learner [agent_0]: step=90, chunks=594, loss=0.4337
+2026-10-07 16:02:48,866 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:02:48,866 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:02:49,966 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 100
+2026-10-07 16:02:49,966 [INFO] colosseum.learner.learner: Learner [agent_0]: step=100, chunks=664, loss=0.3938
+2026-10-07 16:02:50,499 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v100 for agent_0 (pool: 10/10)
+2026-10-07 16:02:50,500 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:02:50,500 [INFO] colosseum.launcher: Saved checkpoint ckpt_v100 for agent_0
+2026-10-07 16:03:07,076 [INFO] colosseum.learner.learner: Learner [agent_0]: step=110, chunks=725, loss=0.3725
+2026-10-07 16:03:19,297 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:03:19,302 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:03:24,686 [INFO] colosseum.learner.learner: Learner [agent_0]: step=120, chunks=785, loss=0.4417
+2026-10-07 16:03:41,766 [INFO] colosseum.learner.learner: Learner [agent_0]: step=130, chunks=840, loss=0.4337
+2026-10-07 16:03:58,641 [INFO] colosseum.learner.learner: Learner [agent_0]: step=140, chunks=899, loss=0.3714
+2026-10-07 16:04:16,206 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 150
+2026-10-07 16:04:16,206 [INFO] colosseum.learner.learner: Learner [agent_0]: step=150, chunks=971, loss=0.4421
+2026-10-07 16:04:16,689 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v150 for agent_0 (pool: 10/10)
+2026-10-07 16:04:16,689 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:04:16,689 [INFO] colosseum.launcher: Saved checkpoint ckpt_v150 for agent_0
+2026-10-07 16:04:20,194 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:04:33,706 [INFO] colosseum.learner.learner: Learner [agent_0]: step=160, chunks=1030, loss=0.3397
+2026-10-07 16:04:50,716 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:04:50,718 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:04:51,026 [INFO] colosseum.learner.learner: Learner [agent_0]: step=170, chunks=1094, loss=0.4040
+2026-10-07 16:05:07,946 [INFO] colosseum.learner.learner: Learner [agent_0]: step=180, chunks=1143, loss=0.3880
+2026-10-07 16:05:21,037 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:05:25,441 [INFO] colosseum.learner.learner: Learner [agent_0]: step=190, chunks=1205, loss=0.4102
+2026-10-07 16:05:43,256 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 200
+2026-10-07 16:05:43,261 [INFO] colosseum.learner.learner: Learner [agent_0]: step=200, chunks=1271, loss=0.3813
+2026-10-07 16:05:43,347 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v200 for agent_0 (pool: 10/10)
+2026-10-07 16:05:43,347 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:05:43,347 [INFO] colosseum.launcher: Saved checkpoint ckpt_v200 for agent_0
+2026-10-07 16:05:51,479 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:05:51,496 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:06:01,346 [INFO] colosseum.learner.learner: Learner [agent_0]: step=210, chunks=1336, loss=0.4243
+2026-10-07 16:06:19,086 [INFO] colosseum.learner.learner: Learner [agent_0]: step=220, chunks=1393, loss=0.3179
+2026-10-07 16:06:21,809 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:06:21,811 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:06:36,411 [INFO] colosseum.learner.learner: Learner [agent_0]: step=230, chunks=1458, loss=0.3467
+2026-10-07 16:06:51,898 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:06:54,116 [INFO] colosseum.learner.learner: Learner [agent_0]: step=240, chunks=1529, loss=0.3883
+2026-10-07 16:07:12,486 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 250
+2026-10-07 16:07:12,486 [INFO] colosseum.learner.learner: Learner [agent_0]: step=250, chunks=1598, loss=0.3708
+2026-10-07 16:07:12,709 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v250 for agent_0 (pool: 10/10)
+2026-10-07 16:07:12,709 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:07:12,709 [INFO] colosseum.launcher: Saved checkpoint ckpt_v250 for agent_0
+2026-10-07 16:07:29,571 [INFO] colosseum.learner.learner: Learner [agent_0]: step=260, chunks=1660, loss=0.4089
+2026-10-07 16:07:46,546 [INFO] colosseum.learner.learner: Learner [agent_0]: step=270, chunks=1717, loss=0.3730
+2026-10-07 16:07:52,542 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:07:52,616 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:08:04,236 [INFO] colosseum.learner.learner: Learner [agent_0]: step=280, chunks=1769, loss=0.4004
+2026-10-07 16:08:21,466 [INFO] colosseum.learner.learner: Learner [agent_0]: step=290, chunks=1818, loss=0.3939
+2026-10-07 16:08:39,036 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 300
+2026-10-07 16:08:39,036 [INFO] colosseum.learner.learner: Learner [agent_0]: step=300, chunks=1876, loss=0.3582
+2026-10-07 16:08:39,551 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v300 for agent_0 (pool: 10/10)
+2026-10-07 16:08:39,551 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 10 checkpoints
+2026-10-07 16:08:39,552 [INFO] colosseum.launcher: Saved checkpoint ckpt_v300 for agent_0
+2026-10-07 16:08:53,194 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:08:56,716 [INFO] colosseum.learner.learner: Learner [agent_0]: step=310, chunks=1934, loss=0.4501
+2026-10-07 16:09:14,191 [INFO] colosseum.learner.learner: Learner [agent_0]: step=320, chunks=1991, loss=0.3973
+2026-10-07 16:09:23,668 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:09:23,669 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:09:23,677 [WARNING] colosseum.launcher: Checkpoint ckpt_v50 for agent_0 not found, using latest
+2026-10-07 16:09:32,126 [INFO] colosseum.learner.learner: Learner [agent_0]: step=330, chunks=2048, loss=0.3703
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 41 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

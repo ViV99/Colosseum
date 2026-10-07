@@ -1,0 +1,26 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 7 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_appo.py::test_compute_loss_returns_expected_keys [32mPASSED[0m[32m [ 14%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_appo.py::test_train_step_updates_version [32mPASSED[0m[32m [ 28%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_appo.py::test_loss_is_finite [32mPASSED[0m[32m [ 42%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_appo.py::test_multiple_train_steps [32mPASSED[0m[32m [ 57%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_appo.py::test_linear_lr_decay [32mPASSED[0m[32m [ 71%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_appo.py::test_cosine_lr_decay [32mPASSED[0m[32m [ 85%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_appo.py::test_constant_lr [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+8.97s call     tests/test_appo.py::test_linear_lr_decay
+7.78s call     tests/test_appo.py::test_cosine_lr_decay
+4.18s call     tests/test_appo.py::test_multiple_train_steps
+3.59s call     tests/test_appo.py::test_constant_lr
+2.43s call     tests/test_appo.py::test_compute_loss_returns_expected_keys
+0.87s call     tests/test_appo.py::test_train_step_updates_version
+0.22s call     tests/test_appo.py::test_loss_is_finite
+
+(3 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m7 passed[0m[32m in 31.18s[0m[32m ==============================[0m

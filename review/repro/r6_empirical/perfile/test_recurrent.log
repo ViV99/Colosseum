@@ -1,0 +1,41 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 21 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_is_recurrent_property [32mPASSED[0m[32m [  4%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_initial_hidden_shape [32mPASSED[0m[32m [  9%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_recurrent_act_returns_4tuple_with_hidden [32mPASSED[0m[32m [ 14%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_recurrent_act_hidden_changes_with_input [32mPASSED[0m[32m [ 19%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_feedforward_act_returns_none_hidden [32mPASSED[0m[32m [ 23%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_gru_act [32mPASSED[0m[32m [ 28%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_evaluate_actions_recurrent_shapes [32mPASSED[0m[32m [ 33%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_evaluate_actions_recurrent_with_masks [32mPASSED[0m[32m [ 38%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_evaluate_actions_recurrent_gradients [32mPASSED[0m[32m [ 42%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_feedforward_evaluate_actions_unchanged [32mPASSED[0m[32m [ 47%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_appo_recurrent_train_step [32mPASSED[0m[32m [ 52%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_appo_recurrent_multiple_steps [32mPASSED[0m[32m [ 57%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_appo_feedforward_backward_compat [32mPASSED[0m[32m [ 61%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_trajectory_chunk_lstm_hidden_to_device [32mPASSED[0m[32m [ 66%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_trajectory_chunk_no_lstm_hidden [32mPASSED[0m[32m [ 71%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_build_network_with_lstm [32mPASSED[0m[32m [ 76%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_build_network_with_gru [32mPASSED[0m[32m [ 80%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_build_network_feedforward_default [32mPASSED[0m[32m [ 85%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_rollout_buffer_lstm_init [32mPASSED[0m[32m [ 90%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_build_chunk_includes_lstm_hidden [32mPASSED[0m[32m [ 95%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_recurrent.py::test_build_chunk_no_lstm_hidden [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+1.19s call     tests/test_recurrent.py::test_appo_recurrent_train_step
+0.12s call     tests/test_recurrent.py::test_appo_recurrent_multiple_steps
+0.04s call     tests/test_recurrent.py::test_build_network_with_lstm
+0.04s call     tests/test_recurrent.py::test_rollout_buffer_lstm_init
+0.02s call     tests/test_recurrent.py::test_evaluate_actions_recurrent_shapes
+0.01s call     tests/test_recurrent.py::test_appo_feedforward_backward_compat
+0.01s call     tests/test_recurrent.py::test_evaluate_actions_recurrent_gradients
+0.01s call     tests/test_recurrent.py::test_recurrent_act_returns_4tuple_with_hidden
+
+(2 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m21 passed[0m[32m in 3.00s[0m[32m ==============================[0m

@@ -1,0 +1,85 @@
+2026-10-07 16:55:08,724 [INFO] MainProcess colosseum.launcher: Colosseum: Starting training pipeline
+2026-10-07 16:55:08,724 [INFO] MainProcess colosseum.launcher:   Agents: ['agent_0']
+2026-10-07 16:55:08,724 [INFO] MainProcess colosseum.launcher:   Algorithm: appo
+2026-10-07 16:55:08,724 [INFO] MainProcess colosseum.launcher:   Workers: 1
+2026-10-07 16:55:08,725 [INFO] MainProcess colosseum.launcher:   Envs per worker: 8
+2026-10-07 16:55:08,725 [INFO] MainProcess colosseum.launcher:   Chunk length: 32
+2026-10-07 16:55:08,767 [INFO] MainProcess colosseum.coordinator.agent_pool: Registered trainable agent: agent_0
+2026-10-07 16:55:08,771 [INFO] MainProcess colosseum.launcher: Learner started for agent agent_0
+2026-10-07 16:55:08,771 [INFO] MainProcess colosseum.coordinator.coordinator: Using SimpleSelfPlayMatchmaker (no checkpoints yet)
+2026-10-07 16:55:08,779 [INFO] MainProcess colosseum.launcher: Training started. Press Ctrl+C to stop.
+2026-10-07 16:55:10,164 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: starting on device=auto
+2026-10-07 16:55:10,201 [INFO] Process-2 colosseum.worker.rollout_worker: Worker 0: starting with 8 envs (sync), chunk_length=32, agents=['agent_0']
+2026-10-07 16:55:17,846 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=10, chunks=80, loss=0.4388
+2026-10-07 16:55:24,716 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=20, chunks=160, loss=0.4077
+2026-10-07 16:55:30,826 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=30, chunks=240, loss=0.4040
+2026-10-07 16:55:33,203 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=40, chunks=320, loss=0.4125
+2026-10-07 16:55:38,533 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=50, chunks=400, loss=0.4121
+2026-10-07 16:55:43,334 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=60, chunks=480, loss=0.4176
+2026-10-07 16:55:50,696 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=70, chunks=560, loss=0.4410
+2026-10-07 16:55:57,221 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=80, chunks=632, loss=0.4351
+2026-10-07 16:56:01,858 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=90, chunks=712, loss=0.4003
+2026-10-07 16:56:07,170 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=100, chunks=792, loss=0.3917
+2026-10-07 16:56:12,086 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=110, chunks=872, loss=0.3928
+2026-10-07 16:56:16,461 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=120, chunks=952, loss=0.4207
+2026-10-07 16:56:17,405 [INFO] MainProcess colosseum.launcher: Received interrupt, stopping...
+Process Process-2:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 99, in _worker_target
+    rollout_worker_process(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/worker/rollout_worker.py", line 476, in rollout_worker_process
+    _run_inference_group(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/worker/rollout_worker.py", line 149, in _run_inference_group
+    actions, log_probs, values, new_hidden = net.act(
+                                             ^^^^^^^^
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/utils/_contextlib.py", line 124, in decorate_context
+    return func(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/networks/actor_critic.py", line 120, in act
+    actions = dist.mode() if deterministic else dist.sample()
+                                                ^^^^^^^^^^^^^
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/networks/distributions.py", line 67, in sample
+    return self._dist.sample()
+           ^^^^^^^^^^^^^^^^^^^
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/distributions/categorical.py", line 147, in sample
+    probs_2d = self.probs.reshape(-1, self._num_events)
+               ^^^^^^^^^^
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/distributions/utils.py", line 171, in __get__
+    value = self.wrapped(instance)
+            ^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/distributions/categorical.py", line 116, in probs
+    return logits_to_probs(self.logits)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/distributions/utils.py", line 99, in logits_to_probs
+    return F.softmax(logits, dim=-1)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/nn/functional.py", line 2213, in softmax
+    ret = input.softmax(dim)
+          ^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+Process Process-1:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 181, in _learner_target
+    learner_process(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/learner/learner.py", line 112, in learner_process
+    metrics = algorithm.train_step(chunks)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/algorithms/appo.py", line 295, in train_step
+    total_loss.backward()
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/_tensor.py", line 623, in backward
+    torch.autograd.backward(
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/autograd/__init__.py", line 395, in backward
+    _engine_run_backward(
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/autograd/graph.py", line 1072, in _engine_run_backward
+    return Variable._execution_engine.run_backward(  # Calls into the C++ engine to run the backward pass
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+2026-10-07 16:56:18,406 [INFO] MainProcess colosseum.launcher: All processes stopped

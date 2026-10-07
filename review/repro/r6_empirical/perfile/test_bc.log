@@ -1,0 +1,26 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 7 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_bc.py::test_offline_bc_from_tensors [32mPASSED[0m[32m [ 14%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_bc.py::test_offline_bc_from_file [32mPASSED[0m[32m [ 28%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_bc.py::test_offline_bc_loss_decreases [32mPASSED[0m[32m [ 42%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_bc.py::test_kickstart_lambda_decay [32mPASSED[0m[32m [ 57%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_bc.py::test_kickstart_loss_computation [32mPASSED[0m[32m [ 71%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_bc.py::test_kickstart_zero_lambda [32mPASSED[0m[32m [ 85%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_bc.py::test_appo_with_kickstart [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+36.18s call     tests/test_bc.py::test_offline_bc_loss_decreases
+14.70s call     tests/test_bc.py::test_offline_bc_from_tensors
+4.33s call     tests/test_bc.py::test_offline_bc_from_file
+2.29s call     tests/test_bc.py::test_appo_with_kickstart
+0.39s call     tests/test_bc.py::test_kickstart_loss_computation
+0.03s setup    tests/test_bc.py::test_kickstart_lambda_decay
+0.01s call     tests/test_bc.py::test_kickstart_zero_lambda
+
+(3 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m========================= [32m[1m7 passed[0m[32m in 61.32s (0:01:01)[0m[32m =========================[0m

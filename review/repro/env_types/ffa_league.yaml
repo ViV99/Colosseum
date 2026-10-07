@@ -1,0 +1,29 @@
+env:
+  env_class: "toy_envs.FFAElimEnv"
+  num_players: 3
+networks:
+  encoder_class: "toy_envs.MLPEncoder"
+  policy_class: "toy_envs.CatPolicy"
+  value_class: "toy_envs.ValueHead"
+  kwargs: {obs_dim: 5, n_actions: 3}
+rollout:
+  chunk_length: 16
+  num_workers: 1
+  envs_per_worker: 4
+  weight_sync_interval_sec: 1.0
+learner:
+  device: "cpu"
+  batch_chunks: 4
+training:
+  phase: "league"
+  total_timesteps: 3000
+self_play:
+  checkpoint_interval: 5
+checkpoint:
+  dir: "./ckpt_ffa_league"
+metrics:
+  use_wandb: false
+  log_interval: 50
+agents:
+  a: {}
+  b: {}

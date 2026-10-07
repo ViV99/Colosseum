@@ -1,0 +1,22 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 6 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_performance.py::test_preallocated_buffer_basic [32mPASSED[0m[32m [ 16%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_performance.py::test_preallocated_buffer_with_masks [32mPASSED[0m[32m [ 33%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_performance.py::test_buffer_reset_reuse [32mPASSED[0m[32m [ 50%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_performance.py::test_pin_memory_cpu_noop [32mPASSED[0m[32m [ 66%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_performance.py::test_vtrace_torch_compile [32mPASSED[0m[32m [ 83%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_performance.py::test_appo_torch_compile [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+1.72s call     tests/test_performance.py::test_appo_torch_compile
+1.46s call     tests/test_performance.py::test_vtrace_torch_compile
+0.29s call     tests/test_performance.py::test_pin_memory_cpu_noop
+0.04s call     tests/test_performance.py::test_preallocated_buffer_basic
+
+(6 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m6 passed[0m[32m in 7.91s[0m[32m ===============================[0m

@@ -1,0 +1,10 @@
+run_worker_test exit=0 secs=3
+3
+run_pipeline_test exit=0 secs=107
+3
+run_distributed_test exit=0 secs=33
+3
+run_subproc_pipeline_test exit=0 secs=52
+3
+run_scaled_test exit=124 secs=600
+3

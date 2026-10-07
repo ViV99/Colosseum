@@ -1,0 +1,8 @@
+Spawning worker...
+Worker pid=24578
+2026-10-07 15:56:25,122 [INFO] colosseum.worker.rollout_worker: Worker 0: starting with 2 envs (sync), chunk_length=8, agents=['agent_0']
+Got chunk 0: obs=torch.Size([8, 3, 3, 3]), ver=0
+Got chunk 1: obs=torch.Size([8, 3, 3, 3]), ver=0
+Got chunk 2: obs=torch.Size([8, 3, 3, 3]), ver=0
+2026-10-07 15:56:25,225 [INFO] colosseum.worker.rollout_worker: Worker 0: finished. Steps=80, chunks_sent=20
+Worker done. Chunks received: 3

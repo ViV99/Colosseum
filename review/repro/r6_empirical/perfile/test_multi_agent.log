@@ -1,0 +1,32 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 10 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_multi_agent.py::test_agent_config_defaults [32mPASSED[0m[32m [ 10%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_multi_agent.py::test_get_trainable_agent_ids_empty [32mPASSED[0m[32m [ 20%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_multi_agent.py::test_get_trainable_agent_ids_multi [32mPASSED[0m[32m [ 30%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_multi_agent.py::test_get_agent_config_no_override [32mPASSED[0m[32m [ 40%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_multi_agent.py::test_get_agent_config_with_override [32mPASSED[0m[32m [ 50%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_multi_agent.py::test_load_multi_agent_config_roundtrip [32mPASSED[0m[32m [ 60%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_multi_agent.py::test_worker_multi_agent_routing [32mPASSED[0m[32m [ 70%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_multi_agent.py::test_derive_worker_configs [32mPASSED[0m[32m [ 80%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_multi_agent.py::test_monitor_loop_per_agent_checkpoint_queues [32mPASSED[0m[32m [ 90%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_multi_agent.py::test_multi_agent_pipeline [32mPASSED[0m[32m [100%][0m
+
+[33m=============================== warnings summary ===============================[0m
+tests/test_multi_agent.py::test_multi_agent_pipeline
+  /usr/lib/python3.12/multiprocessing/popen_fork.py:66: DeprecationWarning: This process (pid=20046) is multi-threaded, use of fork() may lead to deadlocks in the child.
+    self.pid = os.fork()
+
+-- Docs: https://docs.pytest.org/en/stable/how-to/capture-warnings.html
+============================= slowest 10 durations =============================
+181.44s call     tests/test_multi_agent.py::test_multi_agent_pipeline
+0.51s call     tests/test_multi_agent.py::test_monitor_loop_per_agent_checkpoint_queues
+0.50s call     tests/test_multi_agent.py::test_worker_multi_agent_routing
+0.01s call     tests/test_multi_agent.py::test_derive_worker_configs
+
+(6 durations < 0.005s hidden.  Use -vv to show these durations.)
+[33m================== [32m10 passed[0m, [33m[1m1 warning[0m[33m in 183.83s (0:03:03)[0m[33m ===================[0m

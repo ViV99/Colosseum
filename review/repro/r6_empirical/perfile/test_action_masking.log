@@ -1,0 +1,30 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 12 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_categorical_mask_blocks_invalid_actions [32mPASSED[0m[32m [  8%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_categorical_mask_entropy [32mPASSED[0m[32m [ 16%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_categorical_apply_mask [32mPASSED[0m[32m [ 25%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_categorical_mode_respects_mask [32mPASSED[0m[32m [ 33%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_categorical_log_prob_with_mask [32mPASSED[0m[32m [ 41%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_gaussian_apply_mask_noop [32mPASSED[0m[32m [ 50%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_act_with_mask [32mPASSED[0m[32m [ 58%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_act_without_mask [32mPASSED[0m[32m [ 66%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_evaluate_actions_with_mask [32mPASSED[0m[32m [ 75%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_trajectory_chunk_with_masks [32mPASSED[0m[32m [ 83%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_trajectory_chunk_without_masks [32mPASSED[0m[32m [ 91%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_action_masking.py::test_appo_with_action_masks [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+2.67s call     tests/test_action_masking.py::test_appo_with_action_masks
+0.24s call     tests/test_action_masking.py::test_evaluate_actions_with_mask
+0.19s call     tests/test_action_masking.py::test_act_without_mask
+0.16s call     tests/test_action_masking.py::test_act_with_mask
+0.02s call     tests/test_action_masking.py::test_categorical_mask_blocks_invalid_actions
+0.01s setup    tests/test_action_masking.py::test_categorical_apply_mask
+
+(4 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m12 passed[0m[32m in 7.27s[0m[32m ==============================[0m

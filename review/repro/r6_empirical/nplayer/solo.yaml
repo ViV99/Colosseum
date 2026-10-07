@@ -1,0 +1,58 @@
+env:
+  env_class: "r6probe.envs.Solo"
+  num_players: 1
+  kwargs: {}
+
+networks:
+  encoder_class: "r6probe.envs.Enc"
+  policy_class: "r6probe.envs.Pol"
+  value_class: "r6probe.envs.Val"
+  kwargs: {}
+
+algorithm:
+  name: "appo"
+  gamma: 0.99
+  gae_lambda: 0.95
+  eps_clip: 0.2
+  value_loss_coeff: 0.5
+  entropy_coeff: 0.01
+  max_grad_norm: 0.5
+  num_epochs: 1
+  minibatch_chunks: 0    # 0 = use all chunks as one batch
+  vtrace_rho_bar: 1.0
+  vtrace_c_bar: 1.0
+  learning_rate: 3.0e-4
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 32        # short for TicTacToe (games are ~5-9 steps)
+  num_workers: 2
+  envs_per_worker: 8
+  weight_sync_interval_sec: 2.0
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  phase: "self_play"
+  total_timesteps: 100000
+
+self_play:
+  checkpoint_interval: 50    # train steps; ~390 train steps in this run → ~7 checkpoints
+  pool_size: 10
+  latest_prob: 0.5
+
+checkpoint:
+  dir: "./checkpoints"
+  save_optimizer: true
+
+metrics:
+  use_wandb: false        # set to true if you want WandB logging
+  wandb_project: "colosseum"
+  wandb_entity: null
+  log_interval: 10
+
+transport:
+  mode: "local"

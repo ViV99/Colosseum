@@ -1,0 +1,46 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 26 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_action_spec_discrete [32mPASSED[0m[32m [  3%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_action_spec_box [32mPASSED[0m[32m [  7%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_action_spec_dict [32mPASSED[0m[32m [ 11%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_action_spec_multi_discrete [32mPASSED[0m[32m [ 15%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_action_spec_tuple [32mPASSED[0m[32m [ 19%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_action_spec_nested_raises [32mPASSED[0m[32m [ 23%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_action_spec_large_discrete_raises [32mPASSED[0m[32m [ 26%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_encode_decode_dict [32mPASSED[0m[32m [ 30%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_encode_decode_multi_discrete [32mPASSED[0m[32m [ 34%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_encode_decode_tuple [32mPASSED[0m[32m [ 38%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_decode_passthrough_discrete [32mPASSED[0m[32m [ 42%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_decode_passthrough_box [32mPASSED[0m[32m [ 46%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_flatten_mask_flat_array [32mPASSED[0m[32m [ 50%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_flatten_mask_dict [32mPASSED[0m[32m [ 53%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_flatten_mask_partial_dict [32mPASSED[0m[32m [ 57%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_composite_dist_sample_shape [32mPASSED[0m[32m [ 61%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_composite_dist_log_prob [32mPASSED[0m[32m [ 65%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_composite_dist_entropy [32mPASSED[0m[32m [ 69%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_composite_dist_mode [32mPASSED[0m[32m [ 73%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_composite_dist_apply_mask [32mPASSED[0m[32m [ 76%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_composite_dist_kl_divergence [32mPASSED[0m[32m [ 80%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_composite_dist_kl_key_mismatch_raises [32mPASSED[0m[32m [ 84%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_composite_dist_gradient_flow [32mPASSED[0m[32m [ 88%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_action_dim_property [32mPASSED[0m[32m [ 92%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_vector_env_composite_decode [32mPASSED[0m[32m [ 96%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_composite_actions.py::test_appo_composite_train_step [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+2.70s call     tests/test_composite_actions.py::test_appo_composite_train_step
+1.76s call     tests/test_composite_actions.py::test_composite_dist_log_prob
+0.13s call     tests/test_composite_actions.py::test_composite_dist_gradient_flow
+0.12s call     tests/test_composite_actions.py::test_composite_dist_kl_divergence
+0.10s call     tests/test_composite_actions.py::test_composite_dist_sample_shape
+0.06s call     tests/test_composite_actions.py::test_encode_decode_dict
+0.06s call     tests/test_composite_actions.py::test_composite_dist_apply_mask
+0.02s call     tests/test_composite_actions.py::test_composite_dist_entropy
+0.01s setup    tests/test_composite_actions.py::test_action_spec_tuple
+0.01s call     tests/test_composite_actions.py::test_encode_decode_multi_discrete
+[32m============================== [32m[1m26 passed[0m[32m in 9.10s[0m[32m ==============================[0m

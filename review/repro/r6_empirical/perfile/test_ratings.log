@@ -1,0 +1,25 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 11 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_elo_win [32mPASSED[0m[32m [  9%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_elo_draw [32mPASSED[0m[32m [ 18%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_elo_repeated_wins [32mPASSED[0m[32m [ 27%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_win_rate_basic [32mPASSED[0m[32m [ 36%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_win_rate_draw [32mPASSED[0m[32m [ 45%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_win_rate_no_matches [32mPASSED[0m[32m [ 54%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_win_rate_matrix [32mPASSED[0m[32m [ 63%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_pfsp_all_arena [32mPASSED[0m[32m [ 72%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_pfsp_all_solo [32mPASSED[0m[32m [ 81%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_pfsp_prioritizes_hard_opponents [32mPASSED[0m[32m [ 90%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_ratings.py::test_coordinator_match_reporting [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+0.18s call     tests/test_ratings.py::test_coordinator_match_reporting
+0.01s call     tests/test_ratings.py::test_pfsp_prioritizes_hard_opponents
+
+(8 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m11 passed[0m[32m in 1.52s[0m[32m ==============================[0m

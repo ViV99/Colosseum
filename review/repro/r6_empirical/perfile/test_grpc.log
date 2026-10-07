@@ -1,0 +1,20 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 5 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_grpc.py::test_serialize_state_dict_compressed [32mPASSED[0m[32m [ 20%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_grpc.py::test_serialize_state_dict_uncompressed [32mPASSED[0m[32m [ 40%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_grpc.py::test_serialize_chunk_roundtrip [32mPASSED[0m[32m [ 60%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_grpc.py::test_grpc_weight_store [32mPASSED[0m[32m [ 80%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_grpc.py::test_grpc_trajectory_transport [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+0.81s call     tests/test_grpc.py::test_grpc_weight_store
+0.44s call     tests/test_grpc.py::test_grpc_trajectory_transport
+0.01s teardown tests/test_grpc.py::test_serialize_state_dict_uncompressed
+
+(7 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m5 passed[0m[32m in 4.59s[0m[32m ===============================[0m

@@ -1,0 +1,232 @@
+2026-10-07 17:01:48,849 [INFO] MainProcess colosseum.launcher: Colosseum: Starting training pipeline
+2026-10-07 17:01:48,849 [INFO] MainProcess colosseum.launcher:   Agents: ['agent_0']
+2026-10-07 17:01:48,850 [INFO] MainProcess colosseum.launcher:   Algorithm: appo
+2026-10-07 17:01:48,850 [INFO] MainProcess colosseum.launcher:   Workers: 4
+2026-10-07 17:01:48,850 [INFO] MainProcess colosseum.launcher:   Envs per worker: 4
+2026-10-07 17:01:48,850 [INFO] MainProcess colosseum.launcher:   Chunk length: 20
+2026-10-07 17:01:48,889 [INFO] MainProcess colosseum.coordinator.agent_pool: Registered trainable agent: agent_0
+2026-10-07 17:01:48,893 [INFO] MainProcess colosseum.launcher: Learner started for agent agent_0
+2026-10-07 17:01:48,893 [INFO] MainProcess colosseum.coordinator.coordinator: Using SimpleSelfPlayMatchmaker (no checkpoints yet)
+2026-10-07 17:01:48,902 [INFO] MainProcess colosseum.launcher: Training started. Press Ctrl+C to stop.
+2026-10-07 17:01:50,541 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: starting on device=auto
+2026-10-07 17:01:50,567 [INFO] Process-4 colosseum.worker.rollout_worker: Worker 2: starting with 4 envs (sync), chunk_length=20, agents=['agent_0']
+2026-10-07 17:01:50,588 [INFO] Process-3 colosseum.worker.rollout_worker: Worker 1: starting with 4 envs (sync), chunk_length=20, agents=['agent_0']
+2026-10-07 17:01:50,596 [INFO] Process-5 colosseum.worker.rollout_worker: Worker 3: starting with 4 envs (sync), chunk_length=20, agents=['agent_0']
+2026-10-07 17:01:50,631 [INFO] Process-2 colosseum.worker.rollout_worker: Worker 0: starting with 4 envs (sync), chunk_length=20, agents=['agent_0']
+2026-10-07 17:01:52,196 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=10, chunks=80, loss=0.0834
+2026-10-07 17:01:52,853 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=20, chunks=160, loss=0.1295
+2026-10-07 17:01:53,434 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=30, chunks=240, loss=0.3677
+2026-10-07 17:01:54,054 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=40, chunks=320, loss=0.2469
+2026-10-07 17:01:54,797 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=50, chunks=400, loss=0.3196
+2026-10-07 17:01:55,422 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=60, chunks=480, loss=0.3451
+2026-10-07 17:01:56,138 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=70, chunks=560, loss=0.3106
+2026-10-07 17:01:56,811 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=80, chunks=640, loss=0.3175
+2026-10-07 17:01:57,449 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=90, chunks=720, loss=0.3743
+2026-10-07 17:01:58,093 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=100, chunks=800, loss=0.3598
+2026-10-07 17:01:58,844 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=110, chunks=880, loss=0.3614
+2026-10-07 17:01:59,462 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=120, chunks=960, loss=0.3945
+2026-10-07 17:02:00,123 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=130, chunks=1040, loss=0.3630
+2026-10-07 17:02:00,758 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=140, chunks=1120, loss=0.3595
+2026-10-07 17:02:01,341 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=150, chunks=1200, loss=0.3187
+2026-10-07 17:02:01,966 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=160, chunks=1280, loss=0.3448
+2026-10-07 17:02:02,684 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=170, chunks=1360, loss=0.3451
+2026-10-07 17:02:03,282 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=180, chunks=1440, loss=0.3304
+2026-10-07 17:02:03,905 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=190, chunks=1520, loss=0.3615
+2026-10-07 17:02:04,546 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=200, chunks=1600, loss=0.3713
+2026-10-07 17:02:05,273 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=210, chunks=1680, loss=0.3690
+2026-10-07 17:02:05,841 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=220, chunks=1760, loss=0.3439
+2026-10-07 17:02:06,489 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=230, chunks=1840, loss=0.3371
+2026-10-07 17:02:07,143 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=240, chunks=1920, loss=0.3300
+2026-10-07 17:02:07,727 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=250, chunks=2000, loss=0.3706
+2026-10-07 17:02:08,421 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=260, chunks=2080, loss=0.3736
+2026-10-07 17:02:09,008 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=270, chunks=2160, loss=0.3825
+2026-10-07 17:02:09,608 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=280, chunks=2240, loss=0.3459
+2026-10-07 17:02:10,226 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=290, chunks=2320, loss=0.3468
+2026-10-07 17:02:10,909 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=300, chunks=2400, loss=0.3283
+2026-10-07 17:02:11,660 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=310, chunks=2480, loss=0.3022
+2026-10-07 17:02:12,279 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=320, chunks=2560, loss=0.3374
+2026-10-07 17:02:12,958 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=330, chunks=2640, loss=0.3337
+2026-10-07 17:02:13,659 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=340, chunks=2720, loss=0.3414
+2026-10-07 17:02:14,318 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=350, chunks=2800, loss=0.3447
+2026-10-07 17:02:14,963 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=360, chunks=2880, loss=0.3135
+2026-10-07 17:02:15,603 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=370, chunks=2960, loss=0.2946
+2026-10-07 17:02:16,237 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=380, chunks=3040, loss=0.3253
+2026-10-07 17:02:16,789 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=390, chunks=3120, loss=0.3217
+2026-10-07 17:02:17,437 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=400, chunks=3200, loss=0.3059
+2026-10-07 17:02:18,188 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=410, chunks=3280, loss=0.2897
+2026-10-07 17:02:18,827 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=420, chunks=3360, loss=0.3276
+2026-10-07 17:02:19,507 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=430, chunks=3440, loss=0.3078
+2026-10-07 17:02:20,189 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=440, chunks=3520, loss=0.2920
+2026-10-07 17:02:20,854 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=450, chunks=3600, loss=0.3063
+2026-10-07 17:02:21,567 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=460, chunks=3680, loss=0.3028
+2026-10-07 17:02:22,187 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=470, chunks=3760, loss=0.3120
+2026-10-07 17:02:22,837 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=480, chunks=3840, loss=0.3708
+2026-10-07 17:02:23,557 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=490, chunks=3920, loss=0.3542
+2026-10-07 17:02:24,270 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=500, chunks=4000, loss=0.3451
+2026-10-07 17:02:24,889 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=510, chunks=4080, loss=0.3456
+2026-10-07 17:02:25,568 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=520, chunks=4160, loss=0.3061
+2026-10-07 17:02:26,325 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=530, chunks=4240, loss=0.3113
+2026-10-07 17:02:26,992 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=540, chunks=4320, loss=0.3441
+2026-10-07 17:02:27,736 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=550, chunks=4400, loss=0.3439
+2026-10-07 17:02:28,376 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=560, chunks=4480, loss=0.3217
+2026-10-07 17:02:28,984 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=570, chunks=4560, loss=0.2961
+2026-10-07 17:02:29,611 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=580, chunks=4640, loss=0.3239
+2026-10-07 17:02:30,334 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=590, chunks=4720, loss=0.3175
+2026-10-07 17:02:31,003 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=600, chunks=4800, loss=0.3333
+2026-10-07 17:02:31,635 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=610, chunks=4880, loss=0.3580
+2026-10-07 17:02:32,244 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=620, chunks=4960, loss=0.3058
+2026-10-07 17:02:32,783 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=630, chunks=5040, loss=0.3037
+2026-10-07 17:02:33,499 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=640, chunks=5120, loss=0.3337
+2026-10-07 17:02:34,138 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=650, chunks=5200, loss=0.3155
+2026-10-07 17:02:34,769 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=660, chunks=5280, loss=0.3045
+2026-10-07 17:02:35,462 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=670, chunks=5360, loss=0.3382
+2026-10-07 17:02:36,028 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=680, chunks=5440, loss=0.3322
+2026-10-07 17:02:36,706 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=690, chunks=5520, loss=0.3453
+2026-10-07 17:02:37,436 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=700, chunks=5600, loss=0.3254
+2026-10-07 17:02:38,024 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=710, chunks=5680, loss=0.3435
+2026-10-07 17:02:38,662 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=720, chunks=5760, loss=0.3410
+2026-10-07 17:02:39,353 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=730, chunks=5840, loss=0.3363
+2026-10-07 17:02:39,973 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=740, chunks=5920, loss=0.3602
+2026-10-07 17:02:40,548 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=750, chunks=6000, loss=0.3370
+2026-10-07 17:02:41,105 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=760, chunks=6080, loss=0.3185
+2026-10-07 17:02:41,777 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=770, chunks=6160, loss=0.3383
+2026-10-07 17:02:42,388 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=780, chunks=6240, loss=0.3612
+2026-10-07 17:02:43,111 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=790, chunks=6320, loss=0.3455
+2026-10-07 17:02:43,742 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=800, chunks=6400, loss=0.3248
+2026-10-07 17:02:44,435 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=810, chunks=6480, loss=0.3062
+2026-10-07 17:02:45,050 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=820, chunks=6560, loss=0.3403
+2026-10-07 17:02:45,716 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=830, chunks=6640, loss=0.3017
+2026-10-07 17:02:46,340 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=840, chunks=6720, loss=0.3363
+2026-10-07 17:02:47,050 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=850, chunks=6800, loss=0.3353
+2026-10-07 17:02:47,718 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=860, chunks=6880, loss=0.3187
+2026-10-07 17:02:48,281 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=870, chunks=6960, loss=0.3255
+2026-10-07 17:02:48,916 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=880, chunks=7040, loss=0.3131
+2026-10-07 17:02:49,567 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=890, chunks=7120, loss=0.3131
+2026-10-07 17:02:50,240 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=900, chunks=7200, loss=0.3412
+2026-10-07 17:02:50,892 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=910, chunks=7280, loss=0.3338
+2026-10-07 17:02:51,541 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=920, chunks=7360, loss=0.3357
+2026-10-07 17:02:52,138 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=930, chunks=7440, loss=0.3239
+2026-10-07 17:02:52,763 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=940, chunks=7520, loss=0.3407
+2026-10-07 17:02:53,342 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=950, chunks=7600, loss=0.3743
+2026-10-07 17:02:53,981 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=960, chunks=7680, loss=0.3631
+2026-10-07 17:02:54,588 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=970, chunks=7760, loss=0.3351
+2026-10-07 17:02:55,243 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=980, chunks=7840, loss=0.3298
+2026-10-07 17:02:55,958 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=990, chunks=7920, loss=0.2884
+2026-10-07 17:02:56,569 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=1000, chunks=8000, loss=0.3302
+2026-10-07 17:02:57,183 [INFO] Process-1 colosseum.learner.learner: Learner [agent_0]: step=1010, chunks=8080, loss=0.3114
+Process Process-3:
+Process Process-4:
+Process Process-1:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 99, in _worker_target
+    rollout_worker_process(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/worker/rollout_worker.py", line 541, in rollout_worker_process
+    tq.put(chunk, timeout=1.0)
+  File "/usr/lib/python3.12/multiprocessing/queues.py", line 89, in put
+    if not self._sem.acquire(block, timeout):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 99, in _worker_target
+    rollout_worker_process(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/worker/rollout_worker.py", line 541, in rollout_worker_process
+    tq.put(chunk, timeout=1.0)
+  File "/usr/lib/python3.12/multiprocessing/queues.py", line 89, in put
+    if not self._sem.acquire(block, timeout):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 181, in _learner_target
+    learner_process(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/learner/learner.py", line 92, in learner_process
+    chunks = _collect_chunks(
+             ^^^^^^^^^^^^^^^^
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/learner/learner.py", line 188, in _collect_chunks
+    chunk = queue.get_nowait()
+            ^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/queues.py", line 135, in get_nowait
+    return self.get(False)
+           ^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/queues.py", line 122, in get
+    return _ForkingPickler.loads(res)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/multiprocessing/reductions.py", line 538, in rebuild_storage_fd
+    fd = df.detach()
+         ^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/resource_sharer.py", line 58, in detach
+    return reduction.recv_handle(conn)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/reduction.py", line 189, in recv_handle
+    return recvfds(s, 1)[0]
+           ^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/reduction.py", line 157, in recvfds
+    msg, ancdata, flags, addr = sock.recvmsg(1, socket.CMSG_SPACE(bytes_size))
+                                ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+Process Process-2:
+Process Process-5:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 99, in _worker_target
+    rollout_worker_process(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/worker/rollout_worker.py", line 525, in rollout_worker_process
+    ).unsqueeze(0)
+      ^^^^^^^^^^^^
+KeyboardInterrupt
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 99, in _worker_target
+    rollout_worker_process(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/worker/rollout_worker.py", line 541, in rollout_worker_process
+    tq.put(chunk, timeout=1.0)
+  File "/usr/lib/python3.12/multiprocessing/queues.py", line 89, in put
+    if not self._sem.acquire(block, timeout):
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+KeyboardInterrupt
+2026-10-07 17:02:58,710 [INFO] MainProcess colosseum.launcher: All processes stopped
+Traceback (most recent call last):
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 475, in launch
+    self._monitor_loop(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 589, in _monitor_loop
+    time.sleep(0.5)
+KeyboardInterrupt
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/r6_runs/scripts/train_logged.py", line 9, in <module>
+    run_training(sys.argv[1], overrides=_parse_overrides(tuple(sys.argv[2:])) or None)
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 697, in run_training
+    launcher.launch()
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 487, in launch
+    logger.info("Received interrupt, stopping...")
+  File "/usr/lib/python3.12/logging/__init__.py", line 1539, in info
+    self._log(INFO, msg, args, **kwargs)
+  File "/usr/lib/python3.12/logging/__init__.py", line 1682, in _log
+    record = self.makeRecord(self.name, level, fn, lno, msg, args,
+             ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/logging/__init__.py", line 1651, in makeRecord
+    rv = _logRecordFactory(name, level, fn, lno, msg, args, exc_info, func,
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/logging/__init__.py", line 343, in __init__
+    self.msecs = int((ct - int(ct)) * 1000) + 0.0  # see gh-89047
+                           ^^^^^^^
+KeyboardInterrupt

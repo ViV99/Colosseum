@@ -1,0 +1,18 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 3 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_distributed.py::test_grpc_weight_sink_and_source [32mPASSED[0m[32m [ 33%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_distributed.py::test_grpc_trajectory_sink_sends_chunk_with_masks [32mPASSED[0m[32m [ 66%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_distributed.py::test_grpc_trajectory_sink_tolerates_dead_learner [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+0.85s call     tests/test_distributed.py::test_grpc_weight_sink_and_source
+0.36s call     tests/test_distributed.py::test_grpc_trajectory_sink_sends_chunk_with_masks
+0.02s call     tests/test_distributed.py::test_grpc_trajectory_sink_tolerates_dead_learner
+
+(6 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m3 passed[0m[32m in 4.36s[0m[32m ===============================[0m

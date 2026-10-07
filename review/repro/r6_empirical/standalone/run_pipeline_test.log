@@ -1,0 +1,82 @@
+Starting full pipeline...
+2026-10-07 15:56:29,165 [INFO] colosseum.launcher: Colosseum: Starting training pipeline
+2026-10-07 15:56:29,165 [INFO] colosseum.launcher:   Agents: ['agent_0']
+2026-10-07 15:56:29,165 [INFO] colosseum.launcher:   Algorithm: appo
+2026-10-07 15:56:29,165 [INFO] colosseum.launcher:   Workers: 1
+2026-10-07 15:56:29,165 [INFO] colosseum.launcher:   Envs per worker: 2
+2026-10-07 15:56:29,165 [INFO] colosseum.launcher:   Chunk length: 8
+2026-10-07 15:56:29,205 [INFO] colosseum.coordinator.agent_pool: Registered trainable agent: agent_0
+2026-10-07 15:56:29,208 [INFO] colosseum.launcher: Learner started for agent agent_0
+2026-10-07 15:56:29,208 [INFO] colosseum.coordinator.coordinator: Using SimpleSelfPlayMatchmaker (no checkpoints yet)
+2026-10-07 15:56:29,216 [INFO] colosseum.launcher: Training started. Press Ctrl+C to stop.
+2026-10-07 15:56:30,576 [INFO] colosseum.learner.learner: Learner [agent_0]: starting on device=auto
+2026-10-07 15:56:30,631 [INFO] colosseum.worker.rollout_worker: Worker 0: starting with 2 envs (sync), chunk_length=8, agents=['agent_0']
+2026-10-07 15:56:36,558 [INFO] colosseum.learner.learner: Learner [agent_0]: step=10, chunks=20, loss=0.2806
+2026-10-07 15:56:41,896 [INFO] colosseum.learner.learner: Learner [agent_0]: step=20, chunks=40, loss=0.4551
+2026-10-07 15:56:47,156 [INFO] colosseum.learner.learner: Learner [agent_0]: step=30, chunks=60, loss=0.3429
+2026-10-07 15:56:52,110 [INFO] colosseum.learner.learner: Learner [agent_0]: step=40, chunks=80, loss=0.3371
+2026-10-07 15:56:57,933 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 50
+2026-10-07 15:56:57,933 [INFO] colosseum.learner.learner: Learner [agent_0]: step=50, chunks=100, loss=0.3077
+2026-10-07 15:56:58,413 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v50 for agent_0 (pool: 1/10)
+2026-10-07 15:56:58,413 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 1 checkpoints
+2026-10-07 15:56:58,413 [INFO] colosseum.launcher: Saved checkpoint ckpt_v50 for agent_0
+2026-10-07 15:56:59,696 [INFO] colosseum.learner.learner: Learner [agent_0]: step=60, chunks=120, loss=0.3968
+2026-10-07 15:57:04,250 [INFO] colosseum.learner.learner: Learner [agent_0]: step=70, chunks=140, loss=0.1632
+2026-10-07 15:57:10,015 [INFO] colosseum.learner.learner: Learner [agent_0]: step=80, chunks=160, loss=0.3534
+2026-10-07 15:57:15,956 [INFO] colosseum.learner.learner: Learner [agent_0]: step=90, chunks=180, loss=0.3384
+2026-10-07 15:57:21,662 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 100
+2026-10-07 15:57:21,663 [INFO] colosseum.learner.learner: Learner [agent_0]: step=100, chunks=196, loss=0.2590
+2026-10-07 15:57:22,120 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v100 for agent_0 (pool: 2/10)
+2026-10-07 15:57:22,120 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 2 checkpoints
+2026-10-07 15:57:22,120 [INFO] colosseum.launcher: Saved checkpoint ckpt_v100 for agent_0
+2026-10-07 15:57:27,138 [INFO] colosseum.learner.learner: Learner [agent_0]: step=110, chunks=213, loss=0.4443
+2026-10-07 15:57:32,923 [INFO] colosseum.learner.learner: Learner [agent_0]: step=120, chunks=231, loss=0.3678
+2026-10-07 15:57:39,190 [INFO] colosseum.learner.learner: Learner [agent_0]: step=130, chunks=251, loss=0.3277
+2026-10-07 15:57:45,206 [INFO] colosseum.learner.learner: Learner [agent_0]: step=140, chunks=271, loss=0.3485
+2026-10-07 15:57:51,476 [INFO] colosseum.learner.learner: Learner [agent_0]: sent checkpoint at version 150
+2026-10-07 15:57:51,476 [INFO] colosseum.learner.learner: Learner [agent_0]: step=150, chunks=291, loss=0.4249
+2026-10-07 15:57:51,978 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v150 for agent_0 (pool: 3/10)
+2026-10-07 15:57:51,979 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 3 checkpoints
+2026-10-07 15:57:51,979 [INFO] colosseum.launcher: Saved checkpoint ckpt_v150 for agent_0
+2026-10-07 15:57:57,776 [INFO] colosseum.learner.learner: Learner [agent_0]: step=160, chunks=311, loss=0.4700
+2026-10-07 15:58:03,514 [INFO] colosseum.learner.learner: Learner [agent_0]: step=170, chunks=331, loss=0.2768
+2026-10-07 15:58:08,386 [INFO] colosseum.learner.learner: Learner [agent_0]: step=180, chunks=351, loss=0.4019
+2026-10-07 15:58:12,221 [INFO] colosseum.learner.learner: Learner [agent_0]: finished. Total train_steps=187
+2026-10-07 15:58:13,172 [INFO] colosseum.launcher: All learner processes exited, stopping workers...
+Process Process-2:
+Traceback (most recent call last):
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 314, in _bootstrap
+    self.run()
+  File "/usr/lib/python3.12/multiprocessing/process.py", line 108, in run
+    self._target(*self._args, **self._kwargs)
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/launcher.py", line 99, in _worker_target
+    rollout_worker_process(
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/worker/rollout_worker.py", line 596, in rollout_worker_process
+    new_version = _sync_weights(
+                  ^^^^^^^^^^^^^^
+  File "/home/viv/dev/repos/Colosseum/src/colosseum/worker/rollout_worker.py", line 731, in _sync_weights
+    payload = weight_queue.get_nowait()
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/queues.py", line 135, in get_nowait
+    return self.get(False)
+           ^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/queues.py", line 122, in get
+    return _ForkingPickler.loads(res)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/lib/python3.12/site-packages/torch/multiprocessing/reductions.py", line 538, in rebuild_storage_fd
+    fd = df.detach()
+         ^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/resource_sharer.py", line 57, in detach
+    with _resource_sharer.get_connection(self._id) as conn:
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/resource_sharer.py", line 86, in get_connection
+    c = Client(address, authkey=process.current_process().authkey)
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/connection.py", line 519, in Client
+    c = SocketClient(address)
+        ^^^^^^^^^^^^^^^^^^^^^
+  File "/usr/lib/python3.12/multiprocessing/connection.py", line 647, in SocketClient
+    s.connect(address)
+FileNotFoundError: [Errno 2] No such file or directory
+2026-10-07 15:58:14,173 [INFO] colosseum.launcher: All processes stopped
+Pipeline completed!

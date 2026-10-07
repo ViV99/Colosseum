@@ -1,0 +1,59 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 14 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_outcomes_from_rewards [32mPASSED[0m[32m [  7%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_outcomes_prefer_env_rank_over_reward [32mPASSED[0m[32m [ 14%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_outcomes_prefer_env_explicit_outcome [32mPASSED[0m[32m [ 21%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_outcomes_fall_back_when_signal_incomplete [32mPASSED[0m[32m [ 28%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_coordinator_aggregates_composite_keys [32mPASSED[0m[32m [ 35%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_coordinator_skips_same_agent_pairs [32mPASSED[0m[32m [ 42%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_pfsp_uses_win_rates [32mPASSED[0m[32m [ 50%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_recurrent_reset_isolates_post_done_steps [32mPASSED[0m[32m [ 57%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_recurrent_without_reset_carries_state [32mPASSED[0m[32m [ 64%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_refresh_pushes_new_checkpoint_to_worker [32mPASSED[0m[32m [ 71%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_worker_applies_command_loads_checkpoint_and_stages_maps [32mPASSED[0m[32m [ 78%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_resume_from_path [31mERROR[0m[31m [ 85%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_resume_from_none_returns_none [31mERROR[0m[31m [ 92%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_review_fixes.py::test_chunk_serialization_preserves_action_masks [32mPASSED[0m[31m [100%][0m
+
+==================================== ERRORS ====================================
+[31m[1m___________________ ERROR at setup of test_resume_from_path ____________________[0m
+
+self = PosixPath('/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/r6_runs/pytest_tmp/test_review_fixes')
+mode = 448, parents = False, exist_ok = False
+
+    [0m[94mdef[39;49;00m[90m [39;49;00m[92mmkdir[39;49;00m([96mself[39;49;00m, mode=[94m0o777[39;49;00m, parents=[94mFalse[39;49;00m, exist_ok=[94mFalse[39;49;00m):[90m[39;49;00m
+    [90m    [39;49;00m[33m"""[39;49;00m
+    [33m    Create a new directory at this given path.[39;49;00m
+    [33m    """[39;49;00m[90m[39;49;00m
+        [94mtry[39;49;00m:[90m[39;49;00m
+>           os.mkdir([96mself[39;49;00m, mode)[90m[39;49;00m
+[1m[31mE           FileNotFoundError: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/r6_runs/pytest_tmp/test_review_fixes'[0m
+
+[1m[31m/usr/lib/python3.12/pathlib.py[0m:1313: FileNotFoundError
+[31m[1m_____________ ERROR at setup of test_resume_from_none_returns_none _____________[0m
+
+self = PosixPath('/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/r6_runs/pytest_tmp/test_review_fixes')
+mode = 448, parents = False, exist_ok = False
+
+    [0m[94mdef[39;49;00m[90m [39;49;00m[92mmkdir[39;49;00m([96mself[39;49;00m, mode=[94m0o777[39;49;00m, parents=[94mFalse[39;49;00m, exist_ok=[94mFalse[39;49;00m):[90m[39;49;00m
+    [90m    [39;49;00m[33m"""[39;49;00m
+    [33m    Create a new directory at this given path.[39;49;00m
+    [33m    """[39;49;00m[90m[39;49;00m
+        [94mtry[39;49;00m:[90m[39;49;00m
+>           os.mkdir([96mself[39;49;00m, mode)[90m[39;49;00m
+[1m[31mE           FileNotFoundError: [Errno 2] No such file or directory: '/tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/r6_runs/pytest_tmp/test_review_fixes'[0m
+
+[1m[31m/usr/lib/python3.12/pathlib.py[0m:1313: FileNotFoundError
+============================= slowest 10 durations =============================
+0.18s call     tests/test_review_fixes.py::test_coordinator_aggregates_composite_keys
+0.08s call     tests/test_review_fixes.py::test_refresh_pushes_new_checkpoint_to_worker
+0.02s call     tests/test_review_fixes.py::test_recurrent_without_reset_carries_state
+0.02s call     tests/test_review_fixes.py::test_recurrent_reset_isolates_post_done_steps
+
+(6 durations < 0.005s hidden.  Use -vv to show these durations.)
+[31m========================= [32m12 passed[0m, [31m[1m2 errors[0m[31m in 1.71s[0m[31m =========================[0m

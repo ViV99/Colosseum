@@ -1,0 +1,26 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 7 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_subproc_vec_env.py::test_subproc_reset_all_parity [32mPASSED[0m[32m [ 14%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_subproc_vec_env.py::test_subproc_step_parity [32mPASSED[0m[32m [ 28%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_subproc_vec_env.py::test_subproc_auto_reset_gives_fresh_obs [32mPASSED[0m[32m [ 42%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_subproc_vec_env.py::test_subproc_reset_done_parity [32mPASSED[0m[32m [ 57%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_subproc_vec_env.py::test_subproc_default_num_workers [32mPASSED[0m[32m [ 71%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_subproc_vec_env.py::test_subproc_uneven_split [32mPASSED[0m[32m [ 85%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_subproc_vec_env.py::test_subproc_close_is_prompt_and_no_zombies [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+0.39s call     tests/test_subproc_vec_env.py::test_subproc_step_parity
+0.36s call     tests/test_subproc_vec_env.py::test_subproc_reset_all_parity
+0.34s call     tests/test_subproc_vec_env.py::test_subproc_default_num_workers
+0.33s call     tests/test_subproc_vec_env.py::test_subproc_uneven_split
+0.33s call     tests/test_subproc_vec_env.py::test_subproc_close_is_prompt_and_no_zombies
+0.28s call     tests/test_subproc_vec_env.py::test_subproc_auto_reset_gives_fresh_obs
+0.27s call     tests/test_subproc_vec_env.py::test_subproc_reset_done_parity
+
+(3 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m7 passed[0m[32m in 2.45s[0m[32m ===============================[0m

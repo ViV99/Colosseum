@@ -1,0 +1,36 @@
+2026-10-07 16:10:07,466 [INFO] colosseum.launcher: Colosseum: Starting training pipeline
+2026-10-07 16:10:07,466 [INFO] colosseum.launcher:   Agents: ['agent_0']
+2026-10-07 16:10:07,466 [INFO] colosseum.launcher:   Algorithm: appo
+2026-10-07 16:10:07,466 [INFO] colosseum.launcher:   Workers: 1
+2026-10-07 16:10:07,466 [INFO] colosseum.launcher:   Envs per worker: 4
+2026-10-07 16:10:07,466 [INFO] colosseum.launcher:   Chunk length: 20
+2026-10-07 16:10:07,535 [INFO] colosseum.coordinator.agent_pool: Registered trainable agent: agent_0
+2026-10-07 16:10:07,575 [INFO] colosseum.launcher: Learner started for agent agent_0
+2026-10-07 16:10:07,576 [INFO] colosseum.coordinator.coordinator: Using SimpleSelfPlayMatchmaker (no checkpoints yet)
+2026-10-07 16:10:07,615 [INFO] colosseum.launcher: Training started. Press Ctrl+C to stop.
+2026-10-07 16:11:56,941 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v25 for agent_0 (pool: 1/5)
+2026-10-07 16:11:56,941 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 1 checkpoints
+2026-10-07 16:11:56,941 [INFO] colosseum.launcher: Saved checkpoint ckpt_v25 for agent_0
+2026-10-07 16:14:36,451 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v50 for agent_0 (pool: 2/5)
+2026-10-07 16:14:36,451 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 2 checkpoints
+2026-10-07 16:14:36,451 [INFO] colosseum.launcher: Saved checkpoint ckpt_v50 for agent_0
+2026-10-07 16:16:16,785 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v75 for agent_0 (pool: 3/5)
+2026-10-07 16:16:16,785 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 3 checkpoints
+2026-10-07 16:16:16,785 [INFO] colosseum.launcher: Saved checkpoint ckpt_v75 for agent_0
+2026-10-07 16:18:03,790 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v100 for agent_0 (pool: 4/5)
+2026-10-07 16:18:03,790 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 4 checkpoints
+2026-10-07 16:18:03,790 [INFO] colosseum.launcher: Saved checkpoint ckpt_v100 for agent_0
+2026-10-07 16:19:48,209 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v125 for agent_0 (pool: 5/5)
+2026-10-07 16:19:48,209 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 5 checkpoints
+2026-10-07 16:19:48,209 [INFO] colosseum.launcher: Saved checkpoint ckpt_v125 for agent_0
+2026-10-07 16:21:31,155 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v150 for agent_0 (pool: 5/5)
+2026-10-07 16:21:31,155 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 5 checkpoints
+2026-10-07 16:21:31,156 [INFO] colosseum.launcher: Saved checkpoint ckpt_v150 for agent_0
+2026-10-07 16:23:40,111 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v175 for agent_0 (pool: 5/5)
+2026-10-07 16:23:40,111 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 5 checkpoints
+2026-10-07 16:23:40,111 [INFO] colosseum.launcher: Saved checkpoint ckpt_v175 for agent_0
+2026-10-07 16:25:02,685 [INFO] colosseum.coordinator.checkpoint_manager: Saved checkpoint ckpt_v200 for agent_0 (pool: 5/5)
+2026-10-07 16:25:02,685 [INFO] colosseum.coordinator.coordinator: Using SelfPlayMatchmaker with 5 checkpoints
+2026-10-07 16:25:02,686 [INFO] colosseum.launcher: Saved checkpoint ckpt_v200 for agent_0
+/usr/lib/python3.12/multiprocessing/resource_tracker.py:254: UserWarning: resource_tracker: There appear to be 23 leaked semaphore objects to clean up at shutdown
+  warnings.warn('resource_tracker: There appear to be %d '

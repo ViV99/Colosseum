@@ -1,0 +1,21 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 6 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_eval.py::test_wilson_ci_basic [32mPASSED[0m[32m [ 16%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_eval.py::test_wilson_ci_extremes [32mPASSED[0m[32m [ 33%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_eval.py::test_wilson_ci_zero_total [32mPASSED[0m[32m [ 50%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_eval.py::test_evaluate_two_agents [32mPASSED[0m[32m [ 66%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_eval.py::test_eval_matrix_summary [32mPASSED[0m[32m [ 83%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_eval.py::test_evaluate_three_agents [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+42.16s call     tests/test_eval.py::test_evaluate_three_agents
+11.71s call     tests/test_eval.py::test_evaluate_two_agents
+0.01s setup    tests/test_eval.py::test_wilson_ci_zero_total
+
+(7 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m6 passed[0m[32m in 57.12s[0m[32m ==============================[0m

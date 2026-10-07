@@ -1,0 +1,33 @@
+
+======================================================================
+EVAL 2v2: agent A always plays 1 (strictly better), agent B always plays 0
+======================================================================
+Agent A vs Agent B | Matches | Win A | Win B | Draw | WR A (95% CI)
+-------------------------------------------------------------------
+         A vs B          |     600 |   208 |     0 |  392 | 0.347 [0.310, 0.386]
+         B vs A          |     600 |     0 |   208 |  392 | 0.000 [0.614, 0.690]
+True A-vs-B team win rate is 1.0; reported win_rate_A=0.35, draws=392/600
+
+======================================================================
+PFSP arena match for a 4-seat game (2 trainable agents)
+======================================================================
+arena seats: ['a', 'b', 'a', 'b'] -> with team={0,1} vs {2,3} both teams are mixed {a,b}
+2-player arena, who sits in seat 0 (launcher always calls with primary agent 'a'): {'a': 200}
+num_players=1 'arena' match seats: ['a']
+3-player FFA arena seats: ['a', 'b', 'a'] (only 2 distinct agents ever; 'a' always 2 seats)
+
+======================================================================
+Coordinator ratings: mixed-team arena result and FFA ranks
+======================================================================
+worker-side player_outcomes dict for seats a,b,a,b (team0 wins): {'a:latest': 0.0, 'b:latest': 0.0}
+ELO after: {'a': 1200.0, 'b': 1200.0}  winrate a vs b: 0.0
+FFA ranks x=1,y=2,z=3 x50 -> ELO: {'x': 1611, 'y': 1201, 'z': 788}
+FFA rank->outcome for 4 players ranks 1,2,2,4: [1.0, 0.6666666666666666, 0.6666666666666666, 0.0]
+solo outcome from rewards [7.0]: [0.5]
+
+======================================================================
+Worker result reporting when one agent holds several seats (FFA a,b,a)
+======================================================================
+seat ranks: a(seat0)=1, b(seat1)=2, a(seat2)=3 -> fair per-agent mean: a=0.5, b=0.5
+reported player_outcomes: {'a:latest': 0.0, 'b:latest': 0.5}  total_rewards: {'a:latest': -1.0, 'b:latest': -1.0}
+ELO after one such match: {'b': 1216.0, 'a': 1184.0}

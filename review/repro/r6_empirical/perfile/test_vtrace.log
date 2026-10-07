@@ -1,0 +1,20 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 8 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_vtrace.py::test_on_policy_reduces_to_nstep [32mPASSED[0m[32m [ 12%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_vtrace.py::test_episode_boundary_resets [32mPASSED[0m[32m [ 25%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_vtrace.py::test_importance_weight_clipping [32mPASSED[0m[32m [ 37%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_vtrace.py::test_output_shapes [32mPASSED[0m[32m [ 50%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_vtrace.py::test_vtrace_all_done [32mPASSED[0m[32m [ 62%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_vtrace.py::test_vtrace_first_step_done [32mPASSED[0m[32m [ 75%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_vtrace.py::test_vtrace_last_step_done [32mPASSED[0m[32m [ 87%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_vtrace.py::test_vtrace_multiple_episodes [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+
+(10 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m8 passed[0m[32m in 1.36s[0m[32m ===============================[0m

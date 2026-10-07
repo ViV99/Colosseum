@@ -1,0 +1,26 @@
+[1m============================= test session starts ==============================[0m
+platform linux -- Python 3.12.3, pytest-9.1.1, pluggy-1.6.0 -- /tmp/claude-1000/-home-viv-dev-repos-Colosseum/c1c58436-6bd4-4d8e-a7d7-ac184cbf43cf/scratchpad/venv/bin/python
+rootdir: /home/viv/dev/repos/Colosseum
+configfile: pyproject.toml
+plugins: platformdirs-4.12.3
+[1mcollecting ... [0mcollected 12 items
+
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_invalid_gamma_too_high [32mPASSED[0m[32m [  8%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_invalid_gamma_negative [32mPASSED[0m[32m [ 16%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_invalid_learning_rate [32mPASSED[0m[32m [ 25%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_invalid_num_workers [32mPASSED[0m[32m [ 33%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_invalid_num_epochs [32mPASSED[0m[32m [ 41%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_invalid_eps_clip [32mPASSED[0m[32m [ 50%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_valid_defaults [32mPASSED[0m[32m [ 58%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_load_config_roundtrip [32mPASSED[0m[32m [ 66%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_missing_env_class [32mPASSED[0m[32m [ 75%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_missing_network_classes [32mPASSED[0m[32m [ 83%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_training_config_seed [32mPASSED[0m[32m [ 91%][0m
+../../../../../../../home/viv/dev/repos/Colosseum/tests/test_config.py::test_learner_config_weight_push_interval [32mPASSED[0m[32m [100%][0m
+
+============================= slowest 10 durations =============================
+0.03s call     tests/test_config.py::test_load_config_roundtrip
+0.01s setup    tests/test_config.py::test_invalid_gamma_too_high
+
+(8 durations < 0.005s hidden.  Use -vv to show these durations.)
+[32m============================== [32m[1m12 passed[0m[32m in 0.47s[0m[32m ==============================[0m
