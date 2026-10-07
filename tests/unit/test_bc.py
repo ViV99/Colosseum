@@ -150,3 +150,20 @@ def test_appo_with_kickstart():
     assert "kickstart_lambda" in metrics
     assert metrics["kickstart_lambda"] > 0
     assert torch.isfinite(torch.tensor(metrics["total_loss"]))
+
+
+def test_offline_bc_and_kickstart_accept_stateful_models():
+    """BC and kickstart go through PolicyModel.step, so a core with output_dim != latent_dim works."""
+    from helpers import make_simple_model
+
+    def lstm_model():
+        return make_simple_model(obs_dim=8, num_actions=4, core="lstm")
+
+    trainer = OfflineBCTrainer(lstm_model(), lr=1e-3, action_type="discrete")
+    trainer.add_data(torch.randn(32, 8), torch.randint(0, 4, (32,)))
+    assert trainer.train(num_epochs=1, batch_size=16)["bc_loss"] > 0
+    assert trainer.model is not None
+
+    ks = KickstartLoss(lstm_model(), initial_lambda=1.0, decay_steps=10)
+    loss = ks.compute(lstm_model(), torch.randn(5, 8))
+    assert loss.shape == () and torch.isfinite(loss) and loss.item() >= 0

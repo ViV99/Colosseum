@@ -16,7 +16,7 @@ import torch
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 
-from colosseum.networks.actor_critic import ActorCriticNetwork
+from colosseum.networks.model import PolicyModel
 
 logger = logging.getLogger(__name__)
 
@@ -26,7 +26,7 @@ class OfflineBCTrainer:
 
     Usage::
 
-        trainer = OfflineBCTrainer(network, lr=1e-3)
+        trainer = OfflineBCTrainer(model, lr=1e-3)
         trainer.load_data("path/to/data")   # or add_data(obs, actions)
         metrics = trainer.train(num_epochs=10, batch_size=256)
 
@@ -34,38 +34,37 @@ class OfflineBCTrainer:
     bool tensor), invalid actions are masked out of the policy distribution
     before computing the loss — matching how masks are used during RL.
 
-    Scope/limitations: BC trains the feedforward policy path (encoder -> policy
-    head); it does not unroll a recurrent trunk, and it loads the full dataset
-    into memory. For very large replay corpora or recurrent policies, pre-train
-    feedforward then fine-tune with RL, or stream data in shards via repeated
+    Scope/limitations: every sample is scored with ``model.step`` from the
+    model's initial state (no sequence unroll yet), and the full dataset is
+    loaded into memory. Stream very large corpora in shards via repeated
     ``add_data`` + ``train`` calls.
     """
 
     def __init__(
         self,
-        network: ActorCriticNetwork,
+        model: PolicyModel,
         lr: float = 1e-3,
         device: str | torch.device = "cpu",
         action_type: str = "discrete",
     ) -> None:
         """
         Args:
-            network: The actor-critic network to train (only encoder+policy used).
+            model: The PolicyModel to train (only its policy distribution is used).
             lr: Learning rate.
             device: Torch device.
             action_type: "discrete" for cross-entropy, "continuous" for MSE.
         """
-        self._network = network.to(device)
+        self._model = model.to(device)
         self._device = device
         self._action_type = action_type
-        self._optimizer = torch.optim.Adam(network.parameters(), lr=lr)
+        self._optimizer = torch.optim.Adam(self._model.parameters(), lr=lr)
 
         self._observations: list[torch.Tensor] = []
         self._actions: list[torch.Tensor] = []
 
     @property
-    def network(self) -> ActorCriticNetwork:
-        return self._network
+    def model(self) -> PolicyModel:
+        return self._model
 
     def add_data(self, observations: torch.Tensor, actions: torch.Tensor) -> None:
         """Add a batch of (obs, action) pairs to the training dataset."""
@@ -155,8 +154,7 @@ class OfflineBCTrainer:
         """Compute BC loss: cross-entropy (discrete), MSE (continuous), or auto (composite)."""
         from colosseum.networks.distributions import CompositeDist
 
-        latent = self._network.encoder(obs)
-        dist = self._network.policy(latent)
+        dist = self._model.step(obs, self._model.initial_state(obs.shape[0], obs.device)).dist
 
         if isinstance(dist, CompositeDist):
             # CompositeDist.log_prob handles discrete/continuous split internally

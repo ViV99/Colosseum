@@ -140,16 +140,6 @@ class LayerFirstLSTMCore(Core):
         return y.squeeze(0), {"h": h, "c": c}
 
 
-def make_simple_network(obs_dim=8, hidden_dim=16, num_actions=4):
-    """Legacy feedforward ActorCriticNetwork (deleted together with actor_critic.py)."""
-    from colosseum.networks.actor_critic import ActorCriticNetwork
-
-    encoder = SimpleEncoder(obs_dim, hidden_dim)
-    policy = SimplePolicy(hidden_dim, num_actions)
-    value = SimpleValue(hidden_dim)
-    return ActorCriticNetwork(encoder, policy, value)
-
-
 CORE_KINDS = ("none", "lstm", "gru", "window")
 
 

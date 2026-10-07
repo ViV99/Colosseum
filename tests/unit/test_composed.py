@@ -5,15 +5,17 @@ from __future__ import annotations
 import pytest
 import torch
 
-from helpers import CORE_KINDS, make_simple_model, make_simple_network
+from helpers import CORE_KINDS, make_simple_model
 
 OBS, B, T = 8, 3, 5
 
 
-def test_stateless_state_dict_keys_match_legacy_actor_critic():
+def test_stateless_state_dict_keys():
+    """A stateless ComposedModel keeps the flat encoder/policy/value checkpoint layout."""
     model = make_simple_model(obs_dim=OBS)
-    legacy = make_simple_network(obs_dim=OBS)
-    assert set(model.state_dict()) == set(legacy.state_dict())
+    assert set(model.state_dict()) == {
+        f"{part}.fc.{param}" for part in ("encoder", "policy", "value") for param in ("weight", "bias")
+    }
     assert not model.is_stateful
 
 

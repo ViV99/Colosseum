@@ -77,52 +77,49 @@ def test_gaussian_apply_mask_noop():
 
 
 # ---------------------------------------------------------------
-# ActorCriticNetwork-level tests
+# PolicyModel-level tests (act / unroll with masks)
 # ---------------------------------------------------------------
 
-def _make_network(obs_dim=8, num_actions=4, hidden=32):
-    """Create a simple network for testing."""
-    from helpers import make_simple_network
-    return make_simple_network(obs_dim=obs_dim, hidden_dim=hidden, num_actions=num_actions)
+def _make_model(obs_dim=8, num_actions=4, hidden=32):
+    from helpers import make_simple_model
+
+    return make_simple_model(obs_dim=obs_dim, hidden_dim=hidden, num_actions=num_actions)
 
 
 def test_act_with_mask():
-    """act() should respect action masks."""
-    net = _make_network(obs_dim=4, num_actions=5)
+    """act() must only pick legal actions."""
+    from colosseum.networks.model import act
+
+    model = _make_model(obs_dim=4, num_actions=5)
     obs = torch.randn(10, 4)
     mask = torch.zeros(10, 5, dtype=torch.bool)
     mask[:, 2] = True  # only action 2 is valid
 
-    actions, log_probs, values, _ = net.act(obs, action_mask=mask)
-    assert (actions == 2).all(), f"Expected all actions=2, got {actions.tolist()}"
-    assert torch.isfinite(log_probs).all()
-    assert torch.isfinite(values).all()
+    out = act(model, obs, None, mask)
+    assert (out.actions == 2).all(), f"Expected all actions=2, got {out.actions.tolist()}"
+    assert torch.isfinite(out.log_probs).all()
+    assert torch.isfinite(out.values).all()
 
 
 def test_act_without_mask():
-    """act() without mask should work as before."""
-    net = _make_network()
-    obs = torch.randn(5, 8)
-    actions, log_probs, values, _ = net.act(obs)
-    assert actions.shape == (5,)
-    assert torch.isfinite(log_probs).all()
+    """act() without a mask samples from the full distribution."""
+    from colosseum.networks.model import act
+
+    out = act(_make_model(), torch.randn(5, 8), None)
+    assert out.actions.shape == (5,)
+    assert torch.isfinite(out.log_probs).all()
 
 
-def test_evaluate_actions_with_mask():
-    """evaluate_actions() should use mask for log_prob and entropy."""
-    net = _make_network(obs_dim=4, num_actions=3)
-    obs = torch.randn(8, 4)
-
-    # Without mask
+def test_unroll_with_all_true_mask_matches_unmasked():
+    """An all-True mask must not change log-probs or entropy."""
+    model = _make_model(obs_dim=4, num_actions=3)
+    obs = torch.randn(2, 4, 4)
+    dones = torch.zeros(2, 4, dtype=torch.bool)
     actions = torch.randint(0, 3, (8,))
-    lp_no_mask, vals, ent_no_mask = net.evaluate_actions(obs, actions)
-
-    # With mask (allow all) — should give same results
-    mask_all = torch.ones(8, 3, dtype=torch.bool)
-    lp_mask, vals2, ent_mask = net.evaluate_actions(obs, actions, action_mask=mask_all)
-
-    assert torch.allclose(lp_no_mask, lp_mask, atol=1e-5)
-    assert torch.allclose(ent_no_mask, ent_mask, atol=1e-5)
+    plain = model.unroll(obs, None, dones)
+    masked = model.unroll(obs, None, dones, torch.ones(2, 4, 3, dtype=torch.bool))
+    assert torch.allclose(plain.dist.log_prob(actions), masked.dist.log_prob(actions), atol=1e-5)
+    assert torch.allclose(plain.dist.entropy(), masked.dist.entropy(), atol=1e-5)
 
 
 # ---------------------------------------------------------------

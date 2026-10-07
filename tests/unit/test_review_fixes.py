@@ -3,18 +3,12 @@
 Covers:
   C4  — coordinator aggregates composite "agent:net" outcome keys to the base
         agent_id so ELO / win-rate / PFSP actually see cross-agent results.
-  C5  — recurrent BPTT resets the hidden state at episode boundaries within a
-        chunk (post-done timesteps must not depend on pre-done inputs).
   C9  — action_masks survive chunk serialization (gRPC path).
   C14 — match outcomes prefer the env's authoritative rank/outcome signal.
 """
 import tempfile
 
 import torch
-import torch.nn as nn
-
-from colosseum.networks.actor_critic import ActorCriticNetwork
-from helpers import SimpleEncoder, SimplePolicy, SimpleValue
 
 # ---------------------------------------------------------------------------
 # C14: outcome derivation
@@ -160,63 +154,6 @@ def test_pfsp_uses_win_rates():
 
 
 # ---------------------------------------------------------------------------
-# C5: recurrent hidden-state reset at episode boundaries
-# ---------------------------------------------------------------------------
-
-def _make_recurrent_net(obs_dim=4, hidden=8, num_actions=3):
-    enc = SimpleEncoder(obs_dim=obs_dim, hidden_dim=hidden)
-    pol = SimplePolicy(in_dim=hidden, num_actions=num_actions)
-    val = SimpleValue(in_dim=hidden)
-    rnn = nn.LSTM(hidden, hidden, 1, batch_first=False)
-    net = ActorCriticNetwork(enc, pol, val, recurrent=rnn)
-    net.eval()
-    return net
-
-
-def test_recurrent_reset_isolates_post_done_steps():
-    """With a done at t=1, outputs at t>=2 must NOT depend on inputs at t<=1."""
-    torch.manual_seed(0)
-    net = _make_recurrent_net()
-    T, B = 4, 1
-
-    obs_a = torch.randn(T, B, 4)
-    obs_b = obs_a.clone()
-    obs_b[0] = torch.randn(B, 4)  # differ before the boundary
-    obs_b[1] = torch.randn(B, 4)  # differ at the boundary
-    actions = torch.zeros(T, B, dtype=torch.long)
-    dones = torch.zeros(T, B)
-    dones[1, 0] = 1.0  # episode ends at t=1
-
-    h0 = net.initial_hidden(B)
-
-    _, va, _ = net.evaluate_actions_recurrent(obs_a, actions, h0, dones_seq=dones)
-    _, vb, _ = net.evaluate_actions_recurrent(obs_b, actions, h0, dones_seq=dones)
-
-    # After the reset, t>=2 depend only on obs[2:], which are identical.
-    assert torch.allclose(va[2:], vb[2:], atol=1e-6), "hidden state leaked across episode boundary"
-    # t<=1 differ (different inputs).
-    assert not torch.allclose(va[:2], vb[:2], atol=1e-6)
-
-
-def test_recurrent_without_reset_carries_state():
-    """Sanity: without dones, state carries over → post-boundary outputs differ."""
-    torch.manual_seed(0)
-    net = _make_recurrent_net()
-    T, B = 4, 1
-
-    obs_a = torch.randn(T, B, 4)
-    obs_b = obs_a.clone()
-    obs_b[0] = torch.randn(B, 4)
-    obs_b[1] = torch.randn(B, 4)
-    actions = torch.zeros(T, B, dtype=torch.long)
-    h0 = net.initial_hidden(B)
-
-    _, va, _ = net.evaluate_actions_recurrent(obs_a, actions, h0, dones_seq=None)
-    _, vb, _ = net.evaluate_actions_recurrent(obs_b, actions, h0, dones_seq=None)
-    assert not torch.allclose(va[2:], vb[2:], atol=1e-6)
-
-
-# ---------------------------------------------------------------------------
 # C9: action_masks survive serialization
 # ---------------------------------------------------------------------------
 
@@ -229,7 +166,7 @@ def test_refresh_pushes_new_checkpoint_to_worker():
     import multiprocessing as mp
 
     from colosseum.coordinator.coordinator import Coordinator
-    from colosseum.core.registry import build_network
+    from colosseum.core.registry import build_model
     from colosseum.core.types import WorkerCommand
     from colosseum.launcher import Launcher
 
@@ -239,7 +176,7 @@ def test_refresh_pushes_new_checkpoint_to_worker():
         coord.agent_pool.register_trainable("agent_0")
 
         # Save a checkpoint, then refresh the matchmaker so it uses it.
-        sd = {k: v.cpu() for k, v in build_network(cfg).state_dict().items()}
+        sd = {k: v.cpu() for k, v in build_model(cfg).state_dict().items()}
         coord.checkpoint_manager.save("agent_0", 50, sd)
         coord.setup_matchmaker("agent_0")
 
@@ -295,12 +232,12 @@ def test_worker_applies_command_loads_checkpoint_and_stages_maps():
 
 def test_resume_from_path(tmp_path):
     from colosseum.coordinator.coordinator import Coordinator
-    from colosseum.core.registry import build_network
+    from colosseum.core.registry import build_model
     from colosseum.launcher import _resolve_resume_state
 
     cfg = _make_cfg(str(tmp_path), phase="self_play")
     weights_path = str(tmp_path / "bc_weights.pt")
-    sd = build_network(cfg).state_dict()
+    sd = build_model(cfg).state_dict()
     torch.save(sd, weights_path)
 
     cfg.training.resume_from = weights_path

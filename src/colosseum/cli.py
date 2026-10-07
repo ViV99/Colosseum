@@ -69,7 +69,7 @@ def bc(
 
     from colosseum.bc.offline_bc import OfflineBCTrainer
     from colosseum.core.config import load_config
-    from colosseum.core.registry import build_network
+    from colosseum.core.registry import build_model
 
     logging.basicConfig(
         level=logging.INFO,
@@ -78,15 +78,14 @@ def bc(
 
     cfg = load_config(config)
 
-    # Build network
-    network = build_network(cfg)
+    model = build_model(cfg)
 
     device = cfg.learner.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     trainer = OfflineBCTrainer(
-        network=network,
+        model=model,
         lr=lr,
         device=device,
         action_type=action_type,
@@ -95,7 +94,7 @@ def bc(
     metrics = trainer.train(num_epochs=epochs, batch_size=batch_size)
 
     # Save trained weights
-    torch.save(network.state_dict(), output)
+    torch.save(model.state_dict(), output)
     click.echo(f"BC training complete. Loss={metrics['bc_loss']:.4f}")
     click.echo(f"Weights saved to {output}")
 
@@ -115,7 +114,7 @@ def eval_cmd(config: str, agents: tuple[str, ...], num_matches: int, num_envs: i
     import torch
 
     from colosseum.core.config import load_config
-    from colosseum.core.registry import build_network, import_class
+    from colosseum.core.registry import build_model, import_class
     from colosseum.eval import evaluate_agents
 
     logging.basicConfig(
@@ -136,11 +135,11 @@ def eval_cmd(config: str, agents: tuple[str, ...], num_matches: int, num_envs: i
         cls = import_class(cfg.env.env_class)
         return cls(**cfg.env.kwargs)
 
-    def network_factory():
-        return build_network(cfg)
+    def model_factory():
+        return build_model(cfg)
 
     matrix = evaluate_agents(
-        agent_configs, env_fn, network_factory,
+        agent_configs, env_fn, model_factory,
         num_matches=num_matches, num_envs=num_envs,
         deterministic=deterministic,
     )

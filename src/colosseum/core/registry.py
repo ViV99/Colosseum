@@ -16,7 +16,6 @@ from colosseum.core.errors import ConfigError
 
 if TYPE_CHECKING:
     from colosseum.core.config import ColosseumConfig
-    from colosseum.networks.actor_critic import ActorCriticNetwork
     from colosseum.networks.model import PolicyModel
 
 
@@ -126,41 +125,6 @@ def build_model(config: ColosseumConfig) -> PolicyModel:
     policy = _build_head(net.policy_class, core.output_dim, net.kwargs)
     value = _build_head(net.value_class, core.output_dim, net.kwargs)
     return ComposedModel(encoder, core, policy, value)
-
-
-def build_network(config: ColosseumConfig) -> ActorCriticNetwork:
-    """TRANSITIONAL: the legacy ``ActorCriticNetwork`` built from the new ``networks`` schema.
-
-    Kept only until every caller uses :func:`build_model`; deleted together with
-    ``networks/actor_critic.py``. Supports ``core`` = null, ``NoCore``,
-    ``LSTMCore`` and ``GRUCore``.
-    """
-    import torch.nn as nn
-
-    from colosseum.networks.actor_critic import ActorCriticNetwork
-    from colosseum.networks.cores import GRUCore, LSTMCore, NoCore
-
-    net = config.networks
-    if net.model_class:
-        raise ConfigError("networks.model_class is not supported by the legacy ActorCriticNetwork path")
-    encoder = import_class(net.encoder_class)(**net.kwargs)
-    out_dim = encoder.latent_dim
-    recurrent = None
-    if net.core is not None:
-        core_cls = import_class(net.core.class_path)
-        hidden = int(net.core.kwargs.get("hidden_size", 128))
-        layers = int(net.core.kwargs.get("num_layers", 1))
-        if issubclass(core_cls, LSTMCore):
-            recurrent = nn.LSTM(out_dim, hidden, layers)
-            out_dim = hidden
-        elif issubclass(core_cls, GRUCore):
-            recurrent = nn.GRU(out_dim, hidden, layers)
-            out_dim = hidden
-        elif not issubclass(core_cls, NoCore):
-            raise ConfigError(f"core {net.core.class_path!r} is not supported by the legacy ActorCriticNetwork path")
-    policy = _build_head(net.policy_class, out_dim, net.kwargs)
-    value = _build_head(net.value_class, out_dim, net.kwargs)
-    return ActorCriticNetwork(encoder, policy, value, recurrent=recurrent)
 
 
 def _check_state_batch_dim(state_a: Any, state_b: Any, batches: tuple[int, int], where: str) -> None:

@@ -2,13 +2,12 @@
 
 
 from colosseum.eval import EvalMatrix, _wilson_ci, evaluate_agents
-from colosseum.networks.actor_critic import ActorCriticNetwork
 from examples.tic_tac_toe.env import TicTacToeEnv
-from examples.tic_tac_toe.networks import TicTacToeEncoder, TicTacToePolicy, TicTacToeValue
+from helpers import CountingEnv, make_simple_model, make_ttt_model
 
 
 def _make_net():
-    return ActorCriticNetwork(TicTacToeEncoder(), TicTacToePolicy(), TicTacToeValue())
+    return make_ttt_model()
 
 
 def test_wilson_ci_basic():
@@ -44,7 +43,7 @@ def test_evaluate_two_agents():
     matrix = evaluate_agents(
         agent_configs,
         env_fn=TicTacToeEnv,
-        network_factory=_make_net,
+        model_factory=_make_net,
         num_matches=20,
         num_envs=4,
     )
@@ -87,7 +86,7 @@ def test_evaluate_three_agents():
     matrix = evaluate_agents(
         agent_configs,
         env_fn=TicTacToeEnv,
-        network_factory=_make_net,
+        model_factory=_make_net,
         num_matches=num_matches,
         num_envs=4,
     )
@@ -113,3 +112,30 @@ def test_evaluate_three_agents():
         r2 = matrix.get(b, a)
         assert r2.wins_a == r.wins_b
         assert r2.wins_b == r.wins_a
+
+
+def test_evaluate_stateful_models():
+    """Eval tracks per-slot model state (LSTM vs window attention) and resets it per match."""
+    from functools import partial
+
+    def lstm():
+        return make_simple_model(obs_dim=4, num_actions=3, core="lstm")
+
+    def window():
+        return make_simple_model(obs_dim=4, num_actions=3, core="window")
+
+    agent_configs = {
+        "lstm": {"state_dict": lstm().state_dict()},
+        "window": {"state_dict": window().state_dict()},
+    }
+    matrix = evaluate_agents(
+        agent_configs,
+        env_fn=partial(CountingEnv, num_players=2, episode_length=5, num_actions=3, obs_dim=4),
+        model_factory=lstm,
+        model_factories={"lstm": lstm, "window": window},
+        num_matches=12,
+        num_envs=3,
+    )
+    r = matrix.get("lstm", "window")
+    assert r is not None and r.num_matches == 12
+    assert r.wins_a + r.wins_b + r.draws == 12

@@ -20,7 +20,8 @@ import torch
 
 from colosseum.envs.base_env import BaseEnv
 from colosseum.envs.vec_env import VectorEnv
-from colosseum.networks.actor_critic import ActorCriticNetwork
+from colosseum.networks.model import PolicyModel, act
+from colosseum.networks.state import State, cat_batch, slice_batch
 
 logger = logging.getLogger(__name__)
 
@@ -83,10 +84,10 @@ def _wilson_ci(wins: int, total: int, z: float = 1.96) -> tuple[float, float]:
 def evaluate_agents(
     agent_configs: dict[str, dict],
     env_fn: Callable[[], BaseEnv],
-    network_factory: Callable[[], ActorCriticNetwork],
+    model_factory: Callable[[], PolicyModel],
     num_matches: int = 100,
     num_envs: int = 8,
-    network_factories: dict[str, Callable[[], ActorCriticNetwork]] | None = None,
+    model_factories: dict[str, Callable[[], PolicyModel]] | None = None,
     deterministic: bool = False,
 ) -> EvalMatrix:
     """Run evaluation matches between all agents.
@@ -97,11 +98,11 @@ def evaluate_agents(
     Args:
         agent_configs: {agent_id: {"state_dict": dict}} — one entry per agent.
         env_fn: Factory to create a BaseEnv instance.
-        network_factory: Default factory to create an ActorCriticNetwork.
+        model_factory: Default factory to create a PolicyModel.
         num_matches: Number of matches to play.
         num_envs: Number of parallel environments for evaluation.
-        network_factories: Optional per-agent network factories. If provided,
-            overrides ``network_factory`` for the corresponding agent.
+        model_factories: Optional per-agent model factories. If provided,
+            overrides ``model_factory`` for the corresponding agent.
 
     Returns:
         EvalMatrix with results for all pairs.
@@ -109,14 +110,14 @@ def evaluate_agents(
     agent_ids = list(agent_configs.keys())
     matrix = EvalMatrix(agent_ids=agent_ids)
 
-    # Load all networks
-    agents: list[tuple[str, ActorCriticNetwork]] = []
+    # Load all models
+    agents: list[tuple[str, PolicyModel]] = []
     for aid in agent_ids:
         cfg = agent_configs[aid]
         factory = (
-            network_factories[aid]
-            if network_factories and aid in network_factories
-            else network_factory
+            model_factories[aid]
+            if model_factories and aid in model_factories
+            else model_factory
         )
         net = factory()
         net.load_state_dict(cfg["state_dict"])
@@ -144,7 +145,7 @@ def evaluate_agents(
 
 
 def _run_matches(
-    agents: list[tuple[str, ActorCriticNetwork]],
+    agents: list[tuple[str, PolicyModel]],
     env_fn: Callable[[], BaseEnv],
     num_matches: int,
     num_envs: int,
@@ -161,10 +162,11 @@ def _run_matches(
 
     Action masks (``info["action_mask"]``) are applied during inference, and
     match outcomes prefer the env's authoritative signal (``info["rank"]`` /
-    ``info["outcome"]``) over cumulative reward.
+    ``info["outcome"]``) over cumulative reward. Every (env, slot) keeps the
+    model state of the agent playing it; the state is reset when the match ends.
 
     Args:
-        agents: List of (agent_id, network) tuples.
+        agents: List of (agent_id, model) tuples.
         env_fn: Factory to create a BaseEnv instance.
         num_matches: Total matches to play.
         num_envs: Number of parallel environments.
@@ -211,6 +213,13 @@ def _run_matches(
     # Per-env slot→agent assignment, re-rolled on each match boundary.
     slot_assign: list[list[int]] = [_roll_assignment() for _ in range(actual_envs)]
 
+    def _fresh_state(e: int, p: int) -> State:
+        return agents[slot_assign[e][p]][1].initial_state(1)
+
+    slot_states: dict[tuple[int, int], State] = {
+        (e, p): _fresh_state(e, p) for e in range(actual_envs) for p in range(num_players)
+    }
+
     matches_done = 0
     total_ep_length = 0
 
@@ -235,19 +244,20 @@ def _run_matches(
                 groups[slot_assign[e][p]].append((e, p))
 
         for agent_idx, slot_pairs in groups.items():
-            net = agents[agent_idx][1]
+            model = agents[agent_idx][1]
             flat_idxs = [e * num_players + p for (e, p) in slot_pairs]
             obs_batch = torch.tensor(obs_flat[flat_idxs], dtype=torch.float32)
             mask_batch = None
             if masks is not None:
                 mask_batch = torch.tensor(masks[flat_idxs], dtype=torch.bool)
+            state = cat_batch([slot_states[(e, p)] for (e, p) in slot_pairs])
             with torch.no_grad():
-                actions, _, _, _ = net.act(
-                    obs_batch, action_mask=mask_batch, deterministic=deterministic,
-                )
-            actions_arr = actions.numpy()
+                out = act(model, obs_batch, state, mask_batch, deterministic=deterministic)
+            actions_arr = out.actions.numpy()
             for k, (e, p) in enumerate(slot_pairs):
                 actions_np[e, p] = actions_arr[k]
+                if out.state is not None:
+                    slot_states[(e, p)] = slice_batch(out.state, k)
 
         next_obs, rewards, terminated, truncated, infos = vec_env.step(actions_np)
 
@@ -299,6 +309,8 @@ def _run_matches(
                 ep_rewards[env_idx] = 0.0
                 ep_lengths[env_idx] = 0
                 slot_assign[env_idx] = _roll_assignment()
+                for p in range(num_players):
+                    slot_states[(env_idx, p)] = _fresh_state(env_idx, p)
 
         obs = next_obs
 

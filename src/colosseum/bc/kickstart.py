@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import torch
 
-from colosseum.networks.actor_critic import ActorCriticNetwork
+from colosseum.networks.model import PolicyModel
 
 
 class KickstartLoss:
@@ -33,17 +33,17 @@ class KickstartLoss:
 
     def __init__(
         self,
-        teacher_network: ActorCriticNetwork,
+        teacher_model: PolicyModel,
         initial_lambda: float = 1.0,
         decay_steps: int = 50000,
     ) -> None:
         """
         Args:
-            teacher_network: Frozen BC model (will be set to eval, no grad).
+            teacher_model: Frozen BC model (will be set to eval, no grad).
             initial_lambda: Starting weight for the KL loss.
             decay_steps: Number of training steps over which lambda decays to 0.
         """
-        self._teacher = teacher_network
+        self._teacher = teacher_model
         self._teacher.eval()
         for p in self._teacher.parameters():
             p.requires_grad_(False)
@@ -64,13 +64,13 @@ class KickstartLoss:
 
     def compute(
         self,
-        student_network: ActorCriticNetwork,
+        student_model: PolicyModel,
         observations: torch.Tensor,
     ) -> torch.Tensor:
         """Compute scaled KL(student || teacher) loss.
 
         Args:
-            student_network: The student policy being trained.
+            student_model: The student policy being trained.
             observations: Batch of observations [B, *obs_shape].
 
         Returns:
@@ -80,14 +80,12 @@ class KickstartLoss:
         if lam <= 0:
             return torch.tensor(0.0, device=observations.device)
 
-        # Get student distribution
-        student_latent = student_network.encoder(observations)
-        student_dist = student_network.policy(student_latent)
-
-        # Get teacher distribution (no grad)
+        # Both policies score every observation from their initial state
+        # (sequence-aware kickstarting comes with the kickstart rewrite).
+        batch, device = observations.shape[0], observations.device
+        student_dist = student_model.step(observations, student_model.initial_state(batch, device)).dist
         with torch.no_grad():
-            teacher_latent = self._teacher.encoder(observations)
-            teacher_dist = self._teacher.policy(teacher_latent)
+            teacher_dist = self._teacher.step(observations, self._teacher.initial_state(batch, device)).dist
 
         # Compute KL divergence via public API
         kl = student_dist.kl_divergence(teacher_dist)
