@@ -1,18 +1,10 @@
-"""Tests for SubprocessVectorEnv: parity with in-process VectorEnv, clean close.
-
-Runnable both as ``python -m pytest tests/test_subproc_vec_env.py`` and
-standalone ``python tests/test_subproc_vec_env.py`` (the latter sets the spawn
-start method under ``__main__``).
-"""
+"""Tests for SubprocessVectorEnv: parity with in-process VectorEnv, clean close."""
 
 import multiprocessing as mp
 import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-sys.path.insert(0, ".")
 
 import numpy as np
 
@@ -218,35 +210,3 @@ def test_subproc_close_is_prompt_and_no_zombies():
 
     # Double close must be a no-op (no raise, no hang).
     sub.close()
-
-
-if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
-
-    print("=" * 60)
-    print("SubprocessVectorEnv tests")
-    print("=" * 60)
-
-    test_subproc_reset_all_parity()
-    print("  reset_all parity PASSED")
-
-    test_subproc_step_parity()
-    print("  step parity PASSED")
-
-    test_subproc_auto_reset_gives_fresh_obs()
-    print("  auto-reset fresh obs PASSED")
-
-    test_subproc_reset_done_parity()
-    print("  reset_done parity PASSED")
-
-    test_subproc_default_num_workers()
-    print("  default num_workers PASSED")
-
-    test_subproc_uneven_split()
-    print("  uneven split PASSED")
-
-    test_subproc_close_is_prompt_and_no_zombies()
-    print("  prompt close / no zombies PASSED")
-
-    print()
-    print("All SubprocessVectorEnv tests PASSED")

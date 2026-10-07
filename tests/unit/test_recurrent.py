@@ -3,7 +3,6 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 import numpy as np
 import torch
@@ -368,9 +367,9 @@ def test_build_network_with_lstm():
     from colosseum.core.registry import build_network
 
     net_cfg = NetworkConfig(
-        encoder_class="tests.test_recurrent.SimpleEncoder",
-        policy_class="tests.test_recurrent.SimplePolicy",
-        value_class="tests.test_recurrent.SimpleValue",
+        encoder_class="helpers.SimpleEncoder",
+        policy_class="helpers.SimplePolicy",
+        value_class="helpers.SimpleValue",
         recurrent_type="lstm",
         recurrent_hidden_size=HIDDEN_SIZE,
         recurrent_num_layers=NUM_LAYERS,
@@ -391,9 +390,9 @@ def test_build_network_with_gru():
     from colosseum.core.registry import build_network
 
     net_cfg = NetworkConfig(
-        encoder_class="tests.test_recurrent.SimpleEncoder",
-        policy_class="tests.test_recurrent.SimplePolicy",
-        value_class="tests.test_recurrent.SimpleValue",
+        encoder_class="helpers.SimpleEncoder",
+        policy_class="helpers.SimplePolicy",
+        value_class="helpers.SimpleValue",
         recurrent_type="gru",
         recurrent_hidden_size=HIDDEN_SIZE,
         recurrent_num_layers=1,
@@ -412,9 +411,9 @@ def test_build_network_feedforward_default():
     from colosseum.core.registry import build_network
 
     net_cfg = NetworkConfig(
-        encoder_class="tests.test_recurrent.SimpleEncoder",
-        policy_class="tests.test_recurrent.SimplePolicy",
-        value_class="tests.test_recurrent.SimpleValue",
+        encoder_class="helpers.SimpleEncoder",
+        policy_class="helpers.SimplePolicy",
+        value_class="helpers.SimpleValue",
     )
     env_cfg = EnvConfig(env_class="examples.tic_tac_toe.env.TicTacToeEnv")
     config = ColosseumConfig(env=env_cfg, networks=net_cfg)

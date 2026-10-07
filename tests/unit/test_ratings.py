@@ -1,10 +1,9 @@
 """Tests for rating systems and PFSP matchmaker."""
+from helpers import example_config
 import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 
@@ -146,7 +145,7 @@ def test_coordinator_match_reporting():
     from colosseum.core.config import ColosseumConfig, load_config
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        config = load_config("configs/examples/tic_tac_toe.yaml")
+        config = load_config(example_config("tic_tac_toe.yaml"))
         cd = config.model_dump()
         cd["checkpoint"]["dir"] = tmpdir
         cd["training"]["phase"] = "league"

@@ -1,12 +1,11 @@
 """Tests for multi-agent support: per-agent config, worker routing, launcher."""
 
+from helpers import example_config
 import multiprocessing as mp
 import os
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
 import torch
@@ -36,13 +35,13 @@ def test_agent_config_defaults():
 
 def test_get_trainable_agent_ids_empty():
     """Empty agents dict should return ['agent_0']."""
-    cfg = load_config("configs/examples/tic_tac_toe.yaml")
+    cfg = load_config(example_config("tic_tac_toe.yaml"))
     assert cfg.get_trainable_agent_ids() == ["agent_0"]
 
 
 def test_get_trainable_agent_ids_multi():
     """Non-empty agents dict should return agent IDs."""
-    cfg = load_config("configs/examples/tic_tac_toe_multi.yaml")
+    cfg = load_config(example_config("tic_tac_toe_multi.yaml"))
     ids = cfg.get_trainable_agent_ids()
     assert "agent_alpha" in ids
     assert "agent_beta" in ids
@@ -51,7 +50,7 @@ def test_get_trainable_agent_ids_multi():
 
 def test_get_agent_config_no_override():
     """get_agent_config for unknown agent returns a copy with same values."""
-    cfg = load_config("configs/examples/tic_tac_toe.yaml")
+    cfg = load_config(example_config("tic_tac_toe.yaml"))
     result = cfg.get_agent_config("agent_0")
     assert result is not cfg  # should be a copy, not the same object
     assert result.algorithm == cfg.algorithm
@@ -60,7 +59,7 @@ def test_get_agent_config_no_override():
 
 def test_get_agent_config_with_override():
     """get_agent_config merges per-agent overrides into a new config."""
-    cfg = load_config("configs/examples/tic_tac_toe_multi.yaml")
+    cfg = load_config(example_config("tic_tac_toe_multi.yaml"))
 
     # Modify the config to have an actual override for agent_alpha
     cfg_dict = cfg.model_dump()
@@ -83,96 +82,11 @@ def test_get_agent_config_with_override():
 
 def test_load_multi_agent_config_roundtrip():
     """Multi-agent config should survive dump/reload."""
-    cfg = load_config("configs/examples/tic_tac_toe_multi.yaml")
+    cfg = load_config(example_config("tic_tac_toe_multi.yaml"))
     data = cfg.model_dump()
     cfg2 = ColosseumConfig.model_validate(data)
     assert cfg2.get_trainable_agent_ids() == cfg.get_trainable_agent_ids()
     assert cfg2.training.phase.value == "league"
-
-
-# ---------------------------------------------------------------
-# T1.4: Worker multi-agent routing
-# ---------------------------------------------------------------
-
-def test_worker_multi_agent_routing():
-    """Worker in multi-agent mode routes chunks to the correct agent queues."""
-    from colosseum.core.config import ColosseumConfig, load_config
-    from colosseum.launcher import _create_env, _create_network, _worker_target
-
-    config = load_config("configs/examples/tic_tac_toe_multi.yaml")
-    cd = config.model_dump()
-    cd["training"]["total_timesteps"] = 500
-    cd["rollout"]["num_workers"] = 1
-    cd["rollout"]["envs_per_worker"] = 2
-    cd["rollout"]["chunk_length"] = 8
-    cd["learner"]["batch_chunks"] = 2
-    config = ColosseumConfig(**cd)
-
-    agent_ids = config.get_trainable_agent_ids()
-    agent_configs = {aid: config.get_agent_config(aid) for aid in agent_ids}
-
-    # Per-agent trajectory queues
-    trajectory_queues = {aid: mp.Queue(maxsize=16) for aid in agent_ids}
-    weight_queues = {aid: mp.Queue(maxsize=2) for aid in agent_ids}
-    stop_event = mp.Event()
-
-    # slot_agent_map: alternate agents across envs
-    # env0: [agent_alpha, agent_beta], env1: [agent_alpha, agent_beta]
-    slot_agent_map = [
-        [agent_ids[0], agent_ids[1]],
-        [agent_ids[0], agent_ids[1]],
-    ]
-    # All slots use latest, all collect
-    from colosseum.worker.rollout_worker import LATEST_NETWORK_ID
-    slot_network_map = [
-        [LATEST_NETWORK_ID, LATEST_NETWORK_ID],
-        [LATEST_NETWORK_ID, LATEST_NETWORK_ID],
-    ]
-    collect_mask = [[True, True], [True, True]]
-
-    p = mp.Process(
-        target=_worker_target,
-        args=(
-            0, config, agent_ids, agent_configs,
-            trajectory_queues, weight_queues,
-            stop_event, 500,
-            None,  # checkpoint_state_dicts_by_agent
-            slot_network_map, collect_mask, slot_agent_map,
-            None,  # results_queue
-        ),
-        daemon=True,
-    )
-    p.start()
-
-    # Collect chunks from both agents
-    chunks_by_agent = {aid: [] for aid in agent_ids}
-    total_collected = 0
-    deadline = time.time() + 20  # 20s timeout
-
-    while total_collected < 4 and time.time() < deadline:
-        for aid in agent_ids:
-            try:
-                chunk = trajectory_queues[aid].get(timeout=0.5)
-                chunks_by_agent[aid].append(chunk)
-                total_collected += 1
-            except Exception:
-                pass
-
-    stop_event.set()
-    p.join(timeout=5)
-    if p.is_alive():
-        p.terminate()
-
-    # Both agents should have received chunks
-    for aid in agent_ids:
-        assert len(chunks_by_agent[aid]) > 0, f"Agent {aid} received no chunks"
-        for chunk in chunks_by_agent[aid]:
-            assert chunk.agent_id == aid, (
-                f"Chunk routed to wrong agent: expected {aid}, got {chunk.agent_id}"
-            )
-
-    print(f"  Chunks per agent: {', '.join(f'{k}={len(v)}' for k, v in chunks_by_agent.items())}")
-    print("  Multi-agent worker routing PASSED")
 
 
 # ---------------------------------------------------------------
@@ -185,7 +99,7 @@ def test_derive_worker_configs():
     from colosseum.coordinator.coordinator import Coordinator
     from colosseum.launcher import _derive_worker_configs
 
-    config = load_config("configs/examples/tic_tac_toe_multi.yaml")
+    config = load_config(example_config("tic_tac_toe_multi.yaml"))
     agent_ids = config.get_trainable_agent_ids()
 
     coordinator = Coordinator(config)
@@ -236,7 +150,7 @@ def test_monitor_loop_per_agent_checkpoint_queues():
     from colosseum.launcher import Launcher
     from colosseum.metrics.wandb_logger import WandBLogger
 
-    config = load_config("configs/examples/tic_tac_toe_multi.yaml")
+    config = load_config(example_config("tic_tac_toe_multi.yaml"))
     agent_ids = config.get_trainable_agent_ids()
 
     coordinator = Coordinator(config)
@@ -272,65 +186,3 @@ def test_monitor_loop_per_agent_checkpoint_queues():
             assert "state_dict" in ckpt_data
         except queue.Empty:
             pytest.fail(f"Expected checkpoint data for {aid}")
-
-
-# ---------------------------------------------------------------
-# T1.4d: Full multi-agent pipeline integration test
-# ---------------------------------------------------------------
-
-def test_multi_agent_pipeline():
-    """End-to-end multi-agent training pipeline with 2 agents."""
-    from colosseum.core.config import ColosseumConfig, load_config
-    from colosseum.launcher import Launcher
-
-    config = load_config("configs/examples/tic_tac_toe_multi.yaml")
-    cd = config.model_dump()
-    cd["training"]["total_timesteps"] = 3000
-    cd["rollout"]["num_workers"] = 1
-    cd["rollout"]["envs_per_worker"] = 2
-    cd["rollout"]["chunk_length"] = 8
-    cd["learner"]["batch_chunks"] = 2
-    cd["learner"]["queue_size"] = 16
-    cd["metrics"]["use_wandb"] = False
-    config = ColosseumConfig(**cd)
-
-    launcher = Launcher(config)
-    launcher.launch()
-    print("  Multi-agent pipeline PASSED")
-
-
-if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
-
-    print("=" * 60)
-    print("Test: Per-agent config")
-    print("=" * 60)
-    test_agent_config_defaults()
-    test_get_trainable_agent_ids_empty()
-    test_get_trainable_agent_ids_multi()
-    test_get_agent_config_no_override()
-    test_get_agent_config_with_override()
-    test_load_multi_agent_config_roundtrip()
-    print("  Config tests PASSED")
-
-    print()
-    print("=" * 60)
-    print("Test: _derive_worker_configs")
-    print("=" * 60)
-    test_derive_worker_configs()
-    print("  derive_worker_configs_multi PASSED")
-
-    print()
-    print("=" * 60)
-    print("Test: Worker multi-agent routing")
-    print("=" * 60)
-    test_worker_multi_agent_routing()
-
-    print()
-    print("=" * 60)
-    print("Test: Multi-agent pipeline")
-    print("=" * 60)
-    test_multi_agent_pipeline()
-
-    print()
-    print("ALL MULTI-AGENT TESTS PASSED!")

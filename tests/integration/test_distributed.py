@@ -5,7 +5,6 @@ import socket
 import sys
 import time
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 import torch
 
@@ -131,8 +130,3 @@ def test_grpc_trajectory_sink_tolerates_dead_learner():
     # Should swallow the RpcError, not raise.
     sink.put(chunk, timeout=0.5)
     transport.close()
-
-
-if __name__ == "__main__":
-    import pytest
-    raise SystemExit(pytest.main([__file__, "-v"]))

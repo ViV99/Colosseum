@@ -12,14 +12,12 @@ import os
 import sys
 import tempfile
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import torch
 import torch.nn as nn
 
 from colosseum.networks.actor_critic import ActorCriticNetwork
-from tests.helpers import SimpleEncoder, SimplePolicy, SimpleValue
+from helpers import SimpleEncoder, SimplePolicy, SimpleValue
 
 
 # ---------------------------------------------------------------------------
@@ -266,7 +264,7 @@ def test_worker_applies_command_loads_checkpoint_and_stages_maps():
     """Worker side: a WorkerCommand loads new checkpoints and stages slot maps."""
     from colosseum.core.types import WorkerCommand
     from colosseum.worker.rollout_worker import LATEST_NETWORK_ID, _apply_command
-    from tests.helpers import make_simple_network
+    from helpers import make_simple_network
 
     def factory():
         return make_simple_network(obs_dim=4, num_actions=3)
@@ -350,8 +348,3 @@ def test_chunk_serialization_preserves_action_masks():
 
     assert restored.action_masks is not None, "action_masks dropped during serialization"
     assert torch.equal(restored.action_masks, masks)
-
-
-if __name__ == "__main__":
-    import pytest
-    raise SystemExit(pytest.main([__file__, "-v"]))

@@ -1,9 +1,9 @@
 """Tests for config validation (Pydantic models)."""
 
+from helpers import example_config
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 import pytest
 from pydantic import ValidationError
@@ -68,7 +68,7 @@ def test_valid_defaults():
 
 def test_load_config_roundtrip():
     """load_config from the example YAML should produce a valid config."""
-    cfg = load_config("configs/examples/tic_tac_toe.yaml")
+    cfg = load_config(example_config("tic_tac_toe.yaml"))
     assert cfg.env.num_players == 2
     assert cfg.algorithm.name == "appo"
     # Dump and reload should preserve values

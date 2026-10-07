@@ -1,10 +1,19 @@
-"""Shared test helpers: simple network components for unit tests."""
+"""Shared test helpers: toy environments and small networks/models."""
+
+from pathlib import Path
 
 import torch
 import torch.nn as nn
 
 from colosseum.networks.base import BaseEncoder, BasePolicy, BaseValue
 from colosseum.networks.distributions import CategoricalDist
+
+REPO_ROOT = Path(__file__).resolve().parent.parent
+
+
+def example_config(name: str) -> Path:
+    """Absolute path of ``configs/examples/<name>`` (tests run with cwd = tmp_path)."""
+    return REPO_ROOT / "configs" / "examples" / name
 
 
 def make_simple_network(obs_dim=8, hidden_dim=16, num_actions=4):

@@ -5,8 +5,6 @@ import tempfile
 
 import torch
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from colosseum.bc.kickstart import KickstartLoss
 from colosseum.bc.offline_bc import OfflineBCTrainer

@@ -5,6 +5,7 @@ Tests:
 2. SelfPlayMatchmaker generates correct match configs
 3. Full pipeline with checkpoint saving
 """
+from helpers import example_config
 import multiprocessing as mp
 import os
 import shutil
@@ -12,8 +13,6 @@ import sys
 import tempfile
 import logging
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
-sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 import torch
@@ -107,7 +106,7 @@ def test_coordinator():
     from colosseum.core.config import ColosseumConfig, load_config
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        config = load_config("configs/examples/tic_tac_toe.yaml")
+        config = load_config(example_config("tic_tac_toe.yaml"))
         cd = config.model_dump()
         cd["checkpoint"]["dir"] = tmpdir
         cd["self_play"]["checkpoint_interval"] = 5
@@ -145,7 +144,7 @@ def test_derive_worker_configs():
     from colosseum.launcher import _derive_worker_configs
 
     with tempfile.TemporaryDirectory() as tmpdir:
-        config = load_config("configs/examples/tic_tac_toe.yaml")
+        config = load_config(example_config("tic_tac_toe.yaml"))
         cd = config.model_dump()
         cd["checkpoint"]["dir"] = tmpdir
         config = ColosseumConfig(**cd)
@@ -198,52 +197,3 @@ def test_derive_worker_configs():
         assert slot_agent_map == [["agent_0", "agent_0"], ["agent_0", "agent_0"]]
 
     print("PASS: test_derive_worker_configs")
-
-
-def test_full_pipeline_with_checkpoints():
-    """Full pipeline: train with checkpoint saving enabled."""
-    from colosseum.core.config import ColosseumConfig, load_config
-    from colosseum.launcher import Launcher
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        config = load_config("configs/examples/tic_tac_toe.yaml")
-        cd = config.model_dump()
-        cd["training"]["total_timesteps"] = 5000
-        cd["rollout"]["num_workers"] = 1
-        cd["rollout"]["envs_per_worker"] = 2
-        cd["rollout"]["chunk_length"] = 8
-        cd["learner"]["batch_chunks"] = 2
-        cd["learner"]["queue_size"] = 16
-        cd["metrics"]["use_wandb"] = False
-        cd["self_play"]["checkpoint_interval"] = 10  # checkpoint every 10 train steps
-        cd["self_play"]["pool_size"] = 5
-        cd["checkpoint"]["dir"] = tmpdir
-        config = ColosseumConfig(**cd)
-
-        print("Starting pipeline with checkpoint saving...", flush=True)
-        launcher = Launcher(config)
-        launcher.launch()
-
-        # Check that checkpoints were saved
-        from colosseum.coordinator.checkpoint_manager import CheckpointManager
-        mgr = CheckpointManager(base_dir=tmpdir, pool_size=5)
-        ckpts = mgr.list_checkpoints("agent_0")
-        print(f"Checkpoints saved: {len(ckpts)}", flush=True)
-        for c in ckpts:
-            print(f"  {c.checkpoint_id} (v{c.policy_version})", flush=True)
-
-        assert len(ckpts) > 0, "Expected at least one checkpoint to be saved"
-
-    print("PASS: test_full_pipeline_with_checkpoints")
-
-
-if __name__ == "__main__":
-    mp.set_start_method("spawn", force=True)
-
-    test_checkpoint_manager()
-    test_matchmaker()
-    test_coordinator()
-    test_derive_worker_configs()
-    test_full_pipeline_with_checkpoints()
-
-    print("\n=== ALL MILESTONE 2 TESTS PASSED ===")

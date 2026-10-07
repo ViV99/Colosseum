@@ -3,7 +3,6 @@
 import os
 import sys
 
-sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "src"))
 
 import numpy as np
 import pytest
@@ -142,9 +141,9 @@ def test_pin_memory_cpu_noop():
     from colosseum.algorithms.appo import APPO
     from colosseum.core.config import AlgorithmConfig
 
-    from tests.test_action_masking import _make_network
+    from helpers import make_simple_network
 
-    net = _make_network(obs_dim=4, num_actions=3)
+    net = make_simple_network(obs_dim=4, hidden_dim=32, num_actions=3)
     config = AlgorithmConfig(name="appo", num_epochs=1, minibatch_chunks=0)
     appo = APPO(net, config, device="cpu", pin_memory=True)
 
@@ -171,9 +170,11 @@ def test_pin_memory_cpu_noop():
 # T2.7: torch.compile for V-trace
 # ---------------------------------------------------------------
 
-@pytest.mark.skipif(not _torch_compile_available(), reason="torch.compile backend unavailable")
+@pytest.mark.slow
 def test_vtrace_torch_compile():
     """Compiled V-trace should produce same results as eager."""
+    if not _torch_compile_available():
+        pytest.skip("torch.compile backend unavailable")
     from colosseum.algorithms.vtrace import compute_vtrace
 
     T, B = 8, 4
@@ -199,15 +200,17 @@ def test_vtrace_torch_compile():
     assert torch.allclose(adv_eager, adv_compiled, atol=1e-5)
 
 
-@pytest.mark.skipif(not _torch_compile_available(), reason="torch.compile backend unavailable")
+@pytest.mark.slow
 def test_appo_torch_compile():
     """APPO should train successfully with use_torch_compile=True."""
+    if not _torch_compile_available():
+        pytest.skip("torch.compile backend unavailable")
     from colosseum.algorithms.appo import APPO
     from colosseum.core.config import AlgorithmConfig
 
-    from tests.test_action_masking import _make_network
+    from helpers import make_simple_network
 
-    net = _make_network(obs_dim=4, num_actions=3)
+    net = make_simple_network(obs_dim=4, hidden_dim=32, num_actions=3)
     config = AlgorithmConfig(
         name="appo", num_epochs=1, minibatch_chunks=0, use_torch_compile=True,
     )
