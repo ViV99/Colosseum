@@ -170,3 +170,84 @@ def test_window_attention_rejects_bad_sizes():
 def test_reset_state_without_tensor_leaves_returns_state_unchanged(kind, empty):
     core = _make(kind)
     assert core.reset_state(empty, torch.tensor([True, False])) is empty
+
+
+def test_window_batched_step_equals_per_row_step_with_different_lengths():
+    """Rows with different ``len`` (0, 1, 3 prior steps) must keep their own masks.
+
+    Guards the head/batch ordering of the attention mask (``repeat_interleave``
+    over heads, batch-major), which equal-length rows cannot detect.
+    """
+    torch.manual_seed(0)
+    core = WindowAttentionCore(IN, d_model=8, window=4, num_heads=2, num_layers=1)
+    rows = []
+    for n_prior in (0, 1, 3):
+        s = core.initial_state(1)
+        for _ in range(n_prior):
+            _, s = core.step(torch.randn(1, IN), s)
+        rows.append(s)
+    assert cat_batch(rows)["len"].tolist() == [0, 1, 3]
+    x = torch.randn(3, IN)
+    y_batch, s_batch = core.step(x, cat_batch(rows))
+    for i in range(3):
+        y_i, s_i = core.step(x[i:i + 1], rows[i])
+        assert torch.allclose(y_batch[i:i + 1], y_i, atol=1e-6), i
+        for a, b in zip(tree_leaves(slice_batch(s_batch, i)), tree_leaves(s_i)):
+            assert torch.allclose(a.float(), b.float(), atol=1e-6), i
+
+
+def test_window_attention_memory_rows_do_not_see_current_input():
+    """Causal mask: block outputs at memory positions are independent of the current ``x``."""
+    torch.manual_seed(0)
+    core = WindowAttentionCore(IN, d_model=8, window=3, num_heads=2, num_layers=2)
+    state = core.initial_state(2)
+    for _ in range(3):  # full window: every memory row is valid
+        _, state = core.step(torch.randn(2, IN), state)
+
+    captured: list[torch.Tensor] = []
+    handle = core.blocks[0].register_forward_hook(lambda mod, inp, out: captured.append(out.detach()))
+    try:
+        core.step(torch.randn(2, IN), state)
+        core.step(torch.randn(2, IN), state)
+    finally:
+        handle.remove()
+    out_a, out_b = captured
+    assert out_a.shape == (2, 4, 8)
+    assert torch.allclose(out_a[:, :-1], out_b[:, :-1], atol=1e-6)  # memory rows
+    assert not torch.allclose(out_a[:, -1], out_b[:, -1], atol=1e-6)  # current row does see x
+
+
+@pytest.mark.parametrize("cls", [LSTMCore, GRUCore])
+def test_rnn_core_matches_native_module_with_nonzero_state(cls):
+    """``unroll`` and the step-loop final state equal the native ``nn.LSTM``/``nn.GRU``.
+
+    ``num_layers=2``, batch 3 and a random non-zero ``s0`` expose ``(h, c)``
+    swaps and ``reshape`` used instead of ``transpose`` between ``[B, L, H]``
+    and the native ``[L, B, H]``.
+    """
+    torch.manual_seed(0)
+    T, B, L, H = 5, 3, 2, 7
+    core = cls(IN, hidden_size=H, num_layers=L)
+    s0 = {k: torch.randn(B, L, H) for k in core.initial_state(B)}
+    x = torch.randn(T, B, IN)
+    no_dones = torch.zeros(T, B, dtype=torch.bool)
+
+    native_s0 = {k: v.transpose(0, 1).contiguous() for k, v in s0.items()}
+    with torch.no_grad():
+        if cls is LSTMCore:
+            y_ref, (hn, cn) = core.rnn(x, (native_s0["h"], native_s0["c"]))
+            final_ref = {"h": hn.transpose(0, 1), "c": cn.transpose(0, 1)}
+        else:
+            y_ref, hn = core.rnn(x, native_s0["h"])
+            final_ref = {"h": hn.transpose(0, 1)}
+
+        y = core.unroll(x, s0, no_dones)
+        state = s0
+        for t in range(T):
+            _, state = core.step(x[t], state)
+
+    assert torch.allclose(y, y_ref, atol=1e-6)
+    assert state.keys() == final_ref.keys()
+    for k in final_ref:
+        assert state[k].shape == (B, L, H)
+        assert torch.allclose(state[k], final_ref[k], atol=1e-6), k
