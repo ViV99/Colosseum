@@ -163,3 +163,10 @@ def test_window_attention_rejects_bad_sizes():
         WindowAttentionCore(IN, window=0)
     with pytest.raises(ValueError, match="num_layers"):
         WindowAttentionCore(IN, num_layers=0)
+
+
+@pytest.mark.parametrize("kind", ["lstm", "window"])
+@pytest.mark.parametrize("empty", [{}, (), [], None])
+def test_reset_state_without_tensor_leaves_returns_state_unchanged(kind, empty):
+    core = _make(kind)
+    assert core.reset_state(empty, torch.tensor([True, False])) is empty

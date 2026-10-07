@@ -103,25 +103,26 @@ def build_model(config: ColosseumConfig) -> PolicyModel:
 
     net = config.networks
     if net.model_class:
-        model = import_class(net.model_class)(**net.kwargs)
-        if not isinstance(model, PolicyModel):
+        model_cls = import_class(net.model_class)
+        if not issubclass(model_cls, PolicyModel):
             raise ConfigError(
                 f"networks.model_class {net.model_class!r} must subclass "
-                f"colosseum.networks.model.PolicyModel, got {type(model).__name__}"
+                f"colosseum.networks.model.PolicyModel, got {model_cls.__name__}"
             )
-        return model
+        return model_cls(**net.kwargs)
 
     encoder = import_class(net.encoder_class)(**net.kwargs)
     latent_dim = encoder.latent_dim
     if net.core is None:
         core = NoCore(latent_dim)
     else:
-        core = import_class(net.core.class_path)(input_dim=latent_dim, **net.core.kwargs)
-        if not isinstance(core, Core):
+        core_cls = import_class(net.core.class_path)
+        if not issubclass(core_cls, Core):
             raise ConfigError(
                 f"networks.core.class {net.core.class_path!r} must subclass "
-                f"colosseum.networks.cores.Core, got {type(core).__name__}"
+                f"colosseum.networks.cores.Core, got {core_cls.__name__}"
             )
+        core = core_cls(input_dim=latent_dim, **net.core.kwargs)
     policy = _build_head(net.policy_class, core.output_dim, net.kwargs)
     value = _build_head(net.value_class, core.output_dim, net.kwargs)
     return ComposedModel(encoder, core, policy, value)
@@ -162,14 +163,28 @@ def build_network(config: ColosseumConfig) -> ActorCriticNetwork:
     return ActorCriticNetwork(encoder, policy, value, recurrent=recurrent)
 
 
-def _check_state(state: Any, batch: int, where: str) -> None:
+def _check_state_batch_dim(state_a: Any, state_b: Any, batches: tuple[int, int], where: str) -> None:
+    """The same state built for two batch sizes must differ only in dim 0 of every leaf.
+
+    Comparing two batch sizes catches layer-first layouts (``[L, B, H]``) that a
+    single batch size cannot, e.g. ``num_layers == B``.
+    """
     from colosseum.networks.state import tree_leaves
 
-    for leaf in tree_leaves(state):
-        if leaf.dim() == 0 or leaf.shape[0] != batch:
+    leaves_a, leaves_b = tree_leaves(state_a), tree_leaves(state_b)
+    if len(leaves_a) != len(leaves_b):
+        raise ConfigError(
+            f"{where}: the state structure depends on the batch size "
+            f"({len(leaves_a)} tensors for B={batches[0]}, {len(leaves_b)} for B={batches[1]})"
+        )
+    for i, (a, b) in enumerate(zip(leaves_a, leaves_b, strict=True)):
+        if a.dim() == 0 or b.dim() == 0 or a.shape[0] != batches[0] or b.shape[0] != batches[1] \
+                or a.shape[1:] != b.shape[1:]:
             raise ConfigError(
-                f"{where}: every state tensor must have the batch dimension first "
-                f"(expected {batch}), got a leaf of shape {tuple(leaf.shape)}"
+                f"{where}: every state tensor must have the batch dimension first; state tensor #{i} "
+                f"has shape {tuple(a.shape)} for B={batches[0]} and {tuple(b.shape)} for B={batches[1]} "
+                f"(expected ({batches[0]}, ...) and ({batches[1]}, ...) with identical other dims). "
+                f"Store RNN states as [B, num_layers, H], not nn.LSTM/nn.GRU's native [num_layers, B, H]."
             )
 
 
@@ -207,11 +222,23 @@ def validate_config(config: ColosseumConfig) -> None:
                 f"constructor argument or size them to match."
             )
 
-        spec = ActionSpec.from_space(env.action_space)
-        obs_dict, info_dict = env.reset(seed=0)
-        sample = torch.as_tensor(np.asarray(obs_dict[0], dtype=np.float32))
-        B, T = 2, 3
+        try:
+            spec = ActionSpec.from_space(env.action_space)
+        except Exception as e:
+            raise ConfigError(
+                f"Unsupported env action_space {env.action_space!r}: {type(e).__name__}: {e}"
+            ) from e
+        try:
+            obs_dict, info_dict = env.reset(seed=0)
+            sample = torch.as_tensor(np.asarray(obs_dict[0], dtype=np.float32))
+        except Exception as e:
+            raise ConfigError(
+                f"env.reset(seed=0) of {config.env.env_class!r} failed or returned no observation "
+                f"for player 0: {type(e).__name__}: {e}"
+            ) from e
+        B, B_ALT, T = 2, 3, 3
         obs = sample.unsqueeze(0).repeat(B, *([1] * sample.dim()))
+        obs_alt = sample.unsqueeze(0).repeat(B_ALT, *([1] * sample.dim()))
         mask = None
         raw_mask = info_dict.get(0, {}).get("action_mask") if isinstance(info_dict, dict) else None
         if raw_mask is not None:
@@ -225,13 +252,19 @@ def validate_config(config: ColosseumConfig) -> None:
                     f"({spec.flat_mask_size},)"
                 )
             mask = torch.as_tensor(flat_mask).unsqueeze(0).repeat(B, 1)
+        mask_alt = None if mask is None else mask[:1].repeat(B_ALT, 1)
 
         model.eval()
         with torch.no_grad():
-            state0 = model.initial_state(B)
-            _check_state(state0, B, "initial_state(2)")
+            try:
+                state0 = model.initial_state(B)
+                state0_alt = model.initial_state(B_ALT)
+            except Exception as e:
+                raise ConfigError(f"model.initial_state(B) failed: {type(e).__name__}: {e}") from e
+            _check_state_batch_dim(state0, state0_alt, (B, B_ALT), "initial_state")
             try:
                 out = model.step(obs, state0, mask)
+                out_alt = model.step(obs_alt, state0_alt, mask_alt)
             except Exception as e:
                 raise ConfigError(
                     f"model.step failed on a dummy batch with obs shape {tuple(obs.shape)}: "
@@ -247,8 +280,14 @@ def validate_config(config: ColosseumConfig) -> None:
                     f"value must have shape [B]=({B},), got {tuple(out.value.shape)}. "
                     f"Squeeze the last dim in the value head."
                 )
-            _check_state(out.state, B, "step() state")
-            actions = out.dist.sample()
+            _check_state_batch_dim(out.state, out_alt.state, (B, B_ALT), "step() state")
+            try:
+                actions = out.dist.sample()
+            except Exception as e:
+                raise ConfigError(
+                    f"sampling from the policy distribution {type(out.dist).__name__} failed: "
+                    f"{type(e).__name__}: {e}"
+                ) from e
             expected = (B, *spec.action_shape)
             if tuple(actions.shape) != expected:
                 raise ConfigError(

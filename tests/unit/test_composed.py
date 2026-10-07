@@ -54,3 +54,9 @@ def test_unroll_rejects_empty_sequence():
     model = make_simple_model(obs_dim=OBS, core="gru")
     with pytest.raises(ValueError, match="T >= 1"):
         model.unroll(torch.zeros(0, B, OBS), model.initial_state(B), torch.zeros(0, B, dtype=torch.bool))
+
+
+@pytest.mark.parametrize("empty", [{}, (), []])
+def test_reset_state_without_tensor_leaves_returns_state_unchanged(empty):
+    model = make_simple_model(obs_dim=OBS, core="lstm")
+    assert model.reset_state(empty, torch.tensor([True, False])) is empty

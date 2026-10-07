@@ -13,8 +13,8 @@ from colosseum.envs.base_env import BaseEnv
 from colosseum.networks.base import BaseEncoder, BasePolicy, BaseValue
 from colosseum.networks.composed import ComposedModel
 from colosseum.networks.cores import Core, GRUCore, LSTMCore, NoCore, WindowAttentionCore
-from colosseum.networks.distributions import CategoricalDist
-from colosseum.networks.model import PolicyModel, StepOutput
+from colosseum.networks.distributions import CategoricalDist, DiagGaussianDist
+from colosseum.networks.model import PolicyModel, StepOutput, UnrollOutput
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -97,6 +97,47 @@ class TinyMonolithicModel(PolicyModel):
         if action_mask is not None:
             dist = dist.apply_mask(action_mask)
         return StepOutput(dist, self.v(x).squeeze(-1), None)
+
+
+class GaussianActionModel(TinyMonolithicModel):
+    """Returns a 2-D Gaussian for a Discrete action space (validate_config: action-shape mismatch)."""
+
+    def step(self, obs, state, action_mask=None):
+        x = obs.reshape(obs.shape[0], -1)
+        mean = self.pi(x)[:, :2]
+        return StepOutput(DiagGaussianDist(mean, torch.zeros_like(mean)), self.v(x).squeeze(-1), None)
+
+
+class BadUnrollModel(TinyMonolithicModel):
+    """``unroll`` returns values shaped [T, B] instead of [T*B] (validate_config must reject it)."""
+
+    def unroll(self, obs, state0, dones, action_mask=None):
+        out = super().unroll(obs, state0, dones, action_mask)
+        return UnrollOutput(out.dist, out.value.reshape(obs.shape[0], obs.shape[1]))
+
+
+class LayerFirstLSTMCore(Core):
+    """Core keeping nn.LSTM's native layer-first state [L, B, H] (validate_config must reject it).
+
+    With ``num_layers=2`` the state of a batch of 2 is ``(2, 2, H)``, so dim 0
+    alone cannot tell layers from batch.
+    """
+
+    def __init__(self, input_dim: int, hidden_size: int = 8, num_layers: int = 2) -> None:
+        super().__init__()
+        self.input_dim = input_dim
+        self.output_dim = hidden_size
+        self.hidden_size = hidden_size
+        self.num_layers = num_layers
+        self.rnn = nn.LSTM(input_dim, hidden_size, num_layers)
+
+    def initial_state(self, batch_size, device="cpu"):
+        zeros = torch.zeros(self.num_layers, batch_size, self.hidden_size, device=device)
+        return {"h": zeros, "c": zeros.clone()}
+
+    def step(self, x, state):
+        y, (h, c) = self.rnn(x.unsqueeze(0), (state["h"], state["c"]))
+        return y.squeeze(0), {"h": h, "c": c}
 
 
 def make_simple_network(obs_dim=8, hidden_dim=16, num_actions=4):
@@ -199,3 +240,18 @@ class CountingEnv(BaseEnv):
         done = self._t >= self.episode_length
         obs = {p: self._obs(p) for p in players}
         return obs, rewards, {p: done for p in players}, {p: False for p in players}, {p: {} for p in players}
+
+
+class WrongMaskEnv(CountingEnv):
+    """CountingEnv whose reset info carries an action mask one entry too long."""
+
+    def reset(self, seed=None):
+        obs, _ = super().reset(seed)
+        return obs, {p: {"action_mask": np.ones(self.num_actions + 1, dtype=bool)} for p in obs}
+
+
+class ResetFailsEnv(CountingEnv):
+    """CountingEnv whose ``reset`` raises (validate_config must wrap it in ConfigError)."""
+
+    def reset(self, seed=None):
+        raise RuntimeError("reset exploded")

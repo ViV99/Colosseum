@@ -41,10 +41,13 @@ class Core(nn.Module, ABC):
         return torch.stack(outputs, dim=0)
 
     def reset_state(self, state: State, done: Tensor) -> State:
-        """Rows where ``done`` ([B]) is True are replaced by initial-state rows."""
-        if state is None:
-            return None
+        """Rows where ``done`` ([B]) is True are replaced by initial-state rows.
+
+        A state without tensor leaves (``None``, empty containers) is returned unchanged.
+        """
         batch = batch_size_of(state)
+        if batch is None:
+            return state
         device = tree_leaves(state)[0].device
         return where_done(done, self.initial_state(batch, device), state)
 

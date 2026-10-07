@@ -146,3 +146,56 @@ def test_validate_config_reports_bad_env_and_bad_class():
                                         networks=NetworkConfig(model_class="helpers.TinyMonolithicModel")))
     with pytest.raises(ConfigError, match="Failed to build model"):
         validate_config(_composed(policy="nope.Policy"))
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: negative validate_config paths
+# ---------------------------------------------------------------------------
+
+COUNTING_ENV = "helpers.CountingEnv"
+
+
+def _monolithic(model_class: str, env_class: str = COUNTING_ENV) -> ColosseumConfig:
+    return ColosseumConfig(
+        env=EnvConfig(env_class=env_class),
+        networks=NetworkConfig(model_class=model_class, kwargs={"obs_dim": 4, "num_actions": 3}),
+    )
+
+
+def test_validate_config_accepts_counting_env_monolithic_model():
+    validate_config(_monolithic("helpers.TinyMonolithicModel"))
+
+
+def test_validate_config_rejects_layer_first_state():
+    cfg = _composed(core={"class": "helpers.LayerFirstLSTMCore", "kwargs": {"num_layers": 2}})
+    with pytest.raises(ConfigError, match=r"batch dimension first.*\(2, 2, 8\).*\(2, 3, 8\)"):
+        validate_config(cfg)
+
+
+def test_validate_config_reports_env_mask_size_mismatch():
+    with pytest.raises(ConfigError, match=r"env action_mask has shape \(4,\).*\(3,\)"):
+        validate_config(_monolithic("helpers.TinyMonolithicModel", env_class="helpers.WrongMaskEnv"))
+
+
+def test_validate_config_reports_action_shape_mismatch():
+    with pytest.raises(ConfigError, match=r"actions of shape \(2, 2\).*expects \(2,\)"):
+        validate_config(_monolithic("helpers.GaussianActionModel"))
+
+
+def test_validate_config_reports_unroll_shape():
+    with pytest.raises(ConfigError, match=r"unroll must return time-major \[T\*B\]=\(6,\).*\(3, 2\)"):
+        validate_config(_monolithic("helpers.BadUnrollModel"))
+
+
+def test_validate_config_wraps_env_reset_failure():
+    with pytest.raises(ConfigError, match="env.reset.*RuntimeError: reset exploded"):
+        validate_config(_monolithic("helpers.TinyMonolithicModel", env_class="helpers.ResetFailsEnv"))
+
+
+def test_wrong_classes_are_rejected_before_construction():
+    # torch.nn.Linear cannot even be constructed without arguments / with input_dim:
+    # the subclass check must come first and give the clear message.
+    with pytest.raises(ConfigError, match="must subclass colosseum.networks.model.PolicyModel"):
+        build_model(_cfg(model_class="torch.nn.Linear"))
+    with pytest.raises(ConfigError, match="must subclass colosseum.networks.cores.Core"):
+        build_model(_composed(core={"class": "torch.nn.Linear"}))
