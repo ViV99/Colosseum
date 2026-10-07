@@ -21,16 +21,23 @@ class WandBLogger:
         if self._enabled:
             try:
                 import wandb
-
-                self._run = wandb.init(
-                    project=config.wandb_project,
-                    entity=config.wandb_entity,
-                    name=run_name,
-                    config={},  # will be updated with full config
+            except ImportError:
+                logger.warning(
+                    "metrics.use_wandb is true but the 'wandb' package is not installed "
+                    "(it is an optional extra: uv pip install -e '.[wandb]'). WandB logging disabled."
                 )
-            except (ImportError, RuntimeError, OSError) as e:
-                logger.warning(f"Failed to initialize WandB: {e}. Logging disabled.")
                 self._enabled = False
+            else:
+                try:
+                    self._run = wandb.init(
+                        project=config.wandb_project,
+                        entity=config.wandb_entity,
+                        name=run_name,
+                        config={},  # will be updated with full config
+                    )
+                except Exception as e:  # any wandb init failure must not stop training
+                    logger.warning(f"Failed to initialize WandB: {e}. Logging disabled.")
+                    self._enabled = False
 
     def log_config(self, config: dict[str, Any]) -> None:
         """Log the full configuration."""

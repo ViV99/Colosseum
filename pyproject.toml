@@ -4,25 +4,32 @@ version = "0.1.0"
 description = "Distributed RL training framework for competitive bot programming"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.2.0",
+    "torch>=2.6",
     "numpy>=1.26.0",
     "gymnasium>=1.0.0",
     "pyyaml>=6.0",
     "pydantic>=2.5.0",
     "lz4>=4.3.0",
-    "wandb>=0.16.0",
     "click>=8.1.0",
 ]
 
 [project.optional-dependencies]
+# The generated code in colosseum/transport/colosseum_pb2*.py requires these versions.
 grpc = [
-    "grpcio>=1.60.0",
-    "grpcio-tools>=1.60.0",
-    "protobuf>=4.25.0",
+    "grpcio>=1.78",
+    "grpcio-tools>=1.78",
+    "protobuf>=6.31",
+]
+wandb = [
+    "wandb>=0.16.0",
+]
+examples = [
+    "Box2D>=2.3.10",  # examples/space_miners (import Box2D); has cp312 manylinux wheels
 ]
 dev = [
-    "pytest>=7.4.0",
-    "ruff>=0.1.0",
+    "pytest>=8.0",
+    "pytest-timeout>=2.3",
+    "ruff>=0.6",
 ]
 
 [project.scripts]
