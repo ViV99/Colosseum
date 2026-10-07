@@ -180,6 +180,13 @@ class RolloutConfig(BaseModel):
         description="Number of child processes for the 'subprocess' vec_env (defaults to "
                     "min(envs_per_worker, cpu_count)). Ignored for 'sync'.",
     )
+    torch_threads: int = Field(
+        default=1,
+        ge=1,
+        description="torch intra-op threads per worker process, set at process start "
+                    "(inter-op threads are always 1). SubprocessVectorEnv children always "
+                    "use 1 thread.",
+    )
     match_refresh_interval_sec: float = Field(
         default=30.0,
         ge=0.0,
@@ -206,6 +213,12 @@ class LearnerConfig(BaseModel):
     pin_memory: bool = Field(
         default=False,
         description="Pin batch tensors for faster CPU-to-GPU transfer. Only effective with CUDA.",
+    )
+    torch_threads: int | None = Field(
+        default=None,
+        ge=1,
+        description="torch threads per learner process. None = auto: 2 on CUDA; on CPU "
+                    "max(1, (cpu_count - num_workers * rollout.torch_threads) // num_learners).",
     )
 
 

@@ -54,7 +54,7 @@ def learner_process(
         resume_state: optional dict with 'state_dict', 'optimizer_state', 'policy_version'
             to resume training from a checkpoint
     """
-    logger.info(f"Learner [{agent_id}]: starting on device={config.device}")
+    logger.info(f"Learner [{agent_id}]: starting on device={resolve_device(config.device)}")
 
     # Create algorithm and network
     algorithm = algorithm_factory()
@@ -155,7 +155,8 @@ def learner_process(
     logger.info(f"Learner [{agent_id}]: finished. Total train_steps={train_step}")
 
 
-def _resolve_device(device_str: str) -> str:
+def resolve_device(device_str: str) -> str:
+    """Resolve ``learner.device``: ``"auto"`` -> ``"cuda"`` if available else ``"cpu"``; others unchanged."""
     if device_str == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
     return device_str

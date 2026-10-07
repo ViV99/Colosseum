@@ -129,7 +129,8 @@ def run_distributed_learner(
     at ``weight_store_address``.
     """
     from colosseum.core.registry import build_model, import_class
-    from colosseum.learner.learner import learner_process
+    from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
+    from colosseum.learner.learner import learner_process, resolve_device
     from colosseum.transport.grpc_transport import serve_trajectory_receiver
     from colosseum.weight_store.grpc_store import GRPCWeightStore
 
@@ -142,9 +143,13 @@ def run_distributed_learner(
     acfg = config.get_agent_config(agent_id)
     max_mb = config.transport.grpc_max_message_mb
 
-    device = acfg.learner.device
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = resolve_device(acfg.learner.device)
+    # The learner role does not know which workers share its machine, so with
+    # learner.torch_threads unset it assumes none (num_workers=0).
+    configure_torch_threads(resolve_learner_threads(
+        acfg.learner.torch_threads, device, num_workers=0,
+        worker_threads=acfg.rollout.torch_threads, num_learners=1,
+    ))
 
     # Trajectory inbox filled by the gRPC server, drained by learner_process.
     chunk_queue: queue.Queue = queue.Queue(maxsize=acfg.learner.queue_size)
@@ -258,46 +263,38 @@ def _dist_worker_target(
     sys.path.insert(0, ".")
 
     from colosseum.core.registry import build_model
+    from colosseum.launcher import _create_env
     from colosseum.transport.grpc_transport import GRPCTransport
     from colosseum.weight_store.grpc_store import GRPCWeightStore
     from colosseum.worker.rollout_worker import rollout_worker_process
 
     max_mb = config.transport.grpc_max_message_mb
     store = GRPCWeightStore(weight_store_address, max_message_mb=max_mb)
-
     transports = {
         aid: GRPCTransport(learner_addresses[aid], max_message_mb=max_mb)
         for aid in agent_ids
     }
-    trajectory_queues = {aid: GRPCTrajectorySink(transports[aid], aid) for aid in agent_ids}
-    weight_queues = {aid: GRPCWeightSource(store, aid) for aid in agent_ids}
-    model_factories = {
-        aid: partial(build_model, agent_configs[aid]) for aid in agent_ids
-    }
-
-    env_class_path = config.env.env_class
-    env_kwargs = config.env.kwargs
 
     worker_seed = None
     if config.training.seed is not None:
         worker_seed = config.training.seed + worker_id * 1000
 
-    from colosseum.launcher import _create_env
-
     rollout_worker_process(
         worker_id=worker_id,
-        env_fn=partial(_create_env, env_class_path, env_kwargs),
+        env_fn=partial(_create_env, config.env.env_class, config.env.kwargs),
         num_envs=config.rollout.envs_per_worker,
         chunk_length=config.rollout.chunk_length,
-        weight_sync_interval=config.rollout.weight_sync_interval_sec,
-        stop_event=stop_event,
-        total_timesteps=total_timesteps,
-        seed=worker_seed,
         agent_ids=agent_ids,
-        model_factories=model_factories,
-        trajectory_queues=trajectory_queues,
-        weight_queues=weight_queues,
+        model_factories={aid: partial(build_model, agent_configs[aid]) for aid in agent_ids},
+        trajectory_queues={aid: GRPCTrajectorySink(transports[aid], aid) for aid in agent_ids},
+        weight_queues={aid: GRPCWeightSource(store, aid) for aid in agent_ids},
+        stop_event=stop_event,
+        gamma=config.algorithm.gamma,
+        weight_sync_interval=config.rollout.weight_sync_interval_sec,
+        torch_threads=config.rollout.torch_threads,
+        max_env_steps=total_timesteps,
         slot_agent_map=slot_agent_map,
+        seed=worker_seed,
         vec_env_kind=config.rollout.vec_env,
         subproc_workers=config.rollout.subproc_workers,
     )

@@ -127,6 +127,7 @@ def _make_config(num_workers: int, checkpoint_dir: str):
             "weight_sync_interval_sec": 2.0,
             "vec_env": "sync",
             "match_refresh_interval_sec": 0.0,
+            "torch_threads": 1,
         },
         learner={
             "device": "cpu",
@@ -134,6 +135,7 @@ def _make_config(num_workers: int, checkpoint_dir: str):
             "batch_chunks": BATCH_CHUNKS,
             "weight_push_interval": 5,
             "pin_memory": False,
+            "torch_threads": None,  # auto: (cpu_count - num_workers * 1) // 1
         },
         training={
             "phase": "self_play",

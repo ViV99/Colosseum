@@ -45,7 +45,11 @@ def test_worker_produces_chunks(tmp_path):
     stop_event = mp.Event()
     proc = mp.Process(
         target=_worker_target,
-        args=(0, config, [agent_id], {agent_id: config}, trajectory_queues, weight_queues, stop_event, 500),
+        kwargs=dict(
+            worker_id=0, config=config, agent_ids=[agent_id], agent_configs={agent_id: config},
+            trajectory_queues=trajectory_queues, weight_queues=weight_queues,
+            stop_event=stop_event, total_timesteps=500,
+        ),
         daemon=True,
     )
     proc.start()
@@ -76,9 +80,11 @@ def test_worker_multi_agent_routing(tmp_path):
     collect_mask = [[True, True], [True, True]]
     proc = mp.Process(
         target=_worker_target,
-        args=(
-            0, config, agent_ids, agent_configs, trajectory_queues, weight_queues,
-            stop_event, 500, None, slot_network_map, collect_mask, slot_agent_map, None,
+        kwargs=dict(
+            worker_id=0, config=config, agent_ids=agent_ids, agent_configs=agent_configs,
+            trajectory_queues=trajectory_queues, weight_queues=weight_queues,
+            stop_event=stop_event, total_timesteps=500,
+            slot_network_map=slot_network_map, collect_mask=collect_mask, slot_agent_map=slot_agent_map,
         ),
         daemon=True,
     )

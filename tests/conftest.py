@@ -11,7 +11,7 @@ from pathlib import Path
 # Must happen before torch is imported anywhere: spawned children inherit the
 # environment, so every worker/learner a test starts uses one OpenMP thread
 # instead of all cores (tests run several processes on a shared machine).
-os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ["OMP_NUM_THREADS"] = "1"
 
 import pytest  # noqa: E402
 import torch  # noqa: E402

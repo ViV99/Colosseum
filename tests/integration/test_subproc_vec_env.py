@@ -25,7 +25,7 @@ def test_subproc_reset_all_parity():
     """reset_all with the same seed yields identical obs shape/dtype/values."""
     num_envs = 6
     ref = VectorEnv(make_ttt_env, num_envs=num_envs)
-    sub = SubprocessVectorEnv(make_ttt_env, num_envs=num_envs, num_workers=3)
+    sub = SubprocessVectorEnv(make_ttt_env, num_envs=num_envs, num_workers=2)
     try:
         assert sub.num_envs == ref.num_envs
         assert sub.num_players == ref.num_players
@@ -50,7 +50,7 @@ def test_subproc_step_parity():
     num_envs = 8
     num_steps = 30
     ref = VectorEnv(make_ttt_env, num_envs=num_envs)
-    sub = SubprocessVectorEnv(make_ttt_env, num_envs=num_envs, num_workers=4)
+    sub = SubprocessVectorEnv(make_ttt_env, num_envs=num_envs, num_workers=2)
     try:
         ref_obs, _ = ref.reset_all(seed=7)
         sub_obs, _ = sub.reset_all(seed=7)
@@ -159,13 +159,13 @@ def test_subproc_reset_done_parity():
 
 def test_subproc_default_num_workers():
     """Default num_workers = min(num_envs, cpu_count); never exceeds num_envs."""
-    sub = SubprocessVectorEnv(make_ttt_env, num_envs=3)
+    sub = SubprocessVectorEnv(make_ttt_env, num_envs=2)
     try:
-        expected = min(3, os.cpu_count() or 1)
+        expected = min(2, os.cpu_count() or 1)
         assert sub.num_workers == expected
         assert sub.num_workers <= sub.num_envs
         obs, _ = sub.reset_all(seed=1)
-        assert obs.shape[0] == 3
+        assert obs.shape[0] == 2
     finally:
         sub.close()
 
@@ -174,7 +174,7 @@ def test_subproc_uneven_split():
     """Workers that don't divide num_envs evenly still cover all envs in order."""
     num_envs = 7
     ref = VectorEnv(make_ttt_env, num_envs=num_envs)
-    sub = SubprocessVectorEnv(make_ttt_env, num_envs=num_envs, num_workers=3)
+    sub = SubprocessVectorEnv(make_ttt_env, num_envs=num_envs, num_workers=2)
     try:
         assert sub.num_envs == num_envs
         r_obs, _ = ref.reset_all(seed=99)
@@ -188,7 +188,7 @@ def test_subproc_uneven_split():
 
 def test_subproc_close_is_prompt_and_no_zombies():
     """close() returns promptly and leaves no live subprocesses behind."""
-    sub = SubprocessVectorEnv(make_ttt_env, num_envs=6, num_workers=3)
+    sub = SubprocessVectorEnv(make_ttt_env, num_envs=6, num_workers=2)
     sub.reset_all(seed=3)
     sub.step(_fixed_actions(6, 2, 9, seed=0))
 

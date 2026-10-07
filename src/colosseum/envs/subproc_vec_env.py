@@ -67,6 +67,11 @@ def _worker_loop(
             seeding globally consistent: local env ``j`` maps to global env
             ``global_offset + j``).
     """
+    import torch
+
+    # Env children only step envs: one torch thread each (R2-04). OMP_NUM_THREADS=1
+    # is already in this process's environment (set by the parent before spawn).
+    torch.set_num_threads(1)
     vec_env = VectorEnv(env_fn, slice_size)
     try:
         while True:
@@ -174,18 +179,28 @@ class SubprocessVectorEnv:
         self._procs: list[Any] = []
         self._closed = False
 
-        for (start, end) in self._slices:
-            parent_conn, child_conn = self._ctx.Pipe()
-            proc = self._ctx.Process(
-                target=_worker_loop,
-                args=(child_conn, env_fn, end - start, start),
-                daemon=True,
-            )
-            proc.start()
-            # Close the child end in the parent so EOF propagates correctly.
-            child_conn.close()
-            self._parent_conns.append(parent_conn)
-            self._procs.append(proc)
+        # Children must start with OMP_NUM_THREADS=1: they import torch while
+        # unpickling env_fn, before _worker_loop runs (R2-04).
+        prev_omp = os.environ.get("OMP_NUM_THREADS")
+        os.environ["OMP_NUM_THREADS"] = "1"
+        try:
+            for (start, end) in self._slices:
+                parent_conn, child_conn = self._ctx.Pipe()
+                proc = self._ctx.Process(
+                    target=_worker_loop,
+                    args=(child_conn, env_fn, end - start, start),
+                    daemon=True,
+                )
+                proc.start()
+                # Close the child end in the parent so EOF propagates correctly.
+                child_conn.close()
+                self._parent_conns.append(parent_conn)
+                self._procs.append(proc)
+        finally:
+            if prev_omp is None:
+                os.environ.pop("OMP_NUM_THREADS", None)
+            else:
+                os.environ["OMP_NUM_THREADS"] = prev_omp
 
     # ------------------------------------------------------------------
     # Public API (mirrors VectorEnv exactly)

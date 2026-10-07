@@ -55,6 +55,7 @@ def _create_model(config: ColosseumConfig):
 
 
 def _worker_target(
+    *,
     worker_id: int,
     config: ColosseumConfig,
     agent_ids: list[str],
@@ -62,7 +63,7 @@ def _worker_target(
     trajectory_queues: dict[str, mp.Queue],
     weight_queues: dict[str, mp.Queue],
     stop_event: mp.Event,
-    total_timesteps: int,
+    total_timesteps: int = 0,
     checkpoint_state_dicts_by_agent: dict[str, dict[str, dict]] | None = None,
     slot_network_map: list[list[str]] | None = None,
     collect_mask: list[list[bool]] | None = None,
@@ -72,58 +73,49 @@ def _worker_target(
 ) -> None:
     """Worker process entry point.
 
-    Builds per-agent model factories INSIDE the process to avoid
-    pickling lambdas across the spawn boundary.
+    Env and model factories are built INSIDE the process (``functools.partial``
+    over top-level functions is picklable under spawn, which the subprocess
+    vec_env needs to ship ``env_fn`` to its children).
     """
     import sys
     from functools import partial
     sys.path.insert(0, ".")
 
+    from colosseum.core.registry import build_model
     from colosseum.worker.rollout_worker import rollout_worker_process
-
-    env_class_path = config.env.env_class
-    env_kwargs = config.env.kwargs
 
     worker_seed = None
     if config.training.seed is not None:
         worker_seed = config.training.seed + worker_id * 1000
 
-    # Build per-agent model factories inside this process (pickling safe)
-    model_factories = {}
-    for aid in agent_ids:
-        acfg = agent_configs[aid]
-        # Default-arg capture ensures each lambda gets its own config
-        model_factories[aid] = lambda _cfg=acfg: _create_model(_cfg)
-
     rollout_worker_process(
         worker_id=worker_id,
-        # functools.partial over a top-level function is picklable under spawn,
-        # which the subprocess vec_env requires (it ships env_fn to children).
-        env_fn=partial(_create_env, env_class_path, env_kwargs),
+        env_fn=partial(_create_env, config.env.env_class, config.env.kwargs),
         num_envs=config.rollout.envs_per_worker,
         chunk_length=config.rollout.chunk_length,
-        weight_sync_interval=config.rollout.weight_sync_interval_sec,
-        stop_event=stop_event,
-        total_timesteps=total_timesteps,
-        results_queue=results_queue,
-        seed=worker_seed,
-        # Multi-agent params
         agent_ids=agent_ids,
-        model_factories=model_factories,
+        model_factories={aid: partial(build_model, agent_configs[aid]) for aid in agent_ids},
         trajectory_queues=trajectory_queues,
         weight_queues=weight_queues,
+        stop_event=stop_event,
+        gamma=config.algorithm.gamma,
+        weight_sync_interval=config.rollout.weight_sync_interval_sec,
+        torch_threads=config.rollout.torch_threads,
+        max_env_steps=total_timesteps,
         checkpoint_state_dicts_by_agent=checkpoint_state_dicts_by_agent,
         slot_agent_map=slot_agent_map,
         slot_network_map=slot_network_map,
         collect_mask=collect_mask,
-        # Runtime match refresh + vec-env backend
+        results_queue=results_queue,
         command_queue=command_queue,
+        seed=worker_seed,
         vec_env_kind=config.rollout.vec_env,
         subproc_workers=config.rollout.subproc_workers,
     )
 
 
 def _learner_target(
+    *,
     agent_id: str,
     config: ColosseumConfig,
     trajectory_queue: mp.Queue,
@@ -134,17 +126,25 @@ def _learner_target(
     checkpoint_queue: mp.Queue | None = None,
     checkpoint_interval: int = 0,
     resume_state: dict | None = None,
+    num_learners: int = 1,
 ) -> None:
-    """Learner process entry point."""
+    """Learner process entry point.
+
+    ``num_learners`` (learner processes on this machine) feeds the automatic
+    torch thread count when ``learner.torch_threads`` is unset.
+    """
     import sys
     sys.path.insert(0, ".")
 
     from colosseum.core.registry import import_class
-    from colosseum.learner.learner import learner_process
+    from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
+    from colosseum.learner.learner import learner_process, resolve_device
 
-    device = config.learner.device
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = resolve_device(config.learner.device)
+    configure_torch_threads(resolve_learner_threads(
+        config.learner.torch_threads, device, config.rollout.num_workers,
+        config.rollout.torch_threads, num_learners,
+    ))
 
     # Resolve algorithm class from config
     algo_class_path = config.algorithm.algorithm_class
@@ -401,12 +401,18 @@ class Launcher:
             resume_state = _resolve_resume_state(cfg, aid, coordinator)
             learner_proc = mp.Process(
                 target=_learner_target,
-                args=(
-                    aid, acfg, trajectory_queues[aid],
-                    weight_queues_per_agent[aid],
-                    self._stop_event, metrics_queue, total_train_steps,
-                    checkpoint_queues[aid], checkpoint_interval,
-                    resume_state,
+                kwargs=dict(
+                    agent_id=aid,
+                    config=acfg,
+                    trajectory_queue=trajectory_queues[aid],
+                    weight_queues=weight_queues_per_agent[aid],
+                    stop_event=self._stop_event,
+                    metrics_queue=metrics_queue,
+                    total_train_steps=total_train_steps,
+                    checkpoint_queue=checkpoint_queues[aid],
+                    checkpoint_interval=checkpoint_interval,
+                    resume_state=resume_state,
+                    num_learners=len(trainable_agents),
                 ),
                 daemon=True,
             )
@@ -446,15 +452,21 @@ class Launcher:
             worker_daemon = cfg.rollout.vec_env != "subprocess"
             worker_proc = mp.Process(
                 target=_worker_target,
-                args=(
-                    worker_id, cfg, trainable_agents, agent_configs,
-                    trajectory_queues, worker_weight_queues,
-                    self._stop_event,
-                    cfg.training.total_timesteps // cfg.rollout.num_workers,
-                    ckpt_dicts_by_agent,
-                    slot_network_map, collect_mask, slot_agent_map,
-                    results_queue,
-                    command_queues[worker_id],
+                kwargs=dict(
+                    worker_id=worker_id,
+                    config=cfg,
+                    agent_ids=trainable_agents,
+                    agent_configs=agent_configs,
+                    trajectory_queues=trajectory_queues,
+                    weight_queues=worker_weight_queues,
+                    stop_event=self._stop_event,
+                    total_timesteps=cfg.training.total_timesteps // cfg.rollout.num_workers,
+                    checkpoint_state_dicts_by_agent=ckpt_dicts_by_agent,
+                    slot_network_map=slot_network_map,
+                    collect_mask=collect_mask,
+                    slot_agent_map=slot_agent_map,
+                    results_queue=results_queue,
+                    command_queue=command_queues[worker_id],
                 ),
                 daemon=worker_daemon,
             )
