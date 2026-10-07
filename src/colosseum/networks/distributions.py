@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Sequence
 
 import torch
 import torch.nn.functional as F
@@ -45,6 +46,15 @@ class Distribution(ABC):
         """
         return self
 
+    @classmethod
+    def cat(cls, dists: Sequence[Distribution]) -> Distribution:
+        """Concatenate same-type distributions along the batch dimension.
+
+        Used by the default ``PolicyModel.unroll`` (a per-step loop). Custom
+        distributions must override it to be used with that default.
+        """
+        raise NotImplementedError(f"{cls.__name__}.cat is not implemented")
+
 
 class CategoricalDist(Distribution):
     """For discrete action spaces with optional action masking."""
@@ -85,11 +95,18 @@ class CategoricalDist(Distribution):
         """Return a new CategoricalDist with invalid actions masked out."""
         return CategoricalDist(logits=self.logits, mask=mask)
 
+    @classmethod
+    def cat(cls, dists: Sequence[CategoricalDist]) -> CategoricalDist:
+        # logits are already normalized and masked (-inf), so no mask is needed.
+        return CategoricalDist(logits=torch.cat([d.logits for d in dists], dim=0))
+
 
 class DiagGaussianDist(Distribution):
     """For continuous action spaces with diagonal covariance."""
 
     def __init__(self, mean: torch.Tensor, log_std: torch.Tensor):
+        self._mean = mean
+        self._log_std = log_std
         self._dist = torch.distributions.Normal(mean, log_std.exp())
 
     @property
@@ -112,6 +129,13 @@ class DiagGaussianDist(Distribution):
         if not isinstance(other, DiagGaussianDist):
             raise TypeError(f"Cannot compute KL between DiagGaussianDist and {type(other).__name__}")
         return torch.distributions.kl_divergence(self._dist, other._dist).sum(dim=-1)
+
+    @classmethod
+    def cat(cls, dists: Sequence[DiagGaussianDist]) -> DiagGaussianDist:
+        return DiagGaussianDist(
+            torch.cat([d._mean for d in dists], dim=0),
+            torch.cat([d._log_std for d in dists], dim=0),
+        )
 
 
 class CompositeDist(Distribution):
@@ -236,3 +260,11 @@ class CompositeDist(Distribution):
             kl = self._dists[k].kl_divergence(other._dists[k])
             total = kl if total is None else total + kl
         return total
+
+    @classmethod
+    def cat(cls, dists: Sequence[CompositeDist]) -> CompositeDist:
+        keys = dists[0]._keys
+        for d in dists:
+            if d._keys != keys:
+                raise ValueError(f"Key mismatch: {d._keys} vs {keys}")
+        return CompositeDist({k: type(dists[0]._dists[k]).cat([d._dists[k] for d in dists]) for k in keys})
