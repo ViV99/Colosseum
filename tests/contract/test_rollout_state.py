@@ -5,6 +5,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from colosseum.networks.state import tree_leaves
 from harness import make_loop, run_steps, simple_factory
 from helpers import CORE_KINDS
 
@@ -27,8 +28,12 @@ def test_chunks_carry_initial_state_with_batch_one(core):
         # The first chunk of each slot starts at an episode start (zero state);
         # the second one starts mid-episode (non-zero state).
         first, second = rec.chunks[:4], rec.chunks[4:]
-        assert all(float(c.initial_state[k].abs().sum()) == 0.0 for c in first for k in ("h",) if k in c.initial_state)
-        assert any(float(sum(v.float().abs().sum() for v in c.initial_state.values())) > 0 for c in second)
+        for c in first:
+            leaves = tree_leaves(c.initial_state)
+            assert leaves
+            assert all(int(torch.count_nonzero(leaf)) == 0 for leaf in leaves), sorted(c.initial_state)
+        assert any(any(int(torch.count_nonzero(leaf)) > 0 for leaf in tree_leaves(c.initial_state))
+                   for c in second)
 
 
 def test_slot_state_is_reset_at_episode_end():
