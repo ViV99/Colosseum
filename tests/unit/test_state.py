@@ -109,6 +109,42 @@ def test_slice_batch_rejects_bool_index():
             slice_batch(s, idx)
 
 
+def test_slice_batch_accepts_numpy_and_range_indices():
+    s = _nested(4)
+    assert torch.equal(slice_batch(s, np.array([3, 0]))["h"], s["h"][[3, 0]])
+    assert torch.equal(slice_batch(s, np.array([True, False, True, False]))["h"], s["h"][[0, 2]])
+    assert slice_batch(s, np.array(2))["h"].shape == (1, 2, 4)
+    assert torch.equal(slice_batch(s, range(1, 3))["h"], s["h"][1:3])
+    with pytest.raises(TypeError, match="dtype"):
+        slice_batch(s, np.array([0.0, 1.0]))
+    with pytest.raises(TypeError, match="single bool"):
+        slice_batch(s, np.array(True))
+
+
+def test_slice_batch_rejects_numpy_bool_index_with_clear_message():
+    s = _nested(3)
+    for idx in (np.bool_(True), np.bool_(False)):
+        with pytest.raises(TypeError, match="single bool is not a valid batch index"):
+            slice_batch(s, idx)
+
+
+@pytest.mark.parametrize("idx", [
+    torch.tensor(1.0),
+    torch.tensor(1.0, dtype=torch.float16),
+    torch.tensor(1.0 + 0j),
+    torch.tensor([0.0, 2.0]),
+])
+def test_slice_batch_rejects_non_integer_index_tensors(idx):
+    with pytest.raises(TypeError, match="dtype"):
+        slice_batch(_nested(3), idx)
+
+
+@pytest.mark.parametrize("idx", [1.0, np.float64(1.0), [0, 1.5], [True, 2]])
+def test_slice_batch_rejects_non_integer_indices(idx):
+    with pytest.raises(TypeError, match="integer"):
+        slice_batch(_nested(3), idx)
+
+
 def test_cat_batch_roundtrip_of_rows():
     s = _nested(4)
     rows = [slice_batch(s, i) for i in range(4)]

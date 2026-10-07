@@ -83,19 +83,35 @@ def slice_batch(state: State, idx: int | Sequence[int] | Tensor) -> State:
 
     A single integer index (any ``numbers.Integral``, e.g. ``np.int64``, or a
     0-dim integer tensor) keeps the batch dim: the result has batch 1. A
-    sequence of indices, an index tensor or a bool mask selects several rows.
-    A single ``bool`` is rejected (it would silently mean index 0 or 1).
+    sequence of integers, an integer index tensor or a 1-D bool mask tensor
+    selects several rows. A single ``bool`` (Python, ``np.bool_`` or 0-dim
+    tensor) is rejected (it would silently mean index 0 or 1), and so are
+    non-integer indices (floats, float/complex tensors): they are never
+    truncated to integers.
     """
-    if isinstance(idx, bool) or (isinstance(idx, Tensor) and idx.dim() == 0
-                                 and idx.dtype == torch.bool):
+    if isinstance(idx, np.ndarray):
+        idx = torch.as_tensor(idx)
+    if isinstance(idx, bool | np.bool_) or (isinstance(idx, Tensor) and idx.dim() == 0
+                                            and idx.dtype == torch.bool):
         raise TypeError("slice_batch: a single bool is not a valid batch index")
-    if isinstance(idx, numbers.Integral) or (isinstance(idx, Tensor) and idx.dim() == 0):
+    if isinstance(idx, Tensor):
+        if idx.dtype.is_floating_point or idx.dtype.is_complex:
+            raise TypeError(f"slice_batch: index tensor must have an integer or bool dtype, got {idx.dtype}")
+        if idx.dim() == 0:
+            idx = int(idx)
+    if isinstance(idx, numbers.Integral):
         i = int(idx)
         return tree_map(lambda t: t[i].unsqueeze(0), state)
     if isinstance(idx, Tensor):
         index = idx if idx.dtype == torch.bool else idx.long()
+    elif isinstance(idx, Sequence) and not isinstance(idx, str | bytes):
+        bad = [i for i in idx if isinstance(i, bool | np.bool_) or not isinstance(i, numbers.Integral)]
+        if bad:
+            raise TypeError(f"slice_batch: index sequence must contain integers only, got {bad!r}")
+        index = torch.as_tensor([int(i) for i in idx], dtype=torch.long)
     else:
-        index = torch.as_tensor(list(idx), dtype=torch.long)
+        raise TypeError(f"slice_batch: batch index must be an integer, an integer sequence or an "
+                        f"index tensor, got {type(idx).__name__}")
     return tree_map(lambda t: t[index.to(t.device)], state)
 
 
