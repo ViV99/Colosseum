@@ -7,6 +7,11 @@ from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
+import torch
+from torch import Tensor
+
+from colosseum.algorithms.appo import APPO
+from colosseum.core.config import AlgorithmConfig
 from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
 from colosseum.worker.rollout_loop import LoopIO, RolloutLoop
 from helpers import CountingEnv, make_simple_model
@@ -113,3 +118,16 @@ def step_index(chunk: TrajectoryChunk, episode_length: int = 5) -> list[int]:
 def player_index(chunk: TrajectoryChunk) -> set[int]:
     """Set of player indices whose observations appear in ``chunk``."""
     return {round(float(x)) for x in chunk.observations[:, 1]}
+
+
+def learner_eval(model: Any, chunks: list[TrajectoryChunk]) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    """Re-evaluate ``chunks`` with a real APPO around ``model``.
+
+    Returns ``(learner_log_probs, learner_values, worker_log_probs, worker_values)``,
+    all ``[T*B]`` in time-major order (index ``t*B + b`` for chunk ``b``).
+    """
+    algo = APPO(model, AlgorithmConfig(), device="cpu")
+    lp, v = algo.evaluate_chunks(chunks)
+    worker_lp = torch.stack([c.action_log_probs for c in chunks], dim=1).reshape(-1)
+    worker_v = torch.stack([c.values for c in chunks], dim=1).reshape(-1)
+    return lp, v, worker_lp, worker_v
