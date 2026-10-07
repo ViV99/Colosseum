@@ -177,7 +177,7 @@ def _run_matches(
     from collections import defaultdict
 
     from colosseum.core.outcomes import player_outcomes
-    from colosseum.worker.rollout_worker import _extract_action_masks
+    from colosseum.worker.rollout_loop import _extract_action_masks
 
     vec_env = VectorEnv(env_fn, min(num_envs, num_matches))
     actual_envs = vec_env.num_envs

@@ -264,7 +264,7 @@ def test_refresh_pushes_new_checkpoint_to_worker():
 def test_worker_applies_command_loads_checkpoint_and_stages_maps():
     """Worker side: a WorkerCommand loads new checkpoints and stages slot maps."""
     from colosseum.core.types import WorkerCommand
-    from colosseum.worker.rollout_worker import LATEST_NETWORK_ID, _apply_command
+    from colosseum.worker.rollout_loop import LATEST_NETWORK_ID, _apply_command
     from helpers import make_simple_network
 
     def factory():

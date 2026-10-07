@@ -213,7 +213,7 @@ def _derive_worker_configs(
         checkpoint_state_dicts_by_agent: {agent_id: {ckpt_id: state_dict}}
         slot_agent_map[env_idx][player_idx] -> agent_id
     """
-    from colosseum.worker.rollout_worker import LATEST_NETWORK_ID
+    from colosseum.worker.rollout_loop import LATEST_NETWORK_ID
 
     collect_mask: list[list[bool]] = []
     slot_network_map: list[list[str]] = []

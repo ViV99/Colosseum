@@ -427,7 +427,7 @@ def test_build_network_feedforward_default():
 
 def test_rollout_buffer_lstm_init():
     """RolloutBuffer should store and clear LSTM init hidden state."""
-    from colosseum.worker.rollout_worker import RolloutBuffer
+    from colosseum.worker.rollout_loop import RolloutBuffer
 
     buf = RolloutBuffer(chunk_length=4, obs_shape=(OBS_DIM,))
     assert buf._lstm_h_init is None
@@ -448,7 +448,7 @@ def test_rollout_buffer_lstm_init():
 
 def test_build_chunk_includes_lstm_hidden():
     """_build_chunk should include lstm_hidden when buffer has it."""
-    from colosseum.worker.rollout_worker import RolloutBuffer, _build_chunk
+    from colosseum.worker.rollout_loop import RolloutBuffer, _build_chunk
 
     buf = RolloutBuffer(chunk_length=2, obs_shape=(OBS_DIM,))
     h = torch.randn(NUM_LAYERS, 1, HIDDEN_SIZE)
@@ -474,7 +474,7 @@ def test_build_chunk_includes_lstm_hidden():
 
 def test_build_chunk_no_lstm_hidden():
     """_build_chunk should leave lstm_hidden as None when buffer has none."""
-    from colosseum.worker.rollout_worker import RolloutBuffer, _build_chunk
+    from colosseum.worker.rollout_loop import RolloutBuffer, _build_chunk
 
     buf = RolloutBuffer(chunk_length=2, obs_shape=(OBS_DIM,))
     for _ in range(2):

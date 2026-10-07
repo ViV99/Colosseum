@@ -25,7 +25,7 @@ def _torch_compile_available() -> bool:
 
 def test_preallocated_buffer_basic():
     """RolloutBuffer pre-allocates and produces correct chunks."""
-    from colosseum.worker.rollout_worker import RolloutBuffer, _build_chunk
+    from colosseum.worker.rollout_loop import RolloutBuffer, _build_chunk
 
     buf = RolloutBuffer(
         chunk_length=4,
@@ -61,7 +61,7 @@ def test_preallocated_buffer_basic():
 
 def test_preallocated_buffer_with_masks():
     """Action masks stored correctly in pre-allocated buffer."""
-    from colosseum.worker.rollout_worker import RolloutBuffer, _build_chunk
+    from colosseum.worker.rollout_loop import RolloutBuffer, _build_chunk
 
     buf = RolloutBuffer(
         chunk_length=3,
@@ -98,7 +98,7 @@ def test_preallocated_buffer_with_masks():
 
 def test_buffer_reset_reuse():
     """Buffer reset + refill produces correct second chunk."""
-    from colosseum.worker.rollout_worker import RolloutBuffer, _build_chunk
+    from colosseum.worker.rollout_loop import RolloutBuffer, _build_chunk
 
     buf = RolloutBuffer(
         chunk_length=2,
