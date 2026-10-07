@@ -1,0 +1,56 @@
+env:
+  env_class: "examples.composite_action.env.ChaseEnv"
+  num_players: 2
+  kwargs: {}
+
+networks:
+  encoder_class: "examples.composite_action.networks.ChaseEncoder"
+  policy_class: "examples.composite_action.networks.ChasePolicy"
+  value_class: "examples.composite_action.networks.ChaseValue"
+  kwargs: {}
+
+algorithm:
+  name: "appo"
+  gamma: 0.99
+  gae_lambda: 0.95
+  eps_clip: 0.2
+  value_loss_coeff: 0.5
+  entropy_coeff: 0.01
+  max_grad_norm: 0.5
+  num_epochs: 1
+  minibatch_chunks: 0
+  vtrace_rho_bar: 1.0
+  vtrace_c_bar: 1.0
+  learning_rate: 3.0e-4
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 20       # matches episode length
+  num_workers: 2
+  envs_per_worker: 4
+  weight_sync_interval_sec: 2.0
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  phase: "self_play"
+  total_timesteps: 5000
+
+self_play:
+  checkpoint_interval: 10    # train steps; ~31 train steps in this run
+  pool_size: 5
+  latest_prob: 0.5
+
+checkpoint:
+  dir: "./checkpoints"
+  save_optimizer: true
+
+metrics:
+  use_wandb: false
+  log_interval: 10
+
+transport:
+  mode: "local"

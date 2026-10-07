@@ -1,0 +1,18 @@
+FROM python:3.13-slim
+
+WORKDIR /app
+
+# Install system dependencies
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy source BEFORE installing: hatchling builds the wheel from src/colosseum,
+# so the package must be present at install time (installing first was a bug).
+COPY pyproject.toml .
+COPY src/ src/
+COPY examples/ examples/
+COPY configs/ configs/
+
+# Install with gRPC extras (needed by the distributed roles).
+RUN pip install --no-cache-dir ".[grpc]"

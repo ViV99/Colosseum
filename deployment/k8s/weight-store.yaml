@@ -1,0 +1,40 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: weight-store
+  namespace: colosseum
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: weight-store
+  template:
+    metadata:
+      labels:
+        app: weight-store
+    spec:
+      containers:
+        - name: weight-store
+          image: colosseum-base:latest
+          command: ["python", "-m", "colosseum", "serve-weight-store", "--port", "50051"]
+          ports:
+            - containerPort: 50051
+          resources:
+            requests:
+              memory: "512Mi"
+              cpu: "500m"
+            limits:
+              memory: "2Gi"
+              cpu: "2000m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: weight-store
+  namespace: colosseum
+spec:
+  selector:
+    app: weight-store
+  ports:
+    - port: 50051
+      targetPort: 50051

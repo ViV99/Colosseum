@@ -1,0 +1,239 @@
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from typing import Optional
+
+import torch
+import torch.nn.functional as F
+
+
+class Distribution(ABC):
+    """Base class for action distributions."""
+
+    @abstractmethod
+    def sample(self) -> torch.Tensor: ...
+
+    @abstractmethod
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor: ...
+
+    @abstractmethod
+    def entropy(self) -> torch.Tensor: ...
+
+    @abstractmethod
+    def mode(self) -> torch.Tensor:
+        """Deterministic action (argmax/mean)."""
+        ...
+
+    @property
+    def action_dim(self) -> int:
+        """Number of values produced by ``sample()`` per batch element.
+
+        Scalar distributions (e.g. Categorical) return 1.
+        Vector distributions (e.g. DiagGaussian) return the action dimension.
+        """
+        raise NotImplementedError
+
+    def kl_divergence(self, other: Distribution) -> torch.Tensor:
+        """Compute KL(self || other). Subclasses should override for efficiency."""
+        raise NotImplementedError(
+            f"kl_divergence not implemented for {type(self).__name__}"
+        )
+
+    def apply_mask(self, mask: torch.Tensor) -> Distribution:
+        """Return a new distribution with invalid actions masked out.
+
+        Default: no-op (returns self). Override for discrete distributions.
+        """
+        return self
+
+
+class CategoricalDist(Distribution):
+    """For discrete action spaces with optional action masking."""
+
+    def __init__(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None):
+        if mask is not None:
+            logits = logits.masked_fill(~mask.bool(), float("-inf"))
+        self._dist = torch.distributions.Categorical(logits=logits)
+
+    @property
+    def logits(self) -> torch.Tensor:
+        return self._dist.logits
+
+    @property
+    def action_dim(self) -> int:
+        return 1  # sample() returns [B] — one integer per element
+
+    def sample(self) -> torch.Tensor:
+        return self._dist.sample()
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        return self._dist.log_prob(actions)
+
+    def entropy(self) -> torch.Tensor:
+        return self._dist.entropy()
+
+    def mode(self) -> torch.Tensor:
+        return self._dist.logits.argmax(dim=-1)
+
+    def kl_divergence(self, other: Distribution) -> torch.Tensor:
+        if not isinstance(other, CategoricalDist):
+            raise TypeError(f"Cannot compute KL between CategoricalDist and {type(other).__name__}")
+        student_log_probs = F.log_softmax(self.logits, dim=-1)
+        teacher_log_probs = F.log_softmax(other.logits, dim=-1)
+        return (student_log_probs.exp() * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+
+    def apply_mask(self, mask: torch.Tensor) -> CategoricalDist:
+        """Return a new CategoricalDist with invalid actions masked out."""
+        return CategoricalDist(logits=self.logits, mask=mask)
+
+
+class DiagGaussianDist(Distribution):
+    """For continuous action spaces with diagonal covariance."""
+
+    def __init__(self, mean: torch.Tensor, log_std: torch.Tensor):
+        self._dist = torch.distributions.Normal(mean, log_std.exp())
+
+    @property
+    def action_dim(self) -> int:
+        return self._dist.mean.shape[-1]  # sample() returns [B, D]
+
+    def sample(self) -> torch.Tensor:
+        return self._dist.rsample()  # reparameterized
+
+    def log_prob(self, actions: torch.Tensor) -> torch.Tensor:
+        return self._dist.log_prob(actions).sum(dim=-1)  # sum across action dims
+
+    def entropy(self) -> torch.Tensor:
+        return self._dist.entropy().sum(dim=-1)
+
+    def mode(self) -> torch.Tensor:
+        return self._dist.mean
+
+    def kl_divergence(self, other: Distribution) -> torch.Tensor:
+        if not isinstance(other, DiagGaussianDist):
+            raise TypeError(f"Cannot compute KL between DiagGaussianDist and {type(other).__name__}")
+        return torch.distributions.kl_divergence(self._dist, other._dist).sum(dim=-1)
+
+
+class CompositeDist(Distribution):
+    """Multi-head distribution for composite action spaces (Dict / Tuple / MultiDiscrete).
+
+    Wraps a dict of sub-distributions.  All public methods operate on *flat*
+    ``float32`` tensors of shape ``[B, flat_size]``, where ``flat_size`` is the
+    sum of per-component action dimensions.
+
+    Keys are sorted alphabetically so that the flat layout matches
+    :class:`~colosseum.core.action_spec.ActionSpec`.
+    """
+
+    def __init__(self, dists: dict[str, Distribution]) -> None:
+        if not dists:
+            raise ValueError("CompositeDist requires at least one sub-distribution")
+
+        self._keys: list[str] = sorted(dists.keys())
+        self._dists: dict[str, Distribution] = {k: dists[k] for k in self._keys}
+
+        # Action layout: offset → (offset, size, is_discrete)
+        offset = 0
+        self._layout: dict[str, tuple[int, int, bool]] = {}
+        for k in self._keys:
+            d = self._dists[k]
+            sz = d.action_dim
+            self._layout[k] = (offset, sz, isinstance(d, CategoricalDist))
+            offset += sz
+        self._flat_size: int = offset
+
+        # Mask layout (only discrete components have masks)
+        mask_offset = 0
+        self._mask_layout: dict[str, tuple[int, int]] = {}
+        for k in self._keys:
+            d = self._dists[k]
+            if isinstance(d, CategoricalDist):
+                ms = d.logits.shape[-1]
+            else:
+                ms = 0
+            self._mask_layout[k] = (mask_offset, ms)
+            mask_offset += ms
+        self._flat_mask_size: int = mask_offset
+
+    # ---- Distribution interface ------------------------------------------
+
+    @property
+    def action_dim(self) -> int:
+        return self._flat_size
+
+    def sample(self) -> torch.Tensor:
+        """Sample from all sub-distributions and return ``[B, flat_size]``."""
+        parts: list[torch.Tensor] = []
+        for k in self._keys:
+            d = self._dists[k]
+            s = d.sample()
+            _, _, is_disc = self._layout[k]
+            if is_disc:
+                s = s.float().unsqueeze(-1)  # [B] → [B, 1]
+            elif s.dim() == 1:
+                s = s.unsqueeze(-1)
+            parts.append(s)
+        return torch.cat(parts, dim=-1)
+
+    def log_prob(self, flat_actions: torch.Tensor) -> torch.Tensor:
+        """Compute log-probability of a flat action tensor ``[B, flat_size]``."""
+        total: Optional[torch.Tensor] = None
+        for k in self._keys:
+            off, sz, is_disc = self._layout[k]
+            d = self._dists[k]
+            if is_disc:
+                sub = flat_actions[:, off].long()
+            else:
+                sub = flat_actions[:, off:off + sz]
+            lp = d.log_prob(sub)
+            total = lp if total is None else total + lp
+        return total
+
+    def entropy(self) -> torch.Tensor:
+        total: Optional[torch.Tensor] = None
+        for k in self._keys:
+            e = self._dists[k].entropy()
+            total = e if total is None else total + e
+        return total
+
+    def mode(self) -> torch.Tensor:
+        parts: list[torch.Tensor] = []
+        for k in self._keys:
+            d = self._dists[k]
+            m = d.mode()
+            _, _, is_disc = self._layout[k]
+            if is_disc:
+                m = m.float().unsqueeze(-1)
+            elif m.dim() == 1:
+                m = m.unsqueeze(-1)
+            parts.append(m)
+        return torch.cat(parts, dim=-1)
+
+    def apply_mask(self, flat_mask: torch.Tensor) -> CompositeDist:
+        """Apply a flat mask ``[B, flat_mask_size]`` to discrete sub-distributions."""
+        new_dists: dict[str, Distribution] = {}
+        for k in self._keys:
+            d = self._dists[k]
+            m_off, m_sz = self._mask_layout[k]
+            if m_sz > 0 and flat_mask is not None:
+                sub_mask = flat_mask[:, m_off:m_off + m_sz]
+                new_dists[k] = d.apply_mask(sub_mask)
+            else:
+                new_dists[k] = d
+        return CompositeDist(new_dists)
+
+    def kl_divergence(self, other: Distribution) -> torch.Tensor:
+        if not isinstance(other, CompositeDist):
+            raise TypeError(
+                f"Cannot compute KL between CompositeDist and {type(other).__name__}"
+            )
+        if self._keys != other._keys:
+            raise ValueError(
+                f"Key mismatch: {self._keys} vs {other._keys}"
+            )
+        total: Optional[torch.Tensor] = None
+        for k in self._keys:
+            kl = self._dists[k].kl_divergence(other._dists[k])
+            total = kl if total is None else total + kl
+        return total

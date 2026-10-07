@@ -1,0 +1,61 @@
+syntax = "proto3";
+
+package colosseum;
+
+// =====================================================================
+// Weight Store Service
+// =====================================================================
+
+service WeightStoreService {
+    // Push new weights for an agent
+    rpc PutWeights(WeightPayloadProto) returns (PutWeightsResponse);
+    // Get latest weights for an agent
+    rpc GetWeights(GetWeightsRequest) returns (WeightPayloadProto);
+    // Get the current policy version for an agent
+    rpc GetVersion(GetVersionRequest) returns (GetVersionResponse);
+}
+
+message WeightPayloadProto {
+    string agent_id = 1;
+    int32 policy_version = 2;
+    // Serialized state_dict: torch.save() bytes, optionally lz4 compressed
+    bytes state_dict_bytes = 3;
+    bool compressed = 4;
+}
+
+message PutWeightsResponse {
+    bool success = 1;
+}
+
+message GetWeightsRequest {
+    string agent_id = 1;
+}
+
+message GetVersionRequest {
+    string agent_id = 1;
+}
+
+message GetVersionResponse {
+    int32 policy_version = 1;
+}
+
+// =====================================================================
+// Trajectory Service (Workers → Learners)
+// =====================================================================
+
+service TrajectoryService {
+    // Workers stream trajectory chunks to the learner
+    rpc SendChunks(stream TrajectoryChunkProto) returns (SendChunksResponse);
+}
+
+message TrajectoryChunkProto {
+    string agent_id = 1;
+    int32 behavior_policy_version = 2;
+    // Serialized tensor data: all tensors packed via torch.save(), optionally lz4
+    bytes tensor_data = 3;
+    bool compressed = 4;
+}
+
+message SendChunksResponse {
+    int32 chunks_received = 1;
+}

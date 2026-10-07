@@ -1,0 +1,5 @@
+FROM colosseum-base:latest
+
+EXPOSE 50051
+ENTRYPOINT ["python", "-m", "colosseum", "serve-weight-store"]
+CMD ["--port", "50051"]

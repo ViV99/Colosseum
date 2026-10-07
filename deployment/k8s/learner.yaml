@@ -1,0 +1,70 @@
+# One learner per trainable agent: serves a TrajectoryService (workers send
+# chunks here), trains, and pushes weights to the weight-store. Persists
+# checkpoints to a PVC. For multiple agents, duplicate this manifest with a
+# distinct name / --agent / Service.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: checkpoints-pvc
+  namespace: colosseum
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: learner-agent-0
+  namespace: colosseum
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: learner-agent-0
+  template:
+    metadata:
+      labels:
+        app: learner-agent-0
+    spec:
+      containers:
+        - name: learner
+          image: colosseum-base:latest
+          command: [
+            "python", "-m", "colosseum", "run-learner",
+            "--config", "configs/examples/tic_tac_toe.yaml",
+            "--agent", "agent_0",
+            "--traj-port", "50052",
+            "--weight-store", "weight-store:50051",
+          ]
+          ports:
+            - containerPort: 50052
+          resources:
+            requests:
+              memory: "2Gi"
+              cpu: "2000m"
+            limits:
+              memory: "8Gi"
+              cpu: "4000m"
+              # nvidia.com/gpu: 1   # uncomment to request a GPU
+          volumeMounts:
+            - name: checkpoints
+              mountPath: /app/checkpoints
+      volumes:
+        - name: checkpoints
+          persistentVolumeClaim:
+            claimName: checkpoints-pvc
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: learner-agent-0
+  namespace: colosseum
+spec:
+  selector:
+    app: learner-agent-0
+  ports:
+    - port: 50052
+      targetPort: 50052

@@ -1,0 +1,68 @@
+env:
+  env_class: "examples.tic_tac_toe.env.TicTacToeEnv"
+  num_players: 2
+  kwargs: {}
+
+networks:
+  encoder_class: "examples.tic_tac_toe.networks.TicTacToeEncoder"
+  policy_class: "examples.tic_tac_toe.networks.TicTacToePolicy"
+  value_class: "examples.tic_tac_toe.networks.TicTacToeValue"
+  kwargs: {}
+
+algorithm:
+  name: "appo"
+  gamma: 0.99
+  gae_lambda: 0.95
+  eps_clip: 0.2
+  value_loss_coeff: 0.5
+  entropy_coeff: 0.01
+  max_grad_norm: 0.5
+  num_epochs: 1
+  minibatch_chunks: 0
+  vtrace_rho_bar: 1.0
+  vtrace_c_bar: 1.0
+  learning_rate: 3.0e-4
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 8
+  num_workers: 1
+  envs_per_worker: 4
+  weight_sync_interval_sec: 2.0
+
+learner:
+  device: "auto"
+  queue_size: 16
+  batch_chunks: 2
+
+training:
+  phase: "league"
+  total_timesteps: 3000
+
+self_play:
+  checkpoint_interval: 30    # train steps; small so the league pool fills during the short run
+  pool_size: 5
+  latest_prob: 0.5
+  self_play_ratio: 0.0   # all arena matches for testing
+
+checkpoint:
+  dir: "./checkpoints"
+  save_optimizer: false
+
+metrics:
+  use_wandb: false
+  log_interval: 5
+
+transport:
+  mode: "local"
+
+# Two trainable agents with same architecture
+agents:
+  agent_alpha:
+    networks: null
+    algorithm: null
+    learner: null
+  agent_beta:
+    networks: null
+    algorithm: null
+    learner: null

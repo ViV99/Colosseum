@@ -1,0 +1,4 @@
+FROM colosseum-base:latest
+
+ENTRYPOINT ["python", "-m", "colosseum", "train"]
+CMD ["--config", "configs/examples/tic_tac_toe.yaml"]

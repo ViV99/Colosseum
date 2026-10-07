@@ -1,0 +1,56 @@
+# Worker pool: each pod runs `run-workers`, spawning rollout workers that send
+# trajectory chunks to the learner Service and pull weights from the weight
+# store. Pods scale horizontally via the HPA — every replica feeds the same
+# learner, so adding pods adds real throughput (unlike the old setup where each
+# replica ran an isolated, self-contained training).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: worker
+  namespace: colosseum
+spec:
+  replicas: 4
+  selector:
+    matchLabels:
+      app: worker
+  template:
+    metadata:
+      labels:
+        app: worker
+    spec:
+      containers:
+        - name: worker
+          image: colosseum-base:latest
+          command: [
+            "python", "-m", "colosseum", "run-workers",
+            "--config", "configs/examples/tic_tac_toe.yaml",
+            "--weight-store", "weight-store:50051",
+            "--learner", "agent_0=learner-agent-0:50052",
+          ]
+          resources:
+            requests:
+              memory: "1Gi"
+              cpu: "2000m"
+            limits:
+              memory: "4Gi"
+              cpu: "4000m"
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: worker-hpa
+  namespace: colosseum
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: worker
+  minReplicas: 2
+  maxReplicas: 16
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

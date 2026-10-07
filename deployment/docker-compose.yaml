@@ -1,0 +1,64 @@
+version: "3.8"
+
+# Real distributed topology: a weight store, one learner per trainable agent,
+# and a pool of workers that feed the learner over gRPC.
+#
+#   workers --(trajectory chunks)--> learner --(weights)--> weight-store
+#      ^------------------(pull latest weights)-------------------|
+
+services:
+  weight-store:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.base
+    command: ["python", "-m", "colosseum", "serve-weight-store", "--port", "50051"]
+    ports:
+      - "50051:50051"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import grpc; grpc.channel_ready_future(grpc.insecure_channel('localhost:50051')).result(timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  learner:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.base
+    command: [
+      "python", "-m", "colosseum", "run-learner",
+      "--config", "configs/examples/tic_tac_toe.yaml",
+      "--agent", "agent_0",
+      "--traj-port", "50052",
+      "--weight-store", "weight-store:50051",
+    ]
+    depends_on:
+      weight-store:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import grpc; grpc.channel_ready_future(grpc.insecure_channel('localhost:50052')).result(timeout=2)"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    volumes:
+      - checkpoints:/app/checkpoints
+
+  workers:
+    build:
+      context: ..
+      dockerfile: deployment/Dockerfile.base
+    command: [
+      "python", "-m", "colosseum", "run-workers",
+      "--config", "configs/examples/tic_tac_toe.yaml",
+      "--weight-store", "weight-store:50051",
+      "--learner", "agent_0=learner:50052",
+    ]
+    depends_on:
+      weight-store:
+        condition: service_healthy
+      learner:
+        condition: service_healthy
+    deploy:
+      replicas: 2   # scale worker pods horizontally
+
+volumes:
+  checkpoints:
