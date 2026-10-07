@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import multiprocessing as mp
 from queue import Empty
-from typing import Optional
 
 from colosseum.core.types import TrajectoryChunk
 from colosseum.transport.base import BaseTransport
@@ -32,7 +31,7 @@ class LocalTransport(BaseTransport):
             raise KeyError(f"No channel for agent '{agent_id}'. Call create_channel() first.")
         self._queues[agent_id].put(chunk)
 
-    def recv_chunk(self, agent_id: str, timeout: Optional[float] = None) -> Optional[TrajectoryChunk]:
+    def recv_chunk(self, agent_id: str, timeout: float | None = None) -> TrajectoryChunk | None:
         """Receive chunk from the agent's queue."""
         if agent_id not in self._queues:
             raise KeyError(f"No channel for agent '{agent_id}'. Call create_channel() first.")

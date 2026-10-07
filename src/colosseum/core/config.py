@@ -10,11 +10,10 @@ from __future__ import annotations
 
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal, Optional
+from typing import Any, Literal
 
 import yaml
 from pydantic import BaseModel, Field
-
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -109,7 +108,7 @@ class NetworkConfig(BaseModel):
         default_factory=dict,
         description="Extra kwargs forwarded to network constructors.",
     )
-    recurrent_type: Optional[str] = Field(
+    recurrent_type: str | None = Field(
         default=None,
         description="Recurrent trunk type: 'lstm', 'gru', or None (feedforward).",
     )
@@ -134,7 +133,7 @@ class RolloutConfig(BaseModel):
                     "the worker process) or 'subprocess' (envs stepped in parallel child "
                     "processes — better for CPU-heavy envs).",
     )
-    subproc_workers: Optional[int] = Field(
+    subproc_workers: int | None = Field(
         default=None,
         description="Number of child processes for the 'subprocess' vec_env (defaults to "
                     "min(envs_per_worker, cpu_count)). Ignored for 'sync'.",
@@ -173,14 +172,14 @@ class TrainingConfig(BaseModel):
 
     phase: TrainingPhase = Field(default=TrainingPhase.SELF_PLAY, description="Current training phase.")
     total_timesteps: int = Field(default=10_000_000, ge=1, description="Total env timesteps before training ends.")
-    seed: Optional[int] = Field(default=None, description="Global random seed for reproducibility.")
-    resume_from: Optional[str] = Field(
+    seed: int | None = Field(default=None, description="Global random seed for reproducibility.")
+    resume_from: str | None = Field(
         default=None,
         description="Resume each trainable agent's network (and optimizer, if available) from "
                     "this checkpoint before training. Either a path to a .pt state_dict (e.g. a "
                     "BC output) or a checkpoint id in the checkpoint dir (e.g. 'ckpt_v100').",
     )
-    kickstart_teacher: Optional[str] = Field(
+    kickstart_teacher: str | None = Field(
         default=None,
         description="Path to a frozen teacher .pt state_dict (e.g. a BC model). When set, a "
                     "decaying KL(student || teacher) term is added to the RL loss (online BC / "
@@ -238,7 +237,7 @@ class MetricsConfig(BaseModel):
 
     use_wandb: bool = Field(default=False, description="Enable Weights & Biases logging.")
     wandb_project: str = Field(default="colosseum", description="WandB project name.")
-    wandb_entity: Optional[str] = Field(default=None, description="WandB entity (team or user).")
+    wandb_entity: str | None = Field(default=None, description="WandB entity (team or user).")
     log_interval: int = Field(default=10, ge=1, description="Log metrics every N training steps.")
 
 
@@ -262,9 +261,9 @@ class TransportConfig(BaseModel):
 class AgentConfig(BaseModel):
     """Per-agent overrides. Fields that are None inherit from global config."""
 
-    networks: Optional[NetworkConfig] = None
-    algorithm: Optional[AlgorithmConfig] = None
-    learner: Optional[LearnerConfig] = None
+    networks: NetworkConfig | None = None
+    algorithm: AlgorithmConfig | None = None
+    learner: LearnerConfig | None = None
 
 
 # ---------------------------------------------------------------------------

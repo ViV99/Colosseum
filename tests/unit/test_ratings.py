@@ -1,17 +1,12 @@
 """Tests for rating systems and PFSP matchmaker."""
-from helpers import example_config
-import os
-import sys
 import tempfile
-
-
-import torch
 
 from colosseum.coordinator.agent_pool import AgentPool
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.coordinator.matchmaker import PFSPMatchmaker
 from colosseum.coordinator.ratings import EloRating, WinRateTracker
 from colosseum.core.types import MatchResult
+from helpers import example_config
 
 
 def test_elo_win():

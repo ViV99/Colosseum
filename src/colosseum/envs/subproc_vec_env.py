@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import os
-from typing import Any, Callable, Optional
-
 import multiprocessing as mp
+import os
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
 from colosseum.envs.base_env import BaseEnv
 from colosseum.envs.vec_env import VectorEnv
-
 
 # ----------------------------------------------------------------------
 # Worker-side commands (sent parent -> subprocess over the Pipe).
@@ -136,7 +135,7 @@ class SubprocessVectorEnv:
         self,
         env_fn: Callable[[], BaseEnv],
         num_envs: int,
-        num_workers: Optional[int] = None,
+        num_workers: int | None = None,
     ) -> None:
         if num_envs < 1:
             raise ValueError(f"num_envs must be >= 1, got {num_envs}")
@@ -193,7 +192,7 @@ class SubprocessVectorEnv:
     # ------------------------------------------------------------------
 
     def reset_all(
-        self, seed: Optional[int] = None
+        self, seed: int | None = None
     ) -> tuple[np.ndarray, list[dict[int, dict]]]:
         """Reset all envs.
 

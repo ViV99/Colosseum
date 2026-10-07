@@ -1,9 +1,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from typing import TYPE_CHECKING
 
 import torch
 import torch.nn as nn
+
+if TYPE_CHECKING:
+    from colosseum.networks.distributions import Distribution
 
 
 class BaseEncoder(nn.Module, ABC):
@@ -25,7 +29,7 @@ class BasePolicy(nn.Module, ABC):
     """Maps latent vector to action distribution."""
 
     @abstractmethod
-    def forward(self, latent: torch.Tensor) -> "Distribution":
+    def forward(self, latent: torch.Tensor) -> Distribution:
         """latent: [B, latent_dim] -> distribution over actions.
 
         Must return an object with sample(), log_prob(actions), entropy() methods.

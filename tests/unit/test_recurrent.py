@@ -1,18 +1,15 @@
 """Tests for RNN/LSTM support (T1.2)."""
 
-import os
-import sys
 
 
 import numpy as np
 import torch
 import torch.nn as nn
 
-from colosseum.networks.actor_critic import ActorCriticNetwork
-from colosseum.core.types import TrajectoryChunk
 from colosseum.algorithms.appo import APPO
 from colosseum.core.config import AlgorithmConfig
-
+from colosseum.core.types import TrajectoryChunk
+from colosseum.networks.actor_critic import ActorCriticNetwork
 from helpers import SimpleEncoder, SimplePolicy, SimpleValue
 
 OBS_DIM = 8
@@ -225,7 +222,7 @@ def test_feedforward_evaluate_actions_unchanged():
 def _make_recurrent_chunks(net, num_chunks=4, chunk_len=8):
     """Generate trajectory chunks with LSTM hidden states."""
     chunks = []
-    for i in range(num_chunks):
+    for _ in range(num_chunks):
         h, c = net.initial_hidden(1)
         # Squeeze to [num_layers, hidden_size] for per-chunk storage
         h_init = h.squeeze(1)
@@ -279,7 +276,7 @@ def test_appo_recurrent_multiple_steps():
         losses.append(metrics["total_loss"])
 
     # Losses should all be finite
-    assert all(np.isfinite(l) for l in losses)
+    assert all(np.isfinite(loss) for loss in losses)
 
 
 def test_appo_feedforward_backward_compat():
@@ -363,7 +360,7 @@ def test_trajectory_chunk_no_lstm_hidden():
 
 def test_build_network_with_lstm():
     """build_network should create LSTM trunk when recurrent_type='lstm'."""
-    from colosseum.core.config import ColosseumConfig, NetworkConfig, EnvConfig
+    from colosseum.core.config import ColosseumConfig, EnvConfig, NetworkConfig
     from colosseum.core.registry import build_network
 
     net_cfg = NetworkConfig(
@@ -386,7 +383,7 @@ def test_build_network_with_lstm():
 
 def test_build_network_with_gru():
     """build_network should create GRU trunk when recurrent_type='gru'."""
-    from colosseum.core.config import ColosseumConfig, NetworkConfig, EnvConfig
+    from colosseum.core.config import ColosseumConfig, EnvConfig, NetworkConfig
     from colosseum.core.registry import build_network
 
     net_cfg = NetworkConfig(
@@ -407,7 +404,7 @@ def test_build_network_with_gru():
 
 def test_build_network_feedforward_default():
     """build_network with no recurrent_type should create feedforward net."""
-    from colosseum.core.config import ColosseumConfig, NetworkConfig, EnvConfig
+    from colosseum.core.config import ColosseumConfig, EnvConfig, NetworkConfig
     from colosseum.core.registry import build_network
 
     net_cfg = NetworkConfig(

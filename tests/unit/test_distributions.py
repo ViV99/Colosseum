@@ -1,7 +1,5 @@
 """Tests for DiagGaussianDist (continuous action distributions)."""
 
-import os
-import sys
 
 
 import pytest

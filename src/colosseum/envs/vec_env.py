@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
@@ -69,7 +70,7 @@ class VectorEnv:
     # ------------------------------------------------------------------
 
     def reset_all(
-        self, seed: Optional[int] = None
+        self, seed: int | None = None
     ) -> tuple[np.ndarray, list[dict[int, dict]]]:
         """Reset all envs.
 

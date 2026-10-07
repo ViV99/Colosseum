@@ -31,7 +31,6 @@ import signal
 import threading
 import time
 from functools import partial
-from typing import Optional
 
 import torch
 
@@ -66,7 +65,7 @@ class GRPCTrajectorySink:
         except grpc.RpcError as e:
             logger.debug(f"Dropping chunk for {self._agent_id}: {e.code()}")
 
-    def put(self, chunk, timeout: Optional[float] = None) -> None:  # noqa: ARG002
+    def put(self, chunk, timeout: float | None = None) -> None:  # noqa: ARG002
         self._send(chunk)
 
     def put_nowait(self, chunk) -> None:
@@ -121,7 +120,7 @@ def run_distributed_learner(
     agent_id: str,
     traj_port: int,
     weight_store_address: str,
-    overrides: Optional[dict] = None,
+    overrides: dict | None = None,
 ) -> None:
     """Run one trainable agent's learner as a standalone gRPC service.
 
@@ -308,7 +307,7 @@ def run_distributed_workers(
     config_path: str,
     weight_store_address: str,
     learner_addresses: dict[str, str],
-    overrides: Optional[dict] = None,
+    overrides: dict | None = None,
 ) -> None:
     """Launch rollout workers that feed remote learners over gRPC.
 
@@ -379,7 +378,7 @@ def run_distributed_workers(
 # =====================================================================
 
 
-def _load(config_path: str, overrides: Optional[dict]) -> ColosseumConfig:
+def _load(config_path: str, overrides: dict | None) -> ColosseumConfig:
     config = load_config(config_path)
     if overrides:
         data = config.model_dump()

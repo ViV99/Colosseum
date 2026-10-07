@@ -11,8 +11,6 @@ to OpenAI Five's approach.
 
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn.functional as F
 
@@ -32,7 +30,7 @@ class APPO(BaseAlgorithm):
         network: ActorCriticNetwork,
         config: AlgorithmConfig,
         device: str | torch.device = "cpu",
-        kickstart: Optional[KickstartLoss] = None,
+        kickstart: KickstartLoss | None = None,
         pin_memory: bool = False,
     ):
         self._network = network.to(device)

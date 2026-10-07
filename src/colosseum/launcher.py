@@ -18,7 +18,6 @@ import logging
 import multiprocessing as mp
 import queue
 import time
-from typing import Optional
 
 import torch
 
@@ -64,12 +63,12 @@ def _worker_target(
     weight_queues: dict[str, mp.Queue],
     stop_event: mp.Event,
     total_timesteps: int,
-    checkpoint_state_dicts_by_agent: Optional[dict[str, dict[str, dict]]] = None,
-    slot_network_map: Optional[list[list[str]]] = None,
-    collect_mask: Optional[list[list[bool]]] = None,
-    slot_agent_map: Optional[list[list[str]]] = None,
-    results_queue: Optional[mp.Queue] = None,
-    command_queue: Optional[mp.Queue] = None,
+    checkpoint_state_dicts_by_agent: dict[str, dict[str, dict]] | None = None,
+    slot_network_map: list[list[str]] | None = None,
+    collect_mask: list[list[bool]] | None = None,
+    slot_agent_map: list[list[str]] | None = None,
+    results_queue: mp.Queue | None = None,
+    command_queue: mp.Queue | None = None,
 ) -> None:
     """Worker process entry point.
 
@@ -132,9 +131,9 @@ def _learner_target(
     stop_event: mp.Event,
     metrics_queue: mp.Queue,
     total_train_steps: int,
-    checkpoint_queue: Optional[mp.Queue] = None,
+    checkpoint_queue: mp.Queue | None = None,
     checkpoint_interval: int = 0,
-    resume_state: Optional[dict] = None,
+    resume_state: dict | None = None,
 ) -> None:
     """Learner process entry point."""
     import sys
@@ -268,7 +267,7 @@ def _resolve_resume_state(
     config: ColosseumConfig,
     agent_id: str,
     coordinator: Coordinator,
-) -> Optional[dict]:
+) -> dict | None:
     """Build a learner resume_state from ``training.resume_from``.
 
     Accepts either a path to a .pt state_dict (e.g. a BC output) or a checkpoint
@@ -498,8 +497,8 @@ class Launcher:
         log_interval: int,
         coordinator: Coordinator,
         agent_ids: list[str],
-        command_queues: Optional[list[mp.Queue]] = None,
-        worker_broadcast_ckpts: Optional[list[dict[str, set]]] = None,
+        command_queues: list[mp.Queue] | None = None,
+        worker_broadcast_ckpts: list[dict[str, set]] | None = None,
     ) -> None:
         """Main process monitors metrics, saves checkpoints, checks for completion.
 

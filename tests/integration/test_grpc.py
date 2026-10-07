@@ -1,10 +1,7 @@
 """Tests for gRPC transport layer: serialization, weight store, trajectory transport."""
-import os
 import queue
 import socket
-import sys
 import time
-
 
 import torch
 

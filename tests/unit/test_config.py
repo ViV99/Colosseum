@@ -1,9 +1,5 @@
 """Tests for config validation (Pydantic models)."""
 
-from helpers import example_config
-import os
-import sys
-
 
 import pytest
 from pydantic import ValidationError
@@ -18,6 +14,7 @@ from colosseum.core.config import (
     TrainingConfig,
     load_config,
 )
+from helpers import example_config
 
 
 def test_invalid_gamma_too_high():

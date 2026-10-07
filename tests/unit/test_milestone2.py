@@ -5,17 +5,12 @@ Tests:
 2. SelfPlayMatchmaker generates correct match configs
 3. Full pipeline with checkpoint saving
 """
-from helpers import example_config
-import multiprocessing as mp
 import os
-import shutil
-import sys
 import tempfile
-import logging
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
 import torch
+
+from helpers import example_config
 
 
 def test_checkpoint_manager():
@@ -60,8 +55,8 @@ def test_checkpoint_manager():
 
 def test_matchmaker():
     """Test SimpleSelfPlayMatchmaker and SelfPlayMatchmaker."""
-    from colosseum.coordinator.matchmaker import SimpleSelfPlayMatchmaker, SelfPlayMatchmaker
     from colosseum.coordinator.checkpoint_manager import CheckpointManager
+    from colosseum.coordinator.matchmaker import SelfPlayMatchmaker, SimpleSelfPlayMatchmaker
 
     # SimpleSelfPlayMatchmaker: all slots collect, no checkpoints
     simple = SimpleSelfPlayMatchmaker()

@@ -1,10 +1,6 @@
 """Unit tests for APPO algorithm."""
-import sys
-import os
 
-import pytest
 import torch
-
 
 from colosseum.algorithms.appo import APPO
 from colosseum.core.config import AlgorithmConfig
@@ -85,7 +81,7 @@ def test_multiple_train_steps():
 
     assert algo.policy_version == 5
     # Loss should change across steps (not be identical)
-    assert not all(l == losses[0] for l in losses)
+    assert not all(loss == losses[0] for loss in losses)
 
 
 # ---------------------------------------------------------------

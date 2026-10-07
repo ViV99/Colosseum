@@ -1,16 +1,12 @@
 """Tests for action masking support (T1.1)."""
 
-import os
-import sys
 
 
-import torch
 import numpy as np
+import torch
 
-from colosseum.networks.distributions import CategoricalDist, DiagGaussianDist
-from colosseum.networks.actor_critic import ActorCriticNetwork
 from colosseum.core.types import TrajectoryChunk
-
+from colosseum.networks.distributions import CategoricalDist, DiagGaussianDist
 
 # ---------------------------------------------------------------
 # Distribution-level tests

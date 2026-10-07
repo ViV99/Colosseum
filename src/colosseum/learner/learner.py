@@ -13,14 +13,13 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
-import time
+from collections.abc import Callable
 from queue import Empty, Full
-from typing import Callable, Optional
 
 import torch
 
 from colosseum.algorithms.base import BaseAlgorithm
-from colosseum.core.config import AlgorithmConfig, LearnerConfig
+from colosseum.core.config import LearnerConfig
 from colosseum.core.types import TrajectoryChunk, WeightPayload
 
 logger = logging.getLogger(__name__)
@@ -33,11 +32,11 @@ def learner_process(
     weight_queues: list[mp.Queue],
     config: LearnerConfig,
     stop_event: mp.Event,
-    metrics_queue: Optional[mp.Queue] = None,
+    metrics_queue: mp.Queue | None = None,
     total_train_steps: int = 0,
-    checkpoint_queue: Optional[mp.Queue] = None,
+    checkpoint_queue: mp.Queue | None = None,
     checkpoint_interval: int = 0,
-    resume_state: Optional[dict] = None,
+    resume_state: dict | None = None,
 ) -> None:
     """Main learner process function.
 
@@ -58,7 +57,6 @@ def learner_process(
     logger.info(f"Learner [{agent_id}]: starting on device={config.device}")
 
     # Create algorithm and network
-    device = _resolve_device(config.device)
     algorithm = algorithm_factory()
 
     # Resume from checkpoint if provided

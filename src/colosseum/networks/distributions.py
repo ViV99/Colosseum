@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
 
 import torch
 import torch.nn.functional as F
@@ -50,7 +49,7 @@ class Distribution(ABC):
 class CategoricalDist(Distribution):
     """For discrete action spaces with optional action masking."""
 
-    def __init__(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def __init__(self, logits: torch.Tensor, mask: torch.Tensor | None = None):
         if mask is not None:
             logits = logits.masked_fill(~mask.bool(), float("-inf"))
         self._dist = torch.distributions.Categorical(logits=logits)
@@ -178,7 +177,7 @@ class CompositeDist(Distribution):
 
     def log_prob(self, flat_actions: torch.Tensor) -> torch.Tensor:
         """Compute log-probability of a flat action tensor ``[B, flat_size]``."""
-        total: Optional[torch.Tensor] = None
+        total: torch.Tensor | None = None
         for k in self._keys:
             off, sz, is_disc = self._layout[k]
             d = self._dists[k]
@@ -191,7 +190,7 @@ class CompositeDist(Distribution):
         return total
 
     def entropy(self) -> torch.Tensor:
-        total: Optional[torch.Tensor] = None
+        total: torch.Tensor | None = None
         for k in self._keys:
             e = self._dists[k].entropy()
             total = e if total is None else total + e
@@ -232,7 +231,7 @@ class CompositeDist(Distribution):
             raise ValueError(
                 f"Key mismatch: {self._keys} vs {other._keys}"
             )
-        total: Optional[torch.Tensor] = None
+        total: torch.Tensor | None = None
         for k in self._keys:
             kl = self._dists[k].kl_divergence(other._dists[k])
             total = kl if total is None else total + kl

@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-from typing import Optional
-
 import torch
 import torch.nn as nn
 
@@ -22,7 +20,7 @@ class ActorCriticNetwork(nn.Module):
         encoder: BaseEncoder,
         policy: BasePolicy,
         value: BaseValue,
-        recurrent: Optional[nn.Module] = None,
+        recurrent: nn.Module | None = None,
     ):
         super().__init__()
         self.encoder = encoder
@@ -62,7 +60,7 @@ class ActorCriticNetwork(nn.Module):
     def forward(
         self,
         obs: torch.Tensor,
-        hidden: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        hidden: tuple[torch.Tensor, torch.Tensor] | None = None,
     ) -> tuple:
         """Forward pass.
 
@@ -97,10 +95,10 @@ class ActorCriticNetwork(nn.Module):
     def act(
         self,
         obs: torch.Tensor,
-        action_mask: Optional[torch.Tensor] = None,
-        hidden: Optional[tuple[torch.Tensor, torch.Tensor]] = None,
+        action_mask: torch.Tensor | None = None,
+        hidden: tuple[torch.Tensor, torch.Tensor] | None = None,
         deterministic: bool = False,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, Optional[tuple]]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, tuple | None]:
         """Inference: sample (or, if ``deterministic``, take the mode) an action.
 
         Args:
@@ -125,7 +123,7 @@ class ActorCriticNetwork(nn.Module):
         self,
         obs: torch.Tensor,
         actions: torch.Tensor,
-        action_mask: Optional[torch.Tensor] = None,
+        action_mask: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Training: compute log_prob, value, entropy for given (obs, action) pairs.
 
@@ -146,8 +144,8 @@ class ActorCriticNetwork(nn.Module):
         obs_seq: torch.Tensor,
         actions_seq: torch.Tensor,
         hidden_init: tuple[torch.Tensor, torch.Tensor],
-        action_mask_seq: Optional[torch.Tensor] = None,
-        dones_seq: Optional[torch.Tensor] = None,
+        action_mask_seq: torch.Tensor | None = None,
+        dones_seq: torch.Tensor | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """Training: process a sequence through encoder + RNN + heads.
 

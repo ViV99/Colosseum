@@ -1,15 +1,12 @@
 """Tests for SubprocessVectorEnv: parity with in-process VectorEnv, clean close."""
 
-import multiprocessing as mp
 import os
-import sys
 import time
-
 
 import numpy as np
 
-from colosseum.envs.vec_env import VectorEnv
 from colosseum.envs.subproc_vec_env import SubprocessVectorEnv
+from colosseum.envs.vec_env import VectorEnv
 
 
 # Top-level (picklable) env factory — required for the spawn start method.

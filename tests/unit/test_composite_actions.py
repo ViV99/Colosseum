@@ -1,7 +1,5 @@
 """Tests for composite action space support (Dict, Tuple, MultiDiscrete)."""
 
-import os
-import sys
 
 
 import gymnasium
@@ -15,7 +13,6 @@ from colosseum.networks.distributions import (
     CompositeDist,
     DiagGaussianDist,
 )
-
 
 # ===================================================================
 # ActionSpec unit tests
@@ -96,7 +93,7 @@ def test_action_spec_nested_raises():
     })
     try:
         ActionSpec.from_space(space)
-        assert False, "Should have raised ValueError"
+        raise AssertionError("Should have raised ValueError")
     except ValueError as e:
         assert "Nested" in str(e)
 
@@ -104,7 +101,7 @@ def test_action_spec_nested_raises():
 def test_action_spec_large_discrete_raises():
     try:
         ActionSpec.from_space(gymnasium.spaces.Discrete(2**24 + 1))
-        assert False, "Should have raised ValueError"
+        raise AssertionError("Should have raised ValueError")
     except ValueError as e:
         assert "float32" in str(e)
 
@@ -321,7 +318,7 @@ def test_composite_dist_kl_key_mismatch_raises():
     cd2 = CompositeDist({"b": CategoricalDist(torch.randn(B, 3))})
     try:
         cd1.kl_divergence(cd2)
-        assert False, "Should have raised ValueError"
+        raise AssertionError("Should have raised ValueError")
     except ValueError:
         pass
 

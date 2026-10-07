@@ -12,7 +12,6 @@ from __future__ import annotations
 
 import logging
 from collections import deque
-from typing import Optional
 
 from colosseum.coordinator.agent_pool import AgentPool
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
@@ -40,7 +39,7 @@ class Coordinator:
             pool_size=config.self_play.pool_size,
             save_optimizer=config.checkpoint.save_optimizer,
         )
-        self._matchmaker: Optional[BaseMatchmaker] = None
+        self._matchmaker: BaseMatchmaker | None = None
         self._match_results: deque[MatchResult] = deque(maxlen=10000)
         self._elo = EloRating()
         self._win_rates = WinRateTracker()
@@ -107,9 +106,9 @@ class Coordinator:
         agent_id: str,
         policy_version: int,
         state_dict: dict,
-        optimizer_state: Optional[dict] = None,
-        metrics: Optional[dict] = None,
-    ) -> Optional[str]:
+        optimizer_state: dict | None = None,
+        metrics: dict | None = None,
+    ) -> str | None:
         """Save checkpoint if policy_version is at a checkpoint interval."""
         interval = self._config.self_play.checkpoint_interval
         if interval > 0 and policy_version > 0 and policy_version % interval == 0:

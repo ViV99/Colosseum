@@ -45,7 +45,9 @@ def train(config: str, overrides: tuple[str, ...]) -> None:
 
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
-@click.option("--data", "-d", required=True, type=click.Path(exists=True), help="Path to BC data (.pt file or directory)")
+@click.option(
+    "--data", "-d", required=True, type=click.Path(exists=True), help="Path to BC data (.pt file or directory)",
+)
 @click.option("--output", "-o", required=True, type=click.Path(), help="Path to save trained model weights (.pt)")
 @click.option("--epochs", default=10, type=int, help="Number of BC training epochs")
 @click.option("--batch-size", default=256, type=int, help="BC training batch size")
@@ -62,7 +64,9 @@ def bc(
 ) -> None:
     """Train a policy via offline Behavioral Cloning."""
     import logging
+
     import torch
+
     from colosseum.bc.offline_bc import OfflineBCTrainer
     from colosseum.core.config import load_config
     from colosseum.core.registry import build_network
@@ -101,11 +105,15 @@ def bc(
 @click.option("--agents", "-a", required=True, multiple=True, help="Agent checkpoint paths (name:path.pt)")
 @click.option("--num-matches", "-n", default=100, type=int, help="Matches per agent pair")
 @click.option("--num-envs", default=8, type=int, help="Parallel environments for eval")
-@click.option("--deterministic", is_flag=True, default=False, help="Act greedily (distribution mode) instead of sampling")
+@click.option(
+    "--deterministic", is_flag=True, default=False, help="Act greedily (distribution mode) instead of sampling",
+)
 def eval_cmd(config: str, agents: tuple[str, ...], num_matches: int, num_envs: int, deterministic: bool) -> None:
     """Evaluate agents/checkpoints against each other (no training)."""
     import logging
+
     import torch
+
     from colosseum.core.config import load_config
     from colosseum.core.registry import build_network, import_class
     from colosseum.eval import evaluate_agents
@@ -201,6 +209,7 @@ def run_workers_cmd(config: str, weight_store: str, learners: tuple[str, ...], o
 def serve_weight_store_cmd(port: int, max_message_mb: int) -> None:
     """Start a gRPC weight store server."""
     import logging
+
     from colosseum.weight_store.grpc_store import serve_weight_store
 
     logging.basicConfig(
@@ -222,6 +231,7 @@ def serve_trajectory_cmd(port: int, max_message_mb: int) -> None:
     """Start a gRPC trajectory receiver server (for learner)."""
     import logging
     import queue
+
     from colosseum.transport.grpc_transport import serve_trajectory_receiver
 
     logging.basicConfig(

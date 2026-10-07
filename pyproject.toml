@@ -45,6 +45,23 @@ packages = ["src/colosseum"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+extend-exclude = [
+    "src/colosseum/transport/colosseum_pb2.py",
+    "src/colosseum/transport/colosseum_pb2_grpc.py",
+    "review",
+    "research",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = [
+    "B027",   # empty non-abstract methods in ABCs are intentional optional hooks
+    "B905",   # zip() without strict= : lengths are checked explicitly where it matters
+    "UP042",  # keep `class X(str, Enum)`; StrEnum changes str() formatting
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["colosseum", "examples", "harness", "helpers"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -1,5 +1,4 @@
 """Unit tests for V-trace computation."""
-import pytest
 import torch
 
 from colosseum.algorithms.vtrace import compute_vtrace

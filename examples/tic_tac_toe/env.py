@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import gymnasium
 import numpy as np
@@ -48,7 +48,7 @@ class TicTacToeEnv(BaseEnv):
         self._done = False
         self._step_count = 0
 
-    def reset(self, seed: Optional[int] = None) -> tuple[dict[int, np.ndarray], dict[int, dict]]:
+    def reset(self, seed: int | None = None) -> tuple[dict[int, np.ndarray], dict[int, dict]]:
         if seed is not None:
             np.random.seed(seed)
         self._board = np.zeros(9, dtype=np.int8)

@@ -11,9 +11,8 @@ import logging
 import random
 import uuid
 from abc import ABC, abstractmethod
-from typing import Optional
 
-from colosseum.coordinator.agent_pool import AgentHandle, AgentPool, AgentType
+from colosseum.coordinator.agent_pool import AgentHandle, AgentPool
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.coordinator.ratings import WinRateTracker
 from colosseum.core.types import MatchConfig, PlayerSlot

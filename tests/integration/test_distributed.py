@@ -1,10 +1,7 @@
 """Tests for the distributed (gRPC) adapters and orchestration (C2)."""
-import os
 import queue
 import socket
-import sys
 import time
-
 
 import torch
 
@@ -41,7 +38,7 @@ def test_grpc_weight_sink_and_source():
         # Nothing published yet → Empty.
         try:
             source.get_nowait()
-            assert False, "expected queue.Empty before any weights"
+            raise AssertionError("expected queue.Empty before any weights")
         except queue.Empty:
             pass
 
@@ -55,7 +52,7 @@ def test_grpc_weight_sink_and_source():
         # No new version → Empty (don't re-pull the same weights).
         try:
             source.get_nowait()
-            assert False, "expected Empty when version unchanged"
+            raise AssertionError("expected Empty when version unchanged")
         except queue.Empty:
             pass
 

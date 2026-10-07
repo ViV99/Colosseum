@@ -10,7 +10,6 @@ from __future__ import annotations
 import logging
 import queue
 from concurrent import futures
-from typing import Optional
 
 import grpc
 
@@ -126,7 +125,7 @@ class GRPCTransport(BaseTransport):
         response = self._stub.SendChunks(chunk_generator())
         return response.chunks_received
 
-    def recv_chunk(self, agent_id: str, timeout: Optional[float] = None) -> Optional[TrajectoryChunk]:
+    def recv_chunk(self, agent_id: str, timeout: float | None = None) -> TrajectoryChunk | None:
         """Not used on the client side — chunks are received by the server."""
         raise NotImplementedError("GRPCTransport.recv_chunk: use TrajectoryServicer on the server side")
 

@@ -4,13 +4,11 @@ from __future__ import annotations
 
 import json
 import logging
-import os
 import random
 import shutil
 import time
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import torch
 
@@ -80,8 +78,8 @@ class CheckpointManager:
         agent_id: str,
         policy_version: int,
         state_dict: dict,
-        optimizer_state: Optional[dict] = None,
-        metrics: Optional[dict] = None,
+        optimizer_state: dict | None = None,
+        metrics: dict | None = None,
     ) -> str:
         """Save a checkpoint. Returns checkpoint_id. Evicts oldest if pool full."""
         checkpoint_id = f"ckpt_v{policy_version}"
@@ -135,7 +133,7 @@ class CheckpointManager:
             raise FileNotFoundError(f"Checkpoint not found: {model_path}")
         return torch.load(model_path, weights_only=True)
 
-    def load_optimizer(self, agent_id: str, checkpoint_id: str) -> Optional[dict]:
+    def load_optimizer(self, agent_id: str, checkpoint_id: str) -> dict | None:
         """Load optimizer state from a checkpoint, if it exists."""
         opt_path = self._base_dir / agent_id / checkpoint_id / "optimizer.pt"
         if opt_path.exists():
@@ -146,12 +144,12 @@ class CheckpointManager:
         """List all checkpoints for an agent, ordered by policy_version."""
         return list(self._index.get(agent_id, []))
 
-    def get_latest(self, agent_id: str) -> Optional[CheckpointInfo]:
+    def get_latest(self, agent_id: str) -> CheckpointInfo | None:
         """Get the most recent checkpoint for an agent."""
         ckpts = self._index.get(agent_id, [])
         return ckpts[-1] if ckpts else None
 
-    def get_random(self, agent_id: str) -> Optional[CheckpointInfo]:
+    def get_random(self, agent_id: str) -> CheckpointInfo | None:
         """Get a random checkpoint from the pool."""
         ckpts = self._index.get(agent_id, [])
         return random.choice(ckpts) if ckpts else None

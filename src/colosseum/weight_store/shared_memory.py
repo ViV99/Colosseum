@@ -14,10 +14,8 @@ managed by the launcher.
 
 from __future__ import annotations
 
-import copy
 import io
 import threading
-from typing import Optional
 
 import torch
 
@@ -47,7 +45,7 @@ class InMemoryWeightStore(BaseWeightStore):
             self._weights[agent_id] = serialized
             self._versions[agent_id] = payload.policy_version
 
-    def get(self, agent_id: str) -> Optional[WeightPayload]:
+    def get(self, agent_id: str) -> WeightPayload | None:
         """Deserialize and return latest weights."""
         with self._lock:
             if agent_id not in self._weights:
@@ -90,7 +88,7 @@ class SharedMemoryWeightStore(BaseWeightStore):
             self._weights[agent_id] = serialized
             self._versions[agent_id] = payload.policy_version
 
-    def get(self, agent_id: str) -> Optional[WeightPayload]:
+    def get(self, agent_id: str) -> WeightPayload | None:
         with self._lock:
             if agent_id not in self._weights:
                 return None

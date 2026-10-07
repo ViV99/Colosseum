@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING, Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import torch
 
@@ -63,7 +63,7 @@ class BaseAlgorithm(ABC):
         """If True, learner adds chunks to a replay buffer instead of training directly."""
         return False
 
-    def create_replay_buffer(self, capacity: int) -> Optional[Any]:
+    def create_replay_buffer(self, capacity: int) -> Any | None:
         """Create a replay buffer for off-policy training.
 
         Returns None for on-policy algorithms (default).

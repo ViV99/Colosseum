@@ -24,8 +24,8 @@ import multiprocessing as mp
 import queue
 import time
 from collections import defaultdict
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -61,11 +61,11 @@ class RolloutBuffer:
     _rewards: np.ndarray = field(init=False, repr=False)
     _dones: np.ndarray = field(init=False, repr=False)
     _values: np.ndarray = field(init=False, repr=False)
-    _action_masks: Optional[np.ndarray] = field(init=False, default=None, repr=False)
+    _action_masks: np.ndarray | None = field(init=False, default=None, repr=False)
     _cursor: int = field(init=False, default=0)
     _has_masks: bool = field(init=False, default=False)
-    _lstm_h_init: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
-    _lstm_c_init: Optional[torch.Tensor] = field(init=False, default=None, repr=False)
+    _lstm_h_init: torch.Tensor | None = field(init=False, default=None, repr=False)
+    _lstm_c_init: torch.Tensor | None = field(init=False, default=None, repr=False)
 
     def __post_init__(self):
         T = self.chunk_length
@@ -119,7 +119,7 @@ def _run_inference_group(
     net: ActorCriticNetwork,
     indices: list[tuple],
     obs_flat: np.ndarray,
-    all_masks: Optional[np.ndarray],
+    all_masks: np.ndarray | None,
     hidden_states: dict,
     out_actions: np.ndarray,
     out_log_probs: np.ndarray,
@@ -163,7 +163,7 @@ def _run_inference_group(
     out_values[idx_arr] = values.numpy().astype(np.float32, copy=False)
 
 
-def _drain_commands(command_queue: Optional[mp.Queue]):
+def _drain_commands(command_queue: mp.Queue | None):
     """Return the most recent WorkerCommand (draining stale ones), or None."""
     if command_queue is None:
         return None
@@ -233,15 +233,15 @@ def rollout_worker_process(
     stop_event: mp.Event,
     weight_sync_interval: float = 5.0,
     total_timesteps: int = 0,
-    checkpoint_state_dicts_by_agent: Optional[dict[str, dict[str, dict]]] = None,
-    slot_network_map: Optional[list[list[str]]] = None,
-    collect_mask: Optional[list[list[bool]]] = None,
-    slot_agent_map: Optional[list[list[str]]] = None,
-    results_queue: Optional[mp.Queue] = None,
-    seed: Optional[int] = None,
-    command_queue: Optional[mp.Queue] = None,
+    checkpoint_state_dicts_by_agent: dict[str, dict[str, dict]] | None = None,
+    slot_network_map: list[list[str]] | None = None,
+    collect_mask: list[list[bool]] | None = None,
+    slot_agent_map: list[list[str]] | None = None,
+    results_queue: mp.Queue | None = None,
+    seed: int | None = None,
+    command_queue: mp.Queue | None = None,
     vec_env_kind: str = "sync",
-    subproc_workers: Optional[int] = None,
+    subproc_workers: int | None = None,
 ) -> None:
     """Main worker process function.
 
@@ -364,7 +364,7 @@ def rollout_worker_process(
     slot_network_map = [list(row) for row in slot_network_map]
     collect_mask = [list(row) for row in collect_mask]
     # Latest received-but-not-yet-applied assignment (applied per-env on done).
-    pending: dict[str, Optional[list]] = {
+    pending: dict[str, list | None] = {
         "slot_agent_map": None, "slot_network_map": None, "collect_mask": None,
     }
 
@@ -401,9 +401,9 @@ def rollout_worker_process(
     # must always exist. Whether a slot actually appends/seals is gated on the
     # live collect_mask below.
     buffers: list[list[RolloutBuffer]] = []
-    for env_idx in range(num_envs):
+    for _ in range(num_envs):
         env_buffers = []
-        for p in range(num_players):
+        for _ in range(num_players):
             env_buffers.append(RolloutBuffer(
                 chunk_length=chunk_length,
                 obs_shape=obs_shape,
@@ -626,7 +626,7 @@ def _report_episode_result(
     ep_length: int,
     slot_nets: list[str],
     slot_agent_ids: list[str],
-    terminal_infos: Optional[dict[int, dict]] = None,
+    terminal_infos: dict[int, dict] | None = None,
 ) -> None:
     """Report episode result to the coordinator via results_queue.
 
@@ -669,7 +669,7 @@ def _extract_action_masks(
     num_envs: int,
     num_players: int,
     action_spec=None,
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     """Extract action masks from env info dicts into a flat array.
 
     Convention: info[env_idx][player_idx]["action_mask"] is a bool ndarray
@@ -700,7 +700,7 @@ def _extract_active_flags(
     infos: list[dict],
     num_envs: int,
     num_players: int,
-) -> Optional[np.ndarray]:
+) -> np.ndarray | None:
     """Per-slot ``info["active"]`` flags, or None if the env doesn't provide them.
 
     For turn-based games, an env can mark which player's action actually matters
@@ -723,9 +723,9 @@ def _extract_active_flags(
     return flags
 
 
-def _sync_weights(network: ActorCriticNetwork, weight_queue: mp.Queue) -> Optional[int]:
+def _sync_weights(network: ActorCriticNetwork, weight_queue: mp.Queue) -> int | None:
     """Pull latest weights from the weight queue (non-blocking)."""
-    latest_payload: Optional[WeightPayload] = None
+    latest_payload: WeightPayload | None = None
     while True:
         try:
             payload = weight_queue.get_nowait()

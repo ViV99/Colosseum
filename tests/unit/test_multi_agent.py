@@ -1,25 +1,17 @@
 """Tests for multi-agent support: per-agent config, worker routing, launcher."""
 
-from helpers import example_config
 import multiprocessing as mp
-import os
-import sys
 import time
-
 
 import pytest
 import torch
-import numpy as np
 
 from colosseum.core.config import (
     AgentConfig,
-    AlgorithmConfig,
     ColosseumConfig,
-    LearnerConfig,
-    NetworkConfig,
     load_config,
 )
-
+from helpers import example_config
 
 # ---------------------------------------------------------------
 # T3.8: Per-agent config tests
@@ -95,8 +87,8 @@ def test_load_multi_agent_config_roundtrip():
 
 def test_derive_worker_configs():
     """Verify slot_agent_map and collect_mask are extracted correctly."""
-    from colosseum.core.types import MatchConfig, PlayerSlot
     from colosseum.coordinator.coordinator import Coordinator
+    from colosseum.core.types import MatchConfig, PlayerSlot
     from colosseum.launcher import _derive_worker_configs
 
     config = load_config(example_config("tic_tac_toe_multi.yaml"))
@@ -147,8 +139,6 @@ def test_derive_worker_configs():
 def test_monitor_loop_per_agent_checkpoint_queues():
     """Monitor loop should process per-agent checkpoint queues."""
     from colosseum.coordinator.coordinator import Coordinator
-    from colosseum.launcher import Launcher
-    from colosseum.metrics.wandb_logger import WandBLogger
 
     config = load_config(example_config("tic_tac_toe_multi.yaml"))
     agent_ids = config.get_trainable_agent_ids()
@@ -172,8 +162,6 @@ def test_monitor_loop_per_agent_checkpoint_queues():
     # mp.Queue serializes in background thread; wait for it to finish
     time.sleep(0.5)
 
-    # Create a minimal launcher and manually invoke checkpoint processing
-    launcher = Launcher(config)
 
     # Process checkpoint queues (simulating part of _monitor_loop)
     import queue

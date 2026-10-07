@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
 import gymnasium
 import numpy as np
@@ -40,7 +40,7 @@ class BaseEnv(ABC):
 
     @abstractmethod
     def reset(
-        self, seed: Optional[int] = None
+        self, seed: int | None = None
     ) -> tuple[dict[int, np.ndarray], dict[int, dict]]:
         """Reset environment.
 
@@ -87,6 +87,6 @@ class BaseEnv(ABC):
         """Clean up resources."""
         pass
 
-    def render(self) -> Optional[Any]:
+    def render(self) -> Any | None:
         """Optional rendering."""
         return None

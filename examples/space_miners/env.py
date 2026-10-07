@@ -8,20 +8,17 @@ Requires: pip install Box2D
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 import gymnasium
 import numpy as np
 
 from colosseum.envs.base_env import BaseEnv
 from examples.space_miners.game_engine import (
-    ASTEROID_RADIUS_UNITS,
-    BASE_COLLECTION_RADIUS_UNITS,
     GAME_HEIGHT,
     GAME_WIDTH,
     MAX_ACCELERATION,
     MAX_VELOCITY,
-    PPM,
     SpaceMinersGameState,
 )
 
@@ -61,7 +58,7 @@ class SpaceMinersEnv(BaseEnv):
         self._max_asteroids = max_asteroids
         self._obs_size = _obs_dim(max_asteroids)
 
-        self._game: Optional[SpaceMinersGameState] = None
+        self._game: SpaceMinersGameState | None = None
         self._prev_scores = [0, 0]
 
     @property
@@ -88,7 +85,7 @@ class SpaceMinersEnv(BaseEnv):
         )
 
     def reset(
-        self, seed: Optional[int] = None
+        self, seed: int | None = None
     ) -> tuple[dict[int, np.ndarray], dict[int, dict]]:
         self._game = SpaceMinersGameState(
             preset=self._preset,

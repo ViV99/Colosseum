@@ -7,7 +7,7 @@ workers, learners, the weight store, and the coordinator.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 
 import torch
 
@@ -51,8 +51,8 @@ class TrajectoryChunk:
     values: torch.Tensor  # [T]
     bootstrap_value: torch.Tensor  # scalar
     behavior_policy_version: int
-    lstm_hidden: Optional[tuple[torch.Tensor, torch.Tensor]] = None
-    action_masks: Optional[torch.Tensor] = None  # [T, num_actions]
+    lstm_hidden: tuple[torch.Tensor, torch.Tensor] | None = None
+    action_masks: torch.Tensor | None = None  # [T, num_actions]
 
     # ------------------------------------------------------------------
     # Helpers
@@ -113,7 +113,7 @@ class PlayerSlot:
     """
 
     agent_id: str
-    checkpoint_id: Optional[str] = None
+    checkpoint_id: str | None = None
     collect_trajectories: bool = True
 
 

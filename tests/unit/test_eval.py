@@ -1,6 +1,4 @@
 """Tests for the evaluation module."""
-import os
-import sys
 
 
 from colosseum.eval import EvalMatrix, _wilson_ci, evaluate_agents

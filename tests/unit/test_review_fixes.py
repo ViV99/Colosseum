@@ -8,17 +8,13 @@ Covers:
   C9  — action_masks survive chunk serialization (gRPC path).
   C14 — match outcomes prefer the env's authoritative rank/outcome signal.
 """
-import os
-import sys
 import tempfile
-
 
 import torch
 import torch.nn as nn
 
 from colosseum.networks.actor_critic import ActorCriticNetwork
 from helpers import SimpleEncoder, SimplePolicy, SimpleValue
-
 
 # ---------------------------------------------------------------------------
 # C14: outcome derivation
@@ -62,8 +58,13 @@ def test_outcomes_fall_back_when_signal_incomplete():
 
 def _make_cfg(tmpdir, phase="league", latest_prob=0.5, envs_per_worker=8):
     from colosseum.core.config import (
-        CheckpointConfig, ColosseumConfig, EnvConfig, NetworkConfig, RolloutConfig,
-        SelfPlayConfig, TrainingConfig,
+        CheckpointConfig,
+        ColosseumConfig,
+        EnvConfig,
+        NetworkConfig,
+        RolloutConfig,
+        SelfPlayConfig,
+        TrainingConfig,
     )
 
     return ColosseumConfig(
@@ -227,9 +228,9 @@ def test_refresh_pushes_new_checkpoint_to_worker():
     """Main process should push freshly-saved checkpoints to workers (delta only)."""
     import multiprocessing as mp
 
+    from colosseum.coordinator.coordinator import Coordinator
     from colosseum.core.registry import build_network
     from colosseum.core.types import WorkerCommand
-    from colosseum.coordinator.coordinator import Coordinator
     from colosseum.launcher import Launcher
 
     with tempfile.TemporaryDirectory() as tmp:
@@ -293,8 +294,8 @@ def test_worker_applies_command_loads_checkpoint_and_stages_maps():
 # ---------------------------------------------------------------------------
 
 def test_resume_from_path(tmp_path):
-    from colosseum.core.registry import build_network
     from colosseum.coordinator.coordinator import Coordinator
+    from colosseum.core.registry import build_network
     from colosseum.launcher import _resolve_resume_state
 
     cfg = _make_cfg(str(tmp_path), phase="self_play")

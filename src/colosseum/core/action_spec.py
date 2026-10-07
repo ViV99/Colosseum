@@ -9,7 +9,7 @@ For simple spaces (Discrete, Box) the codec is a no-op pass-through.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Union
+from typing import Any
 
 import numpy as np
 
@@ -247,7 +247,7 @@ class ActionSpec:
                 flat[c.offset:c.offset + c.size] = np.asarray(val, dtype=np.float32).flat
         return flat
 
-    def flatten_mask(self, mask: Union[np.ndarray, dict]) -> np.ndarray:
+    def flatten_mask(self, mask: np.ndarray | dict) -> np.ndarray:
         """Normalize an action mask to a flat bool array of ``flat_mask_size``.
 
         Accepts:

@@ -15,7 +15,7 @@ If neither is present for all players, outcomes are derived from total reward.
 
 from __future__ import annotations
 
-from typing import Optional, Sequence
+from collections.abc import Sequence
 
 import numpy as np
 
@@ -33,7 +33,7 @@ def outcomes_from_rewards(total_rewards: Sequence[float]) -> list[float]:
 def outcomes_from_terminal_infos(
     terminal_infos: dict[int, dict],
     num_players: int,
-) -> Optional[list[float]]:
+) -> list[float] | None:
     """Try to derive outcomes from env-provided ``outcome`` or ``rank`` keys.
 
     Returns a list of per-player outcomes in ``[0, 1]``, or ``None`` if the env
@@ -75,8 +75,8 @@ def outcomes_from_terminal_infos(
 
 def player_outcomes(
     total_rewards: Sequence[float],
-    terminal_infos: Optional[dict[int, dict]] = None,
-    num_players: Optional[int] = None,
+    terminal_infos: dict[int, dict] | None = None,
+    num_players: int | None = None,
 ) -> list[float]:
     """Authoritative per-player outcomes: prefer env signal, else reward.
 

@@ -7,12 +7,11 @@ torch.save() for tensors + optional lz4 compression.
 from __future__ import annotations
 
 import io
-from typing import Optional
 
 import lz4.frame
 import torch
 
-from colosseum.core.types import TrajectoryChunk, WeightPayload
+from colosseum.core.types import TrajectoryChunk
 
 
 def serialize_state_dict(state_dict: dict, compress: bool = True) -> tuple[bytes, bool]:

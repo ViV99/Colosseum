@@ -1,7 +1,5 @@
 """Tests for Phase 3 performance optimizations."""
 
-import os
-import sys
 
 
 import numpy as np
@@ -140,7 +138,6 @@ def test_pin_memory_cpu_noop():
     """pin_memory=True on CPU doesn't crash, produces valid results."""
     from colosseum.algorithms.appo import APPO
     from colosseum.core.config import AlgorithmConfig
-
     from helpers import make_simple_network
 
     net = make_simple_network(obs_dim=4, hidden_dim=32, num_actions=3)
@@ -207,7 +204,6 @@ def test_appo_torch_compile():
         pytest.skip("torch.compile backend unavailable")
     from colosseum.algorithms.appo import APPO
     from colosseum.core.config import AlgorithmConfig
-
     from helpers import make_simple_network
 
     net = make_simple_network(obs_dim=4, hidden_dim=32, num_actions=3)

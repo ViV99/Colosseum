@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import logging
 from concurrent import futures
-from typing import Optional
 
 import grpc
 
@@ -118,7 +117,7 @@ class GRPCWeightStore(BaseWeightStore):
         )
         self._stub.PutWeights(request)
 
-    def get(self, agent_id: str) -> Optional[WeightPayload]:
+    def get(self, agent_id: str) -> WeightPayload | None:
         request = colosseum_pb2.GetWeightsRequest(agent_id=agent_id)
         try:
             response = self._stub.GetWeights(request)

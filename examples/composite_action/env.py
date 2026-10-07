@@ -68,7 +68,7 @@ class ChaseEnv(BaseEnv):
         for p in range(2):
             a = actions[p]
             d = int(a["direction"])
-            s = float(np.clip(a["speed"], 0.0, 1.0)) if not isinstance(a["speed"], (int, float)) else float(np.clip(a["speed"], 0.0, 1.0))
+            s = float(np.clip(a["speed"], 0.0, 1.0))
             self._positions[p] += _DIRS[d] * s
             self._positions[p] = np.clip(self._positions[p], 0.0, _GRID)
 

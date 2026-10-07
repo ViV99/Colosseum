@@ -11,10 +11,8 @@ from __future__ import annotations
 
 import logging
 from pathlib import Path
-from typing import Optional
 
 import torch
-import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.data import DataLoader, TensorDataset
 

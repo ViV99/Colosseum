@@ -1,7 +1,5 @@
 """Tests for VectorEnv: shapes, auto-reset, terminal info, seeding."""
 
-import os
-import sys
 
 
 import numpy as np

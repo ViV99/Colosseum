@@ -1,10 +1,8 @@
 """Tests for Behavioral Cloning: offline BC trainer and kickstart loss."""
 import os
-import sys
 import tempfile
 
 import torch
-
 
 from colosseum.bc.kickstart import KickstartLoss
 from colosseum.bc.offline_bc import OfflineBCTrainer

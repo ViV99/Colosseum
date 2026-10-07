@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import logging
-from typing import Any, Optional
+from typing import Any
 
 from colosseum.core.config import MetricsConfig
 
@@ -13,7 +13,7 @@ logger = logging.getLogger(__name__)
 class WandBLogger:
     """Centralized WandB logging for training metrics."""
 
-    def __init__(self, config: MetricsConfig, run_name: Optional[str] = None) -> None:
+    def __init__(self, config: MetricsConfig, run_name: str | None = None) -> None:
         self._config = config
         self._enabled = config.use_wandb
         self._run = None
@@ -44,7 +44,7 @@ class WandBLogger:
         if self._enabled and self._run is not None:
             self._run.config.update(config)
 
-    def log_metrics(self, metrics: dict[str, Any], step: Optional[int] = None) -> None:
+    def log_metrics(self, metrics: dict[str, Any], step: int | None = None) -> None:
         """Log training metrics."""
         if self._enabled and self._run is not None:
             import wandb

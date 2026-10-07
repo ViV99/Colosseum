@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import logging
 import math
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -51,7 +51,7 @@ class EvalMatrix:
     agent_ids: list[str]
     results: dict[tuple[str, str], EvalResult] = field(default_factory=dict)
 
-    def get(self, a: str, b: str) -> Optional[EvalResult]:
+    def get(self, a: str, b: str) -> EvalResult | None:
         return self.results.get((a, b))
 
     def summary(self) -> str:
@@ -86,7 +86,7 @@ def evaluate_agents(
     network_factory: Callable[[], ActorCriticNetwork],
     num_matches: int = 100,
     num_envs: int = 8,
-    network_factories: Optional[dict[str, Callable[[], ActorCriticNetwork]]] = None,
+    network_factories: dict[str, Callable[[], ActorCriticNetwork]] | None = None,
     deterministic: bool = False,
 ) -> EvalMatrix:
     """Run evaluation matches between all agents.
