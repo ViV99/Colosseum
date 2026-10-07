@@ -7,6 +7,9 @@ This is the top-level entry point that wires together:
 - Weight synchronization (via mp.Queue)
 - Metrics logging
 
+Everything that crosses a process boundary (queue items and Process
+arguments) is numpy + primitives, never torch tensors (R6-02).
+
 With mp.set_start_method("spawn"), all arguments to Process targets must be
 picklable. We pass config objects (pydantic models) and string class paths
 instead of closures/lambdas, and let each process instantiate its own objects.
@@ -19,11 +22,13 @@ import multiprocessing as mp
 import queue
 import time
 
+import numpy as np
 import torch
 
 from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
-from colosseum.core.types import MatchConfig
+from colosseum.core.ipc import from_numpy_tree, to_numpy_tree
+from colosseum.core.types import MatchConfig, state_dict_from_numpy, state_dict_to_numpy
 from colosseum.metrics.wandb_logger import WandBLogger
 
 logger = logging.getLogger(__name__)
@@ -201,7 +206,7 @@ def _derive_worker_configs(
     coordinator: Coordinator,
     agent_ids: list[str],
 ) -> tuple[
-    dict[str, dict[str, dict]],  # checkpoint_state_dicts_by_agent
+    dict[str, dict[str, dict[str, np.ndarray]]],  # checkpoint_state_dicts_by_agent
     list[list[str]],             # slot_network_map
     list[list[bool]],            # collect_mask
     list[list[str]],             # slot_agent_map
@@ -210,7 +215,9 @@ def _derive_worker_configs(
 
     Returns:
         (checkpoint_state_dicts_by_agent, slot_network_map, collect_mask, slot_agent_map)
-        checkpoint_state_dicts_by_agent: {agent_id: {ckpt_id: state_dict}}
+        checkpoint_state_dicts_by_agent: {agent_id: {ckpt_id: numpy state_dict}};
+            these cross the process boundary (worker Process arguments and
+            ``WorkerCommand.new_checkpoints``), so they are numpy, never torch.
         slot_agent_map[env_idx][player_idx] -> agent_id
     """
     from colosseum.worker.rollout_loop import LATEST_NETWORK_ID
@@ -218,7 +225,7 @@ def _derive_worker_configs(
     collect_mask: list[list[bool]] = []
     slot_network_map: list[list[str]] = []
     slot_agent_map: list[list[str]] = []
-    checkpoint_state_dicts_by_agent: dict[str, dict[str, dict]] = {
+    checkpoint_state_dicts_by_agent: dict[str, dict[str, dict[str, np.ndarray]]] = {
         aid: {} for aid in agent_ids
     }
 
@@ -240,7 +247,7 @@ def _derive_worker_configs(
                         sd = coordinator.checkpoint_manager.load(
                             slot.agent_id, ckpt_id,
                         )
-                        agent_ckpts[ckpt_id] = sd
+                        agent_ckpts[ckpt_id] = state_dict_to_numpy(sd)
                     except FileNotFoundError:
                         logger.warning(
                             f"Checkpoint {ckpt_id} for {slot.agent_id} "
@@ -398,7 +405,8 @@ class Launcher:
         # Start one learner per agent
         for aid in trainable_agents:
             acfg = agent_configs[aid]
-            resume_state = _resolve_resume_state(cfg, aid, coordinator)
+            # numpy only: Process arguments cross the process boundary (R6-02).
+            resume_state = to_numpy_tree(_resolve_resume_state(cfg, aid, coordinator))
             learner_proc = mp.Process(
                 target=_learner_target,
                 kwargs=dict(
@@ -558,8 +566,8 @@ class Launcher:
                         ckpt_id = coordinator.maybe_save_checkpoint(
                             agent_id=aid,
                             policy_version=ckpt_data["policy_version"],
-                            state_dict=ckpt_data["state_dict"],
-                            optimizer_state=ckpt_data.get("optimizer_state"),
+                            state_dict=state_dict_from_numpy(ckpt_data["state_dict"]),
+                            optimizer_state=from_numpy_tree(ckpt_data.get("optimizer_state")),
                         )
                         if ckpt_id is not None:
                             logger.info(f"Saved checkpoint {ckpt_id} for {aid}")
@@ -627,7 +635,7 @@ class Launcher:
             ) = _derive_worker_configs(match_configs, coordinator, agent_ids)
 
             # Checkpoint deltas not yet sent to this worker.
-            new_ckpts: dict[str, dict[str, dict]] = {}
+            new_ckpts: dict[str, dict[str, dict[str, np.ndarray]]] = {}
             sent_sets = worker_broadcast_ckpts[worker_id]
             for aid in agent_ids:
                 for ckpt_id, sd in ckpt_dicts_by_agent.get(aid, {}).items():
@@ -689,7 +697,6 @@ def run_training(config_path: str, overrides: dict | None = None) -> None:
         import random
         seed = config.training.seed
         torch.manual_seed(seed)
-        import numpy as np
         np.random.seed(seed)
         random.seed(seed)
         logger.info(f"Global seed set to {seed}")

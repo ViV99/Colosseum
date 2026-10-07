@@ -2,11 +2,14 @@
 
 Each Learner runs in a separate process and owns one trainable agent's
 training loop. It:
-1. Receives TrajectoryChunks from workers via a mp.Queue
+1. Receives chunk payloads (numpy, ``TrajectoryChunk.to_payload()``) from
+   workers via a mp.Queue and decodes them
 2. Batches them
 3. Calls algorithm.train_step() to compute loss and update weights
-4. Pushes new weights to worker processes via weight queues
-5. Logs metrics
+4. Pushes new weights (numpy ``WeightPayload``) to worker processes via weight queues
+5. Sends metrics and numpy checkpoint snapshots to the main process
+
+Nothing this process puts on a queue contains a torch tensor (R6-02).
 """
 
 from __future__ import annotations
@@ -20,7 +23,8 @@ import torch
 
 from colosseum.algorithms.base import BaseAlgorithm
 from colosseum.core.config import LearnerConfig
-from colosseum.core.types import TrajectoryChunk, WeightPayload
+from colosseum.core.ipc import from_numpy_tree, to_numpy_tree
+from colosseum.core.types import TrajectoryChunk, WeightPayload, state_dict_from_numpy, state_dict_to_numpy
 
 logger = logging.getLogger(__name__)
 
@@ -43,7 +47,7 @@ def learner_process(
     Args:
         agent_id: the trainable agent this learner owns
         algorithm_factory: factory to create the algorithm (includes network)
-        trajectory_queue: queue to receive TrajectoryChunks from workers
+        trajectory_queue: queue to receive chunk payloads (``TrajectoryChunk.to_payload()``)
         weight_queues: list of queues to push weights to workers
         config: learner configuration
         stop_event: set to signal the learner to stop
@@ -51,8 +55,8 @@ def learner_process(
         total_train_steps: stop after this many training steps (0 = run until stop_event)
         checkpoint_queue: optional queue to send checkpoint snapshots to main process
         checkpoint_interval: save checkpoint every N train steps (0 = disabled)
-        resume_state: optional dict with 'state_dict', 'optimizer_state', 'policy_version'
-            to resume training from a checkpoint
+        resume_state: optional dict with 'state_dict' (numpy), 'optimizer_state'
+            (numpy tree or None) and 'policy_version' to resume training from a checkpoint
     """
     logger.info(f"Learner [{agent_id}]: starting on device={resolve_device(config.device)}")
 
@@ -62,9 +66,10 @@ def learner_process(
     # Resume from checkpoint if provided
     train_step = 0
     if resume_state is not None:
-        algorithm.model.load_state_dict(resume_state["state_dict"])
-        if "optimizer_state" in resume_state and hasattr(algorithm, "_optimizer"):
-            algorithm._optimizer.load_state_dict(resume_state["optimizer_state"])
+        # resume_state is numpy (it crossed the process boundary as a Process argument).
+        algorithm.model.load_state_dict(state_dict_from_numpy(resume_state["state_dict"]))
+        if resume_state.get("optimizer_state") is not None and hasattr(algorithm, "_optimizer"):
+            algorithm._optimizer.load_state_dict(from_numpy_tree(resume_state["optimizer_state"]))
         train_step = resume_state.get("policy_version", 0)
         if hasattr(algorithm, "_policy_version"):
             algorithm._policy_version = train_step
@@ -79,78 +84,84 @@ def learner_process(
     # Off-policy: create replay buffer if algorithm requires it
     replay_buffer = algorithm.create_replay_buffer(config.queue_size * 4)
 
-    # Push initial weights to workers
-    _push_weights(algorithm, agent_id, weight_queues)
+    try:
+        # Push initial weights to workers
+        _push_weights(algorithm, agent_id, weight_queues)
 
-    while not stop_event.is_set():
-        if total_train_steps > 0 and train_step >= total_train_steps:
-            break
+        while not stop_event.is_set():
+            if total_train_steps > 0 and train_step >= total_train_steps:
+                break
 
-        # Collect a batch of chunks
-        chunks = _collect_chunks(
-            trajectory_queue,
-            batch_size=config.batch_chunks,
-            timeout=1.0,
-        )
-
-        if not chunks:
-            continue
-
-        total_chunks_received += len(chunks)
-
-        # Train step: off-policy adds to buffer, on-policy trains directly
-        if replay_buffer is not None:
-            for chunk in chunks:
-                replay_buffer.add(chunk)
-            if len(replay_buffer) < config.batch_chunks:
-                continue
-            batch = replay_buffer.sample(config.batch_chunks)
-            metrics = algorithm.train_step(batch)
-        else:
-            metrics = algorithm.train_step(chunks)
-        train_step += 1
-
-        # Push updated weights to all workers at configured interval
-        if train_step % config.weight_push_interval == 0:
-            _push_weights(algorithm, agent_id, weight_queues)
-
-        # Checkpoint: send state_dict to main process at checkpoint intervals
-        pv = algorithm.policy_version
-        if (checkpoint_queue is not None
-                and checkpoint_interval > 0
-                and pv > 0
-                and pv % checkpoint_interval == 0):
-            state_dict_cpu = {
-                k: v.cpu().clone()
-                for k, v in algorithm.model.state_dict().items()
-            }
-            optimizer_state = algorithm.optimizer_state_dict
-            try:
-                checkpoint_queue.put_nowait({
-                    "policy_version": pv,
-                    "state_dict": state_dict_cpu,
-                    "optimizer_state": optimizer_state,
-                })
-                logger.info(f"Learner [{agent_id}]: sent checkpoint at version {pv}")
-            except Full:
-                logger.warning(f"Learner [{agent_id}]: checkpoint queue full, skipping v{pv}")
-
-        # Log metrics
-        if metrics_queue is not None:
-            metrics["agent_id"] = agent_id
-            metrics["train_step"] = train_step
-            metrics["chunks_received"] = total_chunks_received
-            try:
-                metrics_queue.put_nowait(metrics)
-            except Full:
-                pass  # Non-critical, don't block on metrics
-
-        if train_step % 10 == 0:
-            logger.info(
-                f"Learner [{agent_id}]: step={train_step}, "
-                f"chunks={total_chunks_received}, "
-                f"loss={metrics.get('total_loss', 0):.4f}"
+            # Collect a batch of chunks
+            chunks = _collect_chunks(
+                trajectory_queue,
+                batch_size=config.batch_chunks,
+                timeout=1.0,
             )
+
+            if not chunks:
+                continue
+
+            total_chunks_received += len(chunks)
+
+            # Train step: off-policy adds to buffer, on-policy trains directly
+            if replay_buffer is not None:
+                for chunk in chunks:
+                    replay_buffer.add(chunk)
+                if len(replay_buffer) < config.batch_chunks:
+                    continue
+                batch = replay_buffer.sample(config.batch_chunks)
+                metrics = algorithm.train_step(batch)
+            else:
+                metrics = algorithm.train_step(chunks)
+            train_step += 1
+
+            # Push updated weights to all workers at configured interval
+            if train_step % config.weight_push_interval == 0:
+                _push_weights(algorithm, agent_id, weight_queues)
+
+            # Checkpoint: send state_dict to main process at checkpoint intervals
+            pv = algorithm.policy_version
+            if (checkpoint_queue is not None
+                    and checkpoint_interval > 0
+                    and pv > 0
+                    and pv % checkpoint_interval == 0):
+                optimizer_state = getattr(algorithm, "optimizer_state_dict", None)
+                try:
+                    checkpoint_queue.put_nowait({
+                        "policy_version": pv,
+                        "state_dict": state_dict_to_numpy(algorithm.model.state_dict()),
+                        "optimizer_state": (
+                            None if optimizer_state is None else to_numpy_tree(optimizer_state)
+                        ),
+                    })
+                    logger.info(f"Learner [{agent_id}]: sent checkpoint at version {pv}")
+                except Full:
+                    logger.warning(f"Learner [{agent_id}]: checkpoint queue full, skipping v{pv}")
+
+            # Log metrics
+            if metrics_queue is not None:
+                metrics["agent_id"] = agent_id
+                metrics["train_step"] = train_step
+                metrics["chunks_received"] = total_chunks_received
+                try:
+                    metrics_queue.put_nowait(metrics)
+                except Full:
+                    pass  # Non-critical, don't block on metrics
+
+            if train_step % 10 == 0:
+                logger.info(
+                    f"Learner [{agent_id}]: step={train_step}, "
+                    f"chunks={total_chunks_received}, "
+                    f"loss={metrics.get('total_loss', 0):.4f}"
+                )
+    finally:
+        # Weight payloads are pickled in full (numpy), so an unread one can keep a
+        # weight queue's feeder thread blocked on a full pipe; workers that already
+        # stopped never read it. Weights are replaceable: do not wait at exit.
+        for wq in weight_queues:
+            if hasattr(wq, "cancel_join_thread"):
+                wq.cancel_join_thread()
 
     logger.info(f"Learner [{agent_id}]: finished. Total train_steps={train_step}")
 
@@ -167,48 +178,33 @@ def _collect_chunks(
     batch_size: int,
     timeout: float = 1.0,
 ) -> list[TrajectoryChunk]:
-    """Collect up to batch_size chunks from the queue.
+    """Collect up to batch_size chunk payloads from the queue and decode them.
 
     Waits up to `timeout` seconds for the first chunk, then collects
     remaining chunks non-blocking up to batch_size.
     """
     chunks: list[TrajectoryChunk] = []
-
-    # Wait for the first chunk with timeout
     try:
-        chunk = queue.get(timeout=timeout)
-        chunks.append(chunk)
+        chunks.append(TrajectoryChunk.from_payload(queue.get(timeout=timeout)))
     except Empty:
         return chunks
-
-    # Collect remaining chunks non-blocking
     while len(chunks) < batch_size:
         try:
-            chunk = queue.get_nowait()
-            chunks.append(chunk)
+            chunks.append(TrajectoryChunk.from_payload(queue.get_nowait()))
         except Empty:
             break
-
     return chunks
 
 
 def _push_weights(
     algorithm: BaseAlgorithm,
     agent_id: str,
-    weight_queues: list[mp.Queue],
+    weight_queues: list,
 ) -> None:
-    """Push current model weights to all worker weight queues."""
-    state_dict = {k: v.cpu().clone() for k, v in algorithm.model.state_dict().items()}
-    payload = WeightPayload(
-        agent_id=agent_id,
-        policy_version=algorithm.policy_version,
-        state_dict=state_dict,
-    )
-
+    """Push current model weights (a numpy WeightPayload) to all worker weight queues."""
+    payload = WeightPayload.from_model(agent_id, algorithm.policy_version, algorithm.model)
     for wq in weight_queues:
         try:
-            # Non-blocking put; if queue is full, skip
-            # (workers will get the next weight update)
             wq.put_nowait(payload)
         except Full:
-            pass
+            pass  # workers will get the next weight update

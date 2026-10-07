@@ -172,6 +172,15 @@ def test_validate_config_rejects_layer_first_state():
         validate_config(cfg)
 
 
+def test_validate_config_accepts_module_level_namedtuple_state():
+    validate_config(_monolithic("helpers.NamedTupleStateModel"))
+
+
+def test_validate_config_rejects_state_that_cannot_cross_processes():
+    with pytest.raises(ConfigError, match=r"initial_state cannot be sent between processes.*UnreachableState"):
+        validate_config(_monolithic("helpers.LocalNamedTupleStateModel"))
+
+
 def test_validate_config_reports_env_mask_size_mismatch():
     with pytest.raises(ConfigError, match=r"env action_mask has shape \(4,\).*\(3,\)"):
         validate_config(_monolithic("helpers.TinyMonolithicModel", env_class="helpers.WrongMaskEnv"))

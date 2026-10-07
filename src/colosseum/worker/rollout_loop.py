@@ -24,7 +24,13 @@ import numpy as np
 import torch
 
 from colosseum.core.action_spec import ActionSpec
-from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
+from colosseum.core.types import (
+    MatchResult,
+    TrajectoryChunk,
+    WeightPayload,
+    WorkerCommand,
+    state_dict_from_numpy,
+)
 from colosseum.envs.base_env import BaseEnv
 from colosseum.envs.vec_env import VectorEnv
 from colosseum.networks.model import PolicyModel, act
@@ -167,7 +173,7 @@ def _apply_command(cmd, models_by_agent, model_factories, pending) -> None:
         for ckpt_id, sd in ckpts.items():
             if ckpt_id not in models_by_agent[aid]:
                 model = model_factories[aid]()
-                model.load_state_dict(sd)
+                model.load_state_dict(state_dict_from_numpy(sd))
                 model.eval()
                 models_by_agent[aid][ckpt_id] = model
     if cmd.slot_agent_map:
@@ -300,7 +306,7 @@ class RolloutLoop:
         slot_agent_map: list[list[str]] | None = None,
         slot_network_map: list[list[str]] | None = None,
         collect_mask: list[list[bool]] | None = None,
-        checkpoint_state_dicts_by_agent: dict[str, dict[str, dict]] | None = None,
+        checkpoint_state_dicts_by_agent: dict[str, dict[str, dict[str, np.ndarray]]] | None = None,
         seed: int | None = None,
         vec_env_kind: str = "sync",
         subproc_workers: int | None = None,
@@ -342,7 +348,7 @@ class RolloutLoop:
             ckpt_dicts = checkpoint_state_dicts_by_agent.get(aid, {})
             for ckpt_id, sd in ckpt_dicts.items():
                 net = model_factories[aid]()
-                net.load_state_dict(sd)
+                net.load_state_dict(state_dict_from_numpy(sd))
                 net.eval()
                 nets[ckpt_id] = net
             if ckpt_dicts:
@@ -449,7 +455,7 @@ class RolloutLoop:
         for aid in self.agent_ids:
             payload = self._io.poll_weights(aid)
             if payload is not None:
-                self._networks[aid][LATEST_NETWORK_ID].load_state_dict(payload.state_dict)
+                self._networks[aid][LATEST_NETWORK_ID].load_state_dict(payload.to_torch_state_dict())
                 self._policy_versions[aid] = payload.policy_version
 
     def run(self, should_stop: Callable[[], bool], max_env_steps: int = 0) -> None:

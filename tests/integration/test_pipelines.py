@@ -10,6 +10,7 @@ import pytest
 
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.core.config import ColosseumConfig, load_config
+from colosseum.core.types import TrajectoryChunk
 from helpers import example_config
 
 
@@ -54,7 +55,7 @@ def test_worker_produces_chunks(tmp_path):
     )
     proc.start()
     try:
-        chunks = [trajectory_queues[agent_id].get(timeout=60) for _ in range(5)]
+        chunks = [TrajectoryChunk.from_payload(trajectory_queues[agent_id].get(timeout=60)) for _ in range(5)]
     finally:
         _stop(proc, stop_event)
     for chunk in chunks:
@@ -95,7 +96,8 @@ def test_worker_multi_agent_routing(tmp_path):
         while time.time() < deadline and min(len(v) for v in chunks_by_agent.values()) < 2:
             for aid in agent_ids:
                 try:
-                    chunks_by_agent[aid].append(trajectory_queues[aid].get(timeout=0.5))
+                    chunks_by_agent[aid].append(
+                        TrajectoryChunk.from_payload(trajectory_queues[aid].get(timeout=0.5)))
                 except queue.Empty:
                     pass
     finally:
@@ -105,7 +107,6 @@ def test_worker_multi_agent_routing(tmp_path):
         assert all(c.agent_id == aid for c in chunks_by_agent[aid])
 
 
-@pytest.mark.slow
 @pytest.mark.timeout(900)
 def test_full_pipeline(tmp_path):
     """Single-agent self-play training runs to completion and saves checkpoints."""
@@ -121,7 +122,6 @@ def test_full_pipeline(tmp_path):
     assert CheckpointManager(str(tmp_path / "checkpoints")).list_checkpoints("agent_0")
 
 
-@pytest.mark.slow
 @pytest.mark.timeout(900)
 def test_full_pipeline_with_checkpoint_pool(tmp_path):
     """Checkpoints are saved every N train steps and the FIFO pool is respected."""
@@ -140,7 +140,6 @@ def test_full_pipeline_with_checkpoint_pool(tmp_path):
     assert [c.policy_version for c in ckpts] == [120, 160, 200, 240, 280]
 
 
-@pytest.mark.slow
 @pytest.mark.timeout(900)
 def test_multi_agent_pipeline(tmp_path):
     """Two-agent league training runs to completion."""
@@ -158,7 +157,6 @@ def test_multi_agent_pipeline(tmp_path):
     assert any(manager.list_checkpoints(aid) for aid in config.get_trainable_agent_ids())
 
 
-@pytest.mark.slow
 @pytest.mark.timeout(900)
 def test_subprocess_vec_env_pipeline(tmp_path):
     """Nested spawn (worker -> env subprocesses) trains to completion."""
@@ -177,7 +175,6 @@ def test_subprocess_vec_env_pipeline(tmp_path):
     assert CheckpointManager(str(tmp_path / "checkpoints")).list_checkpoints("agent_0")
 
 
-@pytest.mark.slow
 @pytest.mark.timeout(900)
 def test_full_pipeline_lstm_core(tmp_path):
     """Recurrent end-to-end run (R1-01): worker chunks with LSTM state train in the learner."""

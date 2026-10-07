@@ -9,6 +9,7 @@ from __future__ import annotations
 import pytest
 import torch
 
+from colosseum.core.types import state_dict_to_numpy
 from harness import learner_eval, make_loop, run_until_chunks, simple_factory, weights_payload
 from helpers import CORE_KINDS
 
@@ -48,7 +49,7 @@ def test_heterogeneous_agents_and_checkpoint_opponents():
     torch.manual_seed(0)
     model_a = simple_factory("lstm")
     model_b = simple_factory("window")
-    ckpt_b = {k: v.clone() for k, v in simple_factory("window").state_dict().items()}
+    ckpt_b = state_dict_to_numpy(simple_factory("window").state_dict())
     loop, rec = make_loop(
         agent_ids=["a", "b"],
         model_factories={"a": lambda: simple_factory("lstm"), "b": lambda: simple_factory("window")},

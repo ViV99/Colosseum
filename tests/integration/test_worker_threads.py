@@ -27,10 +27,8 @@ def _omp_three(monkeypatch):
 
 
 def _observations(item) -> np.ndarray:
-    """Chunk observations from a queue item (a TrajectoryChunk before T2.2, a payload dict after)."""
-    if isinstance(item, dict):
-        return np.asarray(item["observations"])
-    return item.observations.numpy()
+    """Chunk observations from a trajectory-queue item (a chunk payload dict, T2.2)."""
+    return np.asarray(item["observations"])
 
 
 def _run_probe_worker(torch_threads: int, vec_env_kind: str) -> np.ndarray:

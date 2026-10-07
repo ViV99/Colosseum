@@ -3,6 +3,7 @@ import queue
 import socket
 import time
 
+import numpy as np
 import torch
 
 from colosseum.core.types import TrajectoryChunk, WeightPayload
@@ -22,7 +23,7 @@ def _free_port():
 
 
 def _make_state_dict():
-    return {"w": torch.randn(10, 10), "b": torch.randn(10)}
+    return {"w": np.random.randn(10, 10).astype(np.float32), "b": np.random.randn(10).astype(np.float32)}
 
 
 def _make_chunk():
@@ -44,7 +45,7 @@ def test_serialize_state_dict_compressed():
     data, compressed = serialize_state_dict(sd, compress=True)
     assert compressed is True
     sd2 = deserialize_state_dict(data, compressed)
-    assert torch.allclose(sd["w"], sd2["w"])
+    assert np.allclose(sd["w"], sd2["w"])
 
 
 def test_serialize_state_dict_uncompressed():
@@ -52,7 +53,7 @@ def test_serialize_state_dict_uncompressed():
     data, compressed = serialize_state_dict(sd, compress=False)
     assert compressed is False
     sd2 = deserialize_state_dict(data, compressed)
-    assert torch.allclose(sd["b"], sd2["b"])
+    assert np.allclose(sd["b"], sd2["b"])
 
 
 def test_serialize_chunk_roundtrip():
@@ -84,7 +85,7 @@ def test_grpc_weight_store():
         result = client.get("agent_0")
         assert result is not None
         assert result.policy_version == 1
-        assert torch.allclose(result.state_dict["w"], sd["w"])
+        assert np.allclose(result.state_dict["w"], sd["w"])
         assert client.get_version("agent_0") == 1
 
         # Update
@@ -113,14 +114,14 @@ def test_grpc_trajectory_transport():
 
         # Send single
         transport.send_chunk("agent_0", chunk)
-        received = chunk_queue.get(timeout=2.0)
+        received = TrajectoryChunk.from_payload(chunk_queue.get(timeout=2.0))
         assert torch.allclose(received.observations, chunk.observations)
 
         # Send batch
         n = transport.send_chunks_batch("agent_0", [chunk, chunk])
         assert n == 2
         for _ in range(2):
-            r = chunk_queue.get(timeout=2.0)
+            r = TrajectoryChunk.from_payload(chunk_queue.get(timeout=2.0))
             assert torch.allclose(r.observations, chunk.observations)
 
         transport.close()

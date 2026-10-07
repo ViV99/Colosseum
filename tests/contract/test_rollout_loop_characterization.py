@@ -5,7 +5,7 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from colosseum.core.types import WorkerCommand
+from colosseum.core.types import WorkerCommand, state_dict_to_numpy
 from harness import (
     NUM_ACTIONS,
     make_loop,
@@ -81,7 +81,7 @@ def test_multi_agent_routing_by_slot():
 
 def test_non_collecting_checkpoint_slot_produces_no_chunks():
     torch.manual_seed(0)
-    ckpt = {k: v.clone() for k, v in simple_factory().state_dict().items()}
+    ckpt = state_dict_to_numpy(simple_factory().state_dict())
     loop, rec = make_loop(
         num_envs=2, chunk_length=4,
         collect_mask=[[True, False], [True, False]],

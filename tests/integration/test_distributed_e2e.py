@@ -7,6 +7,7 @@ import socket
 import time
 
 import pytest
+import torch
 
 from helpers import example_config
 
@@ -19,7 +20,21 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-@pytest.mark.slow
+def _wait_for(condition, timeout: float, what: str) -> None:
+    """Poll ``condition()`` every 0.1 s until it is true; fail after ``timeout`` seconds."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail(f"timed out after {timeout:.0f} s waiting for {what}")
+        time.sleep(0.1)
+
+
+def _port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.2)
+        return s.connect_ex(("localhost", port)) == 0
+
+
 @pytest.mark.timeout(600)
 def test_distributed_grpc_pipeline(tmp_path):
     """The learner trains on chunks from gRPC workers and publishes weights (version > 0)."""
@@ -43,6 +58,7 @@ def test_distributed_grpc_pipeline(tmp_path):
         "checkpoint.dir": str(tmp_path / "checkpoints"),
     }
 
+    ckpt_root = tmp_path / "checkpoints" / agent
     ws_server = serve_weight_store(port=ws_port)
     learner = mp.Process(
         target=run_distributed_learner,
@@ -50,20 +66,24 @@ def test_distributed_grpc_pipeline(tmp_path):
         daemon=False,
     )
     learner.start()
-    try:
-        time.sleep(2.0)  # let the TrajectoryService bind
-        run_distributed_workers(cfg_path, ws_addr, {agent: learner_addr}, overrides)
-        time.sleep(2.0)  # let the learner drain the last chunks
-    finally:
-        learner.terminate()
-        learner.join(timeout=10)
-
     client = GRPCWeightStore(ws_addr)
     try:
+        _wait_for(lambda: _port_open(traj_port), 60, "the learner's TrajectoryService to bind")
+        run_distributed_workers(cfg_path, ws_addr, {agent: learner_addr}, overrides)
+        _wait_for(lambda: client.get_version(agent) > 0, 60, "a trained weight version in the store")
+        # The learner's checkpoint drainer turns numpy snapshots back into torch files.
+        _wait_for(lambda: any(ckpt_root.glob("*/meta.json")), 60, "a checkpoint saved by the learner")
         version = client.get_version(agent)
         payload = client.get(agent)
     finally:
+        learner.terminate()
+        learner.join(timeout=10)
         client.close()
         ws_server.stop(0)
     assert payload is not None, "no weights were published to the store"
     assert version > 0, f"learner did not train/publish (version={version})"
+    # The newest checkpoint is complete (model.pt is written before meta.json) and
+    # cannot have been evicted; the learner has exited, so nothing writes any more.
+    newest = max((m.parent for m in ckpt_root.glob("*/meta.json")), key=lambda d: int(d.name[len("ckpt_v"):]))
+    state_dict = torch.load(newest / "model.pt", weights_only=True)
+    assert state_dict and all(isinstance(v, torch.Tensor) for v in state_dict.values())

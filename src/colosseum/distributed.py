@@ -35,7 +35,8 @@ from functools import partial
 import torch
 
 from colosseum.core.config import ColosseumConfig, load_config
-from colosseum.core.types import WeightPayload
+from colosseum.core.ipc import from_numpy_tree
+from colosseum.core.types import WeightPayload, state_dict_from_numpy
 
 logger = logging.getLogger(__name__)
 
@@ -47,7 +48,7 @@ logger = logging.getLogger(__name__)
 
 
 class GRPCTrajectorySink:
-    """``.put``-compatible sink that ships chunks to a learner over gRPC.
+    """``.put``-compatible sink that ships chunk payloads to a learner over gRPC.
 
     Transient RPC failures (e.g. the learner restarting or shutting down) drop
     the chunk rather than crashing the worker — trajectory data is replaceable,
@@ -211,8 +212,8 @@ def run_distributed_learner(
                 coordinator_ckpt.save(
                     agent_id=agent_id,
                     policy_version=data["policy_version"],
-                    state_dict=data["state_dict"],
-                    optimizer_state=data.get("optimizer_state"),
+                    state_dict=state_dict_from_numpy(data["state_dict"]),
+                    optimizer_state=from_numpy_tree(data.get("optimizer_state")),
                 )
 
     drainer = threading.Thread(target=_drain_checkpoints, daemon=True)

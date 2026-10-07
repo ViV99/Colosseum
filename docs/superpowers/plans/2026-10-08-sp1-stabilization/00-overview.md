@@ -289,9 +289,17 @@ class WorkerCommand:            # new_checkpoints become numpy state dicts (T2.2
 
 `PlayerSlot` and `MatchConfig` are unchanged.
 
-### `colosseum.core.ipc` (T2.3, T2.5)
+### `colosseum.core.ipc` (T2.2, T2.3, T2.5)
 
 ```python
+# T2.2: the single numpy <-> torch conversion point (torch->numpy copies, bf16->float32;
+# numpy->torch shares writable C-contiguous arrays, copies the rest)
+def tensor_to_numpy(t: Tensor) -> np.ndarray: ...
+def numpy_to_tensor(a: np.ndarray) -> Tensor: ...
+def to_numpy_tree(obj: Any) -> Any: ...                  # dict/list/tuple/namedtuple, tensor leaves -> numpy
+def from_numpy_tree(obj: Any) -> Any: ...
+def find_tensor(obj: Any, path: str = "item") -> str | None: ...
+def assert_no_tensors(obj: Any, what: str = "item") -> None: ...   # TypeError naming the path
 def put_latest(q: mp.Queue, item: Any, timeout: float = 1.0) -> bool: ...   # maxsize=1 queue; evicts a stale/in-flight item (see amendment B1)
 def drain_latest(q: mp.Queue) -> Any | None: ...         # returns the newest available item or None
 class SharedCounter:                                     # wraps mp.Value("q")

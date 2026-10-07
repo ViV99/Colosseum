@@ -69,5 +69,5 @@ addopts = "-ra --strict-markers"
 timeout = 300
 markers = [
     "gpu: needs a CUDA device (auto-skipped without CUDA)",
-    "slow: longer than ~20 s, or races known until T2.2; excluded from the fast suite (-m 'not gpu and not slow')",
+    "slow: longer than ~20 s; excluded from the fast suite (-m 'not gpu and not slow')",
 ]

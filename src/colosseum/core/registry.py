@@ -152,12 +152,32 @@ def _check_state_batch_dim(state_a: Any, state_b: Any, batches: tuple[int, int],
             )
 
 
+def _check_state_payload(state: Any) -> None:
+    """The model state must survive the inter-process payload round trip.
+
+    Chunks carry ``initial_state`` to the learner as numpy over ``mp.Queue``
+    (pickle) or gRPC (:func:`colosseum.transport.serialization.pack_payload`).
+    Both rebuild namedtuples by module path, so e.g. a namedtuple class created
+    inside a function would only fail later, in a queue feeder thread.
+    """
+    from colosseum.networks.state import slice_batch, state_from_numpy, state_to_numpy
+    from colosseum.transport.serialization import pack_payload, unpack_payload
+
+    if state is None:
+        return
+    try:
+        state_from_numpy(unpack_payload(*pack_payload(state_to_numpy(slice_batch(state, 0)))))
+    except (TypeError, ValueError) as e:
+        raise ConfigError(f"initial_state cannot be sent between processes: {e}") from e
+
+
 def validate_config(config: ColosseumConfig) -> None:
     """Build the env and the model and exercise ``step``/``unroll`` on dummy data.
 
     Raises :class:`ConfigError` with a precise message on any structural problem
     (bad class, head/core dimension mismatch, wrong value shape, state without a
-    batch dim, action/mask size mismatch) before any process is spawned.
+    batch dim or that cannot be sent between processes, action/mask size
+    mismatch) before any process is spawned.
     """
     import numpy as np
     import torch
@@ -226,6 +246,7 @@ def validate_config(config: ColosseumConfig) -> None:
             except Exception as e:
                 raise ConfigError(f"model.initial_state(B) failed: {type(e).__name__}: {e}") from e
             _check_state_batch_dim(state0, state0_alt, (B, B_ALT), "initial_state")
+            _check_state_payload(state0)
             try:
                 out = model.step(obs, state0, mask)
                 out_alt = model.step(obs_alt, state0_alt, mask_alt)

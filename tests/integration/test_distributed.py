@@ -3,6 +3,7 @@ import queue
 import socket
 import time
 
+import numpy as np
 import torch
 
 from colosseum.core.types import TrajectoryChunk, WeightPayload
@@ -15,7 +16,7 @@ def _free_port():
 
 
 def _state_dict():
-    return {"w": torch.randn(4, 4), "b": torch.randn(4)}
+    return {"w": np.random.randn(4, 4).astype(np.float32), "b": np.random.randn(4).astype(np.float32)}
 
 
 # ---------------------------------------------------------------------------
@@ -47,7 +48,7 @@ def test_grpc_weight_sink_and_source():
         sink.put_nowait(WeightPayload("agent_0", 1, sd1))
         payload = source.get_nowait()
         assert payload.policy_version == 1
-        assert torch.allclose(payload.state_dict["w"], sd1["w"])
+        assert np.allclose(payload.state_dict["w"], sd1["w"])
 
         # No new version → Empty (don't re-pull the same weights).
         try:
@@ -98,7 +99,7 @@ def test_grpc_trajectory_sink_sends_chunk_with_masks():
         )
         sink.put(chunk, timeout=1.0)
 
-        received = chunk_queue.get(timeout=2.0)
+        received = TrajectoryChunk.from_payload(chunk_queue.get(timeout=2.0))
         assert received.action_masks is not None
         assert torch.equal(received.action_masks, masks)
         transport.close()

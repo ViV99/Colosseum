@@ -3,8 +3,8 @@
 import multiprocessing as mp
 import time
 
+import numpy as np
 import pytest
-import torch
 
 from colosseum.core.config import (
     AgentConfig,
@@ -153,7 +153,7 @@ def test_monitor_loop_per_agent_checkpoint_queues():
     # This test just verifies the monitor loop's queue draining works
     # by putting items and checking they don't crash
     for aid in agent_ids:
-        state_dict = {"weight": torch.randn(3, 3)}
+        state_dict = {"weight": np.random.randn(3, 3).astype(np.float32)}
         checkpoint_queues[aid].put({
             "policy_version": 100,
             "state_dict": state_dict,

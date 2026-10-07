@@ -215,6 +215,40 @@ def test_state_to_numpy_is_a_copy():
     assert payload["x"].sum() == 0.0
 
 
+def test_state_from_numpy_copies_read_only_arrays_without_warning():
+    """gRPC/np.frombuffer arrays are read-only: copy them, never warn (T2.2)."""
+    import warnings
+
+    ro = np.frombuffer(np.arange(6, dtype=np.float32).tobytes(), dtype=np.float32).reshape(1, 6)
+    assert not ro.flags.writeable
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        back = state_from_numpy({"h": ro, "pair": Pair(ro, [ro])})
+    assert torch.equal(back["h"], torch.arange(6, dtype=torch.float32).view(1, 6))
+    back["h"].add_(1.0)  # writable, and does not alias the read-only buffer
+    assert ro[0, 0] == 0.0
+    assert isinstance(back["pair"], Pair)
+
+
+def test_state_from_numpy_shares_writable_contiguous_arrays():
+    """Documented aliasing: a writable C-contiguous array is used zero-copy on CPU."""
+    arr = np.zeros((1, 2), np.float32)
+    back = state_from_numpy(arr)
+    back.add_(1.0)
+    assert arr[0, 0] == 1.0
+    strided = np.zeros((1, 4), np.float32)[:, ::2]
+    state_from_numpy(strided).add_(1.0)  # non-contiguous: copied
+    assert strided.sum() == 0.0
+
+
+def test_state_to_numpy_upcasts_bfloat16_to_float32():
+    h = torch.randn(2, 3).to(torch.bfloat16)
+    payload = state_to_numpy({"h": h, "n": torch.tensor([[1]])})
+    assert payload["h"].dtype == np.float32 and payload["n"].dtype == np.int64
+    back = state_from_numpy(payload)
+    assert back["h"].dtype == torch.float32 and torch.equal(back["h"], h.float())
+
+
 def test_state_to_device():
     s = _nested(2)
     moved = state_to(s, "cpu")

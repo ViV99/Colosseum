@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from collections import namedtuple
 from pathlib import Path
 
 import gymnasium
@@ -97,6 +98,30 @@ class TinyMonolithicModel(PolicyModel):
         if action_mask is not None:
             dist = dist.apply_mask(action_mask)
         return StepOutput(dist, self.v(x).squeeze(-1), None)
+
+
+HCState = namedtuple("HCState", ["h", "c"])
+
+
+class NamedTupleStateModel(TinyMonolithicModel):
+    """Stateful model whose state is a module-level namedtuple (crosses processes fine)."""
+
+    state_cls = HCState
+
+    def initial_state(self, batch_size, device="cpu"):
+        return self.state_cls(torch.zeros(batch_size, 2, device=device), torch.zeros(batch_size, 2, device=device))
+
+    def step(self, obs, state, action_mask=None):
+        out = super().step(obs, None, action_mask)
+        return StepOutput(out.dist, out.value, self.state_cls(state.h + 1.0, state.c))
+
+
+class LocalNamedTupleStateModel(NamedTupleStateModel):
+    """State namedtuple class is not reachable by module path (validate_config must reject it)."""
+
+    def __init__(self, obs_dim: int = 27, num_actions: int = 9) -> None:
+        super().__init__(obs_dim, num_actions)
+        self.state_cls = namedtuple("UnreachableState", ["h", "c"])
 
 
 class GaussianActionModel(TinyMonolithicModel):

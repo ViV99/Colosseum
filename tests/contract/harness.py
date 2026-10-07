@@ -31,12 +31,8 @@ def counting_env_fn(num_players: int = 2, episode_length: int = 5) -> Callable[[
 
 
 def weights_payload(agent_id: str, model: Any, version: int) -> WeightPayload:
-    """Weight payload carrying ``model``'s current parameters."""
-    return WeightPayload(
-        agent_id=agent_id,
-        policy_version=version,
-        state_dict={k: v.detach().clone() for k, v in model.state_dict().items()},
-    )
+    """Numpy weight payload carrying ``model``'s current parameters."""
+    return WeightPayload.from_model(agent_id, version, model)
 
 
 @dataclass

@@ -200,7 +200,7 @@ def test_refresh_pushes_new_checkpoint_to_worker():
 
 def test_worker_applies_command_loads_checkpoint_and_stages_maps():
     """Worker side: a WorkerCommand loads new checkpoints and stages slot maps."""
-    from colosseum.core.types import WorkerCommand
+    from colosseum.core.types import WorkerCommand, state_dict_to_numpy
     from colosseum.worker.rollout_loop import LATEST_NETWORK_ID, _apply_command
     from helpers import make_simple_model
 
@@ -209,7 +209,7 @@ def test_worker_applies_command_loads_checkpoint_and_stages_maps():
 
     networks_by_agent = {"agent_0": {LATEST_NETWORK_ID: factory()}}
     factories = {"agent_0": factory}
-    ckpt_sd = factory().state_dict()
+    ckpt_sd = state_dict_to_numpy(factory().state_dict())
 
     cmd = WorkerCommand(
         slot_agent_map=[["agent_0", "agent_0"]],

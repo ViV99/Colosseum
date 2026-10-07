@@ -13,6 +13,8 @@ import queue
 from collections.abc import Callable
 from typing import Any
 
+import numpy as np
+
 from colosseum.core.threads import configure_torch_threads
 from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
 from colosseum.envs.base_env import BaseEnv
@@ -60,7 +62,7 @@ def rollout_worker_process(
     weight_sync_interval: float = 5.0,
     torch_threads: int = 1,
     max_env_steps: int = 0,
-    checkpoint_state_dicts_by_agent: dict[str, dict[str, Any]] | None = None,
+    checkpoint_state_dicts_by_agent: dict[str, dict[str, dict[str, np.ndarray]]] | None = None,
     slot_agent_map: list[list[str]] | None = None,
     slot_network_map: list[list[str]] | None = None,
     collect_mask: list[list[bool]] | None = None,
@@ -72,10 +74,10 @@ def rollout_worker_process(
 ) -> None:
     """Worker process entry point (see module docstring).
 
-    Queues are adapted to ``LoopIO`` callbacks: chunks go to
-    ``trajectory_queues[chunk.agent_id]`` (blocking put that gives up when
-    ``stop_event`` is set), weights are drained newest-wins from
-    ``weight_queues[agent_id]``, results are put non-blocking on
+    Queues are adapted to ``LoopIO`` callbacks: chunk payloads
+    (``TrajectoryChunk.to_payload()``) go to ``trajectory_queues[chunk.agent_id]``
+    (blocking put that gives up when ``stop_event`` is set), weights are
+    drained newest-wins from ``weight_queues[agent_id]``, results are put non-blocking on
     ``results_queue`` and commands are drained with merged checkpoints from
     ``command_queue``. ``max_env_steps`` limits this worker's env steps
     (0 = until stopped).
@@ -83,10 +85,11 @@ def rollout_worker_process(
     configure_torch_threads(torch_threads)
 
     def send_chunk(chunk: TrajectoryChunk) -> None:
+        payload = chunk.to_payload()  # numpy only across processes (R6-02)
         q = trajectory_queues[chunk.agent_id]
         while not stop_event.is_set():
             try:
-                q.put(chunk, timeout=1.0)
+                q.put(payload, timeout=1.0)
                 return
             except queue.Full:
                 continue

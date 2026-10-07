@@ -6,12 +6,26 @@ workers, learners, the weight store, and the coordinator.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
+import numpy as np
 import torch
+import torch.nn as nn
 
-from colosseum.networks.state import State, tree_map
+from colosseum.core.ipc import numpy_to_tensor, tensor_to_numpy
+from colosseum.networks.state import State, state_from_numpy, state_to_numpy, tree_map
+
+
+def state_dict_to_numpy(state_dict: Mapping[str, torch.Tensor]) -> dict[str, np.ndarray]:
+    """Detached CPU numpy copies of a torch ``state_dict`` (bfloat16 -> float32)."""
+    return {key: tensor_to_numpy(value) for key, value in state_dict.items()}
+
+
+def state_dict_from_numpy(state_dict: Mapping[str, np.ndarray]) -> dict[str, torch.Tensor]:
+    """CPU torch tensors from a numpy ``state_dict``; inverse of :func:`state_dict_to_numpy`."""
+    return {key: numpy_to_tensor(value) for key, value in state_dict.items()}
 
 
 @dataclass
@@ -91,6 +105,40 @@ class TrajectoryChunk:
         """Pin all tensors to page-locked memory for faster host-to-device copies."""
         return self._apply_to_tensors(lambda t: t.pin_memory())
 
+    def to_payload(self) -> dict[str, Any]:
+        """Numpy + primitives form for crossing a process boundary (spec block 2)."""
+        return {
+            "agent_id": str(self.agent_id),
+            "observations": tensor_to_numpy(self.observations),
+            "actions": tensor_to_numpy(self.actions),
+            "action_log_probs": tensor_to_numpy(self.action_log_probs),
+            "rewards": tensor_to_numpy(self.rewards),
+            "dones": tensor_to_numpy(self.dones),
+            "values": tensor_to_numpy(self.values),
+            "bootstrap_value": float(self.bootstrap_value),
+            "behavior_policy_version": int(self.behavior_policy_version),
+            "initial_state": state_to_numpy(self.initial_state),
+            "action_masks": None if self.action_masks is None else tensor_to_numpy(self.action_masks),
+        }
+
+    @classmethod
+    def from_payload(cls, payload: Mapping[str, Any]) -> TrajectoryChunk:
+        """Rebuild a chunk (CPU tensors) from :meth:`to_payload` output."""
+        masks = payload.get("action_masks")
+        return cls(
+            agent_id=str(payload["agent_id"]),
+            observations=numpy_to_tensor(payload["observations"]),
+            actions=numpy_to_tensor(payload["actions"]),
+            action_log_probs=numpy_to_tensor(payload["action_log_probs"]),
+            rewards=numpy_to_tensor(payload["rewards"]),
+            dones=numpy_to_tensor(payload["dones"]),
+            values=numpy_to_tensor(payload["values"]),
+            bootstrap_value=torch.tensor(float(payload["bootstrap_value"]), dtype=torch.float32),
+            behavior_policy_version=int(payload["behavior_policy_version"]),
+            initial_state=state_from_numpy(payload.get("initial_state")),
+            action_masks=None if masks is None else numpy_to_tensor(masks),
+        )
+
 
 @dataclass
 class PlayerSlot:
@@ -160,40 +208,51 @@ class WorkerCommand:
 
     Lets matchmaking evolve *during* training: the coordinator periodically
     re-generates slot assignments (e.g. PFSP opponent picks, fresh self-play
-    checkpoints) and ships them to each worker, which applies them at the next
-    episode boundary. ``new_checkpoints`` carries any checkpoint state_dicts the
-    worker does not yet have, so historical opponents can enter its network pool
+    checkpoints) and ships them to each worker, which applies them per env at
+    its next episode boundary. ``new_checkpoints`` carries the checkpoint
+    weights (numpy, see :func:`state_dict_to_numpy`) the worker does not have
+    yet (deltas only), so historical opponents can enter its model pool
     without restarting the process.
 
     Attributes:
         slot_agent_map: ``[num_envs][num_players]`` -> agent_id.
-        slot_network_map: ``[num_envs][num_players]`` -> network_id
-            (``"latest"`` or a checkpoint id).
-        collect_mask: ``[num_envs][num_players]`` -> whether the slot collects
-            trajectories.
-        new_checkpoints: ``{agent_id: {checkpoint_id: state_dict}}`` — checkpoints
-            to load into the worker's network pool (deltas only).
+        slot_network_map: ``[num_envs][num_players]`` -> ``"latest"`` or a checkpoint id.
+        collect_mask: ``[num_envs][num_players]`` -> whether the slot collects trajectories.
+        new_checkpoints: ``{agent_id: {checkpoint_id: numpy state_dict}}``.
     """
 
     slot_agent_map: list[list[str]] = field(default_factory=list)
     slot_network_map: list[list[str]] = field(default_factory=list)
     collect_mask: list[list[bool]] = field(default_factory=list)
-    new_checkpoints: dict[str, dict[str, dict]] = field(default_factory=dict)
+    new_checkpoints: dict[str, dict[str, dict[str, np.ndarray]]] = field(default_factory=dict)
 
 
 @dataclass
 class WeightPayload:
-    """Serialisable container for model weights flowing through the weight store.
+    """Model weights flowing from a learner to workers (numpy, never torch).
 
     Attributes:
         agent_id: The agent these weights belong to.
-        policy_version: Monotonically increasing version counter.  Workers
-            compare this against the version used to collect a trajectory chunk
-            so the learner can compute V-trace importance weights.
-        state_dict: The ``state_dict()`` of the model, mapping parameter names
-            to tensors.
+        policy_version: Monotonically increasing version counter (number of
+            train steps). Workers stamp it on the chunks they collect so the
+            learner can compute V-trace importance weights.
+        state_dict: ``model.state_dict()`` as numpy arrays (see
+            :func:`state_dict_to_numpy`).
     """
 
     agent_id: str
     policy_version: int
-    state_dict: dict[str, torch.Tensor] = field(default_factory=dict)
+    state_dict: dict[str, np.ndarray] = field(default_factory=dict)
+
+    @classmethod
+    def from_model(cls, agent_id: str, policy_version: int, model: nn.Module) -> WeightPayload:
+        """Snapshot ``model``'s current weights as a numpy payload."""
+        return cls(
+            agent_id=agent_id,
+            policy_version=int(policy_version),
+            state_dict=state_dict_to_numpy(model.state_dict()),
+        )
+
+    def to_torch_state_dict(self) -> dict[str, torch.Tensor]:
+        """CPU torch ``state_dict`` for ``model.load_state_dict``."""
+        return state_dict_from_numpy(self.state_dict)

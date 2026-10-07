@@ -16,6 +16,8 @@ import numpy as np
 import torch
 from torch import Tensor
 
+from colosseum.core.ipc import numpy_to_tensor, tensor_to_numpy
+
 State = Any  # None | Tensor | tuple | list | dict[str, State]; tensor leaves are batch-first
 
 
@@ -165,11 +167,16 @@ def where_done(done: Tensor, reset: State, state: State) -> State:
 
 
 def state_to_numpy(state: State) -> Any:
-    """Same structure with ``np.ndarray`` leaves (detached CPU copies)."""
+    """Same structure with ``np.ndarray`` leaves (detached CPU copies).
+
+    Leaves are converted by :func:`colosseum.core.ipc.tensor_to_numpy`:
+    ``bfloat16`` (which numpy lacks) is upcast to ``float32``, so
+    :func:`state_from_numpy` returns those leaves as ``float32``.
+    """
     if state is None:
         return None
     if isinstance(state, Tensor):
-        return state.detach().cpu().numpy().copy()
+        return tensor_to_numpy(state)
     if _is_namedtuple(state):
         return type(state)(*(state_to_numpy(s) for s in state))
     if isinstance(state, tuple):
@@ -182,11 +189,17 @@ def state_to_numpy(state: State) -> Any:
 
 
 def state_from_numpy(obj: Any, device: str | torch.device = "cpu") -> State:
-    """Inverse of :func:`state_to_numpy`."""
+    """Inverse of :func:`state_to_numpy`.
+
+    Aliasing (see :func:`colosseum.core.ipc.numpy_to_tensor`): on CPU, a
+    writable C-contiguous array is shared with the returned tensor (zero copy);
+    read-only (e.g. ``np.frombuffer``) or non-contiguous arrays are copied, so
+    no "non-writable array" warning is emitted.
+    """
     if obj is None:
         return None
     if isinstance(obj, np.ndarray):
-        return torch.from_numpy(np.ascontiguousarray(obj)).to(device)
+        return numpy_to_tensor(obj).to(device)
     if _is_namedtuple(obj):
         return type(obj)(*(state_from_numpy(o, device) for o in obj))
     if isinstance(obj, tuple):
