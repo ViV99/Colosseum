@@ -94,3 +94,18 @@ def test_train_rejects_invalid_config_without_creating_a_run_dir(tmp_path, monke
     run_dir = launcher_module.run_training(str(_misordered_config(tmp_path)), fixed)
     assert run_dir.root == runs / "retry" and launched == [run_dir]
     assert run_dir.resolved_config_path.is_file()
+
+
+def test_train_rejects_missing_resume_source_without_creating_a_run_dir(tmp_path, monkeypatch,
+                                                                       restore_root_logging):
+    import colosseum.launcher as launcher_module
+
+    monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *args, **kwargs: None)
+    monkeypatch.setattr(launcher_module, "Launcher", _fail("Launcher"))
+    runs = tmp_path / "runs"
+    overrides = {"run.dir": str(runs), "run.name": "resumed",
+                 "networks.policy_class": "helpers.TwelveHeadPolicy",
+                 "training.resume_from": str(tmp_path / "no_such_run")}
+    with pytest.raises(ConfigError, match="resume_from"):
+        launcher_module.run_training(str(_misordered_config(tmp_path)), overrides)
+    assert not runs.exists()

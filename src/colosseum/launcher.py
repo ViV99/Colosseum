@@ -776,6 +776,9 @@ def run_training(config_path: str, overrides: dict | None = None) -> RunDir:
     # Before the run dir exists: an invalid config leaves nothing behind, so a corrected
     # retry with the same run.name works.
     validate_agent_configs(config)
+    if config.training.resume_from:
+        from colosseum.coordinator.checkpoint_manager import classify_resume_source
+        classify_resume_source(config.training.resume_from)  # exists and has a known layout (nothing loaded)
     apply_global_seed(config.training.seed)  # after overrides: --set training.seed works (R3-27)
     run_dir = RunDir.create(config, config_path)
     config = run_dir.with_run_name(config)  # the resolved config and checkpoint hashes agree

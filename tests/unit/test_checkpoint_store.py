@@ -259,6 +259,25 @@ def test_resolve_resume_checkpoint_dir_run_dir_and_pt(tmp_path):
         assert not contains_tensor(result)
 
 
+def test_classify_resume_source_reads_only_the_layout(tmp_path):
+    from colosseum.coordinator.checkpoint_manager import (
+        RESUME_CHECKPOINT_DIR,
+        RESUME_PT_FILE,
+        RESUME_RUN_DIR,
+        classify_resume_source,
+    )
+
+    CheckpointManager(tmp_path / "run" / "checkpoints").save("a", 1, sd(1))
+    garbage = tmp_path / "garbage.pt"
+    garbage.write_bytes(b"not a torch file")  # classified by name only, never loaded
+    assert classify_resume_source(tmp_path / "run") == RESUME_RUN_DIR
+    assert classify_resume_source(str(tmp_path / "run" / "checkpoints" / "a" / "ckpt_v1")) == RESUME_CHECKPOINT_DIR
+    assert classify_resume_source(garbage) == RESUME_PT_FILE
+    for bad in (tmp_path / "missing", tmp_path / "run" / "checkpoints", tmp_path / "x.txt"):
+        with pytest.raises(ConfigError, match="resume_from"):
+            classify_resume_source(bad)
+
+
 def test_resolve_resume_wraps_unreadable_checkpoints_in_config_error(tmp_path):
     base = tmp_path / "run" / "checkpoints"
     CheckpointManager(base).save("a", 2, sd(2), meta_extra={"env_steps": None})

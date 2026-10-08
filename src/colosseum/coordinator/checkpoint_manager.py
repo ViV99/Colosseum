@@ -304,10 +304,35 @@ def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
     }
 
 
+RESUME_RUN_DIR = "run_dir"
+RESUME_CHECKPOINT_DIR = "checkpoint_dir"
+RESUME_PT_FILE = "pt_file"
+
+
+def classify_resume_source(resume_from: str | Path) -> str:
+    """Kind of a ``training.resume_from`` source, from the file system only (nothing is loaded).
+
+    Returns ``RESUME_RUN_DIR`` (a dir containing ``checkpoints/``), ``RESUME_CHECKPOINT_DIR``
+    (a dir containing ``model.pt``) or ``RESUME_PT_FILE`` (a ``.pt`` file); anything else
+    raises ConfigError.
+    """
+    path = Path(resume_from)
+    if path.is_dir() and (path / "checkpoints").is_dir():
+        return RESUME_RUN_DIR
+    if path.is_dir() and (path / MODEL_FILE).is_file():
+        return RESUME_CHECKPOINT_DIR
+    if path.is_file() and path.suffix == ".pt":
+        return RESUME_PT_FILE
+    raise ConfigError(
+        f"training.resume_from={str(resume_from)!r}: expected a checkpoint dir (containing {MODEL_FILE}), "
+        f"a run dir (containing checkpoints/), or a .pt file"
+    )
+
+
 def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
     """Resolve ``training.resume_from`` for one agent.
 
-    Accepted forms:
+    Accepted forms (see ``classify_resume_source``):
     - a checkpoint dir (contains ``model.pt``): its weights, trainer state and version;
     - a previous run dir (contains ``checkpoints/``): the agent's latest checkpoint
       there, or ``None`` (with a warning) if the agent has none;
@@ -318,7 +343,8 @@ def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
     """
     check_agent_id(agent_id)
     path = Path(resume_from)
-    if path.is_dir() and (path / "checkpoints").is_dir():
+    kind = classify_resume_source(path)
+    if kind == RESUME_RUN_DIR:
         try:
             infos = _read_agent_dir(path / "checkpoints" / agent_id, strict=True)
         except ConfigError as e:
@@ -327,21 +353,16 @@ def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
             logger.warning(f"resume_from={resume_from}: no checkpoints for agent '{agent_id}'; starting fresh")
             return None
         return _load_checkpoint_dir(infos[-1].path, resume_from)
-    if path.is_dir() and (path / MODEL_FILE).is_file():
+    if kind == RESUME_CHECKPOINT_DIR:
         return _load_checkpoint_dir(path, resume_from)
-    if path.is_file() and path.suffix == ".pt":
-        try:
-            state = torch.load(path, map_location="cpu", weights_only=True)
-        except Exception as e:  # noqa: BLE001 - any unpickling failure means a bad resume source
-            raise ConfigError(f"training.resume_from={resume_from!r}: cannot load weights ({e})") from e
-        if not isinstance(state, dict) or not all(isinstance(v, torch.Tensor) for v in state.values()):
-            raise ConfigError(f"training.resume_from={resume_from!r}: expected a state_dict of tensors")
-        return {"model_state": torch_state_to_numpy(state), "trainer_state": None,
-                "policy_version": 0, "env_steps": 0, "source": str(path)}
-    raise ConfigError(
-        f"training.resume_from={resume_from!r}: expected a checkpoint dir (containing {MODEL_FILE}), "
-        f"a run dir (containing checkpoints/), or a .pt file"
-    )
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as e:  # noqa: BLE001 - any unpickling failure means a bad resume source
+        raise ConfigError(f"training.resume_from={resume_from!r}: cannot load weights ({e})") from e
+    if not isinstance(state, dict) or not all(isinstance(v, torch.Tensor) for v in state.values()):
+        raise ConfigError(f"training.resume_from={resume_from!r}: expected a state_dict of tensors")
+    return {"model_state": torch_state_to_numpy(state), "trainer_state": None,
+            "policy_version": 0, "env_steps": 0, "source": str(path)}
 
 
 def check_model_state(model: torch.nn.Module, model_state: dict[str, np.ndarray], source: str) -> None:

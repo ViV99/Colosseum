@@ -191,3 +191,68 @@ def test_distributed_workers_role_includes_the_sanitized_hostname(monkeypatch, h
 
     monkeypatch.setattr(distributed.socket, "gethostname", lambda: host)
     assert distributed.workers_role() == role
+
+
+@pytest.mark.parametrize("role", ["learner-agent_0", "workers-node-1"])
+def test_role_dir_records_the_base_run_name(tmp_path, role):
+    """A distributed role dir is <run_name>-<role>; the resolved config keeps <run_name>,
+    so re-running it as the same role reproduces the layout (no doubled role suffix)."""
+    cfg = make_config(tmp_path)
+    run = RunDir.create(cfg, config_path="myexp.yaml", role=role)
+    resolved = load_config(run.write_resolved_config(cfg))
+    assert re.fullmatch(r"myexp-\d{8}-\d{6}", resolved.run.name)
+    assert run.run_name == resolved.run.name and run.root.name == f"{resolved.run.name}-{role}"
+
+    resolved.run.dir = str(tmp_path / "rerun")
+    again = RunDir.create(resolved, config_path="myexp.yaml", role=role)
+    assert again.root == tmp_path / "rerun" / f"{resolved.run.name}-{role}"
+    assert load_config(again.write_resolved_config(resolved)).run.name == resolved.run.name
+
+
+def test_auto_suffix_goes_before_the_role(tmp_path, monkeypatch):
+    from datetime import datetime
+
+    import colosseum.core.run_dir as run_dir_module
+
+    class FrozenClock:
+        @staticmethod
+        def now():
+            return datetime(2026, 1, 2, 3, 4, 5)
+
+    monkeypatch.setattr(run_dir_module, "datetime", FrozenClock)
+    cfg = make_config(tmp_path)
+    (tmp_path / "runs" / "exp-20260102-030405-learner-a").mkdir(parents=True)
+    run = RunDir.create(cfg, config_path="exp.yaml", role="learner-a")
+    assert run.root.name == "exp-20260102-030405-2-learner-a"
+    assert load_config(run.write_resolved_config(cfg)).run.name == "exp-20260102-030405-2"
+
+
+def test_distributed_workers_entry_point_records_the_base_run_name(tmp_path, monkeypatch, restore_root_logging):
+    import multiprocessing as mp
+
+    import colosseum.distributed as distributed
+
+    class NeverStartedProcess:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def start(self):
+            pass
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(mp, "set_start_method", lambda *args, **kwargs: None)
+    monkeypatch.setattr(distributed.mp, "Process", NeverStartedProcess)
+    monkeypatch.setattr(distributed.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(distributed.socket, "gethostname", lambda: "node 7")
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump(make_config(tmp_path).model_dump(mode="json", by_alias=True)))
+    distributed.run_distributed_workers(str(path), "localhost:1", {"alpha": "localhost:2"})
+    (root,) = (tmp_path / "runs").iterdir()
+    resolved = load_config(root / "config.resolved.yaml")
+    assert re.fullmatch(r"cfg-\d{8}-\d{6}", resolved.run.name)
+    assert root.name == f"{resolved.run.name}-workers-node-7"

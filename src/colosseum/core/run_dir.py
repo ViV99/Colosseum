@@ -33,7 +33,14 @@ def safe_path_component(value: str, fallback: str) -> str:
 
 @dataclass(frozen=True)
 class RunDir:
+    """``root`` is ``<run.dir>/<run_name>`` or, for a distributed role, ``<run.dir>/<run_name>-<role>``.
+
+    ``run_name`` is the base run name shared by all roles of a run (``None`` for
+    ``RunDir.open``, which then falls back to ``root.name``).
+    """
+
     root: Path
+    run_name: str | None = None
 
     @property
     def logs(self) -> Path:
@@ -63,24 +70,25 @@ class RunDir:
     @classmethod
     def create(cls, config: ColosseumConfig, config_path: str | Path | None = None,
                role: str | None = None) -> RunDir:
-        """Create ``<run.dir>/<name>[-<role>]`` with ``logs/`` and ``checkpoints/``.
+        """Create ``<run.dir>/<run_name>[-<role>]`` with ``logs/`` and ``checkpoints/``.
 
-        The default name is ``<config_stem>-<YYYYmmdd-HHMMSS>`` and gets a ``-2``, ``-3``, ...
-        suffix if taken. An explicit ``run.name`` whose dir already exists is an error,
-        so a run never mixes into another run's checkpoints (R4-06, R5-13). The root is
-        claimed with an exclusive ``mkdir``, so two processes never get the same dir.
+        The default run name is ``<config_stem>-<YYYYmmdd-HHMMSS>``; if its dir is taken
+        the run name gets a ``-2``, ``-3``, ... suffix (before the role, so the layout is
+        always ``<run_name>-<role>``). An explicit ``run.name`` whose dir already exists is
+        an error, so a run never mixes into another run's checkpoints (R4-06, R5-13). The
+        root is claimed with an exclusive ``mkdir``, so two processes never get the same dir.
         """
         stem = safe_path_component(Path(config_path).stem, "run") if config_path is not None else "run"
         explicit = config.run.name is not None
         base = config.run.name if explicit else f"{stem}-{datetime.now():%Y%m%d-%H%M%S}"
-        if role:
-            base = f"{base}-{role}"
         check_path_component(base, "run name")
+        if role:
+            check_path_component(role, "run role")
         parent = Path(config.run.dir)
         parent.mkdir(parents=True, exist_ok=True)
-        root = parent / base
-        suffix = 2
+        run_name, suffix = base, 2
         while True:
+            root = parent / (f"{run_name}-{role}" if role else run_name)
             try:
                 root.mkdir()
                 break
@@ -90,22 +98,24 @@ class RunDir:
                         f"Run directory {root} already exists; choose another run.name "
                         f"(--set run.name=...) or delete it"
                     ) from None
-                root = parent / f"{base}-{suffix}"
+                run_name = f"{base}-{suffix}"
                 suffix += 1
-        run = cls(root)
+        run = cls(root, run_name)
         run.logs.mkdir()
         run.checkpoints.mkdir()
         return run
 
     def with_run_name(self, config: ColosseumConfig) -> ColosseumConfig:
-        """``config`` with ``run.name`` set to this run's effective name.
+        """``config`` with ``run.name`` set to this run's effective base name.
 
-        An auto-named run (``run.name: null``) records the name it got (``root.name``);
-        an explicit name is kept as is.
+        An auto-named run (``run.name: null``) records the name it got, without any role
+        suffix, so re-running the resolved config as the same role reproduces
+        ``<run_name>-<role>``; an explicit name is kept as is.
         """
         if config.run.name is not None:
             return config
-        return config.model_copy(update={"run": config.run.model_copy(update={"name": self.root.name})})
+        name = self.run_name if self.run_name is not None else self.root.name
+        return config.model_copy(update={"run": config.run.model_copy(update={"name": name})})
 
     def write_resolved_config(self, config: ColosseumConfig) -> Path:
         """Write ``config`` (with the effective run name) atomically to ``config.resolved.yaml``."""

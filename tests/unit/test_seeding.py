@@ -8,7 +8,7 @@ import pytest
 import torch
 import yaml
 
-from colosseum.core.config import ColosseumConfig
+from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.utils.seeding import derive_seed, learner_seed
 from helpers import make_test_run_dir
 
@@ -155,6 +155,14 @@ def test_run_learner_seeds_before_building_the_model(
     assert np.array_equal(a, b)
     assert not np.array_equal(a, run("alpha", 6))
     assert not np.array_equal(a, run("beta", 5))  # distinct per-agent stream
+    # Every auto-named learner role dir is <base run name>-learner-<agent>, and its resolved
+    # config records the base name (re-running it reproduces the layout).
+    role_dirs = sorted((tmp_path / "runs").iterdir())
+    assert len(role_dirs) == 4
+    for role_dir in role_dirs:
+        resolved = load_config(role_dir / "config.resolved.yaml")
+        assert role_dir.name in (f"{resolved.run.name}-learner-alpha", f"{resolved.run.name}-learner-beta")
+        assert "learner" not in resolved.run.name
 
     # Same stream as a local-mode learner of the same agent.
     from colosseum.launcher import _learner_main
