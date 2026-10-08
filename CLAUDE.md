@@ -293,7 +293,7 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
   - On Ctrl+C / SIGTERM the final checkpoints are saved within the shutdown grace (`SHUTDOWN_GRACE_SEC = 7`); no process is alive after 10 s.
 - **Eval:** `PolicyModel`-based with per-seat state and seat rotation; W/D/L with Wilson CIs, per-seat breakdown, solo mode, JSON output; architecture taken from checkpoint `meta.json`.
 - **BC / kickstart:** distribution-aware `-log_prob` loss with masks, sequence training for stateful models, forward-KL kickstarting.
-- **Learning checks:** fast bandit and combination-lock chain tests (with a `gamma=0` negative control); the slow tic-tac-toe test (`configs/examples/tic_tac_toe.yaml`, ~70 s on 8 CPU cores) reaches 86–93% wins against a random legal-move player (threshold 80%).
+- **Learning checks:** fast bandit and combination-lock chain tests (with a `gamma=0` negative control); the slow tic-tac-toe test (`configs/examples/tic_tac_toe.yaml`, ~70 s on 8 CPU cores) reaches 86–94% wins against a random legal-move player (threshold 80%).
 
 ### Partial
 - **Distributed mode** (`serve-weight-store`, `run-learner`, `run-workers`) works for latest-weights self-play only: no coordinator, league, ratings, `metrics.jsonl` or WandB; per-worker budgets; `run-learner` ignores `training.resume_from`.

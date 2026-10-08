@@ -33,7 +33,7 @@ Run directory: runs/ttt-quickstart
 ```
 
 On an 8-core CPU the run (2 workers × 16 envs, 600,000 env steps) takes about a minute (52–73 s measured). Afterwards the latest
-checkpoint, played greedily with the action mask, wins 86–93% of games against a random legal-move player (four
+checkpoint, played greedily with the action mask, wins 86–94% of games against a random legal-move player (six
 measured runs of 400 games each; `tests/learning/test_ttt_slow.py` requires >= 80%). Re-running with the same
 `run.name` is refused; pick another name or delete `runs/ttt-quickstart`.
 
