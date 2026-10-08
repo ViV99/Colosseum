@@ -286,6 +286,21 @@ def make_loop(env_factory: Callable[[], BaseEnv],
     return loop, col
 
 
+def run_until_chunks(loop: RolloutLoop, collected: Collected, n_chunks: int,
+                     max_steps: int = 10_000) -> list[TrajectoryChunk]:
+    """Step ``loop`` until ``collected`` holds at least ``n_chunks`` chunks; return the first ``n_chunks``.
+
+    Raises ``AssertionError`` if ``max_steps`` loop steps are not enough.
+    """
+    for _ in range(max_steps):
+        if len(collected.chunks) >= n_chunks:
+            return collected.chunks[:n_chunks]
+        loop.step()
+    if len(collected.chunks) >= n_chunks:
+        return collected.chunks[:n_chunks]
+    raise AssertionError(f"RolloutLoop produced only {len(collected.chunks)} chunks after {max_steps} steps")
+
+
 def add_to_counter(counter, n: int) -> None:
     """Spawn target: add 1 to a SharedCounter n times."""
     for _ in range(n):

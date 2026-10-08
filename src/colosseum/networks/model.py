@@ -15,6 +15,7 @@ import torch.nn as nn
 from torch import Tensor
 
 from colosseum.networks.distributions import Distribution
+from colosseum.networks.normalization import NormalizeObs
 from colosseum.networks.state import State, batch_size_of, tree_leaves, where_done
 
 
@@ -107,9 +108,19 @@ class PolicyModel(nn.Module, ABC):
         device = tree_leaves(state)[0].device
         return where_done(done, self.initial_state(batch, device), state)
 
+    @torch.no_grad()
     def update_normalizers(self, obs: Tensor) -> None:
-        """Update running observation statistics (no-op unless the model has any)."""
-        return None
+        """Update running observation statistics from fresh training data.
+
+        The algorithm calls this exactly once per train step, before any loss
+        forward, with all new observations of the step (``[N, *obs_shape]``).
+        Default: ``update(obs)`` on every ``NormalizeObs`` submodule (a no-op when
+        there are none). Override when a normalizer sees something other than the
+        raw observation.
+        """
+        for module in self.modules():
+            if isinstance(module, NormalizeObs):
+                module.update(obs)
 
     @property
     def is_stateful(self) -> bool:

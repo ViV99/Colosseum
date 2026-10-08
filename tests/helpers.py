@@ -177,7 +177,7 @@ CORE_KINDS = ("none", "lstm", "gru", "window")
 
 
 def make_core(kind: str, input_dim: int) -> Core:
-    """Small core of each kind; recurrent sizes differ from input_dim on purpose (R1-21)."""
+    """Small core of each kind; every core width except "none" differs from input_dim on purpose (R1-21)."""
     if kind == "none":
         return NoCore(input_dim)
     if kind == "lstm":
@@ -185,7 +185,7 @@ def make_core(kind: str, input_dim: int) -> Core:
     if kind == "gru":
         return GRUCore(input_dim, hidden_size=24)
     if kind == "window":
-        return WindowAttentionCore(input_dim, d_model=16, window=3, num_heads=2)
+        return WindowAttentionCore(input_dim, d_model=24, window=3, num_heads=2)
     raise ValueError(f"unknown core kind {kind!r}")
 
 
@@ -364,16 +364,12 @@ def rollout_chunks(
     ``to_payload()``/``from_payload()`` exactly as they would across processes.
     """
     # Local import: dataflow_helpers imports this module.
-    from dataflow_helpers import make_loop
+    from dataflow_helpers import make_loop, run_until_chunks
 
     loop, collected = make_loop(env_fn, lambda: copy.deepcopy(model), agent_ids=("a",),
                                 num_envs=num_envs, chunk_length=chunk_length, seed=seed)
     try:
-        for _ in range(100_000):
-            if len(collected.chunks) >= num_chunks:
-                break
-            loop.step()
+        chunks = run_until_chunks(loop, collected, num_chunks)
     finally:
         loop.close()
-    assert len(collected.chunks) >= num_chunks, f"RolloutLoop produced only {len(collected.chunks)} chunks"
-    return [TrajectoryChunk.from_payload(c.to_payload()) for c in collected.chunks[:num_chunks]]
+    return [TrajectoryChunk.from_payload(c.to_payload()) for c in chunks]

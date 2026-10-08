@@ -251,6 +251,11 @@ class APPO(BaseAlgorithm):
         metrics_accum: dict[str, float] = {}
         num_updates = 0
 
+        # Refresh observation-normalization statistics once per train step, from
+        # this step's fresh samples only (never once per epoch/minibatch forward).
+        obs_all = torch.cat([torch.as_tensor(c.observations) for c in chunks], dim=0)
+        self._model.update_normalizers(obs_all.to(self._device))
+
         for _epoch in range(cfg.num_epochs):
             # For APPO, we typically do a single pass (num_epochs=1)
             # because the data is already off-policy. Multiple epochs

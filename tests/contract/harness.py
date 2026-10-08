@@ -15,6 +15,7 @@ from colosseum.core.types import TrajectoryChunk, WeightPayload
 from colosseum.worker.rollout_loop import RolloutLoop
 from dataflow_helpers import Collected
 from dataflow_helpers import make_loop as build_loop
+from dataflow_helpers import run_until_chunks as run_until_chunks  # re-export for the contract tests
 from helpers import CountingEnv, make_simple_model
 
 OBS_DIM = 4
@@ -64,16 +65,6 @@ def make_loop(
 def run_steps(loop: RolloutLoop, n: int) -> None:
     for _ in range(n):
         loop.step()
-
-
-def run_until_chunks(loop: RolloutLoop, rec: Collected, n_chunks: int,
-                     max_steps: int = 10_000) -> list[TrajectoryChunk]:
-    """Step until at least ``n_chunks`` chunks were sent; return the first ``n_chunks``."""
-    for _ in range(max_steps):
-        if len(rec.chunks) >= n_chunks:
-            return rec.chunks[:n_chunks]
-        loop.step()
-    raise AssertionError(f"only {len(rec.chunks)} chunks after {max_steps} steps")
 
 
 def step_index(chunk: TrajectoryChunk, episode_length: int = 5) -> list[int]:
