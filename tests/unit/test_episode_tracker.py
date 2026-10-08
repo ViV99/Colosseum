@@ -74,11 +74,52 @@ def test_actions_must_be_exactly_the_acting_seats():
     (StepResult(acting={0}, obs=_obs(0), rewards={2: 1.0}), "seat 2.*a reward for an empty seat"),
     (StepResult(acting={0}, obs=_obs(0), terminated={2}), "terminated for an empty seat"),
     (StepResult(acting={0}, obs=_obs(0), rewards={9: 1.0}), "seat 9.*a reward for an empty seat"),
+    (StepResult(acting={0}, obs=_obs(0), final_obs=_obs(2)), "seat 2.*final_obs for an empty seat"),
+    # The final step checks empty seats too.
+    (StepResult(acting=set(), obs=_obs(2), episode_over=True), "seat 2.*an observation for an empty seat"),
+    (StepResult(acting=set(), obs={}, action_masks={2: np.ones(3, bool)}, episode_over=True),
+     "seat 2.*an action mask for an empty seat"),
+    (StepResult(acting=set(), obs={}, global_state={2: OBS}, episode_over=True),
+     "seat 2.*a global_state for an empty seat"),
+    (StepResult(acting=set(), obs={}, final_obs=_obs(2), episode_over=True), "seat 2.*final_obs for an empty seat"),
+    (StepResult(acting=set(), obs={}, final_obs=_obs(0, 1, 2), episode_over=True, truncated=True),
+     "seat 2.*final_obs for an empty seat"),
+    (StepResult(acting=set(), obs={}, rewards={2: 1.0}, episode_over=True), "seat 2.*a reward for an empty seat"),
 ])
 def test_empty_seats_get_nothing(result, message):
     tracker, _ = _tracker("2p", acting=(0, 1))
     with pytest.raises(EnvContractError, match=message):
         tracker.on_step({0: 0, 1: 0}, result)
+
+
+@pytest.mark.parametrize("result, message", [
+    (StepResult(acting={"0"}, obs=_obs(0)), r"StepResult.acting: seats must be ints, got '0' \(str\)"),
+    (StepResult(acting={0}, obs={"0": OBS}), r"StepResult.obs: seats must be ints, got '0'"),
+    (StepResult(acting={0}, obs=_obs(0), rewards={"1": 1.0}), r"StepResult.rewards: seats must be ints"),
+    (StepResult(acting={0}, obs=_obs(0), terminated={1.0}), r"StepResult.terminated: seats must be ints"),
+    (StepResult(acting={0}, obs=_obs(0), action_masks={True: np.ones(3, bool)}),
+     r"StepResult.action_masks: seats must be ints, got True \(bool\)"),
+    (StepResult(acting={0}, obs=_obs(0), global_state={"0": OBS}), r"StepResult.global_state: seats must be ints"),
+    (StepResult(acting=set(), obs={}, episode_over=True, truncated=True, final_obs={"0": OBS}),
+     r"StepResult.final_obs: seats must be ints"),
+    (StepResult(acting={0}, obs=_obs(0), action_masks=None), r"StepResult.action_masks must be a dict of seat"),
+    (StepResult(acting={0}, obs=None), r"StepResult.obs must be a dict of seat -> value, got NoneType"),
+    (StepResult(acting=0, obs=_obs(0)), r"StepResult.acting must be a set of seats, got int"),
+])
+def test_malformed_fields_are_contract_errors(result, message):
+    tracker, _ = _tracker()
+    with pytest.raises(EnvContractError, match=r"^worker 0, env 3, episode step 1, layout 3p: " + message):
+        tracker.on_step({0: 0, 1: 0, 2: 0}, result)
+    with pytest.raises(EnvContractError, match=r"^worker 0, env 3, episode step 0, layout 3p: " + message):
+        EpisodeTracker(FFA, context="worker 0, env 3").on_reset("3p", result)
+
+
+def test_numpy_integer_seats_are_accepted():
+    tracker, masks = _tracker(acting=(np.int64(0), np.int64(1), np.int64(2)))
+    assert sorted(masks) == [0, 1, 2]
+    tracker.on_step({0: 0, 1: 0, 2: 0}, StepResult(acting={np.int64(1)}, obs={np.int64(1): OBS},
+                                                   rewards={np.int64(2): 1.0}))
+    assert tracker.acting() == {1} and tracker.seat_returns() == [0.0, 0.0, 1.0]
 
 
 def test_reward_in_the_elimination_step_is_allowed_and_later_ones_are_not():
@@ -195,6 +236,17 @@ def test_global_state_rules():
     plain = EpisodeTracker(FFA)
     with pytest.raises(EnvContractError, match="declares no global_state_space"):
         plain.on_reset("2p", StepResult(acting={0, 1}, obs=_obs(0, 1), global_state={0: gs}))
+    plain.on_reset("2p", StepResult(acting={0, 1}, obs=_obs(0, 1)))
+    with pytest.raises(EnvContractError, match="seat 0, episode step 1, layout 2p: .*declares no global_state_space"):
+        plain.on_step({0: 0, 1: 0}, StepResult(acting=set(), obs={}, episode_over=True, global_state={0: gs}))
+
+
+def test_global_state_of_waiting_seats_is_ignored():
+    gs = np.zeros(4, dtype=np.float32)
+    tracker = EpisodeTracker(GlobalStateGame().spec)
+    tracker.on_reset("2p", StepResult(acting={0, 1}, obs=_obs(0, 1), global_state={0: gs, 1: gs}))
+    tracker.on_step({0: 0, 1: 0}, StepResult(acting={0}, obs=_obs(0), global_state={0: gs, 1: np.zeros((7, 7))}))
+    assert tracker.acting() == {0}
 
 
 def test_max_idle_steps():
@@ -207,6 +259,14 @@ def test_max_idle_steps():
     tracker.on_step({}, idle)
     with pytest.raises(EnvContractError, match="more than env.max_idle_steps=2 steps in a row"):
         tracker.on_step({}, idle)
+
+
+def test_reset_without_acting_seats_counts_as_the_first_idle_step():
+    tracker = EpisodeTracker(FFA, max_idle_steps=2)
+    tracker.on_reset("2p", StepResult(acting=set(), obs={}))
+    tracker.on_step({}, StepResult(acting=set(), obs={}))
+    with pytest.raises(EnvContractError, match="episode step 2, layout 2p: more than env.max_idle_steps=2"):
+        tracker.on_step({}, StepResult(acting=set(), obs={}))
 
 
 def test_team_result_default_and_explicit():

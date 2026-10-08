@@ -18,6 +18,8 @@ from __future__ import annotations
 
 import enum
 import math
+import numbers
+from collections.abc import Mapping, Set
 from typing import Any
 
 from colosseum.core.errors import EnvContractError
@@ -114,6 +116,7 @@ class EpisodeTracker:
         self.layout = layout
         if not isinstance(result, StepResult):
             raise self._fail(f"reset must return a StepResult, got {type(result).__name__}")
+        self._check_fields(result)
         n = self.spec.layout_size(layout)
         self._phase = [SeatPhase.LIVE if s < n else SeatPhase.EMPTY for s in range(self.spec.max_seats)]
         self._returns = [0.0] * n
@@ -144,6 +147,7 @@ class EpisodeTracker:
                              f"{sorted(self._acting)}")
         if not isinstance(result, StepResult):
             raise self._fail(f"step must return a StepResult, got {type(result).__name__}")
+        self._check_fields(result)
         self._check_seat_keys(result.rewards, "a reward")
         for seat, value in result.rewards.items():
             try:
@@ -160,6 +164,8 @@ class EpisodeTracker:
         if result.episode_over:
             if result.acting:
                 raise self._fail(f"episode_over with a non-empty acting set {sorted(result.acting)}")
+            self._check_empty_seat_data(result)
+            self._check_global_state_roles(result)
             if result.truncated:
                 self._check_truncation(result)
         overlap = set(result.acting) & set(result.terminated)
@@ -201,9 +207,6 @@ class EpisodeTracker:
                 if seat not in gs:
                     raise self._fail("truncated episode without the final global_state the role declares", seat)
                 rules.global_state.check(gs[seat], f"{self._where(seat)}: final global_state")
-        self._check_extra_seats(final_obs, "final_obs")
-        self._check_extra_seats(result.global_state, "a global_state")
-        self._check_global_state_roles(result)
 
     def _check_global_state_roles(self, result: StepResult) -> None:
         for seat in result.global_state or {}:
@@ -216,6 +219,32 @@ class EpisodeTracker:
             if self.phase(seat) is SeatPhase.EMPTY:
                 raise self._fail(f"{what} for an empty seat", seat)
 
+    def _check_empty_seat_data(self, result: StepResult) -> None:
+        """Observations, masks, global states and final observations for EMPTY seats are errors."""
+        self._check_extra_seats(result.obs, "an observation")
+        self._check_extra_seats(result.action_masks, "an action mask")
+        self._check_extra_seats(result.global_state, "a global_state")
+        self._check_extra_seats(result.final_obs, "final_obs")
+
+    def _check_fields(self, result: StepResult) -> None:
+        """Container types and integer seat keys of a StepResult, before any rule reads them."""
+        fields = {"acting": result.acting, "terminated": result.terminated, "obs": result.obs,
+                  "action_masks": result.action_masks, "rewards": result.rewards}
+        if result.final_obs is not None:
+            fields["final_obs"] = result.final_obs
+        if result.global_state is not None:
+            fields["global_state"] = result.global_state
+        for name, value in fields.items():
+            if name in ("acting", "terminated"):
+                if not isinstance(value, (Set, list, tuple)):
+                    raise self._fail(f"StepResult.{name} must be a set of seats, got {type(value).__name__}")
+            elif not isinstance(value, Mapping):
+                raise self._fail(f"StepResult.{name} must be a dict of seat -> value, got {type(value).__name__}")
+            for seat in value:
+                if not isinstance(seat, numbers.Integral) or isinstance(seat, bool):
+                    raise self._fail(f"StepResult.{name}: seats must be ints, got {seat!r} "
+                                     f"({type(seat).__name__})")
+
     def _accept_next(self, result: StepResult) -> dict[int, Tree | None]:
         """Check the next acting set with its observations, masks and global states."""
         acting = set(result.acting)
@@ -225,9 +254,7 @@ class EpisodeTracker:
                 raise self._fail("an empty seat is in acting", seat)
             if phase is SeatPhase.ELIMINATED:
                 raise self._fail(f"a seat eliminated at episode step {self._eliminated[seat]} is in acting", seat)
-        self._check_extra_seats(result.obs, "an observation")
-        self._check_extra_seats(result.action_masks, "an action mask")
-        self._check_extra_seats(result.global_state, "a global_state")
+        self._check_empty_seat_data(result)
         masks: dict[int, Tree | None] = {}
         for seat in sorted(acting):
             rules = self._rules_of(seat)
