@@ -15,11 +15,13 @@ from dataclasses import dataclass, field
 import gymnasium
 import numpy as np
 import torch
+import torch.nn as nn
 
 from colosseum.core.ipc import assert_no_tensors, put_latest
 from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
 from colosseum.envs.base_env import BaseEnv
-from colosseum.networks.model import PolicyModel
+from colosseum.networks.distributions import CategoricalDist
+from colosseum.networks.model import PolicyModel, StepOutput
 from colosseum.worker.rollout_loop import LoopIO, RolloutLoop
 from helpers import TinyMonolithicModel
 
@@ -288,3 +290,55 @@ def add_to_counter(counter, n: int) -> None:
     """Spawn target: add 1 to a SharedCounter n times."""
     for _ in range(n):
         counter.add(1)
+
+
+class ProbeModel(PolicyModel):
+    """Deterministic-value test model.
+
+    - logits are zeros (uniform over legal actions; the mask is applied);
+    - ``value = obs @ obs_coeffs + state_coef * n`` where ``n`` counts this slot's
+      ``step`` calls since its state was last reset (``stateful=True``; state
+      ``{"n": [B, 1]}``), else 0;
+    - every ``step`` call appends its batch size to ``self.calls``.
+    """
+
+    def __init__(self, obs_coeffs=(0.0, 0.0, 0.0, 0.0), state_coef: float = 0.0,
+                 stateful: bool = False, num_actions: int = NUM_ACTIONS) -> None:
+        super().__init__()
+        self.register_buffer("obs_coeffs", torch.tensor(obs_coeffs, dtype=torch.float32))
+        self.state_coef = float(state_coef)
+        self.stateful = stateful
+        self.num_actions = num_actions
+        self.bias = nn.Parameter(torch.zeros(1))
+        self.calls: list[int] = []
+
+    def initial_state(self, batch_size: int, device="cpu"):
+        if not self.stateful:
+            return None
+        return {"n": torch.zeros(batch_size, 1, device=device)}
+
+    def step(self, obs, state, action_mask=None) -> StepOutput:
+        self.calls.append(int(obs.shape[0]))
+        batch = obs.shape[0]
+        n = state["n"] if self.stateful else torch.zeros(batch, 1)
+        value = obs.float() @ self.obs_coeffs + self.state_coef * n[:, 0] + self.bias * 0.0
+        dist = CategoricalDist(torch.zeros(batch, self.num_actions), mask=action_mask)
+        new_state = {"n": n + 1.0} if self.stateful else None
+        return StepOutput(dist=dist, value=value, state=new_state)
+
+
+def slot_transitions(chunks: list[TrajectoryChunk]) -> dict[tuple[int, int], list[dict]]:
+    """Flatten chunks into per-(env_id, player) transition lists, in chunk order.
+
+    Relies on obs = [env_id, ep, t, player] (the ``_Base`` envs).
+    """
+    out: dict[tuple[int, int], list[dict]] = {}
+    for chunk in chunks:
+        for i in range(chunk.chunk_length):
+            o = chunk.observations[i].tolist()
+            out.setdefault((int(o[0]), int(o[3])), []).append({
+                "ep": int(o[1]), "t": int(o[2]), "action": int(chunk.actions[i]),
+                "reward": float(chunk.rewards[i]), "done": bool(chunk.dones[i]),
+                "value": float(chunk.values[i]), "log_prob": float(chunk.action_log_probs[i]),
+            })
+    return out

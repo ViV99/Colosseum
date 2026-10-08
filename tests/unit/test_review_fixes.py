@@ -199,31 +199,40 @@ def test_refresh_pushes_new_checkpoint_to_worker():
 
 
 def test_worker_applies_command_loads_checkpoint_and_stages_maps():
-    """Worker side: a WorkerCommand loads new checkpoints and stages slot maps."""
+    """Worker side: a WorkerCommand loads new checkpoints and stages slot maps.
+
+    Drives the real RolloutLoop (T2.6 folded ``_apply_command`` into
+    ``RolloutLoop._poll_command``): the checkpoint enters the model pool at once,
+    the slot maps only at the env's next episode boundary.
+    """
     from colosseum.core.types import WorkerCommand, state_dict_to_numpy
-    from colosseum.worker.rollout_loop import LATEST_NETWORK_ID, _apply_command
+    from colosseum.worker.rollout_loop import LATEST_NETWORK_ID
+    from dataflow_helpers import EnvFactory, GridStepEnv, make_loop
     from helpers import make_simple_model
 
     def factory():
         return make_simple_model(obs_dim=4, num_actions=3)
 
-    networks_by_agent = {"agent_0": {LATEST_NETWORK_ID: factory()}}
-    factories = {"agent_0": factory}
+    loop, col = make_loop(EnvFactory(GridStepEnv, lengths=(3,)), factory,
+                          agent_ids=("agent_0",), num_envs=1)
     ckpt_sd = state_dict_to_numpy(factory().state_dict())
-
-    cmd = WorkerCommand(
+    col.commands.append(WorkerCommand(
         slot_agent_map=[["agent_0", "agent_0"]],
         slot_network_map=[["latest", "ckpt_v50"]],
         collect_mask=[[True, False]],
         new_checkpoints={"agent_0": {"ckpt_v50": ckpt_sd}},
-    )
-    pending = {"slot_agent_map": None, "slot_network_map": None, "collect_mask": None}
+    ))
+    loop.step()
 
-    _apply_command(cmd, networks_by_agent, factories, pending)
-
-    assert "ckpt_v50" in networks_by_agent["agent_0"], "checkpoint not loaded into pool"
-    assert pending["slot_agent_map"] == [["agent_0", "agent_0"]]
-    assert pending["collect_mask"] == [[True, False]]
+    assert "ckpt_v50" in loop._models["agent_0"], "checkpoint not loaded into pool"
+    # Staged, not applied mid-episode.
+    assert loop._slot_network_map == [[LATEST_NETWORK_ID, LATEST_NETWORK_ID]]
+    assert loop._collect_mask == [[True, True]]
+    loop.step()
+    loop.step()  # episode end -> assignment applied
+    assert loop._slot_network_map == [[LATEST_NETWORK_ID, "ckpt_v50"]]
+    assert loop._collect_mask == [[True, False]]
+    loop.close()
 
 
 # ---------------------------------------------------------------------------

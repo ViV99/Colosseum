@@ -125,9 +125,13 @@ def test_initial_and_periodic_weight_sync_set_policy_version():
     rec.weights["agent_0"] = [weights_payload("agent_0", src, 9)]
     run_steps(loop, 1)  # the sync at the end of this step picks up version 9
     run_steps(loop, 3)
+    # behavior_policy_version is the version at a chunk's FIRST transition (T2.6):
+    # these chunks started on step 5, before the sync loaded version 9.
+    assert [c.behavior_policy_version for c in rec.chunks[2:]] == [7, 7]
+    run_steps(loop, 4)  # chunks recorded entirely under version 9
     loop.close()
-    assert rec.chunks[-1].behavior_policy_version == 9
-    latest = loop._networks["agent_0"]["latest"]
+    assert [c.behavior_policy_version for c in rec.chunks[4:]] == [9, 9]
+    latest = loop._models["agent_0"]["latest"]
     for k, v in src.state_dict().items():
         assert torch.equal(latest.state_dict()[k], v)
 

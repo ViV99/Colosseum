@@ -144,6 +144,37 @@ def evaluate_agents(
     return matrix
 
 
+def _extract_action_masks(
+    infos: list[dict],
+    num_envs: int,
+    num_players: int,
+    action_spec=None,
+) -> np.ndarray | None:
+    """Extract action masks from env info dicts into a flat array.
+
+    Convention: info[env_idx][player_idx]["action_mask"] is a bool ndarray
+    or dict of per-component bool ndarrays (for composite action spaces).
+    Returns [num_envs * num_players, num_actions] bool array, or None if no masks.
+    """
+    if not infos:
+        return None
+    first_info = infos[0]
+    if not isinstance(first_info, dict) or 0 not in first_info:
+        return None
+    if "action_mask" not in first_info[0]:
+        return None
+
+    masks = []
+    for env_idx in range(num_envs):
+        for p in range(num_players):
+            raw = infos[env_idx][p]["action_mask"]
+            if isinstance(raw, dict) and action_spec is not None:
+                masks.append(action_spec.flatten_mask(raw))
+            else:
+                masks.append(raw)
+    return np.array(masks, dtype=bool)
+
+
 def _run_matches(
     agents: list[tuple[str, PolicyModel]],
     env_fn: Callable[[], BaseEnv],
@@ -179,7 +210,6 @@ def _run_matches(
     from collections import defaultdict
 
     from colosseum.core.outcomes import player_outcomes
-    from colosseum.worker.rollout_loop import _extract_action_masks
 
     vec_env = VectorEnv(env_fn, min(num_envs, num_matches))
     actual_envs = vec_env.num_envs

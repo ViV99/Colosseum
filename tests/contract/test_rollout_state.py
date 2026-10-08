@@ -5,8 +5,11 @@ from __future__ import annotations
 import pytest
 import torch
 
+from colosseum.core.types import state_dict_to_numpy
+from colosseum.networks.distributions import CategoricalDist
+from colosseum.networks.model import PolicyModel, StepOutput
 from colosseum.networks.state import tree_leaves
-from harness import make_loop, run_steps, simple_factory
+from harness import NUM_ACTIONS, make_loop, run_steps, simple_factory
 from helpers import CORE_KINDS
 
 
@@ -41,9 +44,9 @@ def test_slot_state_is_reset_at_episode_end():
     loop, _ = make_loop(model_factories={"agent_0": lambda: simple_factory("gru")},
                         num_envs=1, chunk_length=4)
     run_steps(loop, 4)
-    assert float(loop._slot_states[(0, 0)]["h"].abs().sum()) > 0
+    assert float(loop._tracks[0][0].state["h"].abs().sum()) > 0
     run_steps(loop, 1)  # 5th step ends the episode (episode_length=5)
-    assert float(loop._slot_states[(0, 0)]["h"].abs().sum()) == 0.0
+    assert float(loop._tracks[0][0].state["h"].abs().sum()) == 0.0
     loop.close()
 
 
@@ -59,3 +62,39 @@ def test_chunk_initial_state_owns_compact_storage():
     for c in mid_episode:
         for leaf in c.initial_state.values():
             assert leaf.untyped_storage().nbytes() == leaf.numel() * leaf.element_size()
+
+
+class LearnedInitStateModel(PolicyModel):
+    """Stateful model whose initial state is a buffer (``h0``) that checkpoints carry."""
+
+    def __init__(self, h0: float = 0.0) -> None:
+        super().__init__()
+        self.register_buffer("h0", torch.full((1, 2), float(h0)))
+
+    def initial_state(self, batch_size: int, device="cpu"):
+        return {"h": self.h0.expand(batch_size, -1).clone().to(device)}
+
+    def step(self, obs, state, action_mask=None) -> StepOutput:
+        batch = obs.shape[0]
+        dist = CategoricalDist(torch.zeros(batch, NUM_ACTIONS), mask=action_mask)
+        return StepOutput(dist=dist, value=state["h"].sum(-1), state={"h": state["h"] + 1.0})
+
+
+def test_episode_start_state_comes_from_the_seated_model():
+    """A frozen checkpoint seat starts every episode from the CHECKPOINT's initial state."""
+    ckpt = state_dict_to_numpy(LearnedInitStateModel(h0=5.0).state_dict())
+    loop, _ = make_loop(
+        model_factories={"agent_0": LearnedInitStateModel}, num_envs=1, chunk_length=4,
+        slot_network_map=[["latest", "ckpt_v1"]], collect_mask=[[True, False]],
+        checkpoint_state_dicts_by_agent={"agent_0": {"ckpt_v1": ckpt}},
+    )
+
+    def h(p):
+        return loop._tracks[0][p].state["h"].tolist()
+
+    assert (h(0), h(1)) == ([[0.0, 0.0]], [[5.0, 5.0]])
+    run_steps(loop, 2)
+    assert (h(0), h(1)) == ([[2.0, 2.0]], [[7.0, 7.0]])
+    run_steps(loop, 3)  # 5th step ends the episode (episode_length=5)
+    assert (h(0), h(1)) == ([[0.0, 0.0]], [[5.0, 5.0]])
+    loop.close()

@@ -29,6 +29,7 @@ from collections.abc import Callable
 from queue import Empty, Full
 from typing import Any
 
+import numpy as np
 import torch
 
 from colosseum.algorithms.base import BaseAlgorithm
@@ -105,6 +106,8 @@ def learner_process(
                 break
             total_chunks_received += len(chunks)
             consumed_samples += sum(c.chunk_length for c in chunks)
+            # Policy lag of the batch, measured before this train step bumps the version.
+            lags = [algorithm.policy_version - c.behavior_policy_version for c in chunks]
 
             progress = _progress(progress_counter, consumed_samples, total_timesteps)
             algorithm.set_progress(progress)
@@ -120,6 +123,8 @@ def learner_process(
                 metrics = algorithm.train_step(chunks)
             train_step += 1
             metrics["progress"] = float(progress)
+            metrics["policy_lag_mean"] = float(np.mean(lags))
+            metrics["policy_lag_max"] = float(np.max(lags))
 
             # Push updated weights to all workers at configured interval
             if train_step % config.weight_push_interval == 0:
