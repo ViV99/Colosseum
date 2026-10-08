@@ -50,8 +50,8 @@ def main() -> None:
 
 @contextmanager
 def _config_errors() -> Iterator[None]:
-    """A config (or env contract) problem found at startup: one line on stderr, exit code 1,
-    no traceback (D10)."""
+    """A config (or env contract, or input data) problem found at startup: one line on stderr,
+    exit code 1, no traceback (D10)."""
     from colosseum.core.errors import ConfigError, EnvContractError
 
     try:
@@ -148,8 +148,9 @@ def bc(
         model, lr=lr, device=device,
         seq_len=seq_len if seq_len is not None else cfg.bc.seq_len,
     )
-    trainer.load_data(data)
-    metrics = trainer.train(num_epochs=epochs, batch_size=batch_size)
+    with _config_errors():  # unreadable or malformed data, actions that do not fit the policy (DataError)
+        trainer.load_data(data)
+        metrics = trainer.train(num_epochs=epochs, batch_size=batch_size)
 
     torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, output)
     message = f"BC training complete: final-epoch NLL={metrics['bc_loss']:.4f}"

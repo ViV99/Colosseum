@@ -31,11 +31,13 @@ the data the policy was trained on.
 from __future__ import annotations
 
 import logging
+import pickle
 from pathlib import Path
 from typing import Any
 
 import torch
 
+from colosseum.core.errors import DataError
 from colosseum.networks.distributions import CategoricalDist, CompositeDist, Distribution
 from colosseum.networks.model import PolicyModel
 
@@ -133,16 +135,16 @@ class OfflineBCTrainer:
         acts = torch.as_tensor(actions)
         n = obs.shape[0]
         if n == 0:
-            raise ValueError("BC data is empty")
+            raise DataError("BC data is empty")
         if acts.shape[0] != n:
-            raise ValueError(f"BC data: {n} observations but {acts.shape[0]} actions")
+            raise DataError(f"BC data: {n} observations but {acts.shape[0]} actions")
         masks = None
         if action_masks is not None:
             masks = torch.as_tensor(action_masks).bool()
             if masks.dim() != 2 or masks.shape[0] != n:
-                raise ValueError(f"BC action_masks must have shape [N, mask_size], got {tuple(masks.shape)}")
+                raise DataError(f"BC action_masks must have shape [N, mask_size], got {tuple(masks.shape)}")
         if self._masks and (masks is None) != (self._masks[0] is None):
-            raise ValueError("BC data: either every batch/file has 'action_masks' or none does")
+            raise DataError("BC data: either every batch/file has 'action_masks' or none does")
         if dones is None:
             if self._model.is_stateful:
                 logger.warning(
@@ -153,7 +155,7 @@ class OfflineBCTrainer:
         else:
             done_t = torch.as_tensor(dones).bool().reshape(-1).clone()
             if done_t.shape[0] != n:
-                raise ValueError(f"BC data: {n} observations but {done_t.shape[0]} dones")
+                raise DataError(f"BC data: {n} observations but {done_t.shape[0]} dones")
         # Never carry state across add_data calls (separate files are unrelated episodes).
         done_t[-1] = True
         self._observations.append(obs)
@@ -166,15 +168,19 @@ class OfflineBCTrainer:
         path = Path(path)
         files = sorted(path.glob("*.pt")) if path.is_dir() else [path]
         if not files:
-            raise FileNotFoundError(f"no .pt files in {path}")
+            raise DataError(f"no .pt files in {path}")
         total = 0
         for f in files:
-            data = torch.load(f, map_location="cpu", weights_only=True)
+            try:
+                data = torch.load(f, map_location="cpu", weights_only=True)
+            except (EOFError, RuntimeError, pickle.UnpicklingError) as e:
+                detail = (str(e).strip().splitlines() or [""])[0]
+                raise DataError(f"{f}: not a readable torch.save file ({type(e).__name__}: {detail})") from e
             if not isinstance(data, dict):
-                raise ValueError(f"{f}: expected a dict with keys {sorted(_KNOWN_KEYS)}")
+                raise DataError(f"{f}: expected a dict with keys {sorted(_KNOWN_KEYS)}")
             missing = _REQUIRED_KEYS - set(data)
             if missing:
-                raise ValueError(f"{f}: missing BC data keys {sorted(missing)} (need observations, actions)")
+                raise DataError(f"{f}: missing BC data keys {sorted(missing)} (need observations, actions)")
             unknown = set(data) - _KNOWN_KEYS
             if unknown:
                 logger.warning("%s: ignoring unknown BC data keys %s", f, sorted(unknown))
@@ -251,12 +257,12 @@ class OfflineBCTrainer:
             self._check_mask_width(dist, masks)
         if isinstance(dist, CategoricalDist):
             if actions.is_floating_point():
-                raise ValueError(
+                raise DataError(
                     "BC actions are floating point but the policy's action space is discrete "
                     "(CategoricalDist); store discrete actions as an integer tensor of shape [N]"
                 )
             if actions.dim() != 1:
-                raise ValueError(f"discrete BC actions must have shape [N], got {tuple(actions.shape)}")
+                raise DataError(f"discrete BC actions must have shape [N], got {tuple(actions.shape)}")
             return actions.long()
         actions = actions.float()
         if actions.dim() == 1:
@@ -266,7 +272,7 @@ class OfflineBCTrainer:
         except NotImplementedError:
             action_dim = None
         if action_dim is not None and (actions.dim() != 2 or actions.shape[1] != action_dim):
-            raise ValueError(
+            raise DataError(
                 f"BC actions must have shape [N, {action_dim}] for {type(dist).__name__}, "
                 f"got {tuple(actions.shape)}"
             )
@@ -275,7 +281,7 @@ class OfflineBCTrainer:
             if cols:
                 sub = actions[:, cols]
                 if not torch.equal(sub, sub.round()):
-                    raise ValueError(
+                    raise DataError(
                         f"BC actions have non-integer values in the discrete components "
                         f"(flat columns {cols}) of a composite action space"
                     )
@@ -290,12 +296,12 @@ class OfflineBCTrainer:
         else:
             expected = 0
         if expected == 0:
-            raise ValueError(
+            raise DataError(
                 f"BC data has action_masks but the policy's {type(dist).__name__} has no discrete "
                 f"component to mask; drop 'action_masks' from the data"
             )
         if masks.shape[1] != expected:
-            raise ValueError(
+            raise DataError(
                 f"BC action_masks have width {masks.shape[1]}, but the policy's {type(dist).__name__} "
                 f"expects {expected} (one column per discrete action, in flat-layout order)"
             )

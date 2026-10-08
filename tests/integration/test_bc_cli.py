@@ -1,4 +1,5 @@
 """`colosseum bc` CLI (T4.4)."""
+import pytest
 import torch
 from click.testing import CliRunner
 
@@ -67,3 +68,45 @@ def test_bc_cli_rejects_non_positive_seq_len(tmp_path):
     ])
     assert result.exit_code == 2
     assert "--seq-len" in result.output
+
+
+def _garbage_file(tmp_path):
+    path = tmp_path / "data.pt"
+    path.write_bytes(b"not a torch file")
+    return path
+
+
+def _missing_actions_file(tmp_path):
+    path = tmp_path / "data.pt"
+    torch.save({"observations": torch.rand(8, 3, 3, 3)}, path)
+    return path
+
+
+def _float_actions_file(tmp_path):
+    path = tmp_path / "data.pt"
+    torch.save({"observations": torch.rand(8, 3, 3, 3), "actions": torch.rand(8)}, path)
+    return path
+
+
+def _empty_dir(tmp_path):
+    path = tmp_path / "no_data"
+    path.mkdir()
+    return path
+
+
+@pytest.mark.parametrize(("make_data", "message"), [
+    (_garbage_file, "data.pt"),
+    (_missing_actions_file, "missing BC data keys ['actions']"),
+    (_float_actions_file, "floating point"),
+    (_empty_dir, "no .pt files"),
+], ids=["unreadable", "missing-key", "action-check", "empty-dir"])
+def test_bc_cli_reports_bad_data_as_one_line_config_error(make_data, message, tmp_path):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(CONFIG)
+    out = tmp_path / "bc.pt"
+    result = CliRunner().invoke(main, ["bc", "-c", str(cfg), "-d", str(make_data(tmp_path)), "-o", str(out)])
+    assert result.exit_code == 1, result.output
+    assert result.stderr.startswith("Config error:") and message in result.stderr, result.stderr
+    assert len(result.stderr.strip().splitlines()) == 1
+    assert "Traceback" not in result.output and isinstance(result.exception, SystemExit)
+    assert not out.exists()

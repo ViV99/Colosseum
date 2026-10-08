@@ -13,3 +13,8 @@ class ConfigError(ColosseumError):
 
 class EnvContractError(ColosseumError):
     """An environment violated the ``BaseEnv`` contract (shapes, masks, flags)."""
+
+
+class DataError(ConfigError, ValueError):
+    """Input data (e.g. offline BC data) is unreadable, has the wrong format or does not fit
+    the configured model. Reported at startup like a config error; also a ``ValueError``."""
