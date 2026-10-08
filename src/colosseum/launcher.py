@@ -194,6 +194,7 @@ def _learner_target(
         checkpoint_queue=checkpoint_queue,
         checkpoint_interval=checkpoint_interval,
         resume_state=resume_state,
+        weight_sync_interval=config.rollout.weight_sync_interval_sec,
     )
 
 

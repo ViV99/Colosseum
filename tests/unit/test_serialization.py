@@ -171,3 +171,35 @@ def test_namedtuple_lookup_never_triggers_module_getattr(monkeypatch):
     with pytest.raises(ValueError, match="lazy_mod_t22.HC"):
         unpack_payload(_raw_payload(skeleton), False)
     assert calls == []
+
+
+def test_negative_dimension_cannot_cancel_a_huge_array_out_of_the_cap():
+    """arr_1 (-10**10,) stored before arr_0 (10**10,): the running total stays <= 0."""
+    import io
+    import zipfile
+
+    def npy(shape) -> bytes:
+        f = io.BytesIO()
+        np.lib.format.write_array_header_1_0(f, {"descr": "<f4", "fortran_order": False, "shape": shape})
+        return f.getvalue() + b"\0" * 16
+
+    blob = io.BytesIO()
+    with zipfile.ZipFile(blob, "w") as zf:
+        zf.writestr("arr_1.npy", npy((-(10**10),)))
+        zf.writestr("arr_0.npy", npy((10**10,)))
+    raw = _raw_payload({"__list__": [{"__nd__": 0}, {"__nd__": 1}]}, blob.getvalue())
+    with pytest.raises(ValueError, match="invalid array shape"):
+        unpack_payload(raw, False, max_bytes=2**20)
+
+
+@pytest.mark.parametrize("value", [
+    np.array(["a", "b"]), np.array([b"x"]), np.zeros(2, dtype="V4"), np.array(["2020-01-01"], dtype="datetime64[D]"),
+])
+def test_weights_payload_rejects_non_numeric_dtypes(value):
+    from colosseum.transport.serialization import validate_state_dict_payload
+
+    numeric = {"w": np.zeros(2, np.float32), "flag": np.array([True]), "n": np.arange(2, dtype=np.uint8),
+               "c": np.zeros(1, np.complex64)}
+    validate_state_dict_payload(numeric)  # bool/int/uint/float/complex are accepted
+    with pytest.raises(ValueError, match="'bad'.*dtype"):
+        validate_state_dict_payload({"w": np.zeros(2, np.float32), "bad": value})

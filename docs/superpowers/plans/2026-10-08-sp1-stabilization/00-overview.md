@@ -393,7 +393,10 @@ def learner_process(*, agent_id: str, algorithm_factory: Callable[[], BaseAlgori
                     trajectory_queue, weight_queues: list, config: LearnerConfig, stop_event,
                     metrics_queue=None, checkpoint_queue=None, checkpoint_interval: int = 0,
                     resume_state: dict | None = None, progress_counter: SharedCounter | None = None,
-                    total_timesteps: int = 0, run_dir: str | None = None) -> None: ...
+                    total_timesteps: int = 0, run_dir: str | None = None,
+                    weight_sync_interval: float = 5.0) -> None: ...
+    # weight_sync_interval (T2.2): rollout.weight_sync_interval_sec; sizes the exit wait for
+    # unread weight payloads (max(60 s, 3 x interval))
 ```
 
 ### `colosseum.coordinator` (T5.1–T5.3)

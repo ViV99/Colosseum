@@ -188,12 +188,15 @@ def _load_arrays(blob: bytes, max_bytes: int) -> list[np.ndarray]:
                     shape, dtype = _read_npy_header(f)
                 if dtype.hasobject:
                     raise ValueError("object arrays are not allowed in a payload")
+                if not (isinstance(shape, tuple) and all(type(d) is int and d >= 0 for d in shape)):
+                    raise ValueError(f"invalid array shape {shape!r} in {name}")
                 total += math.prod(shape) * dtype.itemsize
                 if total > max_bytes:
                     raise ValueError(f"payload arrays declare {total} bytes, over the cap of {max_bytes} bytes")
         with np.load(io.BytesIO(blob), allow_pickle=False) as npz:
             return [npz[f"arr_{i}"] for i in range(len(names))]
-    except (zipfile.BadZipFile, EOFError, OSError) as e:
+    except (zipfile.BadZipFile, EOFError, OSError, MemoryError) as e:
+        # Whatever a malformed archive triggers surfaces as ValueError (INVALID_ARGUMENT).
         raise ValueError(f"malformed payload array archive: {type(e).__name__}: {e}") from e
 
 
@@ -251,7 +254,7 @@ def serialize_state_dict(state_dict: dict[str, np.ndarray], compress: bool = Tru
 
 
 def validate_state_dict_payload(state_dict: Any) -> None:
-    """Raise ValueError unless ``state_dict`` is a ``dict[str, np.ndarray]``."""
+    """Raise ValueError unless ``state_dict`` is a ``dict[str, np.ndarray]`` with numeric dtypes."""
     if not isinstance(state_dict, dict):
         raise ValueError(f"weights payload must be a dict, got {type(state_dict).__name__}")
     for key, value in state_dict.items():
@@ -259,6 +262,8 @@ def validate_state_dict_payload(state_dict: Any) -> None:
             raise ValueError(f"weights payload key {key!r} is not a str")
         if not isinstance(value, np.ndarray):
             raise ValueError(f"weights payload entry {key!r} is {type(value).__name__}, not a numpy array")
+        if value.dtype.kind not in "biufc":  # bool/int/uint/float/complex: what torch.from_numpy accepts
+            raise ValueError(f"weights payload entry {key!r} has non-numeric dtype {value.dtype}")
 
 
 def deserialize_state_dict(

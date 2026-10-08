@@ -94,19 +94,21 @@ def _ttt_config(**sections):
     return ColosseumConfig(**data)
 
 
-def _run_learner_target(monkeypatch, config, num_learners):
+def _run_learner_target(monkeypatch, config, num_learners, seen=None):
     """Call ``_learner_target`` in-process with ``learner_process`` stubbed out.
 
-    Returns the torch thread count and the algorithm seen by the learner loop.
+    Returns the torch thread count and the algorithm seen by the learner loop;
+    ``seen`` (if given) also receives the ``learner_process`` kwargs.
     """
     import sys
 
     import colosseum.learner.learner as learner_mod
     from colosseum.launcher import _learner_target
 
-    seen = {}
+    seen = {} if seen is None else seen
 
     def fake_learner_process(**kwargs):
+        seen["kwargs"] = kwargs
         seen["threads"] = torch.get_num_threads()
         seen["algorithm"] = kwargs["algorithm_factory"]()
 
@@ -149,3 +151,11 @@ def test_resolve_device_auto_without_cuda_is_cpu(monkeypatch):
     assert resolve_device("auto") == "cpu"
     assert resolve_device("cpu") == "cpu"
     assert resolve_device("cuda:1") == "cuda:1"  # explicit devices pass through unchanged
+
+
+def test_learner_target_passes_weight_sync_interval(monkeypatch):
+    """The learner's exit flush wait is sized from the workers' weight sync interval (T2.2)."""
+    config = _ttt_config(learner={"device": "cpu", "torch_threads": 1}, rollout={"weight_sync_interval_sec": 90.0})
+    seen = {}
+    _run_learner_target(monkeypatch, config, num_learners=1, seen=seen)
+    assert seen["kwargs"]["weight_sync_interval"] == 90.0

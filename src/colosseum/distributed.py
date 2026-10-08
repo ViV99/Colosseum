@@ -234,6 +234,7 @@ def run_distributed_learner(
             total_train_steps=total_train_steps,
             checkpoint_queue=checkpoint_queue if coordinator_ckpt is not None else None,
             checkpoint_interval=config.self_play.checkpoint_interval,
+            weight_sync_interval=acfg.rollout.weight_sync_interval_sec,
         )
     finally:
         stop_event.set()

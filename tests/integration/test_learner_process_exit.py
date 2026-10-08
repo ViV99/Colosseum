@@ -134,3 +134,13 @@ def test_learner_budget_exit_does_not_deadlock_with_a_worker_blocked_on_chunks()
         worker_done.set()
         thread.join(timeout=10)
         _cleanup(proc, weights, traj)
+
+
+def test_weight_flush_timeout_scales_with_weight_sync_interval():
+    """A live worker syncs every weight_sync_interval; the exit flush must outlast that."""
+    from colosseum.learner.learner import _weight_flush_timeout
+
+    assert _weight_flush_timeout(0.5) == 60.0
+    assert _weight_flush_timeout(5.0) == 60.0
+    assert _weight_flush_timeout(60.0) == 180.0
+    assert _weight_flush_timeout(90.0) == 270.0

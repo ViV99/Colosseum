@@ -43,6 +43,7 @@ def learner_process(
     checkpoint_queue: mp.Queue | None = None,
     checkpoint_interval: int = 0,
     resume_state: dict | None = None,
+    weight_sync_interval: float = 5.0,
 ) -> None:
     """Main learner process function.
 
@@ -59,6 +60,8 @@ def learner_process(
         checkpoint_interval: save checkpoint every N train steps (0 = disabled)
         resume_state: optional dict with 'state_dict' (numpy), 'optimizer_state'
             (numpy tree or None) and 'policy_version' to resume training from a checkpoint
+        weight_sync_interval: the workers' ``rollout.weight_sync_interval_sec``; sizes
+            the exit wait for pending weight payloads (see ``_weight_flush_timeout``)
     """
     logger.info(f"Learner [{agent_id}]: starting on device={resolve_device(config.device)}")
 
@@ -158,22 +161,31 @@ def learner_process(
                     f"loss={metrics.get('total_loss', 0):.4f}"
                 )
     finally:
-        _release_weight_queues(weight_queues, trajectory_queue, stop_event)
+        _release_weight_queues(
+            weight_queues, trajectory_queue, stop_event, timeout=_weight_flush_timeout(weight_sync_interval),
+        )
 
     logger.info(f"Learner [{agent_id}]: finished. Total train_steps={train_step}")
 
 
-# Longest wait at exit for workers to read pending weight payloads. A live worker
-# syncs weights every few seconds while this learner drains its chunks; a worker
-# silent for this long is assumed gone (e.g. crashed), so its queue is abandoned.
-_WEIGHT_FLUSH_TIMEOUT_SEC = 60.0
+# Shortest exit wait for workers to read pending weight payloads (see
+# _weight_flush_timeout). A worker silent for longer is assumed gone (e.g.
+# crashed), so its queue is abandoned.
+_MIN_WEIGHT_FLUSH_TIMEOUT_SEC = 60.0
+
+
+def _weight_flush_timeout(weight_sync_interval: float) -> float:
+    """Exit wait for pending weight payloads: a live worker syncs weights every
+    ``weight_sync_interval`` seconds (while this learner drains its chunks), so
+    wait for several intervals, and never less than a minute."""
+    return max(_MIN_WEIGHT_FLUSH_TIMEOUT_SEC, 3.0 * float(weight_sync_interval))
 
 
 def _release_weight_queues(
     weight_queues: list,
     trajectory_queue,
     stop_event,
-    timeout: float = _WEIGHT_FLUSH_TIMEOUT_SEC,
+    timeout: float = _MIN_WEIGHT_FLUSH_TIMEOUT_SEC,
     poll: float = 0.1,
 ) -> None:
     """Let pending weight payloads reach the workers before this process exits.
