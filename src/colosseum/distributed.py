@@ -147,7 +147,9 @@ def run_distributed_learner(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    config = _load(config_path, overrides)
+    config = load_config(config_path, overrides)
+    from colosseum.utils.seeding import apply_global_seed
+    apply_global_seed(config.training.seed)
     acfg = config.get_agent_config(agent_id)
     validate_config(acfg)
     max_mb = config.transport.grpc_max_message_mb
@@ -350,7 +352,7 @@ def run_distributed_workers(
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    config = _load(config_path, overrides)
+    config = load_config(config_path, overrides)
     agent_ids = list(learner_addresses.keys()) or config.get_trainable_agent_ids()
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_ids}
     for aid in agent_ids:
@@ -421,17 +423,3 @@ def _install_stop_signal_handlers(stop_event: threading.Event) -> None:
 
     signal.signal(signal.SIGINT, _handler)
     signal.signal(signal.SIGTERM, _handler)
-
-
-def _load(config_path: str, overrides: dict | None) -> ColosseumConfig:
-    config = load_config(config_path)
-    if overrides:
-        data = config.model_dump()
-        for key, value in overrides.items():
-            parts = key.split(".")
-            d = data
-            for part in parts[:-1]:
-                d = d[part]
-            d[parts[-1]] = value
-        config = ColosseumConfig(**data)
-    return config

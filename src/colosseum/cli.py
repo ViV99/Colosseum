@@ -12,23 +12,15 @@ def main() -> None:
 
 
 def _parse_overrides(overrides: tuple[str, ...]) -> dict:
-    """Parse --set key=value pairs into a dict."""
+    """Parse ``--set key=value`` pairs; values use YAML semantics (null, numbers, lists)."""
+    from colosseum.core.config import parse_override_value
+
     result = {}
     for ov in overrides:
         if "=" not in ov:
-            raise click.BadParameter(
-                f"Override must be in key=value format, got: {ov!r}"
-            )
+            raise click.BadParameter(f"Override must be key=value, got: {ov!r}")
         key, value = ov.split("=", 1)
-        try:
-            value = int(value)
-        except ValueError:
-            try:
-                value = float(value)
-            except ValueError:
-                if value.lower() in ("true", "false"):
-                    value = value.lower() == "true"
-        result[key] = value
+        result[key.strip()] = parse_override_value(value)
     return result
 
 
@@ -147,15 +139,23 @@ def eval_cmd(config: str, agents: tuple[str, ...], num_matches: int, num_envs: i
 
 @main.command("validate")
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
-def validate_cmd(config: str) -> None:
-    """Validate a config: build env + networks and run a dummy forward pass."""
+@click.option("--set", "overrides", multiple=True, help="Override config values (e.g., --set env.num_players=2)")
+def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
+    """Validate a config: schema, env num_players, and a dummy forward of every agent's model."""
+    import sys
+
     from colosseum.core.config import load_config
+    from colosseum.core.errors import ConfigError
     from colosseum.core.registry import validate_config
 
-    cfg = load_config(config)
-    for aid in cfg.get_trainable_agent_ids():
-        validate_config(cfg.get_agent_config(aid))
-        click.echo(f"  OK: agent '{aid}'")
+    try:
+        cfg = load_config(config, _parse_overrides(overrides) or None)
+        for aid in cfg.get_trainable_agent_ids():
+            validate_config(cfg.get_agent_config(aid))
+            click.echo(f"  OK: agent '{aid}'")
+    except ConfigError as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
     click.echo("Config is valid.")
 
 

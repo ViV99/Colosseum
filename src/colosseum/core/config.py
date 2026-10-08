@@ -1,22 +1,26 @@
 """Pydantic v2 configuration models for the Colosseum framework.
 
 Every section of the training pipeline (algorithm, environment, network,
-rollout, learner, self-play, checkpointing, metrics, transport) has its own
+rollout, learner, self-play, checkpointing, metrics, transport, run) has its own
 model with sensible defaults.  The top-level :class:`ColosseumConfig` combines
 them all and can be loaded from a YAML file via :func:`load_config`.
 """
 
 from __future__ import annotations
 
+import copy
+import datetime
 import hashlib
 import json
 import re
+import types
+import typing
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
 
 from colosseum.core.errors import ConfigError
 
@@ -74,7 +78,13 @@ class TransportMode(str, Enum):
 # ---------------------------------------------------------------------------
 
 
-class AlgorithmConfig(BaseModel):
+class StrictModel(BaseModel):
+    """Base for every config model: unknown keys are errors, not silently ignored (R5-07)."""
+
+    model_config = ConfigDict(extra="forbid")
+
+
+class AlgorithmConfig(StrictModel):
     """Hyperparameters for the RL algorithm."""
 
     name: str = "appo"
@@ -121,7 +131,7 @@ class AlgorithmConfig(BaseModel):
     amp_dtype: str = Field(default="float16", description="AMP dtype: 'float16' or 'bfloat16'.")
 
 
-class EnvConfig(BaseModel):
+class EnvConfig(StrictModel):
     """Environment specification."""
 
     env_class: str = Field(
@@ -132,7 +142,7 @@ class EnvConfig(BaseModel):
     kwargs: dict[str, Any] = Field(default_factory=dict, description="Extra kwargs forwarded to the env constructor.")
 
 
-class CoreConfig(BaseModel):
+class CoreConfig(StrictModel):
     """Core (trunk) between encoder and heads: ``{class: <dotted path>, kwargs: {...}}``."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
@@ -148,7 +158,7 @@ class CoreConfig(BaseModel):
     )
 
 
-class NetworkConfig(BaseModel):
+class NetworkConfig(StrictModel):
     """Model specification: a monolithic ``model_class`` or encoder + core + heads."""
 
     model_config = ConfigDict(extra="forbid")
@@ -192,7 +202,7 @@ class NetworkConfig(BaseModel):
         return self
 
 
-class RolloutConfig(BaseModel):
+class RolloutConfig(StrictModel):
     """Worker / rollout collection settings."""
 
     chunk_length: int = Field(default=256, ge=1, description="Timesteps per trajectory chunk (T).")
@@ -231,7 +241,7 @@ class RolloutConfig(BaseModel):
     )
 
 
-class LearnerConfig(BaseModel):
+class LearnerConfig(StrictModel):
     """Learner process settings."""
 
     device: str = Field(default="auto", description="Torch device string ('auto', 'cuda:0', 'cpu').")
@@ -256,7 +266,7 @@ class LearnerConfig(BaseModel):
     )
 
 
-class TrainingConfig(BaseModel):
+class TrainingConfig(StrictModel):
     """Top-level training loop settings."""
 
     phase: TrainingPhase = Field(default=TrainingPhase.SELF_PLAY, description="Current training phase.")
@@ -289,7 +299,7 @@ class TrainingConfig(BaseModel):
     )
 
 
-class SelfPlayConfig(BaseModel):
+class SelfPlayConfig(StrictModel):
     """Self-play and PFSP / league settings."""
 
     checkpoint_interval: int = Field(
@@ -326,7 +336,7 @@ class SelfPlayConfig(BaseModel):
     )
 
 
-class CheckpointConfig(BaseModel):
+class CheckpointConfig(StrictModel):
     """Checkpoint storage settings."""
 
     dir: str = Field(default="checkpoints", description="Directory for saving checkpoints.")
@@ -338,7 +348,7 @@ class CheckpointConfig(BaseModel):
     )
 
 
-class MetricsConfig(BaseModel):
+class MetricsConfig(StrictModel):
     """Logging and metrics settings."""
 
     use_wandb: bool = Field(default=False, description="Enable Weights & Biases logging.")
@@ -347,7 +357,18 @@ class MetricsConfig(BaseModel):
     log_interval: int = Field(default=10, ge=1, description="Log metrics every N training steps.")
 
 
-class TransportConfig(BaseModel):
+class RunConfig(StrictModel):
+    """Where a training run writes its outputs: ``<dir>/<name>/``."""
+
+    name: str | None = Field(
+        default=None,
+        description="Run name; default '<config_stem>-<YYYYmmdd-HHMMSS>'. An existing non-empty run dir "
+                    "with an explicit name is an error.",
+    )
+    dir: str = Field(default="runs", description="Parent directory of all runs.")
+
+
+class TransportConfig(StrictModel):
     """Communication backend settings."""
 
     mode: TransportMode = Field(default=TransportMode.LOCAL, description="Transport backend to use.")
@@ -364,15 +385,33 @@ class TransportConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class AgentConfig(BaseModel):
-    """Per-agent overrides. Fields that are None inherit from global config."""
+class AgentOverride(StrictModel):
+    """Per-agent overrides as partial dicts.
 
-    networks: NetworkConfig | None = None
-    algorithm: AlgorithmConfig | None = None
-    learner: LearnerConfig | None = None
+    They are deep-merged onto the global section before validation (R5-08), so an
+    override that sets only ``learning_rate`` keeps every other global algorithm value.
+    """
+
+    networks: dict[str, Any] | None = None
+    algorithm: dict[str, Any] | None = None
+    learner: dict[str, Any] | None = None
 
 
-class BCConfig(BaseModel):
+_AGENT_SECTIONS = ("networks", "algorithm", "learner")
+
+
+def deep_merge(base: dict, override: dict) -> dict:
+    """Recursively merge ``override`` into a copy of ``base``. Non-dict values replace."""
+    out = copy.deepcopy(base)
+    for key, value in override.items():
+        if isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = deep_merge(out[key], value)
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
+
+class BCConfig(StrictModel):
     """Offline behavioral cloning (``colosseum bc``)."""
 
     seq_len: int = Field(
@@ -387,7 +426,7 @@ class BCConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-class ColosseumConfig(BaseModel):
+class ColosseumConfig(StrictModel):
     """Top-level configuration combining every section.
 
     Can be loaded from a YAML file via :func:`load_config`.
@@ -404,15 +443,23 @@ class ColosseumConfig(BaseModel):
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     bc: BCConfig = Field(default_factory=BCConfig)
     transport: TransportConfig = Field(default_factory=TransportConfig)
-    agents: dict[str, AgentConfig] = Field(
+    run: RunConfig = Field(default_factory=RunConfig)
+    agents: dict[str, AgentOverride] = Field(
         default_factory=dict,
         description="Per-agent config overrides. Keys are agent IDs. "
                     "Empty = single agent_0 using global config.",
     )
 
+    @field_validator("agents", mode="before")
+    @classmethod
+    def _null_agent_means_no_override(cls, value: Any) -> Any:
+        if isinstance(value, dict):
+            return {k: ({} if v is None else v) for k, v in value.items()}
+        return value
+
     @field_validator("agents")
     @classmethod
-    def _check_agent_ids(cls, agents: dict[str, AgentConfig]) -> dict[str, AgentConfig]:
+    def _check_agent_ids(cls, agents: dict[str, AgentOverride]) -> dict[str, AgentOverride]:
         for agent_id in agents:
             try:
                 check_path_component(agent_id, "agent id")
@@ -420,25 +467,30 @@ class ColosseumConfig(BaseModel):
                 raise ValueError(str(e)) from e
         return agents
 
+    @model_validator(mode="after")
+    def _validate_agent_overrides(self) -> ColosseumConfig:
+        for agent_id in self.agents:
+            try:
+                self.get_agent_config(agent_id)
+            except ValidationError as e:
+                raise ValueError(f"agents.{agent_id}: invalid override:\n{e}") from None
+        return self
+
     def get_agent_config(self, agent_id: str) -> ColosseumConfig:
-        """Return an effective config for a specific agent.
-
-        Creates a copy where networks/algorithm/learner are overridden
-        by any agent-specific values.
-        """
-        if agent_id not in self.agents:
-            return self.model_copy(deep=True)
-
-        overrides = self.agents[agent_id]
-        data = self.model_dump()
-
-        if overrides.networks is not None:
-            data["networks"] = overrides.networks.model_dump()
-        if overrides.algorithm is not None:
-            data["algorithm"] = overrides.algorithm.model_dump()
-        if overrides.learner is not None:
-            data["learner"] = overrides.learner.model_dump()
-
+        """Effective config of one agent: global sections deep-merged with its override."""
+        if self.agents and agent_id not in self.agents:
+            raise ConfigError(f"Unknown agent '{agent_id}'. Known agents: {sorted(self.agents)}")
+        if not self.agents and agent_id != "agent_0":
+            raise ConfigError(
+                f"Unknown agent '{agent_id}': without an 'agents' section the only agent is 'agent_0'"
+            )
+        data = self.model_dump(by_alias=True)
+        override = self.agents.get(agent_id)
+        if override is not None:
+            for section in _AGENT_SECTIONS:
+                part = getattr(override, section)
+                if part:
+                    data[section] = deep_merge(data[section], part)
         data["agents"] = {}
         return ColosseumConfig.model_validate(data)
 
@@ -457,24 +509,93 @@ class ColosseumConfig(BaseModel):
 # ---------------------------------------------------------------------------
 
 
-def load_config(path: str | Path) -> ColosseumConfig:
-    """Read a YAML file and return a fully validated :class:`ColosseumConfig`.
+_NUMBER_RE = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?")
 
-    Args:
-        path: Filesystem path to the YAML configuration file.
 
-    Returns:
-        A validated ``ColosseumConfig`` instance.
+def parse_override_value(raw: str) -> Any:
+    """Parse a ``--set key=value`` value with YAML semantics.
 
-    Raises:
-        FileNotFoundError: If *path* does not exist.
-        pydantic.ValidationError: If the YAML content fails validation.
-        yaml.YAMLError: If the file is not valid YAML.
+    ``null`` gives None, lists and dicts are YAML, and numbers include ``1e-4`` (which
+    plain YAML 1.1 would keep as a string). A date-like value stays a string.
     """
+    if not raw.strip():
+        return None
+    value = yaml.safe_load(raw)
+    if isinstance(value, (datetime.date, datetime.datetime)):
+        return raw
+    if isinstance(value, str) and _NUMBER_RE.fullmatch(value.strip()):
+        number = float(value)
+        is_int_literal = "." not in value and "e" not in value.lower()
+        return int(number) if is_int_literal else number
+    return value
+
+
+def _unwrap_optional(tp: Any) -> Any:
+    if typing.get_origin(tp) in (typing.Union, types.UnionType):
+        args = [a for a in typing.get_args(tp) if a is not type(None)]
+        if len(args) == 1:
+            return args[0]
+    return tp
+
+
+def _check_override_path(parts: list[str]) -> None:
+    """Walk the schema of ColosseumConfig along ``parts``; raise ConfigError on an unknown key."""
+    tp: Any = ColosseumConfig
+    for i, part in enumerate(parts):
+        tp = _unwrap_optional(tp)
+        where = ".".join(parts[: i + 1])
+        if isinstance(tp, type) and issubclass(tp, BaseModel):
+            fields = tp.model_fields
+            name = next((n for n, f in fields.items() if part in (n, f.alias)), None)
+            if name is None:
+                raise ConfigError(f"Unknown config key '{where}' (valid keys here: {sorted(fields)})")
+            tp = fields[name].annotation
+        elif typing.get_origin(tp) is dict:
+            tp = typing.get_args(tp)[1]
+        elif tp is Any:
+            return  # free-form dict (env.kwargs, agent override bodies): checked at validation
+        else:
+            raise ConfigError(f"Cannot set '{'.'.join(parts)}': '{'.'.join(parts[:i])}' is not a section")
+
+
+def apply_overrides(data: dict, overrides: dict[str, Any]) -> dict:
+    """Return a copy of raw config ``data`` with dotted-path ``overrides`` applied.
+
+    Missing intermediate sections are created (e.g. ``agents.alpha.algorithm``). An
+    unknown path raises ConfigError. Values are validated later by ``model_validate``.
+    """
+    out = copy.deepcopy(data)
+    for key, value in overrides.items():
+        parts = key.split(".")
+        if not all(parts):
+            raise ConfigError(f"Malformed override key '{key}'")
+        _check_override_path(parts)
+        node = out
+        for part in parts[:-1]:
+            child = node.get(part)
+            if child is None:
+                child = node[part] = {}
+            elif not isinstance(child, dict):
+                raise ConfigError(f"Cannot set '{key}': '{part}' holds a {type(child).__name__}, not a section")
+            node = child
+        node[parts[-1]] = value
+    return out
+
+
+def load_config(path: str | Path, overrides: dict[str, Any] | None = None) -> ColosseumConfig:
+    """Read YAML, apply ``--set`` overrides, validate. Any problem raises ConfigError."""
     path = Path(path)
-    with path.open("r") as fh:
-        raw: dict[str, Any] = yaml.safe_load(fh) or {}
-    return ColosseumConfig.model_validate(raw)
+    try:
+        with path.open("r") as fh:
+            raw: dict[str, Any] = yaml.safe_load(fh) or {}
+    except (OSError, yaml.YAMLError) as e:
+        raise ConfigError(f"Cannot read config {path}: {e}") from e
+    if overrides:
+        raw = apply_overrides(raw, overrides)
+    try:
+        return ColosseumConfig.model_validate(raw)
+    except ValidationError as e:
+        raise ConfigError(f"Invalid config {path}:\n{e}") from e
 
 
 def config_hash(config: ColosseumConfig) -> str:

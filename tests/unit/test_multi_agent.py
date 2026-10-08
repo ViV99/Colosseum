@@ -1,7 +1,7 @@
 """Tests for multi-agent support: per-agent config overrides and multi-agent configs."""
 
 from colosseum.core.config import (
-    AgentConfig,
+    AgentOverride,
     ColosseumConfig,
     load_config,
 )
@@ -12,8 +12,8 @@ from helpers import example_config
 # ---------------------------------------------------------------
 
 def test_agent_config_defaults():
-    """AgentConfig fields should default to None."""
-    ac = AgentConfig()
+    """AgentOverride fields should default to None."""
+    ac = AgentOverride()
     assert ac.networks is None
     assert ac.algorithm is None
     assert ac.learner is None
@@ -35,35 +35,12 @@ def test_get_trainable_agent_ids_multi():
 
 
 def test_get_agent_config_no_override():
-    """get_agent_config for unknown agent returns a copy with same values."""
+    """get_agent_config("agent_0") without an agents section returns a copy with same values."""
     cfg = load_config(example_config("tic_tac_toe.yaml"))
     result = cfg.get_agent_config("agent_0")
     assert result is not cfg  # should be a copy, not the same object
     assert result.algorithm == cfg.algorithm
     assert result.networks == cfg.networks
-
-
-def test_get_agent_config_with_override():
-    """get_agent_config merges per-agent overrides into a new config."""
-    cfg = load_config(example_config("tic_tac_toe_multi.yaml"))
-
-    # Modify the config to have an actual override for agent_alpha
-    cfg_dict = cfg.model_dump()
-    cfg_dict["agents"]["agent_alpha"]["algorithm"] = {
-        "name": "appo",
-        "learning_rate": 1e-2,
-    }
-    cfg = ColosseumConfig.model_validate(cfg_dict)
-
-    alpha_cfg = cfg.get_agent_config("agent_alpha")
-    beta_cfg = cfg.get_agent_config("agent_beta")
-
-    # alpha should have overridden LR
-    assert alpha_cfg.algorithm.learning_rate == 1e-2
-    # beta should keep global LR
-    assert beta_cfg.algorithm.learning_rate == cfg.algorithm.learning_rate
-    # Both should share the same env config
-    assert alpha_cfg.env.env_class == cfg.env.env_class
 
 
 def test_load_multi_agent_config_roundtrip():

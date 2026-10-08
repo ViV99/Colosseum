@@ -171,6 +171,24 @@ def _check_state_payload(state: Any) -> None:
         raise ConfigError(f"initial_state cannot be sent between processes: {e}") from e
 
 
+def check_env_num_players(config: ColosseumConfig) -> None:
+    """``env.num_players`` in the config must equal the env's own ``num_players`` (R5-16)."""
+    try:
+        env = import_class(config.env.env_class)(**config.env.kwargs)
+    except Exception as e:
+        raise ConfigError(f"Failed to create env {config.env.env_class!r}: {type(e).__name__}: {e}") from e
+    try:
+        actual = int(env.num_players)
+    finally:
+        close = getattr(env, "close", None)
+        if callable(close):
+            close()
+    if actual != config.env.num_players:
+        raise ConfigError(
+            f"env.num_players={config.env.num_players} but {config.env.env_class}.num_players={actual}"
+        )
+
+
 def validate_config(config: ColosseumConfig) -> None:
     """Build the env and the model and exercise ``step``/``unroll`` on dummy data.
 
@@ -186,6 +204,7 @@ def validate_config(config: ColosseumConfig) -> None:
     from colosseum.networks.composed import ComposedModel
     from colosseum.networks.distributions import Distribution
 
+    check_env_num_players(config)
     try:
         env = import_class(config.env.env_class)(**config.env.kwargs)
     except Exception as e:

@@ -55,6 +55,26 @@ def _create_env(env_class_path: str, kwargs: dict):
     return cls(**kwargs)
 
 
+def warn_static_ownership_skew(config: ColosseumConfig) -> None:
+    """Warn when static matchmaking splits envs unevenly between trainable agents.
+
+    Env ``g`` is owned by ``agents[(g + refresh_round) % n]``. With
+    ``match_refresh_interval_sec == 0`` the round never advances, so if the env count
+    is not a multiple of the agent count (or smaller than it) some agents get
+    permanently more training data than others, or none at all.
+    """
+    n = len(config.get_trainable_agent_ids())
+    total_envs = config.rollout.num_workers * config.rollout.envs_per_worker
+    if config.rollout.match_refresh_interval_sec == 0 and n > 1 and total_envs % n != 0:
+        logger.warning(
+            f"rollout.match_refresh_interval_sec=0 with {total_envs} envs "
+            f"(num_workers * envs_per_worker) and {n} trainable agents: env ownership never "
+            f"rotates, so data per agent is skewed"
+            + (" and some agents get no data" if total_envs < n else "")
+            + ". Use a multiple of the agent count or enable match refresh."
+        )
+
+
 def _create_model(config: ColosseumConfig):
     """Create the agent's PolicyModel inside a worker/learner process."""
     from colosseum.core.registry import build_model
@@ -332,6 +352,7 @@ class Launcher:
         from colosseum.core.registry import validate_config
         for aid in trainable_agents:
             validate_config(agent_configs[aid])
+        warn_static_ownership_skew(cfg)
 
         # Initialize coordinator
         coordinator = Coordinator(cfg)
@@ -716,34 +737,15 @@ class Launcher:
 
 
 def run_training(config_path: str, overrides: dict | None = None) -> None:
-    """Entry point: load config and launch training."""
-    mp.set_start_method("spawn", force=True)
+    """Entry point: load config (overrides applied), seed, launch training."""
+    from colosseum.utils.seeding import apply_global_seed
 
+    mp.set_start_method("spawn", force=True)
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
-
-    config = load_config(config_path)
-
-    # Set global seeds for reproducibility
-    if config.training.seed is not None:
-        import random
-        seed = config.training.seed
-        torch.manual_seed(seed)
-        np.random.seed(seed)
-        random.seed(seed)
-        logger.info(f"Global seed set to {seed}")
-
-    if overrides:
-        config_dict = config.model_dump()
-        for key, value in overrides.items():
-            parts = key.split(".")
-            d = config_dict
-            for part in parts[:-1]:
-                d = d[part]
-            d[parts[-1]] = value
-        config = ColosseumConfig(**config_dict)
-
+    config = load_config(config_path, overrides)
+    apply_global_seed(config.training.seed)  # after overrides: --set training.seed works (R3-27)
     launcher = Launcher(config)
     launcher.launch()
