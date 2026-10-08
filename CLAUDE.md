@@ -53,7 +53,7 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
 - SAC (continuous), AlphaZero/MuZero (MCTS)
 
 **Behavioral Cloning:**
-- Offline BC: supervised learning from recorded trajectories (cross-entropy/MSE loss)
+- Offline BC: supervised learning from recorded trajectories (`-log_prob` of the recorded action for every distribution type, masks applied)
 - Online BC (kickstarting): `loss = RL_loss + λ * KL(BC_teacher || policy)` (forward KL by default, `training.kickstart_kl`), λ decays over training
 - Both approaches available; BC phase runs before RL phase
 
@@ -95,7 +95,7 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
 ### Phase 2: Behavioral Cloning (optional)
 - **Offline BC**: load trajectories from disk (recorded games from other players, etc.)
 - **Online BC**: scripted agent generates trajectories, neural agent learns from them
-- Training: supervised cross-entropy/MSE loss
+- Training: supervised `-log_prob` loss (masked; sequences for stateful models)
 - Result: initial policy that plays at basic level
 
 ### Phase 3: Self-Play
@@ -115,10 +115,13 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
 - Dynamic: add/remove agents and machines at any time without stopping
 
 ### Eval Mode
-- Inference-only matchups between any set of checkpoints/agents
-- No training, just collect win rates with confidence intervals
-- Supports N-player games with round-robin agent assignment and pairwise result extraction
-- Command: `colosseum eval -c cfg.yaml -a A=runs/<name>/checkpoints/<agent>/ckpt_v<N> -a B=runs/<name>/checkpoints/<agent>/ckpt_v<M> --num-matches 1000 --output result.json`
+- Inference-only matchups between any set of checkpoints / `.pt` state dicts (`colosseum.eval`); no training
+- Same semantics as training rollouts: one model `State` per (env, seat), `info["active"]` and action masks
+- Seat rotation via `schedule_lineups`: for a pair (a, b), match m gives seat s to `(a, b)[(s + m) % 2]`; `--num-matches` is per pair (rounded up to even), so every agent plays every seat equally often; in an N-player game a pairwise match fills all N seats with the two agents alternately
+- Pairwise report: W/D/L, win rate and score (draw = half) with draw-aware 95% Wilson intervals, per-seat breakdown, mean returns and episode length
+- Solo mode (one agent, or a 1-player env): mean return and outcome with 95% normal intervals
+- JSON output with `--output`; architecture of each checkpoint rebuilt from its `meta.json` (`.pt` files from `--config`)
+- Command: `colosseum eval -c config.yaml -a A=runs/x/checkpoints/agent_0/ckpt_v100 -a B=runs/x/checkpoints/agent_0/ckpt_v200 --num-matches 1000 --output result.json` (`--num-matches` is per pair; the architecture comes from each checkpoint's `meta.json`)
 
 ---
 
@@ -242,171 +245,98 @@ User writes env + encoder + networks → selects algorithm + matchmaking via con
 
 ## Implementation Status
 
-All 6 milestones + 5 improvement phases + composite actions + code cleanup fully implemented. **148 tests passing, 2 skipped.**
+State after SP1 (foundation and stabilization, branch `sp1-stabilization`). Test suite: **868** fast tests, **3** slow, **16** GPU-only (`pytest -m "not gpu and not slow"` is the CI suite). The full review that motivated SP1 is `review/README.md` (a frozen snapshot of the pre-SP1 code; never edit it); the SP1 spec is `docs/superpowers/specs/2026-10-08-sp1-stabilization-design.md`.
 
-### Milestone 1: Core + Single-Machine APPO (MVP) — DONE
+Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on `sys.path`, also for spawned children):
+- `colosseum validate -c cfg.yaml [--set k=v ...]`: schema, env `num_players`, a dummy step/unroll of every agent's model.
+- `colosseum train -c cfg.yaml [--set k=v ...]`: single-machine training into `runs/<name>/`.
+- `colosseum eval -c cfg.yaml -a name=path [-a ...] --num-matches N --output result.json [--deterministic] [--seed S]`.
+- `colosseum bc -c cfg.yaml --data <file-or-dir> --output bc.pt [--epochs E] [--seq-len L]`.
+- Distributed (limited): `colosseum serve-weight-store --port P`, `colosseum run-learner -c cfg.yaml --agent A --traj-port P --weight-store host:port`, `colosseum run-workers -c cfg.yaml --weight-store host:port -l A=host:port`.
 
-Working end-to-end IMPALA-style training loop on one machine.
+### Works (single machine)
+- **Training loop:** IMPALA-style. Workers (CPU inference, `RolloutLoop`) → per-agent learners (APPO + V-trace with `vtrace_lambda`) → newest-wins weight queues.
+  - Only numpy payloads cross process boundaries.
+  - Every learner update uses exactly `learner.batch_chunks` chunks.
+  - `training.total_timesteps` is a global env-step budget; the LR follows its progress.
+  - torch threads are limited per process (`rollout.torch_threads`, auto for learners).
+- **Models:** `PolicyModel` protocol with an opaque `State` pytree.
+  - `ComposedModel(encoder, core, policy, value)` with cores `NoCore`, `LSTMCore`, `GRUCore`, `WindowAttentionCore`.
+  - Monolithic models are possible via `networks.model_class`.
+  - The learner reproduces the worker's log-probs and values for all four cores (contract tests).
+  - Optional observation normalization (`NormalizeObs`, updated once per train step).
+- **Transitions:**
+  - Agent-owned buffers parked across match changes.
+  - Transitions stay open until the slot acts again; there is no extra bootstrap forward.
+  - Turn-based games via `info["active"]`.
+  - Truncation adds `γ·V(final_obs)`.
+  - Action masks everywhere.
+  - `ActionSpec` keeps natural component order; composite (`Dict`/`Tuple`/`MultiDiscrete`) actions via `CompositeDist`.
+- **League:**
+  - Every trainable agent owns envs in rotation.
+  - Self-play against own checkpoints; league with N-player PFSP arenas; shuffled seats.
+  - Pairwise per-seat ratings (ELO with K/(N−1), fractional win-rate matrix, `wr_vs_past` over the last 500 pairs). `k_scale = 1/(N−1)` is per seat, so an agent duplicated into several seats of one match gets proportionally more ELO exposure from that match.
+  - FIFO checkpoint pool, atomic and confined to the run dir.
+  - Final checkpoint on every stop.
+  - Resume from a checkpoint dir, a run dir or a `.pt`. Explicit resume is strict: a missing or malformed `meta.json` in the selected agent dir is a `ConfigError` naming the path (the background checkpoint index skips such entries with a warning).
+- **Observability:** `runs/<name>/` (`run.dir`/`run.name`; default name `<config stem>-<YYYYmmdd-HHMMSS>`; an existing explicit name is refused) with `config.resolved.yaml`, `logs/` (`main`, `learner-<agent>`, `worker-<i>`, `worker-<i>-env<k>`), `metrics.jsonl` (train / episodes / ratings / system), `ratings.json`, `checkpoints/<agent>/ckpt_v<N>/{model.pt, trainer_state.pt, meta.json}`; console progress per agent; optional WandB (one run, `<agent>/train_step` axis per agent, `ratings/*`, `system/*`, `episodes/*` on `env_steps`).
+- **Config:**
+  - Pydantic with `extra="forbid"`.
+  - Partial agent overrides deep-merged onto the global sections (`agents.<id>.{networks,algorithm,learner}`).
+  - Agent ids are safe path components without `.` (`[A-Za-z0-9_][A-Za-z0-9_-]*`) and not `ratings`/`system`/`episodes`/`train`.
+  - `--set` with YAML values for `train` / `validate` / `run-learner` / `run-workers`.
+  - `validate` checks `env.num_players`, reset masks with the worker's seat rules, and the model protocol.
+- **Lifecycle:**
+  - Exit codes 0 (budget reached) / 1 (config error or a dead child) / 130 (SIGINT) / 143 (SIGTERM); `eval` also 2 for bad arguments.
+  - Children ignore SIGINT and die with the parent.
+  - A dead child stops the run with a pointer to its log.
+  - On Ctrl+C / SIGTERM the final checkpoints are saved within the shutdown grace (`SHUTDOWN_GRACE_SEC = 7`); no process is alive after 10 s.
+- **Eval:** `PolicyModel`-based with per-seat state and seat rotation; W/D/L with Wilson CIs, per-seat breakdown, solo mode, JSON output; architecture taken from checkpoint `meta.json`.
+- **BC / kickstart:** distribution-aware `-log_prob` loss with masks, sequence training for stateful models, forward-KL kickstarting.
+- **Learning checks:** fast bandit and combination-lock chain tests (with a `gamma=0` negative control); the slow tic-tac-toe test (`configs/examples/tic_tac_toe.yaml`, ~70 s on 8 CPU cores) reaches 86–93% wins against a random legal-move player (threshold 80%).
 
-| Component | File | Description |
-|-----------|------|-------------|
-| Core types | `core/types.py` | TrajectoryChunk (with lstm_hidden, action_masks), PlayerSlot, MatchConfig, MatchResult, WeightPayload |
-| ActionSpec | `core/action_spec.py` | Flat ↔ structured codec for composite action spaces (Dict, Tuple, MultiDiscrete) |
-| Config | `core/config.py` | Pydantic v2 models, YAML loading, per-agent overrides, `load_config()` |
-| Registry | `core/registry.py` | `import_class()`, `build_network()` (with optional LSTM/GRU trunk) |
-| BaseEnv | `envs/base_env.py` | N-player symmetric environment ABC |
-| VectorEnv | `envs/vec_env.py` | K envs stepped sequentially, auto-reset |
-| Networks | `networks/base.py` | BaseEncoder (with `latent_dim`), BasePolicy, BaseValue ABCs |
-| Distributions | `networks/distributions.py` | CategoricalDist (with action masking), DiagGaussianDist, CompositeDist (multi-head for Dict/Tuple/MultiDiscrete) |
-| ActorCritic | `networks/actor_critic.py` | `act()` (4-tuple with hidden), `evaluate_actions()`, `evaluate_actions_recurrent()`, optional LSTM/GRU trunk |
-| V-trace | `algorithms/vtrace.py` | Pure `compute_vtrace()` function (numerically stabilized) |
-| APPO | `algorithms/appo.py` | V-trace + PPO clip + entropy, minibatch, AMP, recurrent training path, kickstart integration |
-| Weight Store | `weight_store/shared_memory.py` | InMemoryWeightStore, SharedMemoryWeightStore |
-| Transport | `transport/local.py` | LocalTransport (mp.Queue per agent) |
-| Worker | `worker/rollout_worker.py` | Multi-agent routing, network pool, LSTM hidden state tracking, action masking, pre-allocated buffers |
-| Learner | `learner/learner.py` | Receive chunks, train, push weights (configurable interval), checkpoint snapshots, pin memory |
-| Coordinator | `coordinator/coordinator.py` | Agent pool + matchmaking + checkpoint management + results feedback |
-| WandB | `metrics/wandb_logger.py` | WandB integration |
-| Launcher | `launcher.py` | Multi-agent training orchestration, monitor loop with results processing |
-| CLI | `cli.py` | `colosseum train`, `bc`, `eval`, `serve-weight-store`, `serve-trajectory` |
-| Example | `examples/tic_tac_toe/` | TicTacToeEnv, Encoder, Policy, Value (simple Discrete actions) |
-| Example | `examples/composite_action/` | ChaseEnv with Dict action space, CompositeDist policy |
+### Partial
+- **Distributed mode** (`serve-weight-store`, `run-learner`, `run-workers`) works for latest-weights self-play only: no coordinator, league, ratings, `metrics.jsonl` or WandB; per-worker budgets; `run-learner` ignores `training.resume_from`.
+- **`deployment/`** (Docker, K8s) is not tested.
 
-### Milestone 2: Self-Play + Checkpoint Management — DONE
+### Not implemented (see Roadmap)
+- Scripted, frozen and external players.
+- Asymmetric or team games, player elimination, Dict observations.
+- Snapshot-level PFSP, OpenSkill / Bradley–Terry ratings, a tournament command.
+- Off-policy algorithms (R2D2/DQN, replay buffer), SAC, AlphaZero/MuZero.
+- GPU inference on workers.
 
-| Component | File | Description |
-|-----------|------|-------------|
-| CheckpointManager | `coordinator/checkpoint_manager.py` | Save/load/FIFO per agent, metadata |
-| AgentPool | `coordinator/agent_pool.py` | Registry: trainable, frozen, scripted agents |
-| Matchmakers | `coordinator/matchmaker.py` | SimpleSelfPlayMatchmaker, SelfPlayMatchmaker, PFSPMatchmaker |
-| Launcher integration | `launcher.py` | Match config generation, collect_mask, checkpoint saves |
+## Roadmap
 
-### Milestone 3: Behavioral Cloning — DONE
+| Sub-project | Scope |
+|---|---|
+| **SP1 Foundation and stabilization** (done) | correct, observable, robust single-machine training; `PolicyModel` protocol |
+| **SP2 Game model** | `GameSpec` / `MultiAgentEnv`, elimination, teams, roles, variable unit counts, per-unit actions, Dict observations, bootstrap moved to the learner |
+| **SP3 Players, league, warm start** | scripted / frozen / external players, PFSP over snapshots, per-agent warm start (`init`, kickstart, critic warm-up), top-k snapshot storage |
+| **SP4 Selection and observability** (parallel with SP5) | match log, OpenSkill / Bradley–Terry, `colosseum tournament`, dashboard, snapshot ratings |
+| **SP5 Distributed** (parallel with SP4) | hub and nodes, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images |
+| **SP6 Speed and extensions** | cuDNN RNN path, fast transformer unroll, GPU inference on workers, inference server, new algorithms |
 
-| Component | File | Description |
-|-----------|------|-------------|
-| Offline BC | `bc/offline_bc.py` | OfflineBCTrainer: load .pt data, supervised CE/MSE loss |
-| Kickstart | `bc/kickstart.py` | KL(teacher \|\| student) by default (configurable), masked, unrolled teacher, linear lambda decay |
-| APPO integration | `algorithms/appo.py` | Optional `kickstart` param adds KL loss to total |
-| CLI | `cli.py` | `colosseum bc --config <path> --data <dir> --output <path>` |
-
-### Milestone 4: PFSP / League Training — DONE
-
-| Component | File | Description |
-|-----------|------|-------------|
-| ELO | `coordinator/ratings.py` | EloRating: pairwise updates, K-factor |
-| Win Rates | `coordinator/ratings.py` | WinRateTracker: pairwise tracking, matrix |
-| PFSPMatchmaker | `coordinator/matchmaker.py` | PFSP priority `(1-wr)^p`, solo/arena match split |
-| Coordinator | `coordinator/coordinator.py` | Match result reporting, ELO/WR updates, league phase |
-
-### Milestone 5: gRPC Distribution — DONE
-
-| Component | File | Description |
-|-----------|------|-------------|
-| Proto | `proto/colosseum.proto` | WeightStoreService, TrajectoryService |
-| Serialization | `transport/serialization.py` | torch.save + lz4 compression |
-| Weight Store Server | `weight_store/grpc_store.py` | WeightStoreServicer + serve_weight_store() |
-| Weight Store Client | `weight_store/grpc_store.py` | GRPCWeightStore(BaseWeightStore) |
-| Trajectory Server | `transport/grpc_transport.py` | TrajectoryServicer + serve_trajectory_receiver() |
-| Trajectory Client | `transport/grpc_transport.py` | GRPCTransport(BaseTransport) |
-| CLI | `cli.py` | `colosseum serve-weight-store`, `serve-trajectory` |
-
-### Milestone 6: Eval + Docker/K8s + Polish — DONE
-
-| Component | File | Description |
-|-----------|------|-------------|
-| Evaluator | `eval.py` | N-player inference-only matchups, round-robin slot assignment, Wilson CI, pairwise results |
-| Docker | `deployment/Dockerfile.*` | Base, worker, weight-store images |
-| Compose | `deployment/docker-compose.yaml` | Local multi-container setup |
-| K8s | `deployment/k8s/` | Namespace, weight-store, worker + HPA |
-
-### Improvement Phase 1: Stability — DONE
-
-- T0.1: VectorEnv circular reference fix in terminal_info
-- T0.2: APPO numerical stability — clamp log_ratio before exp
-- T0.3: V-trace numerical stability — clamp log_rhos before exp
-- T0.4: Worker inference fills log_probs/values for all slots
-- T0.5: PFSP division-by-zero uniform fallback
-- T0.6: CLI override parsing with proper validation
-- T0.7: Replace bare `except Exception` with specific handlers
-- C1: DRY `_apply_to_tensors()` in TrajectoryChunk
-- C2: `build_network()` in registry.py (single factory)
-- C3: Deduplicated worker inference logic
-- C4: Fix Kickstart private field access
-- C7: torch.load security (weights_only)
-
-### Improvement Phase 2: Architecture — DONE
-
-- T1.1: Action masking (`CategoricalDist` mask, `apply_mask()`, threaded through act/evaluate)
-- T1.3: Dynamic algorithm selection via `algorithm_class` config + registry
-- T1.5: Coordinator runtime feedback loop (workers report results, ELO/WR live updates)
-- T1.7: Worker network pool (dict[str, ActorCriticNetwork] per agent, dynamic N networks)
-
-### Improvement Phase 3: Performance — DONE
-
-- T2.1: Pre-allocated rollout buffers (numpy arrays + write cursor, zero-copy torch.from_numpy)
-- T2.2: Smart weight push (configurable `weight_push_interval`, shared WeightPayload)
-- T2.3: Pinned memory for CPU→GPU transfer (`pin_memory` config, `non_blocking=True`)
-- T2.7: `torch.compile` for V-trace (optional, configurable)
-
-### Improvement Phase 4: Config & Tests — DONE
-
-- T3.1: Global random seed (per-worker `seed + worker_id` streams)
-- T3.2: AMP support (`use_amp`, `amp_dtype`, GradScaler)
-- T3.4: LR schedule completion (linear, cosine, constant — all working)
-- T3.6: Advantage normalization per minibatch
-- T4.1-T4.7: VectorEnv, distributions, config validation, multi-player, LR schedule, graceful shutdown, trajectory boundary tests
-
-### Improvement Phase 5: Multi-Agent & RNN — DONE
-
-- T3.8: Per-agent config overrides (`AgentConfig`, `get_agent_config()`, `get_trainable_agent_ids()`)
-- T1.4: Multi-agent launcher (per-agent learners, shared workers, multi-agent routing, slot_agent_map)
-- T5.1: Eval N-player support (round-robin slot assignment, pairwise extraction from N-player matches)
-- T1.2: RNN/LSTM support:
-  - ActorCriticNetwork: optional recurrent trunk, `act()` 4-tuple, `evaluate_actions_recurrent()` for [T,B] sequences
-  - Worker: hidden state tracking per (env, player), save at chunk start, reset on episode done
-  - APPO: recurrent training path (detects `lstm_hidden`, uses `evaluate_actions_recurrent`)
-  - Registry: `build_network()` creates LSTM/GRU from `recurrent_type` config
-  - Config: `recurrent_type`, `recurrent_hidden_size`, `recurrent_num_layers` in NetworkConfig
-
-### Composite Action Spaces — DONE
-
-Native support for `gymnasium.spaces.Dict`, `Tuple`, and `MultiDiscrete` action spaces:
-- `ActionSpec` codec (`core/action_spec.py`): auto-derives flat ↔ structured mapping from gymnasium space. Supports encode/decode/flatten_mask.
-- `CompositeDist` (`networks/distributions.py`): multi-head distribution wrapping dict of sub-distributions. sample/log_prob/entropy/mode/apply_mask/kl_divergence on flat tensors.
-- `action_dim` property on all Distribution subclasses for introspection.
-- VectorEnv: auto-decodes flat actions to structured dicts at env boundary.
-- Worker: uses ActionSpec for buffer allocation and dtype (fixes old int64 bug for Box spaces).
-- Eval: uses ActionSpec for correct action array allocation.
-- BC: auto-detects CompositeDist and handles log_prob delegation.
-- Zero overhead for simple Discrete/Box spaces (all paths check `is_composite` flag).
-- Example: `examples/composite_action/` — ChaseEnv with Dict(direction+speed).
-
-### Code Cleanup — DONE
-
-- Removed all backward-compat shims: single-agent params in worker, dual launch paths in launcher, legacy `_worker_target`/`_derive_worker_configs`. Single-agent is now a special case of multi-agent (one agent in dict).
-- Removed `_ALGO_MAP` hardcoded dict — `algorithm_class` has proper default in config.
-- `get_agent_config()` returns deep copy (not self) to prevent mutation of global config.
-- Queue sizes extracted to named constants.
-- Pre-allocated inference arrays in worker (reused per step via `.fill(0)` instead of `np.zeros()`).
-- Cached obs_shape/dtype in VectorEnv (avoids `observation_space.sample()` per reset).
-- Coordinator match_results bounded to deque(maxlen=10000).
-- Test helpers deduplicated into `tests/helpers.py`.
-
-### Remaining Open Items
-
-1. **Replay buffer** for off-policy algorithms (R2D2, DQN — Tier 2)
-2. **Fault tolerance** (worker/learner crash recovery)
-3. **Distributed launcher** that uses gRPC transport instead of mp.Queue
-4. **SAC / AlphaZero / MuZero** algorithms (Tier 3)
-5. **Real K8s testing** and HPA tuning
-6. **SubprocessVectorEnv** (parallel env stepping for CPU-heavy envs)
-7. **Persistent gRPC streams** (one stream per agent channel, not per chunk)
-8. **Faster serialization** (safetensors / direct tensor bytes)
-9. **SharedMemory zero-copy weight store** (raw shared_memory instead of mp.Manager)
-10. **Asymmetric environment support** (different obs/action spaces per player)
-11. **Observation normalization** (running mean/std)
-12. **Config inheritance / profiles** (`extends: base.yaml`)
+### Open items parked during SP1
+- **SP4:**
+  - full unification of the eval engine with `RolloutLoop` (eval reuses the seat/mask rules from `core/seat_info.py` but has its own loop);
+  - paired, rating-based checkpoint selection (Bradley–Terry with bootstrap) instead of per-pair Wilson intervals.
+- **SP5:**
+  - distributed learner resume (`run-learner` never applies `training.resume_from`);
+  - metrics hub / `metrics.jsonl` / WandB for the distributed roles (today: per-process logs only);
+  - resource leak when `run-learner` setup fails after the trajectory server, weight-store client or drainer started (seeding or drainer start failure);
+  - one budget semantics for distributed mode (today `total_timesteps / num_workers` per worker; learner progress = `consumed_samples / total_timesteps`);
+  - newest-wins weight-queue eviction unpickles the stale payload (CPU ∝ model size × workers) → per-machine weight cache.
+- **SP6:**
+  - normalizer statistics are updated before the loss forward, so the ratio is not exactly 1 at zero lag on early steps (updating after the epochs would give exact parity);
+  - `WindowAttentionCore` rebuilds its masks every step (cache with the fast path);
+  - BC windows are not episode-aligned.
+- **Tier 2 algorithms:** replay buffer for R2D2/DQN (the replay path would also need its own normalizer-stat and warm-up handling).
+- **Minor, unscheduled:**
+  - `--set` lists follow YAML 1.1, so `--set x=[1e-4,2]` keeps `1e-4` as a string (scalars are parsed correctly; write `1.0e-4` in lists);
+  - the main process builds a ratings snapshot on every monitor pass (negligible cost);
+  - stale parked rollout buffers have no age limit (bounded by agents × envs × players).
+  - config inheritance / profiles (`extends: base.yaml`).
 
 ## Tech Stack
 

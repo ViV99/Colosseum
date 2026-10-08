@@ -1,693 +1,385 @@
 # Colosseum
 
-Distributed RL training framework for competitive bot programming competitions (Lux AI, Neural MMO, CodeCraft, etc.).
+A reusable training framework for competitive bot-programming competitions (Lux AI, Neural MMO, CodeCraft, ...):
+behavioural cloning → RL → self-play → league, built on an IMPALA-style asynchronous actor–learner (APPO with V-trace)
+in PyTorch, without Ray.
 
-Full pipeline: **Behavioral Cloning -> Self-Play -> PFSP/League**, with IMPALA-style async architecture, multi-agent league training, composite action spaces (Dict/Tuple/MultiDiscrete), action masking, RNN/LSTM support, and distributed training via gRPC.
+> **Status (SP1 of 6).** Single-machine training is the supported mode: correct, observable and robust for
+> 1v1 games with simultaneous or turn-based moves, solo games, multi-agent self-play and a league where all agents meet.
+> Read [Status and limitations](#status-and-limitations) before relying on anything else.
 
-**148 tests passing.** Single-machine and distributed (gRPC + Kubernetes) modes.
-
----
-
-## Installation
-
-```bash
-git clone <repo-url> && cd Colosseum
-python -m venv .venv && source .venv/bin/activate
-pip install -e .
-
-# For distributed training (gRPC)
-pip install -e ".[grpc]"
-
-# For development
-pip install -e ".[dev]"
-```
-
-Requirements: Python 3.11+, PyTorch 2.2+.
-
----
-
-## Quick Start
-
-### Train (Self-Play)
+## Quick start
 
 ```bash
-colosseum train --config configs/examples/tic_tac_toe.yaml
+git clone <repo-url> Colosseum && cd Colosseum
+scripts/setup-dev.sh            # uv + .venv (Python 3.12) + CPU torch + colosseum[grpc,dev,examples]
+source .venv/bin/activate
+
+colosseum validate -c configs/examples/tic_tac_toe.yaml
+colosseum train -c configs/examples/tic_tac_toe.yaml --set run.name=ttt-quickstart
 ```
 
-### Train (Multi-Agent League)
+`scripts/setup-dev.sh --gpu` installs the CUDA build of torch instead of the CPU one.
+
+Training prints its run directory and one progress line per agent every 10 seconds (log lines go to stderr; the
+same lines are in `runs/ttt-quickstart/logs/main.log`):
+
+```
+Run directory: runs/ttt-quickstart
+... [INFO] main colosseum.progress: [agent_0] step 991 |  42.2% budget | 14,372 env-steps/s | loss 0.2190 | entropy 1.251 | return 0.000
+...
+... [INFO] main colosseum.progress: [agent_0] step 2298 | 100.0% budget | 10,106 env-steps/s | loss 0.0235 | entropy 0.327 | return 0.090 | wr_vs_past 0.95
+... [INFO] main colosseum.launcher: Training finished; outputs in runs/ttt-quickstart
+```
+
+On an 8-core CPU the run (2 workers × 16 envs, 600,000 env steps) takes about a minute (52–73 s measured). Afterwards the latest
+checkpoint, played greedily with the action mask, wins 86–93% of games against a random legal-move player (four
+measured runs of 400 games each; `tests/learning/test_ttt_slow.py` requires >= 80%). Re-running with the same
+`run.name` is refused; pick another name or delete `runs/ttt-quickstart`.
+
+Evaluate the newest checkpoint against the oldest one still kept:
 
 ```bash
-colosseum train --config configs/examples/tic_tac_toe_multi.yaml
+NEW=$(ls -d runs/ttt-quickstart/checkpoints/agent_0/ckpt_v* | sort -V | tail -1)
+OLD=$(ls -d runs/ttt-quickstart/checkpoints/agent_0/ckpt_v* | sort -V | head -1)
+colosseum eval -c configs/examples/tic_tac_toe.yaml -a new=$NEW -a old=$OLD --num-matches 200 --output eval.json
 ```
 
-### Evaluate Checkpoints
+Continue training from that run (policy versions, optimizer state and the env-step counter continue):
 
 ```bash
-colosseum eval -c configs/examples/tic_tac_toe.yaml \
-  -a agent_a=runs/<run_name>/checkpoints/agent_0/ckpt_v100 \
-  -a agent_b=runs/<run_name>/checkpoints/agent_0/ckpt_v200 \
-  --num-matches 1000
+colosseum train -c configs/examples/tic_tac_toe.yaml --set run.name=ttt-continued \
+  --set training.resume_from=runs/ttt-quickstart --set training.total_timesteps=1200000
 ```
 
-### Behavioral Cloning
+A two-agent league:
 
 ```bash
-colosseum bc -c configs/examples/tic_tac_toe.yaml \
-  --data path/to/expert_data/ \
-  --output pretrained_weights.pt \
-  --epochs 20
+colosseum train -c configs/examples/tic_tac_toe_multi.yaml --set run.name=ttt-league
 ```
 
-### Override Config from CLI
+`runs/` and `eval.json` are git-ignored.
 
-```bash
-colosseum train -c configs/examples/tic_tac_toe.yaml \
-  --set training.total_timesteps=500000 \
-  --set rollout.num_workers=8 \
-  --set algorithm.learning_rate=1e-4 \
-  --set metrics.use_wandb=true
+## What a run writes
+
+```
+runs/<name>/
+  config.resolved.yaml      the config after --set overrides and agent merging
+  logs/main.log             main process (also printed to the console)
+  logs/learner-<agent>.log  one file per learner
+  logs/worker-<i>.log       one file per rollout worker (worker-<i>-env<k>.log for subprocess envs)
+  metrics.jsonl             one JSON record per line (below)
+  ratings.json              latest ELO / win-rate matrix / wr_vs_past, rewritten periodically and at the end
+  checkpoints/<agent>/ckpt_v<N>/{model.pt, trainer_state.pt, meta.json}
 ```
 
----
+The run directory is `<run.dir>/<run.name>` (`run.dir` defaults to `runs`, relative to the current directory). Without
+`run.name` it is `<config stem>-<YYYYmmdd-HHMMSS>`. Checkpoints always live inside the run directory.
 
-## Writing Your Own Game
+`metrics.jsonl` records (`"kind"` field):
 
-Implement 4 classes and a YAML config to use Colosseum for any competition.
+| kind | content |
+|---|---|
+| `train` | APPO metrics of one agent (`agent`, `train_step`, losses, entropy, `approx_kl`, `explained_variance`, `grad_norm`, `rho_mean`, `rho_clip_frac`, `policy_lag_mean/max`, `lr`, ...) every `metrics.log_interval` train steps |
+| `episodes` | per agent since the previous record: `episodes`, `return_mean`, `length_mean`, `wdl` = W/D/L against `latest` (self), `past` (own checkpoints) and `arena` (other agents), `seat_counts` |
+| `ratings` | `elo`, `win_rates`, `games`, `wr_vs_past`, `past_games` |
+| `system` | `env_steps`, `env_steps_per_sec`, `train_steps_per_sec` per agent, learner `queue_depths`, `parked_buffers`, `workers_reporting` |
+
+`meta.json` of a checkpoint holds `agent_id`, `checkpoint_id`, `policy_version`, `timestamp`, `config_hash`,
+`env_steps`, `final` and the agent's `networks` section, so `colosseum eval` can rebuild any checkpoint's architecture.
+
+### WandB
+
+WandB is optional and only a viewer; `metrics.jsonl` stays the source of truth. Install the extra with
+`uv pip install --python .venv/bin/python -e ".[wandb]"` and set `metrics.use_wandb: true`
+(or `--set metrics.use_wandb=true`). A training run is one WandB run:
+- per-agent training metrics are `<agent>/<metric>` on the axis `<agent>/train_step`;
+- `ratings/*`, `system/*` and `episodes/*` (nested keys such as `ratings/elo/<agent>`) are on the axis `env_steps`.
+
+Without an interactive `wandb login`, set `WANDB_API_KEY`, or `WANDB_MODE=offline` to log locally (upload later with
+`wandb sync`). A WandB failure logs one warning and disables WandB; it never stops training. The distributed roles
+(`run-learner`, `run-workers`) have no WandB and no `metrics.jsonl` until SP5.
+
+## Process lifecycle
+
+- `training.total_timesteps` is the global number of env steps over all workers. When it is reached, every learner
+  sends a final checkpoint, the main process saves it, all processes stop, and the exit code is 0.
+- If any worker or learner dies, training stops with exit code 1 and a message like
+  `worker-0 died (exit -9), see runs/<name>/logs/worker-0.log`.
+- Ctrl-C (SIGINT) and SIGTERM stop the run: the learners send final checkpoints, which are saved within a shutdown
+  grace of 7 seconds; then any remaining child is terminated, so no process is left after 10 seconds. The exit codes
+  are 130 (SIGINT) and 143 (SIGTERM). Child processes ignore Ctrl-C themselves (the main process stops them) and die
+  with the main process if it is killed.
+- An invalid config exits with code 1 and a one-line `Config error: ...`, without a traceback.
+- `colosseum eval` uses the same codes (0 / 1 / 130 / 143), plus 2 for bad command-line arguments.
+
+## Writing your own game
 
 ### 1. Environment
 
 ```python
 # my_game/env.py
-import gymnasium
-import numpy as np
+import gymnasium, numpy as np
 from colosseum.envs.base_env import BaseEnv
 
 class MyGameEnv(BaseEnv):
     @property
-    def num_players(self) -> int:
-        return 2  # supports 1-N players
-
+    def num_players(self) -> int: return 2
     @property
-    def observation_space(self) -> gymnasium.spaces.Space:
-        return gymnasium.spaces.Box(low=0, high=1, shape=(8, 8, 3), dtype=np.float32)
-
+    def observation_space(self): return gymnasium.spaces.Box(0, 1, (16,), np.float32)
     @property
-    def action_space(self) -> gymnasium.spaces.Space:
-        return gymnasium.spaces.Discrete(64)
-        # Also supported: Dict, Tuple, MultiDiscrete, Box — see Composite Actions below
+    def action_space(self): return gymnasium.spaces.Discrete(4)   # Dict / Tuple / MultiDiscrete also work
 
     def reset(self, seed=None):
-        # Returns: (obs_dict, info_dict) keyed by player index 0..N-1
-        obs = {i: np.zeros((8, 8, 3), dtype=np.float32) for i in range(self.num_players)}
-        info = {i: {} for i in range(self.num_players)}
-        return obs, info
+        obs = {p: np.zeros(16, np.float32) for p in range(2)}
+        infos = {p: {"active": p == 0, "action_mask": np.ones(4, bool)} for p in range(2)}
+        return obs, infos
 
-    def step(self, actions):
-        # actions: dict[int, action] keyed by player index
-        # Returns: (obs, rewards, terminated, truncated, infos) — all dicts keyed by player
+    def step(self, actions):            # actions: {player: action}
         ...
+        return obs, rewards, terminated, truncated, infos   # every value is a dict keyed by player
 ```
 
-**Action masking** — return `"action_mask"` in per-player info dicts:
+Per-player `info` keys the framework understands:
+- `active` (bool): whose move it is. Only active players run inference and record transitions.
+  Rewards that arrive while a player waits are credited to its last move. Without `active`, every player acts every step.
+- `action_mask` (bool array): legal actions, applied in training, evaluation and BC. An active player whose mask has
+  no legal action is an error.
+- `outcome` (float in [0, 1]) or `rank` (int, 1 = best) in the terminal info: the authoritative match result used by
+  ratings and eval. Without them, the outcome is derived from episode rewards.
 
-```python
-def step(self, actions):
-    ...
-    infos = {
-        0: {"action_mask": np.array([True, True, False, ...], dtype=bool)},
-        1: {"action_mask": np.array([True, False, True, ...], dtype=bool)},
-    }
-    return obs, rewards, terminated, truncated, infos
-```
+`terminated` ends an episode; `truncated` (time limit) bootstraps with the value of the final observation.
 
-### 2. Neural Networks
+### 2. Model
+
+The default model is `encoder → core → policy head / value head`:
 
 ```python
 # my_game/networks.py
-import torch
 import torch.nn as nn
 from colosseum.networks.base import BaseEncoder, BasePolicy, BaseValue
 from colosseum.networks.distributions import CategoricalDist
 
-class MyEncoder(BaseEncoder):
-    def __init__(self):
-        super().__init__()
-        self.net = nn.Sequential(nn.Flatten(), nn.Linear(192, 128), nn.ReLU())
-
+class Encoder(BaseEncoder):
+    def __init__(self, **kwargs):
+        super().__init__(); self.net = nn.Sequential(nn.Linear(16, 64), nn.ReLU())
     @property
-    def latent_dim(self) -> int:
-        return 128  # required: tells the framework the output dimension
+    def latent_dim(self): return 64
+    def forward(self, obs): return self.net(obs)
 
-    def forward(self, obs):
-        return self.net(obs)
+class Policy(BasePolicy):
+    def __init__(self, in_dim: int = 64, **kwargs):     # in_dim = the core's output size
+        super().__init__(); self.net = nn.Linear(in_dim, 4)
+    def forward(self, features): return CategoricalDist(logits=self.net(features))
 
-class MyPolicy(BasePolicy):
-    def __init__(self):
-        super().__init__()
-        self.fc = nn.Linear(128, 64)
-
-    def forward(self, latent):
-        return CategoricalDist(logits=self.fc(latent))
-
-class MyValue(BaseValue):
-    def __init__(self):
-        super().__init__()
-        self.fc = nn.Sequential(nn.Linear(128, 32), nn.ReLU(), nn.Linear(32, 1))
-
-    def forward(self, latent):
-        return self.fc(latent).squeeze(-1)
+class Value(BaseValue):
+    def __init__(self, in_dim: int = 64, **kwargs):
+        super().__init__(); self.net = nn.Linear(in_dim, 1)
+    def forward(self, features): return self.net(features).squeeze(-1)
 ```
 
-For continuous actions, use `DiagGaussianDist`. For composite actions (Dict/Tuple/MultiDiscrete), use `CompositeDist` — see below.
+Cores (`colosseum.networks.cores`):
+- `null`: no memory;
+- `LSTMCore` / `GRUCore` (`hidden_size`, `num_layers`);
+- `WindowAttentionCore` (`d_model`, `window`, `num_heads`, `num_layers`): causal attention over the last `window`
+  latents of the episode (example: `configs/examples/tic_tac_toe_attention.yaml`).
+
+For anything else, subclass `colosseum.networks.model.PolicyModel` (`initial_state`, `step`, optionally `unroll`) and
+set `networks.model_class`. Composite actions (`Dict`, `Tuple`, `MultiDiscrete`) use
+`colosseum.networks.distributions.CompositeDist`; see `examples/composite_action` and `configs/examples/chase.yaml`.
 
 ### 3. Config
 
 ```yaml
 # my_game/config.yaml
-env:
-  env_class: "my_game.env.MyGameEnv"
-  num_players: 2
-
+run: {name: null, dir: runs}            # outputs go to runs/<name>/ (default name: <config stem>-<timestamp>)
+env: {env_class: my_game.env.MyGameEnv, num_players: 2}
 networks:
-  encoder_class: "my_game.networks.MyEncoder"
-  policy_class: "my_game.networks.MyPolicy"
-  value_class: "my_game.networks.MyValue"
-
-algorithm:
-  name: "appo"
-  learning_rate: 3.0e-4
-
-rollout:
-  chunk_length: 128
-  num_workers: 4
-  envs_per_worker: 16
-
-training:
-  phase: "self_play"
-  total_timesteps: 10_000_000
-  seed: 42
-
-self_play:
-  checkpoint_interval: 1000
-  pool_size: 20
-  latest_prob: 0.5
-
-metrics:
-  use_wandb: true
-  wandb_project: "my-competition"
+  encoder_class: my_game.networks.Encoder
+  core: {class: colosseum.networks.cores.LSTMCore, kwargs: {hidden_size: 128}}   # or null
+  policy_class: my_game.networks.Policy
+  value_class: my_game.networks.Value
+training: {phase: self_play, total_timesteps: 2000000}
 ```
-
-### 4. Train
 
 ```bash
-colosseum train --config my_game/config.yaml
+colosseum validate -c my_game/config.yaml     # schema, env num_players, a dummy step/unroll of the model
+colosseum train -c my_game/config.yaml
 ```
 
----
+The current directory is put on `sys.path` (also for the spawned worker and learner processes), so run the commands
+from the directory that contains `my_game/`.
 
-## Training Phases
+## Configuration reference
 
-### Phase 1: Behavioral Cloning (optional)
-
-Pre-train from expert data to bootstrap the policy:
+Unknown keys are errors at every level. `--set key=value` accepts YAML values (`null`, numbers such as `1e-4`, lists,
+`{}`; quote a value to keep it a string, e.g. `--set run.name='"123"'`) and works for `train`, `validate`,
+`run-learner` and `run-workers`:
 
 ```bash
-colosseum bc -c config.yaml --data expert_games/ --output bc_weights.pt --epochs 50
+colosseum train -c configs/examples/tic_tac_toe.yaml --set run.name=lr-test \
+  --set algorithm.learning_rate=1e-3 --set rollout.num_workers=4 --set training.resume_from=null
 ```
 
-Each `.pt` file is a dict with `observations` `[N, *obs_shape]`, `actions` (`[N]` int for Discrete,
-`[N, D]` float for Box, the `ActionSpec` flat layout for Dict/Tuple/MultiDiscrete), and optional
-`action_masks` `[N, mask_size]` bool and `dones` `[N]` bool. The loss is `-log pi(a|s)` with the
-masks applied; an expert action that is illegal under its mask is an error. Stateful models
-(LSTM/GRU/attention cores) train on windows of `bc.seq_len` transitions (`--seq-len`), resetting
-the state at `dones`.
+Inside a list, YAML 1.1 rules apply: `--set x=[1e-4,2]` keeps `1e-4` as a string; write `1.0e-4` there.
 
-Use **kickstarting** during RL to regularize towards a teacher via decaying KL loss:
+| section | keys (defaults) |
+|---|---|
+| `run` | `name` (null → `<config stem>-<YYYYmmdd-HHMMSS>`; an existing explicit name is an error), `dir` (`runs`) |
+| `env` | `env_class`, `num_players` (2; must equal the env's), `kwargs` |
+| `networks` | `model_class` (null) or `encoder_class` + `core` (`{class, kwargs}` or null) + `policy_class` + `value_class`; `kwargs` (passed to every constructor) |
+| `algorithm` | `algorithm_class` (APPO), `gamma` 0.99, `vtrace_lambda` 1.0, `vtrace_rho_bar` 1.0, `vtrace_c_bar` 1.0, `eps_clip` 0.2, `value_loss_coeff` 0.5, `entropy_coeff` 0.01, `max_grad_norm` 0.5, `num_epochs` 1, `minibatch_chunks` 0, `learning_rate` 3e-4, `lr_schedule` (`linear`; also `constant`, `cosine`; follows the share of `total_timesteps` done), `normalize_advantages` (true), `use_amp` (false), `amp_dtype` (`float16` / `bfloat16`), `use_torch_compile` (false) |
+| `rollout` | `chunk_length` 256, `num_workers` 4, `envs_per_worker` 8, `torch_threads` 1, `weight_sync_interval_sec` 5, `vec_env` (`sync`/`subprocess`), `subproc_workers`, `match_refresh_interval_sec` 30 |
+| `learner` | `device` (`auto`), `batch_chunks` 16 (every update uses exactly this many chunks), `queue_size` 64, `weight_push_interval` 5, `torch_threads` (auto), `pin_memory` (false) |
+| `training` | `phase` (`self_play` / `league`), `total_timesteps` (global env steps), `seed`, `resume_from`, `kickstart_teacher`, `kickstart_lambda` 1.0, `kickstart_decay_steps` 50000, `kickstart_kl` (`forward` = KL(teacher‖student), or `reverse`) |
+| `self_play` | `checkpoint_interval` (train steps), `pool_size` (FIFO per agent), `latest_prob`, `self_play_ratio` (league: share of self-play matches), `pfsp_exponent`, `shuffle_seats` (true) |
+| `checkpoint` | `save_optimizer` (true: also save `trainer_state.pt`) |
+| `metrics` | `log_interval` (train steps between `train` records), `console_interval_sec` 10, `use_wandb`, `wandb_project`, `wandb_entity` |
+| `bc` | `seq_len` 64 (sequence length for stateful models in `colosseum bc`) |
+| `transport` | `grpc_max_message_mb` 64 (distributed mode; `mode` and `grpc_port` are not used, ports are command-line flags) |
+| `agents` | `{agent_id: {networks: {...}, algorithm: {...}, learner: {...}}}`: partial overrides, deep-merged onto the global sections |
 
-```yaml
-training:
-  phase: "self_play"
-  resume_from: "bc_weights.pt"   # start from the BC weights (policy_version 0)
-```
-
-### Phase 2: Self-Play
-
-Agent plays against a pool of its own historical checkpoints.
-
-```yaml
-training:
-  phase: "self_play"
-self_play:
-  checkpoint_interval: 1000    # save every N train steps
-  pool_size: 20                # FIFO: keep last 20 checkpoints
-  latest_prob: 0.5             # 50% chance opponent is current policy
-```
-
-### Phase 3: PFSP / League
-
-Multiple trainable agents compete. PFSP focuses training on hard opponents.
+**Agents.** Without an `agents` section there is one agent, `agent_0`. With it, every key is a trainable agent with its
+own learner; an override changes only the keys it names:
 
 ```yaml
-training:
-  phase: "league"
-self_play:
-  self_play_ratio: 0.5        # 50% solo (own checkpoints), 50% arena (vs other agents)
-  pfsp_exponent: 1.0          # higher = more focus on hard opponents
-
 agents:
-  agent_alpha:
-    networks: null             # null = inherit global config
-    algorithm: null
-    learner: null
-  agent_beta:
-    algorithm:
-      learning_rate: 1.0e-4   # agent_beta uses different LR
+  alpha: {}
+  beta:
+    algorithm: {learning_rate: 1.0e-4}                       # every other algorithm key stays global
+    networks: {core: {class: colosseum.networks.cores.GRUCore, kwargs: {hidden_size: 64}}}
 ```
 
-Each agent in `agents:` gets its own learner process. Workers are shared — chunks are routed to the correct learner by `agent_id`.
+An agent id names directories and metric namespaces: it may contain letters, digits, `_` and `-` (not starting with
+`-`), no `.` (so `--set agents.<id>.algorithm.learning_rate=...` always works), and it cannot be `ratings`, `system`,
+`episodes` or `train`.
 
-ELO and pairwise win rates tracked automatically by the coordinator.
+**Matchmaking.** Every env has an owner: the trainable agents take turns by env index, rotating at every match refresh.
+- `self_play`: the owner's latest weights in every seat, except that each non-owner seat plays a random own checkpoint
+  (not collecting data) with probability `1 - latest_prob`.
+- `league`: with probability `self_play_ratio` the match is a self-play match. Otherwise it is an arena match: the owner
+  plus N−1 opponents drawn by PFSP, `(1 - win_rate)^pfsp_exponent`, from the other agents, with replacement; every
+  arena seat collects data.
 
----
+**Ratings.** Seats are shuffled. Every pair of seats of different agents scores 1 / 0.5 / 0 by outcome. The win-rate
+matrix and ELO use those pairs; all pairs of one match are applied at once with K scaled by `k_scale = 1/(N−1)`. The
+scale is per seat, so an agent that fills several seats of one match (an arena with fewer agents than seats) gets
+proportionally more ELO exposure from that match. `wr_vs_past` is the latest weights' score against the agent's own
+checkpoints over the last 500 pairs.
 
-## Multi-Agent League Training
+**Resume.** `training.resume_from` accepts:
+- a checkpoint dir (weights + optimizer + versions);
+- a previous run dir (each agent takes its latest checkpoint there; an agent without checkpoints starts fresh with a
+  warning);
+- a `.pt` state dict (weights only, e.g. the output of `colosseum bc`). It is applied to every agent and must match
+  each agent's architecture.
 
-Define multiple agents with optional per-agent overrides:
+An explicit resume is strict: a checkpoint with a missing or malformed `meta.json` in the selected directory is a
+config error naming the path, never silently skipped.
 
-```yaml
-training:
-  phase: "league"
+## Behavioural cloning and kickstarting
 
-agents:
-  aggressive_agent:
-    algorithm:
-      entropy_coeff: 0.02      # more exploration
-      learning_rate: 5.0e-4
-  defensive_agent:
-    algorithm:
-      entropy_coeff: 0.005     # less exploration
-      learning_rate: 1.0e-4
-  baseline_agent:
-    networks: null              # uses global network config
-    algorithm: null             # uses global algorithm config
+```bash
+colosseum bc -c my_game/config.yaml --data path/to/demos/ --output bc.pt --epochs 20
+colosseum train -c my_game/config.yaml --set training.resume_from=bc.pt
 ```
 
-Per-agent fields that can be overridden: `networks`, `algorithm`, `learner`. Unset (`null`) fields inherit from the global config. When `agents:` is empty or absent, a single agent `agent_0` uses the global config.
+BC data: `.pt` files with `observations`, `actions` and optional `action_masks` and `dones`. The loss is `-log_prob` of
+the recorded action for every distribution type. Masks are applied. Stateful models train on sequences of `--seq-len`
+steps (default `bc.seq_len`, 64) that reset at `dones`.
 
----
-
-## RNN/LSTM for Partial Observability
-
-For games with fog-of-war or memory requirements, add a recurrent trunk:
-
-```yaml
-networks:
-  encoder_class: "my_game.networks.MyEncoder"
-  policy_class: "my_game.networks.MyPolicy"
-  value_class: "my_game.networks.MyValue"
-  recurrent_type: "lstm"        # "lstm", "gru", or null (feedforward)
-  recurrent_hidden_size: 128
-  recurrent_num_layers: 1
-```
-
-When `recurrent_type` is set, an LSTM/GRU module is inserted between the encoder and policy/value heads. The policy and value head input dimension must match `recurrent_hidden_size` (not `encoder.latent_dim`).
-
-The worker automatically:
-- Maintains hidden state per (env, player) pair
-- Passes hidden through inference calls
-- Resets hidden state on episode boundaries
-- Stores initial hidden at each chunk start for the learner
-
-APPO automatically detects recurrent chunks and uses sequence-level training (`evaluate_actions_recurrent`) instead of the stateless path.
-
----
-
-## Action Masking
-
-Environments return valid action masks via info dicts. The framework automatically:
-
-1. Passes masks to `CategoricalDist` which sets invalid action logits to `-inf`
-2. Threads masks through `act()` (inference) and `evaluate_actions()` (training)
-3. Stores masks in `TrajectoryChunk` for correct off-policy evaluation
-
-Enable by returning `"action_mask"` in your env's `step()` and `reset()` info dicts — no config changes needed.
-
----
-
-## Composite Action Spaces (Dict / Tuple / MultiDiscrete)
-
-For competitions where agents output structured actions like `{"action_type": int, "accel": float, "target": int}`, use `gymnasium.spaces.Dict` (or `Tuple` / `MultiDiscrete`):
-
-```python
-# Environment
-class MyEnv(BaseEnv):
-    @property
-    def action_space(self):
-        return gymnasium.spaces.Dict({
-            "action_type": gymnasium.spaces.Discrete(5),
-            "target_pos": gymnasium.spaces.Box(low=-1, high=1, shape=(2,)),
-        })
-
-    def step(self, actions):
-        # actions[player_idx] is a dict: {"action_type": 3, "target_pos": array([0.5, -0.2])}
-        ...
-```
-
-```python
-# Policy — returns CompositeDist with multiple heads
-from colosseum.networks.distributions import CompositeDist, CategoricalDist, DiagGaussianDist
-
-class MyPolicy(BasePolicy):
-    def __init__(self):
-        super().__init__()
-        self.type_head = nn.Linear(128, 5)
-        self.pos_mean = nn.Linear(128, 2)
-        self.pos_logstd = nn.Parameter(torch.zeros(2))
-
-    def forward(self, latent):
-        return CompositeDist({
-            "action_type": CategoricalDist(self.type_head(latent)),
-            "target_pos": DiagGaussianDist(
-                self.pos_mean(latent),
-                self.pos_logstd.expand(latent.shape[0], -1),
-            ),
-        })
-```
-
-The framework handles everything transparently:
-- Internally, composite actions are flattened to a single `float32` tensor (zero overhead for the training pipeline)
-- `ActionSpec` auto-derives the flat layout from the action space
-- VectorEnv decodes flat tensors back to dicts before passing to `env.step()`
-- APPO, V-trace, TrajectoryChunk all work unchanged — they see flat tensors
-- Action masking works with composite spaces: return a flat mask or a dict of per-head masks in info
-
-Supported spaces: `Discrete`, `Box`, `Dict`, `Tuple`, `MultiDiscrete`. Nested composite (Dict-in-Dict) is not supported.
-
-See `examples/composite_action/` for a complete working example.
-
----
-
-## Automatic Mixed Precision (AMP)
-
-For faster GPU training:
-
-```yaml
-algorithm:
-  use_amp: true
-  amp_dtype: "float16"    # or "bfloat16"
-```
-
-Wraps the forward pass in `torch.autocast` and uses `GradScaler` for float16. Only active on CUDA devices.
-
----
+Kickstarting adds `lambda * KL(teacher‖student)` to the RL loss, decaying linearly over `kickstart_decay_steps`:
+`--set training.kickstart_teacher=bc.pt`. The teacher uses the student's architecture.
 
 ## Evaluation
 
-Inference-only matchups between any agents/checkpoints:
+`colosseum eval` plays inference-only matches between checkpoints (`-a name=path`, repeatable; a path is a checkpoint
+dir or a `.pt` state dict). It reuses the training semantics: per-seat model state, `active` and action masks.
+- Two or more agents: every pair plays `--num-matches` matches (rounded up to an even number) with rotated seats, so
+  each agent plays every seat equally often. The report gives W/D/L, the win rate and the score (a draw counts as half)
+  with 95% Wilson intervals, a per-seat breakdown, mean returns and episode length.
+- One agent, or a 1-player env (solo mode): `--num-matches` episodes per agent, mean return and outcome with 95%
+  intervals.
+- `--output result.json` writes the machine-readable report; `--deterministic` plays greedily.
+
+A checkpoint's architecture comes from its `meta.json`; a `.pt` file is built from `--config`.
+
+## Distributed mode (limited)
+
+The roles run as separate processes, possibly on separate machines:
 
 ```bash
-colosseum eval -c config.yaml \
-  -a agent_a=runs/<run_name>/checkpoints/agent_0/ckpt_v100 \
-  -a agent_b=runs/<run_name>/checkpoints/agent_0/ckpt_v200 \
-  -a agent_c=runs/<run_name>/checkpoints/agent_1/ckpt_v50 \
-  --num-matches 1000 \
-  --num-envs 16 \
-  --output result.json
+colosseum serve-weight-store --port 50051                                              # machine A
+colosseum run-learner -c cfg.yaml --agent agent_0 --traj-port 50052 --weight-store A:50051   # machine B
+colosseum run-workers -c cfg.yaml --weight-store A:50051 -l agent_0=B:50052                  # machines C, D, ...
 ```
 
-`--num-matches` is per pair. Seats rotate, so each agent plays every seat equally often. The report gives W/D/L,
-the win rate and the score (W + D/2)/n, each with a 95% Wilson interval (the score interval is a conservative
-approximation), plus a per-seat breakdown. A checkpoint directory is built from its `meta.json` `networks`, so
-different architectures can be compared. A `.pt` file uses the config's `networks`. With one agent or a 1-player
-env the report is solo: mean return and outcome with 95% normal intervals.
+`run-learner` writes `runs/<name>-learner-<agent>/` (logs, checkpoints). `run-workers` writes
+`runs/<name>-workers-<host>/` (logs), so several worker machines can share one `run.name` on a shared filesystem.
 
----
+Limitations in SP1 (to be fixed in SP5):
+- there is no coordinator: workers play the latest weights of every agent in a fixed round-robin, with no historical
+  opponents, no league, no ratings and no `metrics.jsonl` or WandB;
+- every `run-workers` host collects `total_timesteps / num_workers` per worker on its own, and the learner's progress is
+  `consumed_samples / total_timesteps`;
+- `run-learner` cannot resume (`training.resume_from` is not applied);
+- no fault tolerance or authentication;
+- `deployment/` (Docker, Kubernetes) is untested.
 
-## Distributed Training (gRPC)
+## Status and limitations
 
-### Multi-Machine Setup
+SP1 ("foundation and stabilization") is the first of six sub-projects that follow the full review in
+[`review/README.md`](review/README.md):
 
-```bash
-# Machine 1: Weight Store
-colosseum serve-weight-store --port 50051
+| | Sub-project | Content |
+|---|---|---|
+| ✔ | SP1 Foundation and stabilization | correct single-machine training, stateful model protocol, run dir, metrics, lifecycle |
+| | SP2 Game model | `GameSpec`/multi-agent env API, player elimination, teams, roles, per-unit actions, Dict observations |
+| | SP3 Players, league, warm start | scripted, frozen and external players; PFSP over snapshots; per-agent `init`/kickstart/critic warm-up; top-k snapshot storage |
+| | SP4 Selection and observability | match log, OpenSkill / Bradley–Terry ratings, `colosseum tournament`, dashboard, snapshot ratings |
+| | SP5 Distributed | hub and nodes, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images |
+| | SP6 Speed and extensions | cuDNN RNN path, fast transformer unroll, GPU inference on workers, inference server, new algorithms |
 
-# Machine 2: Trajectory Receiver (learner side)
-colosseum serve-trajectory --port 50052
-
-# Machine 3+: Workers
-colosseum train --config config.yaml --set transport.mode=grpc
-```
-
-```yaml
-transport:
-  mode: "grpc"                 # "local" (mp.Queue) or "grpc"
-  grpc_port: 50051
-  grpc_max_message_mb: 64
-```
-
-### Docker Compose
-
-```bash
-cd deployment && docker compose up
-```
-
-### Kubernetes
-
-```bash
-kubectl apply -f deployment/k8s/
-```
-
-Worker pods auto-scale via HPA based on CPU utilization. See `deployment/k8s/` for manifests.
-
----
-
-## Full Configuration Reference
-
-### `algorithm`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `name` | `"appo"` | Algorithm name (cosmetic) |
-| `algorithm_class` | `"colosseum.algorithms.appo.APPO"` | Dotted import path to algorithm class |
-| `gamma` | `0.99` | Discount factor |
-| `vtrace_lambda` | `1.0` | V-trace λ: trace coefficients c_t = λ·min(c̄, ρ_t); 1.0 = plain V-trace (GAE is not used) |
-| `eps_clip` | `0.2` | PPO clipping epsilon |
-| `value_loss_coeff` | `0.5` | Value-function loss coefficient |
-| `entropy_coeff` | `0.01` | Entropy bonus coefficient |
-| `max_grad_norm` | `0.5` | Max gradient norm for clipping |
-| `num_epochs` | `1` | PPO epochs per batch |
-| `minibatch_chunks` | `0` | Minibatch size in trajectory **chunks** (over batch dim B, not timesteps; sequences stay intact). 0 = all chunks as one batch |
-| `vtrace_rho_bar` | `1.0` | V-trace truncation for importance weights |
-| `vtrace_c_bar` | `1.0` | V-trace truncation for trace-cutting |
-| `learning_rate` | `3e-4` | Initial learning rate |
-| `lr_schedule` | `"linear"` | `"constant"`, `"linear"`, or `"cosine"` |
-| `normalize_advantages` | `true` | Normalize advantages per minibatch |
-| `use_torch_compile` | `false` | Compile V-trace with torch.compile |
-| `use_amp` | `false` | Enable automatic mixed precision |
-| `amp_dtype` | `"float16"` | AMP dtype: `"float16"` or `"bfloat16"` |
-
-### `env`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `env_class` | **required** | Dotted import path to BaseEnv subclass |
-| `num_players` | `2` | Number of player slots per match |
-| `kwargs` | `{}` | Extra kwargs forwarded to env constructor |
-
-### `networks`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `encoder_class` | **required** | Dotted path to BaseEncoder subclass |
-| `policy_class` | **required** | Dotted path to BasePolicy subclass |
-| `value_class` | **required** | Dotted path to BaseValue subclass |
-| `kwargs` | `{}` | Extra kwargs forwarded to network constructors |
-| `recurrent_type` | `null` | `"lstm"`, `"gru"`, or `null` (feedforward) |
-| `recurrent_hidden_size` | `128` | Hidden size for recurrent trunk |
-| `recurrent_num_layers` | `1` | Number of recurrent layers |
-
-### `rollout`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `chunk_length` | `256` | Timesteps per trajectory chunk (T) |
-| `num_workers` | `4` | Number of worker processes |
-| `envs_per_worker` | `8` | Vectorized envs per worker |
-| `weight_sync_interval_sec` | `5.0` | How often workers pull fresh weights (seconds) |
-
-### `learner`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `device` | `"auto"` | `"auto"`, `"cuda:0"`, `"cpu"` |
-| `queue_size` | `64` | Max trajectory chunks buffered |
-| `batch_chunks` | `16` | Chunks aggregated into one training batch |
-| `weight_push_interval` | `5` | Push weights to workers every N training steps (each push clones the state_dict; workers pull every `weight_sync_interval_sec`) |
-| `pin_memory` | `false` | Pin batch tensors for faster CPU-to-GPU transfer |
-
-### `training`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `phase` | `"self_play"` | `"bc"`, `"self_play"`, or `"league"` |
-| `total_timesteps` | `10_000_000` | Total env steps before training ends |
-| `seed` | `null` | Global random seed (null = non-deterministic) |
-| `resume_from` | `null` | Resume from a checkpoint dir (`.../agent_0/ckpt_v100`: weights, trainer state, policy version, env steps), a previous run dir (containing `checkpoints/`: each agent's latest checkpoint), or a `.pt` state_dict (weights only) |
-
-### `self_play`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `checkpoint_interval` | `1000` | Save checkpoint every N **training** steps (optimizer updates), not env steps. One train step = `chunk_length * batch_chunks` env steps |
-| `pool_size` | `20` | Max checkpoints in FIFO pool per agent |
-| `latest_prob` | `0.5` | Probability of latest policy as opponent |
-| `self_play_ratio` | `0.5` | Fraction of solo matches (rest are arena) |
-| `pfsp_exponent` | `1.0` | PFSP priority exponent: `(1 - win_rate)^p` |
-
-### `checkpoint`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `dir` | `"checkpoints"` | Checkpoint directory |
-| `save_optimizer` | `true` | Include the trainer state (optimizer, LR progress, scaler, counters) in checkpoints as `trainer_state.pt` |
-
-### `metrics`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `use_wandb` | `false` | Enable Weights & Biases logging |
-| `wandb_project` | `"colosseum"` | WandB project name |
-| `wandb_entity` | `null` | WandB entity (team or user) |
-| `log_interval` | `10` | Write a `train` record to `metrics.jsonl` every N training steps |
-| `console_interval_sec` | `10.0` | Seconds between console progress lines and `episodes`/`system`/`ratings` records (`ratings.json` is rewritten at the same cadence) |
-
-### `transport`
-
-| Key | Default | Description |
-|-----|---------|-------------|
-| `mode` | `"local"` | `"local"` (mp.Queue) or `"grpc"` |
-| `grpc_port` | `50051` | gRPC service port |
-| `grpc_max_message_mb` | `64` | Max gRPC message size in MiB |
-
-### `agents`
-
-Per-agent config overrides. Keys are agent IDs. Empty = single `agent_0` using global config.
-
-```yaml
-agents:
-  my_agent:
-    networks: null              # null = inherit global
-    algorithm:                  # override specific fields
-      learning_rate: 1.0e-4
-    learner:
-      device: "cuda:1"
-```
-
----
-
-## Architecture
-
-```
-                         ┌────────────────┐
-                         │  Coordinator   │
-                         │  (matchmaking, │
-                         │   checkpoints, │
-                         │   ELO/PFSP)    │
-                         └───────┬────────┘
-                                 │
-              ┌──────────────────┼──────────────────┐
-              │                  │                   │
-     ┌────────▼────────┐  ┌─────▼──────┐  ┌────────▼────────┐
-     │  Worker 0       │  │  Worker 1  │  │  Worker N       │
-     │  VectorEnv(K)   │  │  ...       │  │  VectorEnv(K)   │
-     │  Multi-Agent    │  │            │  │  Multi-Agent    │
-     │  Inference      │  │            │  │  Inference      │
-     └────────┬────────┘  └─────┬──────┘  └────────┬────────┘
-              │                  │                   │
-              │  TrajectoryChunks (routed by agent_id)
-              │  (mp.Queue / gRPC)
-              │                  │                   │
-     ┌────────▼────────┐  ┌─────▼──────┐  ┌────────▼────────┐
-     │  Learner A      │  │  Learner B │  │  Learner C      │
-     │  (agent_alpha)  │  │  (agent_β) │  │  (agent_γ)      │
-     │  APPO + V-trace │  │  APPO      │  │  APPO           │
-     │  GPU/CPU        │  │  GPU/CPU   │  │  GPU/CPU        │
-     └────────┬────────┘  └─────┬──────┘  └────────┬────────┘
-              │                  │                   │
-              └──────── Weight Updates ─────────────┘
-                        (mp.Queue / gRPC)
-                                 │
-                         ┌───────▼────────┐
-                         │  Weight Store  │
-                         │  (per-agent    │
-                         │   weights)     │
-                         └────────────────┘
-```
-
-- **Workers**: run environments + batched inference (grouped by agent_id + network_id), collect trajectory chunks, route to correct learner. Support action masking, LSTM hidden state tracking.
-- **Learners**: one per trainable agent. Receive chunks, train with APPO (V-trace + PPO clip), push weights. Support recurrent training path, AMP.
-- **Coordinator**: agent pool, checkpoint FIFO, matchmaking (self-play/PFSP), ELO/win-rate tracking, match result processing.
-- **Weight Store**: latest model weights per agent (shared memory or gRPC service).
-
-Workers and learners run fully async with no synchronization barriers. V-trace corrects for policy lag.
-
----
+Known limitations today:
+- **Game model:** symmetric players with identical observation and action spaces; a match ends for everyone at once
+  (no elimination); no teams or roles.
+- **League:** only trainable agents. PFSP picks among agents' latest weights, not snapshots. Checkpoints are a FIFO pool.
+  Online ELO is a progress indicator, not a selection-grade rating.
+- **Speed:** recurrent and attention cores unroll step by step on the learner. Worker inference is CPU only.
+- **Distributed:** see above.
 
 ## Tests
 
 ```bash
-# Run all tests (148 pass, 2 skip)
-python -m pytest tests/ -v
-
-# By category
-python -m pytest tests/test_vtrace.py             # V-trace math
-python -m pytest tests/test_appo.py               # APPO loss computation
-python -m pytest tests/test_action_masking.py     # Action masking
-python -m pytest tests/test_recurrent.py          # LSTM/GRU support
-python -m pytest tests/test_multi_agent.py        # Multi-agent league
-python -m pytest tests/test_composite_actions.py  # Dict/Tuple/MultiDiscrete actions
-python -m pytest tests/test_bc.py                 # Behavioral Cloning
-python -m pytest tests/test_ratings.py            # ELO, PFSP matchmaking
-python -m pytest tests/test_eval.py               # Evaluation module
-python -m pytest tests/test_grpc.py               # gRPC transport
-python -m pytest tests/test_config.py             # Config validation
-python -m pytest tests/test_distributions.py      # Distributions
-python -m pytest tests/test_vec_env.py            # VectorEnv
-python -m pytest tests/test_performance.py        # Performance optimizations
-python -m pytest tests/test_integration.py        # End-to-end integration
-
-# Standalone integration tests (use multiprocessing.spawn)
-python tests/run_pipeline_test.py               # Full pipeline, 1 worker
-python tests/run_scaled_test.py                 # 4 workers, scaled
+.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI)
+.venv/bin/python -m pytest -m slow -v                       # tic-tac-toe learning test + torch.compile tests (~1.5 min)
+.venv/bin/python -m pytest -m gpu -v                        # CUDA machine only, see docs/GPU_CHECKS.md
 ```
 
----
+Layout:
+- `tests/unit`: pure functions and classes;
+- `tests/contract`: the real worker loop feeding the real APPO, in-process;
+- `tests/integration`: CLI and multi-process runs (`colosseum train`/`eval`/`bc` subprocesses, gRPC, distributed roles);
+- `tests/learning`: does it learn (fast bandit and chain checks, BC; the slow tic-tac-toe run).
 
-## Project Structure
+Tests write only under pytest's `tmp_path`. Throughput measurements are in [`docs/benchmarks.md`](docs/benchmarks.md).
+
+## Project structure
 
 ```
 src/colosseum/
-    core/           types.py, config.py, registry.py, action_spec.py
-    envs/           base_env.py, vec_env.py
-    networks/       base.py, distributions.py, actor_critic.py
-    algorithms/     base.py, vtrace.py, appo.py
-    worker/         rollout_worker.py
-    learner/        learner.py
-    coordinator/    coordinator.py, matchmaker.py, agent_pool.py,
-                    checkpoint_manager.py, ratings.py
-    weight_store/   base.py, shared_memory.py, grpc_store.py
-    transport/      base.py, local.py, grpc_transport.py, serialization.py
-    bc/             offline_bc.py, kickstart.py
-    metrics/        wandb_logger.py
-    eval.py
-    launcher.py
-    cli.py
-
-examples/
-    tic_tac_toe/            env.py, networks.py (Discrete actions)
-    composite_action/       env.py, networks.py (Dict actions + CompositeDist)
-configs/examples/           tic_tac_toe.yaml, tic_tac_toe_multi.yaml, chase.yaml
-proto/                      colosseum.proto
-deployment/                 Dockerfiles, docker-compose.yaml, k8s/
-tests/                      148 tests across 16 test files + helpers.py
+  cli.py launcher.py distributed.py eval.py
+  core/         config, types, registry, action_spec, outcomes, errors, ipc, run_dir, seat_info, threads
+  networks/     model (PolicyModel, act), composed, cores, state, distributions, normalization, base
+  algorithms/   appo, vtrace, base
+  worker/       rollout_loop (RolloutLoop), slots, rollout_worker (process wrapper)
+  learner/      learner process, checkpoint payloads
+  coordinator/  coordinator, matchmaker, ratings, checkpoint_manager, agent_pool
+  metrics/      jsonl, aggregator, console, hub, wandb_logger
+  envs/         base_env, vec_env, subproc_vec_env
+  bc/ transport/ weight_store/ utils/
+examples/       tic_tac_toe, composite_action (chase), space_miners (Box2D, from the examples extra)
+configs/examples/
+scripts/        setup-dev.sh, bench_throughput.py
+docs/           benchmarks.md, GPU_CHECKS.md
 ```
