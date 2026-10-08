@@ -137,16 +137,18 @@ def test_stop_signal_handler_cannot_deadlock_on_the_event_lock():
     import signal
     import threading
 
-    from colosseum.distributed import _install_stop_signal_handlers
+    from colosseum.utils.process import ProcessSupervisor
 
     stop = threading.Event()
     previous = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    supervisor = ProcessSupervisor(stop)  # the learner role's signal handling (T6.5)
     try:
-        _install_stop_signal_handlers(stop)
+        supervisor.install_signal_handlers()
         with stop._cond:  # e.g. the main thread is inside stop_event.set() when SIGTERM arrives
             os.kill(os.getpid(), signal.SIGTERM)
             sum(range(10))  # bytecode boundary: the Python-level handler runs here
         assert stop.wait(timeout=5)
+        assert supervisor.received_signal == signal.SIGTERM
     finally:
-        for sig, handler in previous.items():
-            signal.signal(sig, handler)
+        supervisor.restore_signal_handlers()
+    assert {s: signal.getsignal(s) for s in previous} == previous

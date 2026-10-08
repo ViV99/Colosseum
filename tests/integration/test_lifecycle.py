@@ -5,7 +5,6 @@ import json
 import os
 import re
 import signal
-import subprocess
 import sys
 import time
 from pathlib import Path
@@ -13,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from cli_runner import REPO_ROOT, TTT_CONFIG, child_env, run_train, start_train, wait_for
+from cli_runner import TTT_CONFIG, run_in_session, run_train, training_process, wait_for
 
 pytestmark = pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs Linux /proc")
 
@@ -88,18 +87,14 @@ def test_normal_finish_exit_0_and_final_checkpoint(tmp_path):
 
 
 def test_killed_worker_gives_exit_1_and_points_to_its_log(tmp_path):
-    proc, root = start_train(TTT_CONFIG, tmp_path, name="killw", overrides=FOREVER)
-    try:
+    with training_process(TTT_CONFIG, tmp_path, name="killw", overrides=FOREVER) as (proc, root):
         assert wait_for(lambda: logged_pid(root, "worker-0") is not None and training_started(root), 120)
         kids = descendants(proc.pid)
         os.kill(logged_pid(root, "worker-0"), signal.SIGKILL)
         assert proc.wait(60) == 1
-    finally:
-        if proc.poll() is None:
-            proc.kill()
+        assert wait_for(lambda: not any(pid_alive(k) for k in kids), 10)
     stderr = (tmp_path / "killw.stderr").read_text()
     assert f"worker-0 died (exit -9), see {root / 'logs' / 'worker-0.log'}" in stderr
-    assert wait_for(lambda: not any(pid_alive(k) for k in kids), 10)
 
 
 def test_learner_crash_in_train_step_gives_exit_1(tmp_path):
@@ -115,8 +110,7 @@ def test_learner_crash_in_train_step_gives_exit_1(tmp_path):
 
 def test_sigterm_stops_all_descendants_within_10s(tmp_path):
     overrides = {**FOREVER, "rollout.vec_env": "subprocess", "rollout.subproc_workers": "2"}
-    proc, root = start_train(TTT_CONFIG, tmp_path, name="term", overrides=overrides)
-    try:
+    with training_process(TTT_CONFIG, tmp_path, name="term", overrides=overrides) as (proc, root):
         # learner + worker + 2 env processes (+ resource tracker)
         assert wait_for(lambda: len(descendants(proc.pid)) >= 4 and training_started(root), 120)
         kids = descendants(proc.pid)
@@ -124,40 +118,29 @@ def test_sigterm_stops_all_descendants_within_10s(tmp_path):
         proc.send_signal(signal.SIGTERM)
         assert proc.wait(15) == 143
         assert wait_for(lambda: not any(pid_alive(k) for k in kids), max(0.0, 10 - (time.monotonic() - t0)))
-    finally:
-        if proc.poll() is None:
-            proc.kill()
     assert final_checkpoints(root), "final checkpoint not saved on SIGTERM"
 
 
 def test_killed_main_process_takes_all_descendants_with_it(tmp_path):
     """PR_SET_PDEATHSIG: children and env grandchildren die with their parent (R3-17, R6-07)."""
     overrides = {**FOREVER, "rollout.vec_env": "subprocess", "rollout.subproc_workers": "2"}
-    proc, root = start_train(TTT_CONFIG, tmp_path, name="kill9", overrides=overrides)
-    try:
+    with training_process(TTT_CONFIG, tmp_path, name="kill9", overrides=overrides) as (proc, root):
         assert wait_for(lambda: len(descendants(proc.pid)) >= 4 and training_started(root), 120)
         kids = descendants(proc.pid)
-        proc.kill()
+        proc.kill()  # the main process only
         assert proc.wait(15) == -signal.SIGKILL
         assert wait_for(lambda: not any(pid_alive(k) for k in kids), 10)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
 
 
 def test_sigint_to_process_group_exits_130_with_final_checkpoint(tmp_path):
     """Ctrl-C reaches every process of the group; children ignore it, so the learner still
     sends its final checkpoint and the main process saves it (T5.3 carried item)."""
-    proc, root = start_train(TTT_CONFIG, tmp_path, name="int", overrides=FOREVER)
-    try:
+    with training_process(TTT_CONFIG, tmp_path, name="int", overrides=FOREVER) as (proc, root):
         assert wait_for(lambda: training_started(root), 120)
         kids = descendants(proc.pid)
         os.killpg(proc.pid, signal.SIGINT)  # like Ctrl-C in a terminal
         assert proc.wait(15) == 130
         assert wait_for(lambda: not any(pid_alive(k) for k in kids), 10)
-    finally:
-        if proc.poll() is None:
-            proc.kill()
     assert "KeyboardInterrupt" not in (tmp_path / "int.stderr").read_text()
     assert final_checkpoints(root), "final checkpoint not saved on Ctrl-C"
 
@@ -167,8 +150,7 @@ def test_config_error_exit_1_without_traceback(tmp_path):
     data = yaml.safe_load(TTT_CONFIG.read_text())
     data["rollout"]["num_worker"] = 3
     bad.write_text(yaml.safe_dump(data))
-    proc = subprocess.run([sys.executable, "-m", "colosseum", "train", "-c", str(bad)], cwd=REPO_ROOT,
-                          env=child_env(), capture_output=True, text=True, timeout=120)
+    proc = run_in_session([sys.executable, "-m", "colosseum", "train", "-c", str(bad)], timeout=120)
     assert proc.returncode == 1
     assert "Config error" in proc.stderr and "num_worker" in proc.stderr
     assert "Traceback" not in proc.stderr
@@ -180,6 +162,6 @@ def test_readme_quickstart_from_repo_root(tmp_path):
     cmd = [str(exe), "train", "-c", "configs/examples/tic_tac_toe.yaml",
            "--set", "training.total_timesteps=2000",
            "--set", f"run.dir={tmp_path / 'runs'}", "--set", "run.name=quickstart"]
-    proc = subprocess.run(cmd, cwd=REPO_ROOT, env=child_env(), capture_output=True, text=True, timeout=240)
+    proc = run_in_session(cmd, timeout=240)
     assert proc.returncode == 0, proc.stderr[-3000:]
     assert (tmp_path / "runs" / "quickstart" / "config.resolved.yaml").exists()

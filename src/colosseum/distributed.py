@@ -47,7 +47,7 @@ from colosseum.core.config import ColosseumConfig, config_hash, load_config
 from colosseum.core.run_dir import RunDir, safe_path_component
 from colosseum.core.types import WeightPayload
 from colosseum.utils.logging import setup_process_logging
-from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child
+from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
 from colosseum.utils.seeding import apply_global_seed, learner_seed
 
 logger = logging.getLogger(__name__)
@@ -134,8 +134,9 @@ def run_distributed_learner(
     traj_port: int,
     weight_store_address: str,
     overrides: dict | None = None,
-) -> None:
-    """Run one trainable agent's learner as a standalone gRPC service.
+) -> int:
+    """Run one trainable agent's learner as a standalone gRPC service; returns the exit code
+    (0 when it stopped at its budget, 128 + signum after SIGINT / SIGTERM).
 
     Starts a TrajectoryService on ``traj_port`` (workers send chunks here),
     trains with the configured algorithm, and pushes weights to the WeightStore
@@ -208,7 +209,9 @@ def run_distributed_learner(
         return algo_cls(model, acfg.algorithm, **kwargs)
 
     stop_event = threading.Event()
-    _install_stop_signal_handlers(stop_event)
+    # SIGINT / SIGTERM set stop_event (and are remembered for the exit code).
+    supervisor = ProcessSupervisor(stop_event)
+    supervisor.install_signal_handlers()
 
     # Seed right before learner_process builds the model (validate_config above also draws
     # from the RNGs). Same per-agent stream as a local-mode learner.
@@ -279,7 +282,13 @@ def run_distributed_learner(
                 break
         traj_server.stop(0)
         store.close()
+        supervisor.restore_signal_handlers()
         logger.info(f"Distributed learner [{agent_id}] stopped.")
+    if supervisor.received_signal is not None:
+        signum = int(supervisor.received_signal)
+        logger.warning(f"Distributed learner [{agent_id}] stopped by {signal.Signals(signum).name}")
+        return 128 + signum
+    return 0
 
 
 # =====================================================================
@@ -410,7 +419,7 @@ def run_distributed_workers(
                 ),
                 daemon=worker_daemon,
             )
-            proc.start()
+            start_process(proc)
             supervisor.add(f"worker-{worker_id}", proc)
 
         logger.info(f"Started {config.rollout.num_workers} distributed workers -> learners "
@@ -429,7 +438,9 @@ def run_distributed_workers(
         supervisor.restore_signal_handlers()
         logger.info("Distributed workers stopped.")
     if supervisor.received_signal is not None:
-        return 128 + int(supervisor.received_signal)
+        signum = int(supervisor.received_signal)
+        logger.warning(f"Received {signal.Signals(signum).name}; distributed workers stopped")
+        return 128 + signum
     if code == 0:
         # Exits after the loop ended (e.g. one worker finished, another crashed meanwhile).
         failures = supervisor.failures(exclude=set(killed))
@@ -447,18 +458,3 @@ def run_distributed_workers(
 def workers_role() -> str:
     """Run-dir role of ``run-workers`` on this machine: ``workers-<host>``."""
     return f"workers-{safe_path_component(socket.gethostname(), 'host')}"
-
-
-def _install_stop_signal_handlers(stop_event: threading.Event) -> None:
-    """SIGINT / SIGTERM set ``stop_event``.
-
-    The handler sets the event from a helper thread: Python runs signal handlers
-    in the main thread between bytecodes, possibly while the main thread holds
-    the event's non-reentrant lock (e.g. inside ``stop_event.set()``); setting
-    it directly in the handler would then deadlock the process forever.
-    """
-    def _handler(*_: object) -> None:
-        threading.Thread(target=stop_event.set, daemon=True).start()
-
-    signal.signal(signal.SIGINT, _handler)
-    signal.signal(signal.SIGTERM, _handler)

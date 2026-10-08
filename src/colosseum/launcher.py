@@ -20,6 +20,7 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import queue
+import signal
 import threading
 import time
 from collections.abc import Callable
@@ -35,7 +36,7 @@ from colosseum.core.run_dir import RunDir
 from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.utils.logging import setup_process_logging
-from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child
+from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
 
 logger = logging.getLogger(__name__)
 
@@ -330,9 +331,14 @@ class _QueueReader:
     ``mp.Queue.get`` reads a whole message in ``recv_bytes`` and ignores any timeout once
     the first bytes are there. A producer killed mid-message (OOM, SIGKILL) therefore
     blocks the reader forever: the main process holds the pipe's write end too, so no EOF
-    ever arrives. Here a read still in progress after ``wait`` seconds is collected by a
-    later call while the producers live. Once one of them has died, the items read so far
-    are returned and the rest of the queue is abandoned with an error.
+    ever arrives. Here ``drain`` waits at most ``wait`` seconds; a read still in progress
+    (a large payload arriving or being unpickled) is collected by a later call. Only the
+    shutdown gives up on it (``abandon``, after its deadline), once every producer is gone.
+
+    After ``abandon`` no further item can arrive: the dead producer was killed inside the
+    feeder's ``send_bytes``, i.e. while holding the queue's cross-process write lock, so no
+    other producer can ever write to that pipe again. Should the stuck read finish anyway,
+    the items it got are logged as dropped.
     """
 
     def __init__(self, q: Any, label: str, dead_producers: Callable[[], list[str]]) -> None:
@@ -342,7 +348,13 @@ class _QueueReader:
         self._thread: threading.Thread | None = None
         self._items: list = []
         self._error: BaseException | None = None
+        self._salvaged: list = []
         self.abandoned = False
+
+    @property
+    def busy(self) -> bool:
+        """A read is in progress (possibly stuck on an incomplete message)."""
+        return self._thread is not None and self._thread.is_alive()
 
     def _read(self) -> None:
         try:
@@ -350,21 +362,26 @@ class _QueueReader:
                 try:
                     item = self._q.get_nowait()
                 except queue.Empty:
-                    return
+                    break
                 except (EOFError, OSError) as e:
                     logger.warning(f"Dropped an unreadable {self._label} queue item: {e!r}")
-                    return
+                    break
                 self._items.append(item)
         except BaseException as e:  # noqa: BLE001 - re-raised by drain() in the main thread
             self._error = e
+        if self.abandoned:
+            logger.warning(f"{len(self._items)} item(s) completed on the abandoned {self._label} queue "
+                           f"after shutdown gave up on it; dropped")
 
     def _take(self) -> list:
         items, self._items = self._items, []
         return items
 
     def drain(self, wait: float = 0.5) -> list:
+        """Items read so far; starts a read when the queue has data. Never blocks longer than ``wait``."""
         if self.abandoned:
-            return []
+            salvaged, self._salvaged = self._salvaged, []
+            return salvaged  # complete items read before the stuck message
         if self._thread is None:
             if self._q.empty():
                 return []
@@ -372,21 +389,22 @@ class _QueueReader:
             self._thread.start()
         self._thread.join(wait)
         if self._thread.is_alive():
-            dead = self._dead_producers()
-            if not dead:
-                return []  # a large item from a live producer is still arriving
-            self._thread.join(1.0)
-            if self._thread.is_alive():
-                self.abandoned = True
-                logger.error(f"{', '.join(dead)} died while sending on the {self._label} queue; "
-                             f"its incomplete item and the rest of that queue are skipped")
-                return self._take()
+            return []  # still reading: a large item is arriving, or the message is incomplete
         self._thread = None
         error, self._error = self._error, None
         items = self._take()
         if error is not None:
             raise error
         return items
+
+    def abandon(self) -> None:
+        """Give up on a read that never completed; the next ``drain`` returns the items read before it."""
+        self._salvaged = self._take()
+        self.abandoned = True
+        dead = self._dead_producers()
+        source = f" ({', '.join(dead)} died while sending)" if dead else ""
+        logger.error(f"An incomplete item on the {self._label} queue was never completed{source}; "
+                     f"it and the rest of that queue are skipped")
 
 
 def _queue_depths(queues: dict[str, Any]) -> dict[str, int]:
@@ -423,6 +441,7 @@ class Launcher:
         self._supervisor = ProcessSupervisor(self._stop_event, log_dir=run_dir.logs)
         self._readers: dict[int, _QueueReader] = {}
         self._reported_failures: set[str] = set()
+        self._signal_logged = False
         self._all_queues: list[mp.Queue] = []
         # Env steps taken by all workers together (spec block 2: global budget).
         self._env_step_counter = SharedCounter()
@@ -528,23 +547,25 @@ class Launcher:
             # The metrics hub (and its file) exists before any child starts: an open failure
             # here cannot orphan children (T6.3). _finish_metrics closes whatever was opened.
             self._open_metrics(resume_states)
+            started = False
             try:
-                try:
-                    self._start_children(
-                        agent_configs, resume_states, trajectory_queues, checkpoint_queues,
-                        weight_queues_per_agent, metrics_queue, results_queue, command_queues,
-                        worker_sent_ckpts,
-                    )
-                except BaseException:
-                    logger.error(f"Starting the child processes failed; stopping the "
-                                 f"{len(self._supervisor.names)} already started")
-                    raise
+                self._start_children(
+                    agent_configs, resume_states, trajectory_queues, checkpoint_queues,
+                    weight_queues_per_agent, metrics_queue, results_queue, command_queues,
+                    worker_sent_ckpts,
+                )
+                started = True
                 logger.info("Training started. Press Ctrl+C to stop.")
                 code = self._monitor_loop(coordinator, trainable_agents, command_queues, worker_sent_ckpts)
-            finally:
-                # Also after a failed start or a monitor error: the started children are
-                # stopped (final checkpoints saved), then the error propagates.
-                killed = self._shutdown()
+            except BaseException as error:
+                # Also after a failed start or a monitor error the started children are
+                # stopped (final checkpoints saved); then the original error propagates.
+                if not started:
+                    logger.error(f"Starting the child processes failed; stopping the "
+                                 f"{len(self._supervisor.names)} already started")
+                self._shutdown_after_error(error)
+                raise
+            killed = self._shutdown()
             code = self._exit_code_after_shutdown(code, killed)
         finally:
             try:
@@ -628,7 +649,7 @@ class Launcher:
                 ),
                 daemon=True,
             )
-            learner_proc.start()
+            start_process(learner_proc)  # SIGINT ignored from the child's first instruction
             self._supervisor.add(f"learner-{aid}", learner_proc)
             logger.info(f"Learner started for agent {aid}")
 
@@ -681,7 +702,7 @@ class Launcher:
                 ),
                 daemon=worker_daemon,
             )
-            worker_proc.start()
+            start_process(worker_proc)
             self._supervisor.add(f"worker-{worker_id}", worker_proc)
 
     def _monitor_loop(
@@ -715,8 +736,10 @@ class Launcher:
             self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot(),
                                  queue_depths=_queue_depths(self._trajectory_queues))
             if self._supervisor.received_signal is not None:
-                return 128 + int(self._supervisor.received_signal)
+                return self._signal_exit_code()
             if self._stop_event.is_set():
+                if self._supervisor.received_signal is not None:  # arrived since the check above
+                    return self._signal_exit_code()
                 # Set by the caller (e.g. scripts/bench_throughput.py stops after a time window).
                 logger.info(f"Stop requested after {env_steps} env steps (budget {total})")
                 return 0
@@ -733,10 +756,22 @@ class Launcher:
                 last_refresh = time.monotonic()
             time.sleep(0.2)
 
+    def _shutdown_after_error(self, error: BaseException) -> None:
+        """Tear down after ``error``. A teardown failure is logged and noted on ``error``,
+        which stays the exception the caller raises."""
+        try:
+            self._shutdown()
+        except Exception as teardown_error:  # noqa: BLE001 - must not replace ``error``
+            logger.exception(f"Shutdown after {type(error).__name__} failed too")
+            error.add_note(f"Shutdown afterwards also failed: {teardown_error!r}")
+
     def _exit_code_after_shutdown(self, code: int, killed: list[str]) -> int:
         """A child that exited non-zero on its own (not terminated by the shutdown) fails the
         run, even if the budget was reached (R3-08). After a signal the signal's code stays
-        and such exits are only warned about."""
+        and such exits are only warned about. A signal that arrived while the run was
+        finishing (e.g. right after the budget was reached) still gives 128 + signum."""
+        if code == 0 and self._supervisor.received_signal is not None:
+            code = self._signal_exit_code()
         for failure in self._supervisor.failures(exclude=set(killed) | self._reported_failures):
             self._reported_failures.add(failure.name)
             if code in (0, 1):
@@ -745,6 +780,14 @@ class Launcher:
             else:
                 logger.warning(failure.message())
         return code
+
+    def _signal_exit_code(self) -> int:
+        """128 + signum of the first SIGINT/SIGTERM; logged once (the handler itself only records it)."""
+        signum = int(self._supervisor.received_signal)
+        if not self._signal_logged:
+            self._signal_logged = True
+            logger.warning(f"Received {signal.Signals(signum).name}, shutting down")
+        return 128 + signum
 
     def _dead_producers(self, names: list[str]) -> list[str]:
         dead = []
@@ -895,8 +938,11 @@ class Launcher:
         While the children wind down, their final checkpoints are saved and results and
         metrics drained (so no child blocks on a full queue). A failed save neither ends the
         grace window (other learners' final snapshots still arrive) nor skips the teardown;
-        the first error is raised after both. Stragglers are then terminated and killed.
+        the first error is raised after both. Stragglers are then terminated and killed, and
+        reads still in progress get until the grace deadline (at least 1 s after the kill)
+        to complete; a read stuck on an incomplete message is then abandoned.
         """
+        deadline = time.monotonic() + SHUTDOWN_GRACE_SEC
         self._stop_event.set()
         first_error: Exception | None = None
 
@@ -920,7 +966,8 @@ class Launcher:
             if killed:
                 logger.warning(f"Terminated processes that did not stop within {SHUTDOWN_GRACE_SEC:.0f}s: "
                                f"{', '.join(killed)}")
-                poll()
+            poll()
+            self._finish_reads(max(deadline, time.monotonic() + 1.0), poll)
             # Detach queue feeder threads so a queue still holding undrained data
             # (e.g. trajectory chunks a now-dead learner never consumed, or large
             # WorkerCommands) cannot block this process from exiting.
@@ -933,6 +980,18 @@ class Launcher:
         if first_error is not None:
             raise first_error
         return killed
+
+    def _finish_reads(self, deadline: float, poll: Callable[[], None]) -> None:
+        """All children are gone: let in-progress reads complete until ``deadline``, then
+        abandon the stuck ones (a producer died mid-message) and take what they read before."""
+        while any(r.busy for r in self._readers.values()) and time.monotonic() < deadline:
+            poll()
+            time.sleep(0.05)
+        stuck = [r for r in self._readers.values() if r.busy and not r.abandoned]
+        for reader in stuck:
+            reader.abandon()
+        if stuck:
+            poll()
 
 
 def run_training(config_path: str, overrides: dict | None = None) -> int:

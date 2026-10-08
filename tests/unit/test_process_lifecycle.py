@@ -1,6 +1,7 @@
 """ProcessSupervisor, child-process init and failure messages (T6.5)."""
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import os
 import signal
@@ -119,23 +120,24 @@ def _unread_queue_sender(marker_dir: str) -> None:
     """Grandchild: put a payload larger than the pipe buffer on a queue nobody reads, then flush it.
 
     Without a parent-death check the flush (join_thread) would block forever.
-    No PR_SET_PDEATHSIG here: the bounded flush itself must notice the dead parent.
+    No PR_SET_PDEATHSIG here: the flush itself must notice the dead parent (its warn_after
+    elapses long before, and must not make it give up).
     """
     from colosseum.utils.process import flush_queue
 
     q = mp.get_context("spawn").Queue()
     q.put(b"x" * (4 << 20))
     Path(marker_dir, "pid").write_text(str(os.getpid()))
-    flushed = flush_queue(q, timeout=120.0)
+    flushed = flush_queue(q, warn_after=0.5)
     Path(marker_dir, "returned").write_text(str(flushed))
 
 
 def _short_lived_parent(marker_dir: str) -> None:
-    """Child: start the sender, wait until it is blocked on the unread payload, then die."""
+    """Child: start the sender, wait until its payload is queued, then die (whether the sender
+    is already inside flush_queue or enters it later, it must notice the dead parent)."""
     proc = mp.get_context("spawn").Process(target=_unread_queue_sender, args=(marker_dir,))
     proc.start()
     _wait_for_file(Path(marker_dir, "pid"), 60)
-    time.sleep(0.5)
     os._exit(0)
 
 
@@ -169,6 +171,105 @@ def test_flush_queue_returns_true_once_the_payload_is_read(tmp_path):
     q = ctx.Queue()
     q.put({"payload": b"y" * (1 << 20)})  # larger than the pipe buffer: the feeder waits for the reader
     reader = spawn(_read_one, q, str(tmp_path), name="reader")
-    assert process_module.flush_queue(q, timeout=60.0)
+    assert process_module.flush_queue(q, warn_after=60.0)
     reader.join(60)
     assert reader.exitcode == 0 and (tmp_path / "read").read_text() == str(1 << 20)
+
+
+def test_flush_queue_never_abandons_items_while_the_parent_lives(tmp_path, caplog):
+    """Past ``warn_after`` the flush warns and keeps waiting: the main process still reads the
+    final checkpoint (or terminates this process); only parent death abandons it."""
+    import threading
+
+    ctx = mp.get_context("spawn")
+    q = ctx.Queue()
+    q.put({"payload": b"z" * (1 << 20)})  # the feeder blocks until someone reads
+    result: list[bool] = []
+    flusher = threading.Thread(target=lambda: result.append(process_module.flush_queue(q, warn_after=0.2)),
+                               daemon=True)
+    with caplog.at_level(logging.WARNING, logger="colosseum.utils.process"):
+        flusher.start()
+        deadline = time.monotonic() + 30
+        while "still unread" not in caplog.text and time.monotonic() < deadline:
+            time.sleep(0.05)
+        assert "still unread after" in caplog.text
+        assert flusher.is_alive() and not q._joincancelled  # warned, not cancelled
+        reader = spawn(_read_one, q, str(tmp_path), name="reader")
+        flusher.join(60)
+    assert result == [True]
+    reader.join(60)
+    assert reader.exitcode == 0 and (tmp_path / "read").read_text() == str(1 << 20)
+
+
+def test_init_child_process_exits_if_the_parent_already_died(monkeypatch):
+    exits = []
+
+    class _Exit(Exception):
+        pass
+
+    def fake_exit(code):
+        exits.append(code)
+        raise _Exit
+
+    monkeypatch.setattr(process_module, "set_parent_death_signal", lambda sig=signal.SIGTERM: True)
+    monkeypatch.setattr(process_module, "parent_alive", lambda: False)
+    monkeypatch.setattr(process_module.os, "_exit", fake_exit)
+    old = signal.getsignal(signal.SIGINT)
+    try:
+        with pytest.raises(_Exit):
+            init_child_process()
+    finally:
+        signal.signal(signal.SIGINT, old)
+    assert exits == [1]
+
+
+def _report_sigint_disposition(out_dir: str) -> None:
+    """First statement of the child: what SIGINT does before any child init ran."""
+    Path(out_dir, "sigint").write_text("ignored" if signal.getsignal(signal.SIGINT) is signal.SIG_IGN else "not")
+
+
+def test_start_process_starts_children_with_sigint_ignored(tmp_path):
+    before = signal.getsignal(signal.SIGINT)
+    proc = mp.get_context("spawn").Process(target=_report_sigint_disposition, args=(str(tmp_path),), daemon=True)
+    process_module.start_process(proc)
+    assert signal.getsignal(signal.SIGINT) is before  # the parent's handler is back right away
+    proc.join(60)
+    assert proc.exitcode == 0
+    assert (tmp_path / "sigint").read_text() == "ignored"
+
+
+def test_signal_handler_cannot_deadlock_on_the_stop_event_lock():
+    """A signal landing while the main thread holds the stop event's non-reentrant lock (e.g.
+    inside ``stop_event.set()`` / ``is_set()``) must not deadlock: the handler only records it."""
+    stop = mp.get_context("spawn").Event()
+    sup = ProcessSupervisor(stop)
+    sup.install_signal_handlers()
+    try:
+        with stop._cond:
+            os.kill(os.getpid(), signal.SIGINT)
+            sum(range(10))  # bytecode boundary: the Python-level handler runs here
+            assert sup.received_signal == signal.SIGINT
+        assert stop.wait(5)
+    finally:
+        sup.restore_signal_handlers()
+
+
+def test_install_signal_handlers_off_the_main_thread_is_a_noop():
+    import threading
+
+    stop = mp.get_context("spawn").Event()
+    sup = ProcessSupervisor(stop)
+    before = signal.getsignal(signal.SIGTERM)
+    errors = []
+
+    def install():
+        try:
+            sup.install_signal_handlers()
+            sup.restore_signal_handlers()
+        except Exception as e:  # noqa: BLE001 - asserted below
+            errors.append(e)
+
+    thread = threading.Thread(target=install)
+    thread.start()
+    thread.join(10)
+    assert errors == [] and signal.getsignal(signal.SIGTERM) == before

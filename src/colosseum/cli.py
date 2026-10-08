@@ -33,6 +33,18 @@ def _config_errors() -> Iterator[None]:
         sys.exit(1)
 
 
+@contextmanager
+def _interrupts() -> Iterator[None]:
+    """Ctrl-C before the run installs its own signal handling (config loading, validation):
+    one line on stderr and exit code 130, as after a handled SIGINT (click would turn it
+    into "Aborted!" with exit code 1)."""
+    try:
+        yield
+    except KeyboardInterrupt:
+        click.echo("Interrupted", err=True)
+        sys.exit(130)
+
+
 _SET_HELP_YAML = (
     " Values are YAML scalars/lists (null, true, 1e-4, [1, 2]); quote a value to force a string, "
     "e.g. --set run.name='\"123\"'."
@@ -65,7 +77,7 @@ def train(config: str, overrides: tuple[str, ...]) -> None:
     from colosseum.launcher import run_training
 
     override_dict = _parse_overrides(overrides)
-    with _config_errors():
+    with _interrupts(), _config_errors():
         code = run_training(config, overrides=override_dict or None)
     sys.exit(code)
 
@@ -203,8 +215,9 @@ def run_learner_cmd(config: str, agent: str, traj_port: int, weight_store: str, 
     from colosseum.distributed import run_distributed_learner
 
     override_dict = _parse_overrides(overrides)
-    with _config_errors():
-        run_distributed_learner(config, agent, traj_port, weight_store, overrides=override_dict or None)
+    with _interrupts(), _config_errors():
+        code = run_distributed_learner(config, agent, traj_port, weight_store, overrides=override_dict or None)
+    sys.exit(code)
 
 
 @main.command("run-workers")
@@ -226,7 +239,7 @@ def run_workers_cmd(config: str, weight_store: str, learners: tuple[str, ...], o
         learner_addresses[aid] = addr
 
     override_dict = _parse_overrides(overrides)
-    with _config_errors():
+    with _interrupts(), _config_errors():
         code = run_distributed_workers(config, weight_store, learner_addresses, overrides=override_dict or None)
     sys.exit(code)
 

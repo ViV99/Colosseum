@@ -824,8 +824,10 @@ def test_shutdown_keeps_draining_after_a_failed_save(tmp_path):
         time.sleep(0.05)
     assert not queues["a0"].empty()
 
+    start = time.monotonic()
     with pytest.raises(OSError, match="disk full"):
         launcher._shutdown()
+    assert time.monotonic() - start < 10.0  # two agents still fit the shutdown bound (T6.5)
     assert all(not p.is_alive() and p.exitcode == 0 for p in procs)
     mgr = launcher._coordinator.checkpoint_manager
     assert [c.meta["final"] for c in mgr.list_checkpoints("a1")] == [True]  # arrived 1.5 s after the failure

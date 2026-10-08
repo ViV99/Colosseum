@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -70,9 +72,29 @@ def run_train(config: Path, tmp_path: Path, name: str = "run", overrides: dict[s
               timeout: float = 240.0, env: dict[str, str] | None = None) -> TrainRun:
     """``env`` entries are added to ``child_env()``."""
     run_parent = tmp_path / "runs"
-    proc = subprocess.run(train_cmd(config, run_parent, name, overrides), cwd=REPO_ROOT,
-                          env={**child_env(), **(env or {})}, capture_output=True, text=True, timeout=timeout)
+    proc = run_in_session(train_cmd(config, run_parent, name, overrides), timeout, env)
     return TrainRun(proc.returncode, proc.stdout, proc.stderr, run_parent / name)
+
+
+def run_in_session(cmd: list[str], timeout: float, env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    """Run ``cmd`` from the repo root in its own session (``env`` added to ``child_env()``);
+    whatever is left of the session afterwards (also on a timeout) is SIGKILLed."""
+    proc = subprocess.Popen(cmd, cwd=REPO_ROOT, env={**child_env(), **(env or {})}, stdout=subprocess.PIPE,
+                            stderr=subprocess.PIPE, text=True, start_new_session=True)
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    finally:
+        _kill_group(proc)
+    return subprocess.CompletedProcess(cmd, proc.returncode, stdout, stderr)
+
+
+def _kill_group(proc: subprocess.Popen) -> None:
+    """SIGKILL the session started for ``proc`` (whatever is left of it) and reap ``proc``."""
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)  # start_new_session: pgid == pid
+    except ProcessLookupError:
+        pass
+    proc.wait()
 
 
 def start_train(config: Path, tmp_path: Path, name: str = "run",
@@ -84,6 +106,18 @@ def start_train(config: Path, tmp_path: Path, name: str = "run",
         proc = subprocess.Popen(train_cmd(config, run_parent, name, overrides), cwd=REPO_ROOT, env=child_env(),
                                 stdout=out, stderr=err, text=True, start_new_session=True)
     return proc, run_parent / name
+
+
+@contextmanager
+def training_process(config: Path, tmp_path: Path, name: str = "run",
+                     overrides: dict[str, str] | None = None) -> Iterator[tuple[subprocess.Popen, Path]]:
+    """``start_train`` whose whole process group (main, children, env grandchildren) is
+    SIGKILLed and reaped on exit, so a failing test leaves no orphans behind."""
+    proc, root = start_train(config, tmp_path, name, overrides)
+    try:
+        yield proc, root
+    finally:
+        _kill_group(proc)
 
 
 def wait_for(predicate: Callable[[], bool], timeout: float, interval: float = 0.2) -> bool:

@@ -228,9 +228,10 @@ def learner_process(
         if send_checkpoint(checkpoint_queue, make_checkpoint_payload(agent_id, algorithm, final=True),
                            block=True, timeout=FINAL_CHECKPOINT_TIMEOUT_SEC):
             logger.info(f"Learner [{agent_id}]: sent final checkpoint v{algorithm.policy_version}")
-        # Wait until the snapshot is flushed into the pipe while the main process reads it;
-        # bounded, and given up once the main process is gone, so this process never hangs.
-        flush_queue(checkpoint_queue, timeout=SHUTDOWN_GRACE_SEC)
+        # Wait until the snapshot is flushed into the pipe while the main process reads it.
+        # Given up only once the main process is gone (it terminates us after its grace
+        # period otherwise), so this process never hangs.
+        flush_queue(checkpoint_queue, warn_after=SHUTDOWN_GRACE_SEC)
 
     logger.info(f"Learner [{agent_id}]: finished. Total train_steps={train_step}")
 

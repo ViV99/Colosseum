@@ -40,9 +40,34 @@ def set_parent_death_signal(sig: int = signal.SIGTERM) -> bool:
 
 def init_child_process() -> None:
     """Signal policy for every child: ignore Ctrl-C (the main process coordinates the stop)
-    and die if the main process disappears (R3-17, R6-07)."""
+    and die if the main process disappears (R3-17, R6-07).
+
+    ``start_process`` already starts children with SIGINT ignored; this keeps it so for
+    processes started otherwise. A parent that died before ``PR_SET_PDEATHSIG`` was set
+    sends no signal any more, so that case exits right here.
+    """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     set_parent_death_signal(signal.SIGTERM)
+    if not parent_alive():
+        os._exit(1)
+
+
+def start_process(proc: Any) -> None:
+    """``proc.start()`` with SIGINT ignored meanwhile, so the child inherits the ignored
+    disposition and ignores Ctrl-C from its first instruction (spawn bootstrap and imports
+    included), before ``init_child_process`` runs.
+
+    A Ctrl-C to this process during the start itself is lost (pressing it again works).
+    Off the main thread signal dispositions cannot change, so the child is just started.
+    """
+    if threading.current_thread() is not threading.main_thread():
+        proc.start()
+        return
+    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    try:
+        proc.start()
+    finally:
+        signal.signal(signal.SIGINT, previous)
 
 
 def parent_alive() -> bool:
@@ -51,13 +76,15 @@ def parent_alive() -> bool:
     return parent is None or parent.is_alive()
 
 
-def flush_queue(q: Any, timeout: float, poll: float = 0.1) -> bool:
+def flush_queue(q: Any, warn_after: float, poll: float = 0.1) -> bool:
     """Close ``q`` and wait until its feeder thread has written every item into the pipe.
 
     ``mp.Queue.join_thread`` blocks until a reader takes a payload larger than the pipe
-    buffer, i.e. forever once the reader is gone. Here the wait ends after ``timeout``
-    seconds or as soon as the parent process has died; the remaining items are then
-    abandoned (``cancel_join_thread``) so this process can exit. Returns True if flushed.
+    buffer, i.e. forever once the reader is gone. Here the wait runs in ``poll``-second
+    slices and gives up only once the parent process has died: then the remaining items
+    are abandoned (``cancel_join_thread``) so this process can exit, and False is returned.
+    While the parent lives the items are never abandoned (the parent reads them, or
+    terminates this process); a warning is logged once after ``warn_after`` seconds.
     Objects without ``join_thread`` (e.g. ``queue.Queue``) need no flush.
     """
     if not hasattr(q, "join_thread"):
@@ -65,19 +92,18 @@ def flush_queue(q: Any, timeout: float, poll: float = 0.1) -> bool:
     q.close()
     joiner = threading.Thread(target=q.join_thread, name="queue-flush", daemon=True)
     joiner.start()
-    deadline = time.monotonic() + timeout
+    warn_at = time.monotonic() + warn_after
     while True:
         joiner.join(poll)
         if not joiner.is_alive():
             return True
         if not parent_alive():
             logger.warning("Parent process is gone; abandoning unread queue items")
-            break
-        if time.monotonic() >= deadline:
-            logger.warning(f"Queue items still unread after {timeout:.0f} s; abandoning them")
-            break
-    q.cancel_join_thread()
-    return False
+            q.cancel_join_thread()
+            return False
+        if warn_at is not None and time.monotonic() >= warn_at:
+            logger.warning(f"Queue items still unread after {warn_after:.0f} s; waiting for the parent process")
+            warn_at = None
 
 
 def run_child(name: str, log_dir: str | None, fn: Callable[..., Any], *args: Any, **kwargs: Any) -> None:
@@ -119,6 +145,8 @@ class ProcessSupervisor:
         self._log_dir = Path(log_dir) if log_dir is not None else None
         self._procs: dict[str, Any] = {}
         self._old_handlers: dict[int, Any] = {}
+        self._pipe: tuple[int, int] | None = None
+        self._watcher: threading.Thread | None = None
         self.received_signal: int | None = None
 
     def add(self, name: str, proc: Any) -> None:
@@ -137,23 +165,55 @@ class ProcessSupervisor:
     def install_signal_handlers(self) -> None:
         """SIGINT/SIGTERM set ``stop_event``; the first signal received is remembered.
 
-        The event is set from a helper thread: the handler runs in the main thread between
+        The handler only records the signal and writes a byte to a self-pipe; a watcher
+        thread started here sets ``stop_event``. The handler runs in the main thread between
         bytecodes, possibly while that thread holds the event's non-reentrant lock (inside
-        ``stop_event.set()`` / ``is_set()``); setting it directly could deadlock.
+        ``stop_event.set()`` / ``is_set()``), so setting the event there could deadlock.
+        Callers log the signal (``received_signal``). Off the main thread (where Python
+        cannot install handlers) this is a no-op.
         """
+        if threading.current_thread() is not threading.main_thread():
+            logger.debug("Not on the main thread; signal handlers not installed")
+            return
+        read_fd, write_fd = os.pipe()
+        os.set_blocking(write_fd, False)
+        self._pipe = (read_fd, write_fd)
+        self._watcher = threading.Thread(target=self._watch, args=(read_fd,), name="stop-on-signal", daemon=True)
+        self._watcher.start()
+
         def _handler(signum, _frame):
             if self.received_signal is None:
                 self.received_signal = signum
-                logger.warning(f"Received {signal.Signals(signum).name}; stopping")
-            threading.Thread(target=self._stop_event.set, name="stop-on-signal", daemon=True).start()
+            try:
+                os.write(write_fd, b"\0")
+            except OSError:  # pipe full: a wake-up is already pending
+                pass
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             self._old_handlers[sig] = signal.signal(sig, _handler)
+
+    def _watch(self, read_fd: int) -> None:
+        while True:
+            try:
+                data = os.read(read_fd, 64)
+            except OSError:
+                return
+            if not data:  # write end closed by restore_signal_handlers
+                return
+            self._stop_event.set()
 
     def restore_signal_handlers(self) -> None:
         for sig, handler in self._old_handlers.items():
             signal.signal(sig, handler)
         self._old_handlers.clear()
+        if self._pipe is not None:
+            read_fd, write_fd = self._pipe
+            self._pipe = None
+            os.close(write_fd)  # the watcher reads EOF and exits
+            if self._watcher is not None:
+                self._watcher.join(1.0)
+                self._watcher = None
+            os.close(read_fd)
 
     def first_failure(self, nonzero_only: bool = False) -> ChildFailure | None:
         """The first child that has exited (with a non-zero code if ``nonzero_only``)."""

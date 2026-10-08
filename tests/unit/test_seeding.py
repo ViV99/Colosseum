@@ -146,7 +146,7 @@ def test_run_learner_seeds_before_building_the_model(
 
     monkeypatch.setattr(grpc_transport, "serve_trajectory_receiver", lambda *a, **k: FakeServer())
     monkeypatch.setattr(grpc_store, "GRPCWeightStore", FakeStore)
-    monkeypatch.setattr(distributed, "_install_stop_signal_handlers", lambda stop_event: None)
+    monkeypatch.setattr(distributed.ProcessSupervisor, "install_signal_handlers", lambda self: None)
 
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump(cfg_data(seed=5, agents=["alpha", "beta"])))
