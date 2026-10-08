@@ -12,6 +12,7 @@ import torch
 
 from colosseum.algorithms.appo import APPO
 from colosseum.core.config import AlgorithmConfig, ColosseumConfig, LearnerConfig, load_config
+from colosseum.core.ipc import assert_no_tensors
 from colosseum.core.types import TrajectoryChunk, WeightPayload, WorkerCommand, state_dict_to_numpy
 from colosseum.learner.learner import learner_process
 from colosseum.worker.rollout_worker import rollout_worker_process
@@ -100,3 +101,42 @@ def test_refresh_commands_carry_numpy_checkpoints(tmp_path):
     cmd = cq.get_nowait()
     state_dict = cmd.new_checkpoints["agent_0"]["ckpt_v50"]
     assert all(isinstance(v, np.ndarray) for v in state_dict.values())
+
+
+def test_learner_resumes_from_numpy_state_and_optimizer_tree():
+    """resume_state crosses the process boundary as numpy (weights + optimizer tree)."""
+    from colosseum.core.ipc import to_numpy_tree
+
+    source = APPO(TinyModel(), AlgorithmConfig(), device="cpu")
+    source.train_step([TrajectoryChunk.from_payload(chunk_payload(T=4, version=v)) for v in range(2)])
+    resume_state = {
+        "state_dict": state_dict_to_numpy(source.model.state_dict()),
+        "optimizer_state": to_numpy_tree(source.optimizer_state_dict),
+        "policy_version": 5,
+    }
+    assert_no_tensors(resume_state)
+    built: list[APPO] = []
+
+    def factory() -> APPO:
+        built.append(APPO(TinyModel(), AlgorithmConfig(), device="cpu"))
+        return built[-1]
+
+    wq = CheckedQueue(maxsize=1)
+    learner_process(
+        agent_id="a", algorithm_factory=factory, trajectory_queue=CheckedQueue(), weight_queues=[wq],
+        config=LearnerConfig(batch_chunks=2, device="cpu"), stop_event=threading.Event(),
+        total_train_steps=5, resume_state=resume_state,  # budget already reached: resume, push, exit
+    )
+    restored = built[0]
+    assert restored.policy_version == 5
+    for key, value in source.model.state_dict().items():
+        assert torch.equal(restored.model.state_dict()[key], value), key
+    src_opt, got_opt = source.optimizer_state_dict, restored.optimizer_state_dict
+    assert src_opt["state"].keys() == got_opt["state"].keys()
+    for idx, slot in src_opt["state"].items():
+        for name, value in slot.items():
+            assert torch.equal(got_opt["state"][idx][name], value), (idx, name)
+    pushed = wq.get_nowait()
+    assert pushed.policy_version == 5
+    for key, value in resume_state["state_dict"].items():
+        assert np.array_equal(pushed.state_dict[key], value), key

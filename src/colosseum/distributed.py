@@ -198,8 +198,7 @@ def run_distributed_learner(
     total_train_steps = max(1, config.training.total_timesteps // env_steps_per_train_step)
 
     stop_event = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop_event.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+    _install_stop_signal_handlers(stop_event)
 
     # Drain checkpoint snapshots to disk in the background.
     def _drain_checkpoints():
@@ -374,6 +373,21 @@ def run_distributed_workers(
 # =====================================================================
 # Helpers
 # =====================================================================
+
+
+def _install_stop_signal_handlers(stop_event: threading.Event) -> None:
+    """SIGINT / SIGTERM set ``stop_event``.
+
+    The handler sets the event from a helper thread: Python runs signal handlers
+    in the main thread between bytecodes, possibly while the main thread holds
+    the event's non-reentrant lock (e.g. inside ``stop_event.set()``); setting
+    it directly in the handler would then deadlock the process forever.
+    """
+    def _handler(*_: object) -> None:
+        threading.Thread(target=stop_event.set, daemon=True).start()
+
+    signal.signal(signal.SIGINT, _handler)
+    signal.signal(signal.SIGTERM, _handler)
 
 
 def _load(config_path: str, overrides: dict | None) -> ColosseumConfig:

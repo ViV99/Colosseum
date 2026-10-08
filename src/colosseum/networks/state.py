@@ -16,13 +16,24 @@ import numpy as np
 import torch
 from torch import Tensor
 
-from colosseum.core.ipc import numpy_to_tensor, tensor_to_numpy
+from colosseum.core.ipc import from_numpy_tree, is_namedtuple, to_numpy_tree
 
 State = Any  # None | Tensor | tuple | list | dict[str, State]; tensor leaves are batch-first
 
 
-def _is_namedtuple(x: Any) -> bool:
-    return isinstance(x, tuple) and hasattr(x, "_fields")
+def _check_nodes(obj: Any, leaf_type: type, what: str) -> None:
+    """Raise TypeError unless ``obj`` is None / ``leaf_type`` / tuple / list / dict of those."""
+    if obj is None or isinstance(obj, leaf_type):
+        return
+    if isinstance(obj, tuple | list):
+        for item in obj:
+            _check_nodes(item, leaf_type, what)
+        return
+    if isinstance(obj, dict):
+        for item in obj.values():
+            _check_nodes(item, leaf_type, what)
+        return
+    raise TypeError(f"Unsupported {what} node type: {type(obj).__name__}")
 
 
 def tree_map(fn: Callable[[Tensor], Tensor], state: State) -> State:
@@ -31,7 +42,7 @@ def tree_map(fn: Callable[[Tensor], Tensor], state: State) -> State:
         return None
     if isinstance(state, Tensor):
         return fn(state)
-    if _is_namedtuple(state):
+    if is_namedtuple(state):
         return type(state)(*(tree_map(fn, s) for s in state))
     if isinstance(state, tuple):
         return tuple(tree_map(fn, s) for s in state)
@@ -50,7 +61,7 @@ def _map2(fn: Callable[[Tensor, Tensor], Tensor], a: State, b: State) -> State:
         return fn(a, b)
     if isinstance(a, tuple) and isinstance(b, tuple) and len(a) == len(b):
         mapped = [_map2(fn, x, y) for x, y in zip(a, b)]
-        return type(a)(*mapped) if _is_namedtuple(a) else tuple(mapped)
+        return type(a)(*mapped) if is_namedtuple(a) else tuple(mapped)
     if isinstance(a, list) and isinstance(b, list) and len(a) == len(b):
         return [_map2(fn, x, y) for x, y in zip(a, b)]
     if isinstance(a, dict) and isinstance(b, dict) and a.keys() == b.keys():
@@ -139,7 +150,7 @@ def cat_batch(states: Sequence[State]) -> State:
         if not all(len(s) == len(first) for s in states):
             raise ValueError("State structures differ: tuple length mismatch")
         parts = [cat_batch([s[i] for s in states]) for i in range(len(first))]
-        return type(first)(*parts) if _is_namedtuple(first) else tuple(parts)
+        return type(first)(*parts) if is_namedtuple(first) else tuple(parts)
     if isinstance(first, list):
         if not all(len(s) == len(first) for s in states):
             raise ValueError("State structures differ: list length mismatch")
@@ -169,46 +180,26 @@ def where_done(done: Tensor, reset: State, state: State) -> State:
 def state_to_numpy(state: State) -> Any:
     """Same structure with ``np.ndarray`` leaves (detached CPU copies).
 
-    Leaves are converted by :func:`colosseum.core.ipc.tensor_to_numpy`:
-    ``bfloat16`` (which numpy lacks) is upcast to ``float32``, so
+    Leaves are converted by :func:`colosseum.core.ipc.to_numpy_tree` (see
+    :func:`colosseum.core.ipc.tensor_to_numpy`): ``bfloat16`` (which numpy
+    lacks) is upcast to ``float32``, so
     :func:`state_from_numpy` returns those leaves as ``float32``.
     """
-    if state is None:
-        return None
-    if isinstance(state, Tensor):
-        return tensor_to_numpy(state)
-    if _is_namedtuple(state):
-        return type(state)(*(state_to_numpy(s) for s in state))
-    if isinstance(state, tuple):
-        return tuple(state_to_numpy(s) for s in state)
-    if isinstance(state, list):
-        return [state_to_numpy(s) for s in state]
-    if isinstance(state, dict):
-        return {k: state_to_numpy(v) for k, v in state.items()}
-    raise TypeError(f"Unsupported state node type: {type(state).__name__}")
+    _check_nodes(state, Tensor, "state")
+    return to_numpy_tree(state)
 
 
 def state_from_numpy(obj: Any, device: str | torch.device = "cpu") -> State:
     """Inverse of :func:`state_to_numpy`.
 
-    Aliasing (see :func:`colosseum.core.ipc.numpy_to_tensor`): on CPU, a
+    Built by :func:`colosseum.core.ipc.from_numpy_tree`. Aliasing (see
+    :func:`colosseum.core.ipc.numpy_to_tensor`): on CPU, a
     writable C-contiguous array is shared with the returned tensor (zero copy);
     read-only (e.g. ``np.frombuffer``) or non-contiguous arrays are copied, so
     no "non-writable array" warning is emitted.
     """
-    if obj is None:
-        return None
-    if isinstance(obj, np.ndarray):
-        return numpy_to_tensor(obj).to(device)
-    if _is_namedtuple(obj):
-        return type(obj)(*(state_from_numpy(o, device) for o in obj))
-    if isinstance(obj, tuple):
-        return tuple(state_from_numpy(o, device) for o in obj)
-    if isinstance(obj, list):
-        return [state_from_numpy(o, device) for o in obj]
-    if isinstance(obj, dict):
-        return {k: state_from_numpy(v, device) for k, v in obj.items()}
-    raise TypeError(f"Unsupported state payload node type: {type(obj).__name__}")
+    _check_nodes(obj, np.ndarray, "state payload")
+    return state_to(from_numpy_tree(obj), device)  # .to() is a no-op on the same device
 
 
 def state_to(state: State, device: str | torch.device) -> State:

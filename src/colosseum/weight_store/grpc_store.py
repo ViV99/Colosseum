@@ -13,7 +13,12 @@ import grpc
 
 from colosseum.core.types import WeightPayload
 from colosseum.transport import colosseum_pb2, colosseum_pb2_grpc
-from colosseum.transport.serialization import deserialize_state_dict, serialize_state_dict
+from colosseum.transport.serialization import (
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    deserialize_state_dict,
+    payload_byte_cap,
+    serialize_state_dict,
+)
 from colosseum.weight_store.base import BaseWeightStore
 from colosseum.weight_store.shared_memory import InMemoryWeightStore
 
@@ -26,15 +31,25 @@ logger = logging.getLogger(__name__)
 
 
 class WeightStoreServicer(colosseum_pb2_grpc.WeightStoreServiceServicer):
-    """gRPC servicer wrapping an InMemoryWeightStore."""
+    """gRPC servicer wrapping an InMemoryWeightStore.
 
-    def __init__(self) -> None:
+    ``PutWeights`` stores only well-formed ``dict[str, np.ndarray]`` weights; a
+    malformed or oversized payload aborts with ``INVALID_ARGUMENT`` and is not
+    stored, so workers never load it.
+    """
+
+    def __init__(self, max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES) -> None:
         self._store = InMemoryWeightStore()
+        self._max_payload_bytes = max_payload_bytes
 
     def PutWeights(self, request, context):
-        state_dict = deserialize_state_dict(
-            request.state_dict_bytes, request.compressed,
-        )
+        try:
+            state_dict = deserialize_state_dict(
+                request.state_dict_bytes, request.compressed, self._max_payload_bytes,
+            )
+        except ValueError as e:
+            logger.warning(f"WeightStore: rejected weights for {request.agent_id!r}: {e}")
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"malformed weights payload: {e}")
         payload = WeightPayload(
             agent_id=request.agent_id,
             policy_version=request.policy_version,
@@ -80,7 +95,7 @@ def serve_weight_store(port: int = 50051, max_workers: int = 4, max_message_mb: 
         ],
     )
     colosseum_pb2_grpc.add_WeightStoreServiceServicer_to_server(
-        WeightStoreServicer(), server,
+        WeightStoreServicer(max_payload_bytes=payload_byte_cap(max_message_mb)), server,
     )
     server.add_insecure_port(f"[::]:{port}")
     server.start()
@@ -106,6 +121,7 @@ class GRPCWeightStore(BaseWeightStore):
             ],
         )
         self._stub = colosseum_pb2_grpc.WeightStoreServiceStub(self._channel)
+        self._max_payload_bytes = payload_byte_cap(max_message_mb)
 
     def put(self, agent_id: str, payload: WeightPayload) -> None:
         data, compressed = serialize_state_dict(payload.state_dict)
@@ -126,7 +142,7 @@ class GRPCWeightStore(BaseWeightStore):
                 return None
             raise
         state_dict = deserialize_state_dict(
-            response.state_dict_bytes, response.compressed,
+            response.state_dict_bytes, response.compressed, self._max_payload_bytes,
         )
         return WeightPayload(
             agent_id=response.agent_id,

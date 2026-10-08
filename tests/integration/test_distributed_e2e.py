@@ -78,6 +78,9 @@ def test_distributed_grpc_pipeline(tmp_path):
     finally:
         learner.terminate()
         learner.join(timeout=10)
+        if learner.is_alive():  # never leave a non-daemon child behind (it would hang pytest)
+            learner.kill()
+            learner.join()
         client.close()
         ws_server.stop(0)
     assert payload is not None, "no weights were published to the store"

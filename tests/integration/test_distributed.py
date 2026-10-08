@@ -128,3 +128,25 @@ def test_grpc_trajectory_sink_tolerates_dead_learner():
     # Should swallow the RpcError, not raise.
     sink.put(chunk, timeout=0.5)
     transport.close()
+
+
+def test_stop_signal_handler_cannot_deadlock_on_the_event_lock():
+    """SIGTERM landing while the main thread holds the stop event's (non-reentrant) lock
+    must not deadlock the learner (it then never exits and hangs its parent)."""
+    import os
+    import signal
+    import threading
+
+    from colosseum.distributed import _install_stop_signal_handlers
+
+    stop = threading.Event()
+    previous = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    try:
+        _install_stop_signal_handlers(stop)
+        with stop._cond:  # e.g. the main thread is inside stop_event.set() when SIGTERM arrives
+            os.kill(os.getpid(), signal.SIGTERM)
+            sum(range(10))  # bytecode boundary: the Python-level handler runs here
+        assert stop.wait(timeout=5)
+    finally:
+        for sig, handler in previous.items():
+            signal.signal(sig, handler)

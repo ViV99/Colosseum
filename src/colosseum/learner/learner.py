@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import threading
+import time
 from collections.abc import Callable
 from queue import Empty, Full
 
@@ -156,14 +158,60 @@ def learner_process(
                     f"loss={metrics.get('total_loss', 0):.4f}"
                 )
     finally:
-        # Weight payloads are pickled in full (numpy), so an unread one can keep a
-        # weight queue's feeder thread blocked on a full pipe; workers that already
-        # stopped never read it. Weights are replaceable: do not wait at exit.
-        for wq in weight_queues:
-            if hasattr(wq, "cancel_join_thread"):
-                wq.cancel_join_thread()
+        _release_weight_queues(weight_queues, trajectory_queue, stop_event)
 
     logger.info(f"Learner [{agent_id}]: finished. Total train_steps={train_step}")
+
+
+# Longest wait at exit for workers to read pending weight payloads. A live worker
+# syncs weights every few seconds while this learner drains its chunks; a worker
+# silent for this long is assumed gone (e.g. crashed), so its queue is abandoned.
+_WEIGHT_FLUSH_TIMEOUT_SEC = 60.0
+
+
+def _release_weight_queues(
+    weight_queues: list,
+    trajectory_queue,
+    stop_event,
+    timeout: float = _WEIGHT_FLUSH_TIMEOUT_SEC,
+    poll: float = 0.1,
+) -> None:
+    """Let pending weight payloads reach the workers before this process exits.
+
+    Numpy weight payloads are pickled in full, so a payload larger than the pipe
+    buffer keeps an ``mp.Queue`` feeder thread blocked until a worker reads it.
+
+    - ``stop_event`` set: workers are stopping and will never read it, so do not
+      wait for the feeders (``cancel_join_thread``).
+    - Otherwise (e.g. budget reached): wait until every feeder has flushed.
+      Cancelling would kill a feeder mid-message, and a live worker would then
+      block forever on the truncated payload. While waiting, keep discarding
+      chunks: a worker blocked on this learner's full trajectory queue only
+      syncs weights once its put succeeds. The wait ends early if
+      ``stop_event`` gets set, and after ``timeout`` seconds the remaining
+      feeders are abandoned (a reader silent that long is assumed dead).
+    """
+    mp_queues = [wq for wq in weight_queues if hasattr(wq, "join_thread")]
+    if not stop_event.is_set():
+        joiners = []
+        for wq in mp_queues:
+            wq.close()  # no more puts; join_thread() waits for the feeder to flush
+            joiner = threading.Thread(target=wq.join_thread, daemon=True)
+            joiner.start()
+            joiners.append(joiner)
+        deadline = time.monotonic() + timeout
+        while any(j.is_alive() for j in joiners) and not stop_event.is_set():
+            if time.monotonic() > deadline:
+                logger.warning(f"Learner: weight payloads unread after {timeout:.0f} s; abandoning them")
+                break
+            try:
+                while True:
+                    trajectory_queue.get_nowait()
+            except Empty:
+                pass
+            stop_event.wait(poll)
+    for wq in mp_queues:
+        wq.cancel_join_thread()  # no-op for the feeders that already flushed
 
 
 def resolve_device(device_str: str) -> str:

@@ -38,7 +38,8 @@ for _name in ("float8_e4m3fn", "float8_e5m2", "float8_e4m3fnuz", "float8_e5m2fnu
         _UPCAST_DTYPES.add(getattr(torch, _name))
 
 
-def _is_namedtuple(x: Any) -> bool:
+def is_namedtuple(x: Any) -> bool:
+    """True for instances of ``collections.namedtuple`` / ``typing.NamedTuple`` classes."""
     return isinstance(x, tuple) and hasattr(x, "_fields")
 
 
@@ -70,7 +71,7 @@ def to_numpy_tree(obj: Any) -> Any:
         return {k: to_numpy_tree(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [to_numpy_tree(v) for v in obj]
-    if _is_namedtuple(obj):
+    if is_namedtuple(obj):
         return type(obj)(*(to_numpy_tree(v) for v in obj))
     if isinstance(obj, tuple):
         return tuple(to_numpy_tree(v) for v in obj)
@@ -85,7 +86,7 @@ def from_numpy_tree(obj: Any) -> Any:
         return {k: from_numpy_tree(v) for k, v in obj.items()}
     if isinstance(obj, list):
         return [from_numpy_tree(v) for v in obj]
-    if _is_namedtuple(obj):
+    if is_namedtuple(obj):
         return type(obj)(*(from_numpy_tree(v) for v in obj))
     if isinstance(obj, tuple):
         return tuple(from_numpy_tree(v) for v in obj)

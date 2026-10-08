@@ -1,4 +1,6 @@
 """gRPC serialization of numpy payloads (T2.2; wire format changes in SP5)."""
+import json
+import sys
 from collections import namedtuple
 
 import numpy as np
@@ -39,7 +41,9 @@ def test_pack_unpack_nested_structures(compress):
     assert back["n"]["x"].shape == (1, 1, 4)
 
 
-def test_pack_rejects_tensors_and_object_arrays():
+def test_pack_rejects_tensors_object_arrays_and_container_keys():
+    with pytest.raises(TypeError):
+        pack_payload({(1, 2): 3})
     with pytest.raises(TypeError):
         pack_payload({"x": torch.zeros(1)})
     with pytest.raises(TypeError):
@@ -99,3 +103,71 @@ def test_unpack_does_not_import_unknown_namedtuple_modules():
     tampered = data.replace(b'"test_serialization"', b'"no_such_mod_xyz123"')  # same length
     with pytest.raises(ValueError, match="no_such_mod_xyz123"):
         unpack_payload(tampered, False)
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: hostile / malformed bytes from the network
+# ---------------------------------------------------------------------------
+
+def _raw_payload(skeleton, arrays_blob: bytes | None = None) -> bytes:
+    """Uncompressed wire bytes with a hand-written skeleton (and an optional npz blob)."""
+    import io
+    import struct
+
+    if arrays_blob is None:
+        buf = io.BytesIO()
+        np.savez(buf)
+        arrays_blob = buf.getvalue()
+    text = json.dumps(skeleton).encode()
+    return struct.pack("<Q", len(text)) + text + arrays_blob
+
+
+def test_oversized_decompressed_payload_is_rejected():
+    data, compressed = pack_payload({"x": np.zeros(2**20, np.float32)})  # 4 MB, compresses to KBs
+    assert len(data) < 2**20
+    with pytest.raises(ValueError, match="exceeds the cap of 1048576 bytes"):
+        unpack_payload(data, compressed, max_bytes=2**20)
+    assert unpack_payload(data, compressed, max_bytes=2**23)["x"].shape == (2**20,)
+
+
+def test_truncated_lz4_frame_is_rejected():
+    data, compressed = pack_payload({"x": np.arange(1000)})
+    with pytest.raises(ValueError, match="truncated"):
+        unpack_payload(data[: len(data) // 2], compressed)
+
+
+def test_array_header_declaring_a_huge_shape_is_rejected_before_allocation():
+    import io
+    import zipfile
+
+    npy = io.BytesIO()
+    np.lib.format.write_array_header_1_0(npy, {"descr": "<f4", "fortran_order": False, "shape": (10**12,)})
+    npy.write(b"\0" * 16)  # far less data than the header claims
+    blob = io.BytesIO()
+    with zipfile.ZipFile(blob, "w") as zf:
+        zf.writestr("arr_0.npy", npy.getvalue())
+    with pytest.raises(ValueError, match="declare 4000000000000 bytes"):
+        unpack_payload(_raw_payload({"__nd__": 0}, blob.getvalue()), False)
+
+
+@pytest.mark.parametrize("skeleton", [
+    {"__nd__": 0}, {"__nd__": -1}, {"__nd__": True}, {"__nd__": "0"}, {"__nd__": 0.0},
+    {"__dict__": 5}, {"__dict__": [[{"__list__": []}, 1]]}, {"__list__": 3}, {"what": 1},
+    {"__namedtuple__": ["m"], "items": []}, {"__namedtuple__": ["m", "C", []]}, {"__tuple__": None},
+])
+def test_malformed_skeletons_raise_value_error(skeleton):
+    with pytest.raises(ValueError):
+        unpack_payload(_raw_payload(skeleton), False)
+
+
+def test_namedtuple_lookup_never_triggers_module_getattr(monkeypatch):
+    import types
+
+    calls = []
+    lazy = types.ModuleType("lazy_mod_t22")
+    lazy.__getattr__ = lambda name: calls.append(name) or HC  # PEP 562 lazy import hook
+    monkeypatch.setitem(sys.modules, "lazy_mod_t22", lazy)
+    skeleton = {"__namedtuple__": ["lazy_mod_t22", "HC", ["h", "c"]], "items": [1, 2]}
+    with pytest.raises(ValueError, match="lazy_mod_t22.HC"):
+        unpack_payload(_raw_payload(skeleton), False)
+    assert calls == []

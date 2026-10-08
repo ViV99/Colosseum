@@ -16,7 +16,13 @@ import grpc
 from colosseum.core.types import TrajectoryChunk
 from colosseum.transport import colosseum_pb2, colosseum_pb2_grpc
 from colosseum.transport.base import BaseTransport
-from colosseum.transport.serialization import deserialize_chunk_payload, serialize_chunk_payload
+from colosseum.transport.serialization import (
+    DEFAULT_MAX_PAYLOAD_BYTES,
+    deserialize_chunk_payload,
+    payload_byte_cap,
+    serialize_chunk_payload,
+    validate_chunk_payload,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -29,20 +35,33 @@ logger = logging.getLogger(__name__)
 class TrajectoryServicer(colosseum_pb2_grpc.TrajectoryServiceServicer):
     """gRPC servicer that receives trajectory chunks from workers.
 
-    Items put on ``chunk_queue`` are chunk payload dicts
-    (``TrajectoryChunk.to_payload()`` form), never tensors.
+    Items put on ``chunk_queue`` are validated chunk payload dicts
+    (``TrajectoryChunk.to_payload()`` form), never tensors. A malformed or
+    oversized chunk aborts the RPC with ``INVALID_ARGUMENT`` (chunks already
+    queued from the same stream stay queued), so the learner only ever sees
+    well-formed payloads.
     """
 
-    def __init__(self, chunk_queue: queue.Queue, max_queue_size: int = 64) -> None:
+    def __init__(self, chunk_queue: queue.Queue, max_payload_bytes: int = DEFAULT_MAX_PAYLOAD_BYTES) -> None:
         self._queue = chunk_queue
+        self._max_payload_bytes = max_payload_bytes
 
     def SendChunks(self, request_iterator, context):
-        """Decode each chunk into its numpy payload dict and queue it for the learner."""
+        """Decode and validate each chunk payload and queue it for the learner."""
         count = 0
         for proto_chunk in request_iterator:
-            payload = deserialize_chunk_payload(proto_chunk.tensor_data, proto_chunk.compressed)
-            payload["agent_id"] = proto_chunk.agent_id
-            payload["behavior_policy_version"] = int(proto_chunk.behavior_policy_version)
+            try:
+                payload = deserialize_chunk_payload(
+                    proto_chunk.tensor_data, proto_chunk.compressed, self._max_payload_bytes,
+                )
+                if not isinstance(payload, dict):
+                    raise ValueError(f"chunk payload must be a dict, got {type(payload).__name__}")
+                payload["agent_id"] = proto_chunk.agent_id
+                payload["behavior_policy_version"] = int(proto_chunk.behavior_policy_version)
+                validate_chunk_payload(payload)
+            except ValueError as e:
+                logger.warning(f"Rejected chunk for {proto_chunk.agent_id!r}: {e}")
+                context.abort(grpc.StatusCode.INVALID_ARGUMENT, f"malformed chunk payload: {e}")
             try:
                 self._queue.put(payload, timeout=5.0)
                 count += 1
@@ -70,7 +89,7 @@ def serve_trajectory_receiver(
         ],
     )
     colosseum_pb2_grpc.add_TrajectoryServiceServicer_to_server(
-        TrajectoryServicer(chunk_queue), server,
+        TrajectoryServicer(chunk_queue, max_payload_bytes=payload_byte_cap(max_message_mb)), server,
     )
     server.add_insecure_port(f"[::]:{port}")
     server.start()

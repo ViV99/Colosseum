@@ -127,3 +127,52 @@ def test_grpc_trajectory_transport():
         transport.close()
     finally:
         server.stop(0)
+
+
+def test_trajectory_servicer_rejects_chunk_without_observations():
+    """A malformed chunk is refused with INVALID_ARGUMENT and never reaches the learner queue."""
+    import grpc
+    import pytest
+
+    from colosseum.transport.grpc_transport import GRPCTransport, serve_trajectory_receiver
+    from dataflow_helpers import chunk_payload
+
+    port = _free_port()
+    chunk_queue = queue.Queue(maxsize=8)
+    server = serve_trajectory_receiver(chunk_queue, port=port)
+    transport = GRPCTransport(f"localhost:{port}")
+    try:
+        bad = chunk_payload(T=4)
+        del bad["observations"]
+        with pytest.raises(grpc.RpcError) as err:
+            transport.send_chunk("agent_0", bad)
+        assert err.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert "observations" in err.value.details()
+        assert chunk_queue.empty()
+        transport.send_chunk("agent_0", chunk_payload(T=4))  # a good chunk still goes through
+        assert TrajectoryChunk.from_payload(chunk_queue.get(timeout=2.0)).chunk_length == 4
+    finally:
+        transport.close()
+        server.stop(0)
+
+
+def test_weight_store_rejects_non_array_weights_entry():
+    """Weights that would crash every worker's load_state_dict are refused and not stored."""
+    import grpc
+    import pytest
+
+    from colosseum.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
+
+    port = _free_port()
+    server = serve_weight_store(port=port)
+    client = GRPCWeightStore(f"localhost:{port}")
+    try:
+        bad = {"w": np.zeros((2, 2), np.float32), "b": [1.0, 2.0]}
+        with pytest.raises(grpc.RpcError) as err:
+            client.put("agent_0", WeightPayload("agent_0", 1, bad))
+        assert err.value.code() == grpc.StatusCode.INVALID_ARGUMENT
+        assert "'b'" in err.value.details()
+        assert client.get("agent_0") is None and client.get_version("agent_0") == -1
+    finally:
+        client.close()
+        server.stop(0)
