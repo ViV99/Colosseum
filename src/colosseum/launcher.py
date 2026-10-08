@@ -737,7 +737,9 @@ class Launcher:
                 ),
                 daemon=True,
             )
-            start_process(learner_proc)  # SIGINT ignored from the child's first instruction
+            # SIGINT stays blocked in the child from its first instruction until
+            # init_child_process (run_child) ignores it and unblocks it.
+            start_process(learner_proc)
             self._supervisor.add(f"learner-{aid}", learner_proc)
             logger.info(f"Learner started for agent {aid}")
 

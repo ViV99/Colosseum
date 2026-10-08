@@ -106,13 +106,15 @@ def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
     test's captured log records. Each live semaphore and queue feeder holds an entry in
     ``multiprocessing.util._finalizer_registry``; collecting only when an entry added during
     the test is still there keeps it cheap (``dict.copy`` is atomic, unlike iterating while
-    feeder threads finalize).
+    feeder threads finalize). The registry is private: on a Python without it, every test
+    is followed by a full collection instead.
     """
-    before = mp_util._finalizer_registry.copy().keys()
+    registry = getattr(mp_util, "_finalizer_registry", None)
+    before = registry.copy().keys() if registry is not None else None
     try:
         return (yield)
     finally:
-        if mp_util._finalizer_registry.copy().keys() - before:
+        if registry is None or registry.copy().keys() - before:
             gc.collect()
 
 

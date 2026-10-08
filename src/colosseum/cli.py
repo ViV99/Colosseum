@@ -9,8 +9,9 @@ from contextlib import contextmanager
 
 import click
 
-# Test hook: when set, the CLI touches this file as soon as Ctrl-C is handled by
-# ``_interrupts`` (lifecycle tests send SIGINT during startup only after it exists).
+# Test hook: when set, the CLI touches this file when ``_interrupts`` becomes active, i.e.
+# from then on a Ctrl-C is handled by it (lifecycle tests send SIGINT during startup only
+# after the file exists).
 _STARTUP_MARKER_ENV = "COLOSSEUM_TEST_STARTUP_MARKER"
 
 

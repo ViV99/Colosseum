@@ -57,14 +57,19 @@ def init_child_process() -> None:
 
 
 def start_process(proc: Any) -> None:
-    """``proc.start()`` with SIGINT blocked in this thread meanwhile.
+    """``proc.start()`` with SIGINT blocked in the calling thread meanwhile.
 
     The child inherits the blocked mask, so a Ctrl-C cannot interrupt it from its first
     instruction (spawn bootstrap and imports included) until ``init_child_process`` ignores
     SIGINT and unblocks it. The target of every process started this way must therefore
-    run ``init_child_process`` (``run_child`` and the subprocess-env loop do). A Ctrl-C
-    reaching this process during the start stays pending and is delivered to its handler
-    after the unblock, so it is not lost.
+    run ``init_child_process`` (``run_child`` and the subprocess-env loop do).
+
+    The mask is per thread, so this process is not shielded: a process-directed SIGINT that
+    arrives during the start is either left pending (and taken after the unblock) or taken
+    by another thread that does not block it, and then the Python handler may run on the
+    main thread while ``proc.start()`` is still in progress. Either way the signal is not
+    lost; callers install a handler that only records the signal before starting children
+    (``ProcessSupervisor.install_signal_handlers``), so running it mid-start is harmless.
     """
     if not hasattr(signal, "pthread_sigmask"):
         proc.start()
