@@ -6,7 +6,10 @@ write when a seat acts, is eliminated or its episode ends) are applied by ``Roll
 this module enforces the invariants they rely on:
 
 - an ACT never takes the last slot, so an open ACT always has room for its BOOT;
-- BOOT follows an open ACT; PAD follows a slot that ends an episode (never an open ACT);
+- BOOT follows an open ACT; a BOOT without ``reset_after`` only closes a chunk (it takes
+  the last slot); PAD follows a slot that ends an episode (never an open ACT);
+- the first ACT of a buffer needs ``begin()`` (model state and policy version) since the
+  last reset;
 - BOOT and PAD slots carry ``ActionSpec.boot_mask()`` and zero actions; a PAD copies the
   previous slot's observation and ``global_state`` (zeros could produce NaN in user encoders);
 - a buffer is parked only at an episode boundary (empty, or ending with a terminal ACT or
@@ -81,6 +84,7 @@ class RolloutBuffer:
         )
         self._cursor = 0
         self._num_acts = 0
+        self._begun = False
         self.initial_state: State = None
         self.policy_version = 0
 
@@ -101,7 +105,7 @@ class RolloutBuffer:
     def has_open(self) -> bool:
         """The last slot is a non-terminal ACT (a transition still collecting rewards)."""
         i = self._cursor - 1
-        return i >= 0 and self._kind[i] == SLOT_ACT and not self._terminal[i]
+        return bool(i >= 0 and self._kind[i] == SLOT_ACT and not self._terminal[i])
 
     @property
     def ends_episode(self) -> bool:
@@ -135,6 +139,7 @@ class RolloutBuffer:
             raise RuntimeError("begin() on a non-empty buffer")
         self.initial_state = state_tree_map(lambda t: t.detach().clone(), initial_state)
         self.policy_version = int(policy_version)
+        self._begun = True
 
     def write_act(
         self,
@@ -151,6 +156,8 @@ class RolloutBuffer:
             raise RuntimeError(
                 f"write_act() with {self.free_slots} free slot(s): an ACT never takes the last slot"
             )
+        if self._cursor == 0 and not self._begun:
+            raise RuntimeError("write_act() on an empty buffer needs begin() first (initial state and version)")
         i = self._cursor
         self._write_obs(i, obs, global_state)
         if self._masks is not None:
@@ -180,8 +187,17 @@ class RolloutBuffer:
         self._reset_after[self._cursor - 1] = True
 
     def write_boot(self, obs: Tree, global_state: Tree | None, reset_after: bool) -> None:
-        """Append a BOOT after the open ACT: the observation the learner bootstraps from."""
+        """Append a BOOT after the open ACT: the observation the learner bootstraps from.
+
+        ``reset_after=False`` (the episode goes on in the next chunk) only closes a chunk, so
+        it needs exactly one free slot; ``reset_after=True`` follows a truncation.
+        """
         self._require_open("write_boot")
+        if not reset_after and self.free_slots != 1:
+            raise RuntimeError(
+                f"write_boot(reset_after=False) with {self.free_slots} free slots: a BOOT without "
+                f"reset_after only closes a chunk and needs exactly one free slot"
+            )
         i = self._cursor
         self._write_obs(i, obs, global_state)
         self._write_non_act(i, SLOT_BOOT, reset_after)
@@ -192,6 +208,8 @@ class RolloutBuffer:
             raise RuntimeError("write_pad() on an empty buffer")
         if self.has_open:
             raise RuntimeError("write_pad() after an open ACT; write a BOOT instead")
+        if not self.ends_episode:
+            raise RuntimeError("write_pad() after a slot that does not end an episode")
         if self.is_full:
             raise RuntimeError("write_pad() on a full buffer")
         i = self._cursor
@@ -248,6 +266,7 @@ class RolloutBuffer:
     def reset(self) -> None:
         self._cursor = 0
         self._num_acts = 0
+        self._begun = False
         self.initial_state = None
         self.policy_version = 0
 
@@ -257,7 +276,8 @@ class BufferPool:
 
     ``acquire(agent)`` returns a parked buffer of that agent if there is one, else a free
     (empty) buffer of that agent, else a new one. ``park(agent, buf)`` takes a buffer
-    released by a seat at an episode boundary.
+    released by a seat at an episode boundary; it must be one of this pool's buffers of
+    that agent (built from the agent's spec).
     """
 
     def __init__(self, num_slots: int, specs: Mapping[str, BufferSpec]) -> None:
@@ -266,16 +286,23 @@ class BufferPool:
         self._parked: dict[str, list[RolloutBuffer]] = defaultdict(list)
         self._free: dict[str, list[RolloutBuffer]] = defaultdict(list)
 
+    def _spec_of(self, agent_id: str) -> BufferSpec:
+        try:
+            return self._specs[agent_id]
+        except KeyError:
+            raise KeyError(f"no buffer spec for agent {agent_id!r}") from None
+
     def acquire(self, agent_id: str) -> RolloutBuffer:
-        if agent_id not in self._specs:
-            raise KeyError(f"no buffer spec for agent {agent_id!r}")
+        spec = self._spec_of(agent_id)
         if self._parked[agent_id]:
             return self._parked[agent_id].pop(0)
         if self._free[agent_id]:
             return self._free[agent_id].pop()
-        return RolloutBuffer(self._num_slots, self._specs[agent_id])
+        return RolloutBuffer(self._num_slots, spec)
 
     def park(self, agent_id: str, buf: RolloutBuffer) -> None:
+        if buf.spec is not self._spec_of(agent_id):
+            raise ValueError(f"cannot park a buffer under {agent_id!r}: it was not built from that agent's spec")
         if buf.slots_used == 0:
             buf.reset()
             self._free[agent_id].append(buf)

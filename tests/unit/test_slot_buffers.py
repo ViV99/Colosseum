@@ -32,13 +32,20 @@ def _obs(v: int) -> dict:
     return {"grid": np.full((2, 2), v, np.uint8), "vec": np.full(3, v / 10, np.float32)}
 
 
+def _buf(num_slots: int, spec: BufferSpec) -> RolloutBuffer:
+    """A buffer after ``begin()``, ready for its first ACT."""
+    buf = RolloutBuffer(num_slots, spec)
+    buf.begin(None, 0)
+    return buf
+
+
 def _act(buf: RolloutBuffer, v: int, *, reward: float = 0.0, mask=None, gs=None, unit_lp=None) -> None:
     action = np.full(3, v % 4, np.int64) if unit_lp is not None else np.int64(v % 3)
     buf.write_act(_obs(v), gs, mask, action, -float(v), unit_lp, reward)
 
 
 def test_act_never_takes_the_last_slot():
-    buf = RolloutBuffer(3, _spec())
+    buf = _buf(3, _spec())
     _act(buf, 1)
     _act(buf, 2)
     assert buf.free_slots == 1 and buf.has_open
@@ -47,7 +54,7 @@ def test_act_never_takes_the_last_slot():
 
 
 def test_boot_requires_an_open_act_and_pad_requires_an_episode_end():
-    buf = RolloutBuffer(4, _spec())
+    buf = _buf(4, _spec())
     with pytest.raises(RuntimeError):
         buf.write_boot(_obs(0), None, reset_after=False)
     with pytest.raises(RuntimeError):
@@ -63,7 +70,7 @@ def test_boot_requires_an_open_act_and_pad_requires_an_episode_end():
 
 
 def test_rewards_go_to_the_open_act_and_terminal_sets_reset_after():
-    buf = RolloutBuffer(4, _spec())
+    buf = _buf(4, _spec())
     _act(buf, 1, reward=0.5)
     buf.add_reward(1.0)
     buf.add_reward(-0.25)
@@ -113,12 +120,13 @@ def test_boot_and_pad_contents():
 
 
 def test_boot_and_pad_overwrite_stale_values_of_a_reused_buffer():
-    buf = RolloutBuffer(2, _spec())
+    buf = _buf(2, _spec())
     mask = np.array([True, False, False])
     _act(buf, 2, mask=mask)
     buf.write_boot(_obs(4), None, reset_after=False)
     buf.build_chunk("a")
     buf.reset()
+    buf.begin(None, 0)
     _act(buf, 5, mask=np.array([False, True, False]), reward=1.0)
     buf.mark_terminal()
     buf.write_pad()
@@ -128,15 +136,15 @@ def test_boot_and_pad_overwrite_stale_values_of_a_reused_buffer():
 
 
 def test_unit_log_probs_are_required_only_for_multi_decider_actions():
-    single = RolloutBuffer(3, _spec())
+    single = _buf(3, _spec())
     _act(single, 1)                                      # K == 1: no unit log-probs
-    multi = RolloutBuffer(3, _spec(units=True))
+    multi = _buf(3, _spec(units=True))
     with pytest.raises(ValueError, match="unit_log_probs"):
         multi.write_act(_obs(1), None, None, np.zeros(3, np.int64), -1.0, None, 0.0)
 
 
 def test_global_state_is_required_when_the_role_declares_it():
-    buf = RolloutBuffer(3, _spec(global_state=True))
+    buf = _buf(3, _spec(global_state=True))
     with pytest.raises(ValueError, match="global_state"):
         _act(buf, 1)
 
@@ -155,7 +163,7 @@ def test_begin_clones_state_and_only_on_an_empty_buffer():
 
 
 def test_build_chunk_needs_a_full_buffer_and_reset_empties_it():
-    buf = RolloutBuffer(2, _spec())
+    buf = _buf(2, _spec())
     _act(buf, 1)
     with pytest.raises(RuntimeError, match="partial"):
         buf.build_chunk("a")
@@ -166,7 +174,7 @@ def test_build_chunk_needs_a_full_buffer_and_reset_empties_it():
 
 
 def test_ends_episode_skips_pads():
-    buf = RolloutBuffer(5, _spec())
+    buf = _buf(5, _spec())
     _act(buf, 1)
     assert not buf.ends_episode
     buf.write_boot(_obs(2), None, reset_after=True)
@@ -178,6 +186,7 @@ def test_ends_episode_skips_pads():
 def test_pool_prefers_parked_then_free_buffers_per_agent():
     pool = BufferPool(4, {"a": _spec(), "b": _spec(units=True)})
     a1 = pool.acquire("a")
+    a1.begin(None, 0)
     _act(a1, 1)
     with pytest.raises(RuntimeError, match="middle of an episode"):
         pool.park("a", a1)
@@ -198,6 +207,7 @@ def test_pool_prefers_parked_then_free_buffers_per_agent():
 def test_pool_refuses_full_buffers_and_unknown_agents():
     pool = BufferPool(2, {"a": _spec()})
     buf = pool.acquire("a")
+    buf.begin(None, 0)
     _act(buf, 1)
     buf.write_boot(_obs(2), None, reset_after=True)
     with pytest.raises(RuntimeError, match="full"):
@@ -209,9 +219,78 @@ def test_pool_refuses_full_buffers_and_unknown_agents():
 def test_parked_reward_sums_unsent_rewards():
     pool = BufferPool(4, {"a": _spec()})
     buf = pool.acquire("a")
+    buf.begin(None, 0)
     _act(buf, 1, reward=1.5)
     buf.add_reward(0.5)
     buf.mark_terminal()
     pool.park("a", buf)
     assert pool.parked_reward("a") == pytest.approx(2.0)
     assert pool.parked_reward("b") == 0.0
+
+
+# -- fix round 1: guards ------------------------------------------------------
+
+
+def test_pad_after_a_boot_without_reset_is_refused():
+    buf = _buf(3, _spec())
+    _act(buf, 1)
+    _act(buf, 2)
+    buf.write_boot(_obs(3), None, reset_after=False)    # the episode goes on in the next chunk
+    assert not buf.ends_episode
+    with pytest.raises(RuntimeError, match="does not end an episode"):
+        buf.write_pad()
+
+
+def test_boot_without_reset_only_closes_a_chunk():
+    buf = _buf(3, _spec())
+    _act(buf, 1)
+    with pytest.raises(RuntimeError, match="exactly one free slot"):
+        buf.write_boot(_obs(2), None, reset_after=False)
+    _act(buf, 2)
+    buf.write_boot(_obs(3), None, reset_after=False)
+    assert buf.is_full and buf.build_chunk("a").kind.tolist() == [SLOT_ACT, SLOT_ACT, SLOT_BOOT]
+
+
+def test_pad_on_a_full_buffer_is_refused():
+    buf = _buf(2, _spec())
+    _act(buf, 1)
+    buf.write_boot(_obs(2), None, reset_after=True)
+    with pytest.raises(RuntimeError, match="full"):
+        buf.write_pad()
+
+
+def test_first_act_needs_begin_since_the_last_reset():
+    buf = RolloutBuffer(3, _spec())
+    with pytest.raises(RuntimeError, match="begin"):
+        _act(buf, 1)
+    buf.begin({"h": torch.ones(1, 2)}, 7)
+    _act(buf, 1)
+    buf.write_boot(_obs(2), None, reset_after=True)
+    buf.reset()
+    assert buf.initial_state is None and buf.policy_version == 0
+    with pytest.raises(RuntimeError, match="begin"):
+        _act(buf, 3)
+
+
+def test_ends_episode_is_false_after_a_terminal_act_and_a_new_open_act():
+    buf = _buf(4, _spec())
+    _act(buf, 1)
+    buf.mark_terminal()
+    _act(buf, 2)
+    assert not buf.ends_episode
+    assert buf.has_open is True and type(buf.has_open) is bool
+    buf.mark_terminal()
+    assert buf.has_open is False
+
+
+def test_pool_park_refuses_unknown_agents_and_foreign_buffers():
+    pool = BufferPool(4, {"a": _spec(), "b": _spec()})
+    buf = pool.acquire("a")
+    with pytest.raises(KeyError):
+        pool.park("zzz", buf)
+    with pytest.raises(ValueError, match="spec"):
+        pool.park("b", buf)                          # same shapes, but agent a's buffer
+    with pytest.raises(ValueError, match="spec"):
+        pool.park("a", RolloutBuffer(4, _spec()))    # not built from agent a's spec
+    pool.park("a", buf)
+    assert pool.acquire("a") is buf
