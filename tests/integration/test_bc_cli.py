@@ -88,6 +88,12 @@ def _float_actions_file(tmp_path):
     return path
 
 
+def _subdir_named_like_data(tmp_path):
+    path = tmp_path / "data_dir"
+    (path / "sub.pt").mkdir(parents=True)  # torch.load on a directory: IsADirectoryError (an OSError)
+    return path
+
+
 def _empty_dir(tmp_path):
     path = tmp_path / "no_data"
     path.mkdir()
@@ -99,7 +105,8 @@ def _empty_dir(tmp_path):
     (_missing_actions_file, "missing BC data keys ['actions']"),
     (_float_actions_file, "floating point"),
     (_empty_dir, "no .pt files"),
-], ids=["unreadable", "missing-key", "action-check", "empty-dir"])
+    (_subdir_named_like_data, "cannot read the BC data file (IsADirectoryError"),
+], ids=["unreadable", "missing-key", "action-check", "empty-dir", "os-error"])
 def test_bc_cli_reports_bad_data_as_one_line_config_error(make_data, message, tmp_path):
     cfg = tmp_path / "cfg.yaml"
     cfg.write_text(CONFIG)
@@ -107,6 +114,26 @@ def test_bc_cli_reports_bad_data_as_one_line_config_error(make_data, message, tm
     result = CliRunner().invoke(main, ["bc", "-c", str(cfg), "-d", str(make_data(tmp_path)), "-o", str(out)])
     assert result.exit_code == 1, result.output
     assert result.stderr.startswith("Config error:") and message in result.stderr, result.stderr
+    assert len(result.stderr.strip().splitlines()) == 1
+    assert "Traceback" not in result.output and isinstance(result.exception, SystemExit)
+    assert not out.exists()
+
+
+def test_bc_cli_reports_a_permission_error_as_one_line_config_error(tmp_path, monkeypatch):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(CONFIG)
+    data = tmp_path / "data.pt"
+    _write_data(data)
+
+    def _denied(*args, **kwargs):
+        raise PermissionError(13, "Permission denied", str(data))
+
+    monkeypatch.setattr(torch, "load", _denied)
+    out = tmp_path / "bc.pt"
+    result = CliRunner().invoke(main, ["bc", "-c", str(cfg), "-d", str(data), "-o", str(out)])
+    assert result.exit_code == 1, result.output
+    assert result.stderr.startswith("Config error:"), result.stderr
+    assert "cannot read the BC data file (PermissionError: Permission denied)" in result.stderr
     assert len(result.stderr.strip().splitlines()) == 1
     assert "Traceback" not in result.output and isinstance(result.exception, SystemExit)
     assert not out.exists()

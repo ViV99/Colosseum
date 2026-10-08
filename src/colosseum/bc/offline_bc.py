@@ -173,6 +173,9 @@ class OfflineBCTrainer:
         for f in files:
             try:
                 data = torch.load(f, map_location="cpu", weights_only=True)
+            except OSError as e:  # PermissionError, IsADirectoryError, FileNotFoundError, I/O errors
+                reason = e.strerror or str(e) or type(e).__name__
+                raise DataError(f"{f}: cannot read the BC data file ({type(e).__name__}: {reason})") from e
             except (EOFError, RuntimeError, pickle.UnpicklingError) as e:
                 detail = (str(e).strip().splitlines() or [""])[0]
                 raise DataError(f"{f}: not a readable torch.save file ({type(e).__name__}: {detail})") from e

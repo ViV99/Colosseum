@@ -19,10 +19,8 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
-import multiprocessing.queues
 import queue
 import signal
-import threading
 import time
 from collections.abc import Callable
 from typing import Any
@@ -32,7 +30,7 @@ import torch
 
 from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
-from colosseum.core.ipc import SharedCounter
+from colosseum.core.ipc import QueueReader, SharedCounter, queue_depths, release_command_queues
 from colosseum.core.run_dir import RunDir
 from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig
 from colosseum.metrics.wandb_logger import WandBLogger
@@ -329,178 +327,6 @@ def _derive_worker_configs(
     return new_ckpts, slot_network_map, collect_mask, slot_agent_map
 
 
-class _QueueReader:
-    """Drains one ``mp.Queue`` on a helper thread, so the main process never blocks on it.
-
-    ``mp.Queue.get`` reads a whole message in ``recv_bytes`` and ignores any timeout once
-    the first bytes are there. A producer killed mid-message (OOM, SIGKILL) therefore
-    blocks the reader forever: the main process holds the pipe's write end too, so no EOF
-    ever arrives. Here ``drain`` waits at most ``wait`` seconds; a read still in progress
-    (a large payload arriving or being unpickled) is collected by a later call. Only the
-    shutdown gives up on it (``abandon``, after its deadline), once every producer is gone.
-
-    After ``abandon`` no further item can arrive: the dead producer was killed inside the
-    feeder's ``send_bytes``, i.e. while holding the queue's cross-process write lock, so no
-    other producer can ever write to that pipe again. Should the stuck read finish anyway,
-    the items it got are logged as dropped.
-    """
-
-    def __init__(self, q: Any, label: str, dead_producers: Callable[[], list[str]]) -> None:
-        self._q = q
-        self._label = label
-        self._dead_producers = dead_producers
-        self._thread: threading.Thread | None = None
-        self._items: list = []
-        self._error: BaseException | None = None
-        self._salvaged: list = []
-        self.abandoned = False
-
-    @property
-    def busy(self) -> bool:
-        """A read is in progress (possibly stuck on an incomplete message)."""
-        return self._thread is not None and self._thread.is_alive()
-
-    def _read(self) -> None:
-        try:
-            while True:
-                try:
-                    item = self._q.get_nowait()
-                except queue.Empty:
-                    break
-                except (EOFError, OSError) as e:
-                    if self.abandoned:  # ended by release(): the incomplete item was already reported
-                        logger.debug(f"Abandoned read on the {self._label} queue ended: {e!r}")
-                    else:
-                        logger.warning(f"Dropped an unreadable {self._label} queue item: {e!r}")
-                    break
-                self._items.append(item)
-        except BaseException as e:  # noqa: BLE001 - re-raised by drain() in the main thread
-            self._error = e
-        if self.abandoned and self._items:
-            logger.warning(f"{len(self._items)} item(s) completed on the abandoned {self._label} queue "
-                           f"after shutdown gave up on it; dropped")
-
-    def _take(self) -> list:
-        items, self._items = self._items, []
-        return items
-
-    def drain(self, wait: float = 0.05) -> list:
-        """Items read so far; starts a read when the queue has data.
-
-        A new read gets up to ``wait`` seconds to finish, so small items come back from this
-        call; a read already in progress is only checked, never waited for, so a stuck
-        reader costs nothing per poll. Non-``mp.Queue`` objects (e.g. ``queue.Queue``),
-        whose ``get_nowait`` never blocks, are read synchronously.
-        """
-        if self.abandoned:
-            salvaged, self._salvaged = self._salvaged, []
-            return salvaged  # complete items read before the stuck message
-        if not isinstance(self._q, mp.queues.Queue):
-            self._read()
-        else:
-            if self._thread is None:
-                if self._q.empty():
-                    return []
-                self._thread = threading.Thread(target=self._read, name=f"drain-{self._label}", daemon=True)
-                self._thread.start()
-                self._thread.join(wait)
-            if self._thread.is_alive():
-                return []  # still reading: a large item is arriving, or the message is incomplete
-            self._thread = None
-        error, self._error = self._error, None
-        items = self._take()
-        if error is not None:
-            raise error
-        return items
-
-    def abandon(self) -> None:
-        """Give up on a read that never completed; the next ``drain`` returns the items read before it."""
-        self._salvaged = self._take()
-        self.abandoned = True
-        dead = self._dead_producers()
-        source = f" ({', '.join(dead)} died while sending)" if dead else ""
-        logger.error(f"An incomplete item on the {self._label} queue was never completed{source}; "
-                     f"it and the rest of that queue are skipped")
-
-    def release(self, timeout: float) -> bool:
-        """End an abandoned read; True once no read thread is left (``timeout`` bounds the wait).
-
-        An abandoned read means every producer is gone, so this process holds the pipe's last
-        write end (it never writes to the queues it reads): closing it makes the stuck
-        ``recv_bytes`` hit end-of-file and the thread exit. The queue can then be closed and
-        freed on the calling thread, rather than its semaphores being finalized with this
-        daemon thread at interpreter exit. Should a producer still hold a write end, the
-        read stays stuck and False is returned.
-        """
-        if self.busy and self.abandoned:
-            try:
-                self._q._writer.close()
-            except (AttributeError, OSError):
-                pass
-            self._thread.join(timeout)
-        return not self.busy
-
-
-def _release_command_queues(queues: list, timeout: float) -> list:
-    """Close the queues this process writes to (worker command queues, maxsize 1) and wait,
-    bounded by ``timeout`` per step, until their feeder threads have exited.
-
-    A feeder thread still running when its queue is freed, or at interpreter exit, drops the
-    last references to the queue's semaphores on that daemon thread, which then unlinks them
-    during interpreter shutdown ("leaked semaphore objects" warning). A command its worker
-    never took would keep the feeder busy (a large one blocks in the pipe write), so it is
-    read back first. A queue still full at the deadline (its reader died holding the read
-    lock) or whose feeder does not exit in time is detached instead (``cancel_join_thread``,
-    the previous behaviour). Returns the queues that were detached.
-    """
-    deadline = time.monotonic() + timeout
-    detached: list = []
-    joiners: list[tuple[Any, threading.Thread]] = []
-    for q in queues:
-        try:
-            while q.full() and time.monotonic() < deadline:
-                try:
-                    q.get(timeout=0.05)
-                except queue.Empty:
-                    pass
-            if q.full():
-                detached.append(q)
-                continue
-            q.close()
-        except Exception as e:  # noqa: BLE001 - best effort: a release never replaces the run's outcome
-            logger.debug(f"Could not drain and close a command queue: {e!r}")
-            detached.append(q)
-            continue
-        joiner = threading.Thread(target=q.join_thread, name="queue-release", daemon=True)
-        joiner.start()
-        joiners.append((q, joiner))
-    join_deadline = time.monotonic() + timeout
-    for q, joiner in joiners:
-        joiner.join(max(0.0, join_deadline - time.monotonic()))
-        if joiner.is_alive():
-            detached.append(q)
-    for q in detached:
-        try:
-            q.cancel_join_thread()
-        except AttributeError:
-            pass
-    if detached:
-        logger.debug(f"{len(detached)} command queue(s) could not be drained and closed in time; "
-                     f"their feeder threads are detached")
-    return detached
-
-
-def _queue_depths(queues: dict[str, Any]) -> dict[str, int]:
-    """Approximate items waiting per queue (-1 where the platform cannot tell)."""
-    depths = {}
-    for name, q in queues.items():
-        try:
-            depths[name] = int(q.qsize())
-        except (NotImplementedError, OSError):
-            depths[name] = -1
-    return depths
-
-
 # =====================================================================
 # Launcher
 # =====================================================================
@@ -522,7 +348,7 @@ class Launcher:
         self._stop_event = mp.Event()
         # Named children (learner-<agent>, worker-<id>), signals and teardown (T6.5).
         self._supervisor = ProcessSupervisor(self._stop_event, log_dir=run_dir.logs)
-        self._readers: dict[int, _QueueReader] = {}
+        self._readers: dict[int, QueueReader] = {}
         self._reported_failures: set[str] = set()
         self._signal_logged = False
         self._all_queues: list[mp.Queue] = []
@@ -824,7 +650,7 @@ class Launcher:
             self._drain_metrics()
             env_steps = int(self._env_step_counter.value)
             self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot(),
-                                 queue_depths=_queue_depths(self._trajectory_queues))
+                                 queue_depths=queue_depths(self._trajectory_queues))
             if self._supervisor.received_signal is not None:
                 return self._signal_exit_code()
             if self._stop_event.is_set():
@@ -891,7 +717,7 @@ class Launcher:
         """Everything currently in ``q``, read without ever blocking on a dead producer."""
         reader = self._readers.get(id(q))
         if reader is None:
-            reader = self._readers[id(q)] = _QueueReader(q, label, lambda: self._dead_producers(producers()))
+            reader = self._readers[id(q)] = QueueReader(q, label, lambda: self._dead_producers(producers()))
         return reader.drain()
 
     def _drain_results(self) -> None:
@@ -923,7 +749,7 @@ class Launcher:
                 self._drain_metrics()
                 self._hub.close(env_steps=int(self._env_step_counter.value),
                                 ratings=self._coordinator.ratings_snapshot(),
-                                queue_depths=_queue_depths(self._trajectory_queues))
+                                queue_depths=queue_depths(self._trajectory_queues))
         finally:
             try:
                 if self._metrics_writer is not None:
@@ -1085,8 +911,8 @@ class Launcher:
         - Command queues (this process is their producer): unread commands are read back,
           then the queue is closed and its feeder thread joined, so no feeder outlives
           ``launch`` to unlink the semaphores during interpreter shutdown
-          (``_release_command_queues``).
-        - A read abandoned on an incomplete message is ended first (``_QueueReader.release``).
+          (``release_command_queues``).
+        - A read abandoned on an incomplete message is ended first (``QueueReader.release``).
           Should it stay stuck (a producer still holds a write end), its queue stays open:
           closing the pipe under that thread is unsafe.
         """
@@ -1094,7 +920,7 @@ class Launcher:
             reader.release(_QUEUE_RELEASE_SEC)
         busy = {key: reader for key, reader in self._readers.items() if reader.busy}
         produced_here = {id(q) for q in self._command_queues}
-        _release_command_queues(self._command_queues, _QUEUE_RELEASE_SEC)
+        release_command_queues(self._command_queues, _QUEUE_RELEASE_SEC)
         for q in self._all_queues:
             if id(q) in produced_here:
                 continue
