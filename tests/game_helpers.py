@@ -13,6 +13,9 @@ from typing import Any
 import numpy as np
 from gymnasium.spaces import Box, Dict, Discrete, MultiBinary
 
+from colosseum.sp2.core.specs import ActionSpec
+from colosseum.sp2.core.tree import Tree
+from colosseum.sp2.envs.contract import EpisodeTracker
 from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
 from colosseum.sp2.envs.spaces import Units
 
@@ -367,3 +370,90 @@ TOY_GAMES: dict[str, Callable[[], MultiAgentEnv]] = {
     "coop": CoopGame,
     "global_state": GlobalStateGame,
 }
+
+
+# ---------------------------------------------------------------------------
+# Drivers (T1.5)
+# ---------------------------------------------------------------------------
+
+
+def _legal(row: np.ndarray | None, n: int) -> np.ndarray:
+    legal = np.arange(n) if row is None else np.flatnonzero(row)
+    return legal if legal.size else np.zeros(1, dtype=np.int64)
+
+
+def sample_legal_action(spec: ActionSpec, mask: Tree | None, rng: np.random.Generator) -> Tree:
+    """A uniformly random legal action (numpy, env format) for a normalized ``mask`` (or None).
+
+    Discrete parts pick among legal values (0 when a units row is empty or the unit absent);
+    box parts are uniform in [-1, 1].
+    """
+    values: dict[tuple[str, ...], Any] = {}
+    for group in spec.groups:
+        row = spec.group_mask(mask, group)
+        if group.kind == "discrete":
+            values[group.path] = np.int64(rng.choice(_legal(row, group.nvec[0])))
+        elif group.kind == "multi_discrete":
+            out, offset = [], 0
+            for n in group.nvec:
+                out.append(rng.choice(_legal(None if row is None else row[offset:offset + n], n)))
+                offset += n
+            values[group.path] = np.array(out, dtype=np.int64)
+        elif group.kind == "box":
+            values[group.path] = rng.uniform(-1.0, 1.0, group.box_dim).astype(np.float32)
+        else:
+            units = group.units
+            U = units.max_units
+            unit = np.ones(U, dtype=bool) if row is None else row["unit"]
+            comps: dict[str, np.ndarray] = {}
+            offset = 0
+            for c in units.components:
+                if c.kind == "discrete":
+                    arr = np.zeros(U, dtype=np.int64)
+                    for u in np.flatnonzero(unit):
+                        sub = None if row is None else row["action"][u, offset:offset + c.size]
+                        arr[u] = rng.choice(_legal(sub, c.size))
+                    offset += c.size
+                else:
+                    arr = rng.uniform(-1.0, 1.0, (U, c.size)).astype(np.float32)
+                    arr[~unit] = 0.0
+                comps[c.name] = arr
+            if units.per_unit_kind == "dict":
+                values[group.path] = comps
+            elif units.per_unit_kind == "multi_discrete":
+                values[group.path] = np.stack([comps[c.name] for c in units.components], axis=1)
+            else:
+                values[group.path] = comps["0"]
+    if not spec.is_dict:
+        return values[spec.groups[0].path]
+    out_tree: dict = {}
+    for path, value in values.items():
+        node = out_tree
+        for key in path[:-1]:
+            node = node.setdefault(key, {})
+        node[path[-1]] = value
+    return out_tree
+
+
+def play_episode(env: MultiAgentEnv, layout: str, *, seed: int | None = None,
+                 rng: np.random.Generator | None = None, tracker: EpisodeTracker | None = None,
+                 max_steps: int = 10_000) -> tuple[EpisodeTracker, list[StepResult]]:
+    """Play one episode with random legal actions, every result checked by an ``EpisodeTracker``.
+
+    Returns the tracker (phases, returns, team result) and every result (reset first).
+    """
+    rng = rng if rng is not None else np.random.default_rng(0)
+    tracker = tracker if tracker is not None else EpisodeTracker(env.spec)
+    specs = {role: ActionSpec.from_space(r.action_space) for role, r in env.spec.roles.items()}
+    result = env.reset(seed, layout)
+    masks = tracker.on_reset(layout, result)
+    results = [result]
+    for _ in range(max_steps):
+        if tracker.episode_over:
+            return tracker, results
+        actions = {seat: sample_legal_action(specs[env.spec.role_of(layout, seat)], masks[seat], rng)
+                   for seat in sorted(tracker.acting())}
+        result = env.step(actions)
+        masks = tracker.on_step(actions, result)
+        results.append(result)
+    raise RuntimeError(f"play_episode: no episode_over within {max_steps} steps")
