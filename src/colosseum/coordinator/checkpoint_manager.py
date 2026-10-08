@@ -7,8 +7,16 @@ Layout (``base_dir`` is ``<run_dir>/checkpoints``)::
         trainer_state.pt    torch.save of BaseAlgorithm.state_dict() (optional)
         meta.json           agent_id, checkpoint_id, policy_version, timestamp, + extras
 
-A checkpoint's path is always ``base_dir/agent_id/checkpoint_id``. A ``path`` stored
-in ``meta.json`` (older layouts, copied runs) is never used (R6-06).
+A checkpoint's path is always ``base_dir/agent_id/checkpoint_id``; both ids must be
+safe path components (``core.config.check_path_component``). A ``path`` stored in
+``meta.json`` (older layouts, copied runs) is never used (R6-06).
+
+Writes go to ``.tmp-<id>-<rand>/`` and are moved into place with ``os.replace``.
+Replacing an existing id first moves it aside to ``.tmp-old-<id>-<rand>/``. On scan,
+a ``.tmp-old-*`` dir is restored when its id is missing (a crash between the two
+moves) and deleted otherwise; a ``.tmp-<id>-*`` dir is deleted only when older than
+``STALE_TMP_AGE_SEC``. (A writer of another process caught exactly between its two
+moves would see its save fail; the previous checkpoint stays intact.)
 """
 
 from __future__ import annotations
@@ -27,6 +35,7 @@ from typing import Any
 import numpy as np
 import torch
 
+from colosseum.core.config import check_path_component
 from colosseum.core.errors import ConfigError
 from colosseum.core.types import state_dict_from_numpy, state_dict_to_numpy
 
@@ -41,6 +50,12 @@ TRAINER_FILE = "trainer_state.pt"
 META_FILE = "meta.json"
 _CKPT_RE = re.compile(r"ckpt_v(\d+)")
 _TMP_PREFIX = ".tmp-"
+_OLD_TMP_RE = re.compile(r"\.tmp-old-(ckpt_v\d+)-[0-9a-f]+")
+# A ``.tmp-<id>-*`` write dir older than this is a leftover of a crashed writer and is
+# deleted on scan. Age, not the writer's pid, decides: in distributed mode learners on
+# other machines may share the checkpoint dir, and their pids mean nothing here. A
+# real save takes seconds, so a younger tmp dir may belong to a live writer.
+STALE_TMP_AGE_SEC = 3600.0
 
 
 @dataclass
@@ -84,6 +99,31 @@ def _read_agent_dir(agent_dir: Path) -> list[CheckpointInfo]:
     return infos
 
 
+def _clean_tmp_dirs(agent_dir: Path) -> None:
+    """Recover or delete leftovers of interrupted saves (see the module docstring)."""
+    now = time.time()
+    for d in agent_dir.glob(f"{_TMP_PREFIX}*"):
+        old = _OLD_TMP_RE.fullmatch(d.name)
+        if old is not None:
+            target = agent_dir / old.group(1)
+            if target.exists():
+                shutil.rmtree(d, ignore_errors=True)
+                continue
+            try:
+                os.replace(d, target)
+                logger.warning(f"Restored checkpoint {target} from an interrupted replace")
+            except OSError as e:
+                logger.warning(f"Could not restore {d} to {target}: {e}")
+            continue
+        try:
+            age = now - d.stat().st_mtime
+        except FileNotFoundError:
+            continue
+        if age > STALE_TMP_AGE_SEC:
+            shutil.rmtree(d, ignore_errors=True)
+            logger.info(f"Removed stale checkpoint write dir {d}")
+
+
 class CheckpointManager:
     """Saves checkpoints atomically and keeps a FIFO pool of ``pool_size`` per agent."""
 
@@ -102,15 +142,17 @@ class CheckpointManager:
     def agents(self) -> list[str]:
         return list(self._index.keys())
 
+    def _agent_dir(self, agent_id: str) -> Path:
+        return self._base_dir / check_path_component(agent_id, "agent id")
+
     def _ckpt_dir(self, agent_id: str, checkpoint_id: str) -> Path:
-        return self._base_dir / agent_id / checkpoint_id
+        return self._agent_dir(agent_id) / check_path_component(checkpoint_id, "checkpoint id")
 
     def _scan(self) -> None:
         for agent_dir in sorted(self._base_dir.iterdir()):
             if not agent_dir.is_dir() or agent_dir.name.startswith("."):
                 continue
-            for stale in agent_dir.glob(f"{_TMP_PREFIX}*"):
-                shutil.rmtree(stale, ignore_errors=True)
+            _clean_tmp_dirs(agent_dir)
             infos = _read_agent_dir(agent_dir)
             if infos:
                 self._index[agent_dir.name] = infos
@@ -129,7 +171,7 @@ class CheckpointManager:
         place with ``os.replace``. An existing checkpoint with the same id is replaced.
         """
         checkpoint_id = f"ckpt_v{int(policy_version)}"
-        agent_dir = self._base_dir / agent_id
+        agent_dir = self._agent_dir(agent_id)
         agent_dir.mkdir(parents=True, exist_ok=True)
         final_dir = agent_dir / checkpoint_id
         tmp_dir = agent_dir / f"{_TMP_PREFIX}{checkpoint_id}-{uuid.uuid4().hex[:8]}"
@@ -192,18 +234,31 @@ class CheckpointManager:
         return entries[-1] if entries else None
 
 
-def _load_checkpoint_dir(ckpt_dir: Path) -> dict[str, Any]:
+def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
+    """Resume state from one checkpoint dir; any unreadable part raises ConfigError."""
     meta_path = ckpt_dir / META_FILE
-    meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
-    match = _CKPT_RE.fullmatch(ckpt_dir.name)
-    version = int(meta.get("policy_version", match.group(1) if match else 0))
     trainer_path = ckpt_dir / TRAINER_FILE
+    match = _CKPT_RE.fullmatch(ckpt_dir.name)
+    try:
+        meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+        if not isinstance(meta, dict):
+            raise ValueError(f"{META_FILE} is not a JSON object")
+        version = int(meta.get("policy_version", match.group(1) if match else 0))
+        env_steps = int(meta.get("env_steps") or 0)  # null: unknown (distributed learners)
+        state = torch.load(ckpt_dir / MODEL_FILE, map_location="cpu", weights_only=True)
+        if not isinstance(state, dict) or not all(isinstance(v, torch.Tensor) for v in state.values()):
+            raise ValueError(f"{MODEL_FILE} is not a state_dict of tensors")
+        trainer_state = trainer_path.read_bytes() if trainer_path.is_file() else None
+    except Exception as e:  # noqa: BLE001 - any read/parse/unpickling failure means a bad resume source
+        raise ConfigError(
+            f"training.resume_from={resume_from!r}: cannot read checkpoint {ckpt_dir} "
+            f"({type(e).__name__}: {e})"
+        ) from e
     return {
-        "model_state": torch_state_to_numpy(
-            torch.load(ckpt_dir / MODEL_FILE, map_location="cpu", weights_only=True)),
-        "trainer_state": trainer_path.read_bytes() if trainer_path.is_file() else None,
+        "model_state": torch_state_to_numpy(state),
+        "trainer_state": trainer_state,
         "policy_version": version,
-        "env_steps": int(meta.get("env_steps", 0)),
+        "env_steps": env_steps,
         "source": str(ckpt_dir),
     }
 
@@ -220,15 +275,16 @@ def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
     The result holds only numpy arrays, bytes and primitives, so it can be passed
     to a learner process.
     """
+    check_path_component(agent_id, "agent id")
     path = Path(resume_from)
     if path.is_dir() and (path / "checkpoints").is_dir():
         infos = _read_agent_dir(path / "checkpoints" / agent_id)
         if not infos:
             logger.warning(f"resume_from={resume_from}: no checkpoints for agent '{agent_id}'; starting fresh")
             return None
-        return _load_checkpoint_dir(infos[-1].path)
+        return _load_checkpoint_dir(infos[-1].path, resume_from)
     if path.is_dir() and (path / MODEL_FILE).is_file():
-        return _load_checkpoint_dir(path)
+        return _load_checkpoint_dir(path, resume_from)
     if path.is_file() and path.suffix == ".pt":
         try:
             state = torch.load(path, map_location="cpu", weights_only=True)

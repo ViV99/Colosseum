@@ -486,8 +486,10 @@ class Launcher:
         except KeyboardInterrupt:
             logger.info("Received interrupt, stopping...")
         finally:
-            self._shutdown()
-            wandb_logger.finish()
+            try:
+                self._shutdown()
+            finally:
+                wandb_logger.finish()
 
     def _monitor_loop(
         self,
@@ -615,9 +617,23 @@ class Launcher:
         self._coordinator.save_checkpoint_payload(payload, meta_extra=meta)
 
     def _drain_all_checkpoints(self) -> None:
+        """Save every queued checkpoint payload.
+
+        A payload that fails to save is logged with its traceback and the remaining
+        ones are still saved; the first error is re-raised at the end.
+        """
+        first_error: Exception | None = None
         for cq in self._checkpoint_queues.values():
             for payload in _drain_queue(cq):
-                self._save_checkpoint(payload)
+                try:
+                    self._save_checkpoint(payload)
+                except Exception as e:  # noqa: BLE001 - keep saving the others, re-raise below
+                    logger.exception(
+                        f"Failed to save checkpoint v{payload.get('policy_version')} of {payload.get('agent_id')}"
+                    )
+                    first_error = first_error or e
+        if first_error is not None:
+            raise first_error
 
     def _refresh_worker_matches(
         self,
@@ -662,26 +678,28 @@ class Launcher:
         """Stop children; save every learner's final checkpoint before tearing them down."""
         self._stop_event.set()
         learner_procs = self._processes[: len(self._agent_ids)]
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline and any(p.is_alive() for p in learner_procs):
+        try:
+            deadline = time.monotonic() + 10.0
+            while time.monotonic() < deadline and any(p.is_alive() for p in learner_procs):
+                self._drain_all_checkpoints()
+                time.sleep(0.1)
             self._drain_all_checkpoints()
-            time.sleep(0.1)
-        self._drain_all_checkpoints()
-
-        # Detach queue feeder threads so a queue still holding undrained data
-        # (e.g. trajectory chunks a now-dead learner never consumed, or large
-        # WorkerCommands) cannot block this process from exiting on join.
-        for q in self._all_queues:
-            try:
-                q.cancel_join_thread()
-            except (AttributeError, OSError):
-                pass
-        for proc in self._processes:
-            proc.join(timeout=3)
-            if proc.is_alive():
-                proc.terminate()
-                proc.join(timeout=2)
-        logger.info("All processes stopped")
+        finally:
+            # Teardown runs even if a checkpoint save failed (the error propagates after it).
+            # Detach queue feeder threads so a queue still holding undrained data
+            # (e.g. trajectory chunks a now-dead learner never consumed, or large
+            # WorkerCommands) cannot block this process from exiting on join.
+            for q in self._all_queues:
+                try:
+                    q.cancel_join_thread()
+                except (AttributeError, OSError):
+                    pass
+            for proc in self._processes:
+                proc.join(timeout=3)
+                if proc.is_alive():
+                    proc.terminate()
+                    proc.join(timeout=2)
+            logger.info("All processes stopped")
 
 
 def run_training(config_path: str, overrides: dict | None = None) -> None:

@@ -4,6 +4,8 @@ from __future__ import annotations
 import io
 import json
 import multiprocessing as mp
+import os
+import queue
 import threading
 import time
 from pathlib import Path
@@ -131,9 +133,61 @@ def test_save_is_atomic_on_failure(tmp_path, monkeypatch):
 
 
 def test_stale_tmp_dirs_are_cleaned_on_scan(tmp_path):
-    (tmp_path / "a" / ".tmp-ckpt_v9-dead").mkdir(parents=True)
+    """Fix round 1: only write dirs older than STALE_TMP_AGE_SEC are leftovers; a young one
+    may be another process's save in progress (shared checkpoint dir) and is kept."""
+    stale = tmp_path / "a" / ".tmp-ckpt_v9-dead"
+    stale.mkdir(parents=True)
+    old = time.time() - cm_module.STALE_TMP_AGE_SEC - 60
+    os.utime(stale, (old, old))
+    live = tmp_path / "a" / ".tmp-ckpt_v10-live"
+    live.mkdir()
+    CheckpointManager(tmp_path)
+    assert [p.name for p in (tmp_path / "a").glob(".tmp-*")] == [".tmp-ckpt_v10-live"]
+
+
+def test_interrupted_replace_is_restored_on_scan(tmp_path):
+    mgr = CheckpointManager(tmp_path)
+    mgr.save("a", 3, sd(3))
+    # Crash between the two os.replace calls of a same-id save: the old copy was moved aside.
+    os.replace(tmp_path / "a" / "ckpt_v3", tmp_path / "a" / ".tmp-old-ckpt_v3-deadbeef")
+    restored = CheckpointManager(tmp_path)
+    assert [c.checkpoint_id for c in restored.list_checkpoints("a")] == ["ckpt_v3"]
+    assert float(restored.load_model("a", "ckpt_v3")["w"][0, 0]) == 3.0
+    # A moved-aside copy next to a complete checkpoint is garbage.
+    (tmp_path / "a" / ".tmp-old-ckpt_v3-0123abcd").mkdir()
     CheckpointManager(tmp_path)
     assert not list((tmp_path / "a").glob(".tmp-*"))
+
+
+@pytest.mark.parametrize("bad", ["../x", "/x", "a/b", "..", "", ".hidden"])
+def test_unsafe_ids_are_rejected(tmp_path, bad):
+    import pydantic
+
+    base = tmp_path / "base"
+    mgr = CheckpointManager(base)
+    mgr.save("a", 1, sd())
+    with pytest.raises(ConfigError, match="agent id"):
+        mgr.save(bad, 1, sd())
+    with pytest.raises(ConfigError, match="agent id"):
+        mgr.load_model(bad, "ckpt_v1")
+    with pytest.raises(ConfigError, match="checkpoint id"):
+        mgr.load_model("a", bad)
+    with pytest.raises(ConfigError, match="checkpoint id"):
+        mgr.load_trainer_state("a", bad)
+    with pytest.raises(ConfigError, match="agent id"):
+        resolve_resume(str(base / "a" / "ckpt_v1"), bad)
+    with pytest.raises(pydantic.ValidationError, match="Invalid agent id"):
+        ColosseumConfig.model_validate({**make_config().model_dump(mode="json"), "agents": {bad: {}}})
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["base"]  # nothing written outside
+    assert sorted(p.name for p in base.iterdir()) == ["a"]
+
+
+def test_normal_ids_still_work(tmp_path):
+    mgr = CheckpointManager(tmp_path)
+    mgr.save("team-a.v2_0", 5, sd(5))
+    assert float(mgr.load_model("team-a.v2_0", "ckpt_v5")["w"][0, 0]) == 5.0
+    cfg = ColosseumConfig.model_validate({**make_config().model_dump(mode="json"), "agents": {"team-a.v2_0": {}}})
+    assert cfg.get_trainable_agent_ids() == ["team-a.v2_0"]
 
 
 def test_duplicate_id_is_replaced_not_duplicated(tmp_path):
@@ -182,6 +236,32 @@ def test_resolve_resume_checkpoint_dir_run_dir_and_pt(tmp_path):
         resolve_resume(str(tmp_path / "missing"), "agent_0")
     for result in (from_run, from_dir, from_pt):
         assert not contains_tensor(result)
+
+
+def test_resolve_resume_wraps_unreadable_checkpoints_in_config_error(tmp_path):
+    base = tmp_path / "run" / "checkpoints"
+    CheckpointManager(base).save("a", 2, sd(2), meta_extra={"env_steps": None})
+    ckpt = base / "a" / "ckpt_v2"
+    assert resolve_resume(str(ckpt), "a")["env_steps"] == 0  # null env_steps (distributed) -> 0
+
+    good_meta = (ckpt / "meta.json").read_text()
+    (ckpt / "meta.json").write_text("{not json")
+    with pytest.raises(ConfigError, match="cannot read checkpoint"):
+        resolve_resume(str(ckpt), "a")
+
+    (ckpt / "meta.json").write_text(good_meta)
+    (ckpt / "model.pt").write_bytes(b"garbage")
+    with pytest.raises(ConfigError, match="cannot read checkpoint"):
+        resolve_resume(str(ckpt), "a")
+    with pytest.raises(ConfigError, match="cannot read checkpoint"):
+        resolve_resume(str(tmp_path / "run"), "a")
+
+
+def test_config_hash_is_stable_and_sensitive():
+    a, b = make_config(), make_config()
+    assert config_hash(a) == config_hash(b) == config_hash(a)
+    assert config_hash(make_config(seed=1)) != config_hash(a)
+    assert config_hash(make_config(seed=1)) != config_hash(make_config(seed=2))
 
 
 def test_check_model_state_reports_architecture_mismatch():
@@ -251,6 +331,7 @@ def test_missing_checkpoint_falls_back_to_latest_and_collects(tmp_path, caplog):
         PlayerSlot("agent_0", "ckpt_v999", False),
     ])
     new_ckpts, nets, collect, agents = _derive_worker_configs([match], coord, ["agent_0"])
+    assert agents == [["agent_0"] * 3]
     assert nets == [["latest", "ckpt_v10", "latest"]]
     assert collect == [[True, False, True]]
     assert list(new_ckpts["agent_0"]) == ["ckpt_v10"]
@@ -260,6 +341,58 @@ def test_missing_checkpoint_falls_back_to_latest_and_collects(tmp_path, caplog):
                                                already_sent={"agent_0": {"ckpt_v10"}})
     assert again["agent_0"] == {}  # already on the worker: not reloaded or resent
     assert nets2 == [["latest", "ckpt_v10", "latest"]]
+
+
+def test_derive_worker_configs_two_agents(tmp_path):
+    """Per-env slot maps for two agents (replaces the deleted test_derive_worker_configs)."""
+    from colosseum.launcher import _derive_worker_configs
+
+    cfg = ColosseumConfig.model_validate({**make_config().model_dump(mode="json"), "agents": {"alpha": {}, "beta": {}}})
+    coord = Coordinator(cfg, checkpoint_dir=tmp_path / "ckpt")
+    coord.checkpoint_manager.save("beta", 4, sd(4))
+    slots = [
+        [PlayerSlot("alpha", None, True), PlayerSlot("beta", None, True)],
+        [PlayerSlot("beta", None, True), PlayerSlot("alpha", None, False)],
+        [PlayerSlot("alpha", None, True), PlayerSlot("beta", "ckpt_v4", False)],
+    ]
+    matches = [MatchConfig(match_id=f"m{i}", player_slots=row) for i, row in enumerate(slots)]
+    new_ckpts, nets, collect, agents = _derive_worker_configs(matches, coord, ["alpha", "beta"])
+    assert agents == [["alpha", "beta"], ["beta", "alpha"], ["alpha", "beta"]]
+    assert nets == [["latest", "latest"], ["latest", "latest"], ["latest", "ckpt_v4"]]
+    assert collect == [[True, True], [True, False], [True, False]]
+    assert new_ckpts["alpha"] == {} and list(new_ckpts["beta"]) == ["ckpt_v4"]
+    assert float(new_ckpts["beta"]["ckpt_v4"]["w"][0, 0]) == 4.0
+
+
+def test_worker_seats_latest_for_unloaded_network_and_reports_it():
+    """A slot naming a network the worker does not have plays (and reports) latest and collects."""
+    from colosseum.core.types import LATEST_NETWORK_ID, WorkerCommand
+    from dataflow_helpers import EnvFactory, GridStepEnv, make_loop, make_tiny_model
+
+    loop, col = make_loop(
+        EnvFactory(GridStepEnv, lengths=(3,)), make_tiny_model, agent_ids=("a",), num_envs=1,
+        slot_agent_map=[["a", "a"]], slot_network_map=[["latest", "ckpt_v9"]], collect_mask=[[True, False]],
+    )
+    assert loop._slot_network_map == [[LATEST_NETWORK_ID, LATEST_NETWORK_ID]]
+    assert loop._collect_mask == [[True, True]]
+    for _ in range(3):
+        loop.step()
+    assert col.results
+    assert all(s.network_id == LATEST_NETWORK_ID for r in col.results for s in r.seats)
+
+    col.commands.append(WorkerCommand(
+        slot_agent_map=[["a", "a"]], slot_network_map=[["ckpt_v7", "latest"]],
+        collect_mask=[[False, True]], new_checkpoints={},
+    ))
+    for _ in range(6):
+        loop.step()
+    assert loop._slot_network_map == [[LATEST_NETWORK_ID, LATEST_NETWORK_ID]]
+    assert loop._collect_mask == [[True, True]]
+    assert len(col.results) >= 3
+    assert all(s.network_id == LATEST_NETWORK_ID for r in col.results for s in r.seats)
+    # Both seats collected the whole time: 9 steps x 2 seats, chunk_length 4.
+    assert len(col.chunks) == 4
+    loop.close()
 
 
 def test_refresh_marks_checkpoints_sent_only_after_successful_put(tmp_path):
@@ -298,11 +431,13 @@ def test_learner_resume_continues_train_step_and_consumed_samples():
     """train_step continues from the restored policy_version, consumed_samples from the trainer state."""
     from colosseum.algorithms.appo import APPO
     from colosseum.core.config import AlgorithmConfig, LearnerConfig
+    from colosseum.core.ipc import SharedCounter
     from colosseum.core.types import TrajectoryChunk
     from colosseum.learner.learner import learner_process
     from dataflow_helpers import CheckedQueue, TinyModel, chunk_payload
 
-    source = APPO(TinyModel(), AlgorithmConfig(), device="cpu")
+    algo_cfg = AlgorithmConfig(lr_schedule="linear")
+    source = APPO(TinyModel(), algo_cfg, device="cpu")
     for step in range(2):
         source.train_step([TrajectoryChunk.from_payload(chunk_payload(T=4, version=step + v)) for v in range(2)])
     assert source.policy_version == 2 and source.consumed_samples == 16
@@ -317,13 +452,17 @@ def test_learner_resume_continues_train_step_and_consumed_samples():
     built: list[APPO] = []
 
     def factory() -> APPO:
-        built.append(APPO(TinyModel(), AlgorithmConfig(), device="cpu"))
+        built.append(APPO(TinyModel(), algo_cfg, device="cpu"))
         return built[-1]
 
+    # The main process seeds the global env-step counter from the resumed checkpoint (D3).
+    counter = SharedCounter()
+    counter.add(400)
     thread = threading.Thread(target=learner_process, kwargs=dict(
         agent_id="a", algorithm_factory=factory, trajectory_queue=traj, weight_queues=[wq],
         config=LearnerConfig(batch_chunks=2, weight_push_interval=1, device="cpu"),
         stop_event=stop, metrics_queue=mq, resume_state=resume_state,
+        progress_counter=counter, total_timesteps=1000,
     ))
     thread.start()
     deadline = time.monotonic() + 60
@@ -336,6 +475,42 @@ def test_learner_resume_continues_train_step_and_consumed_samples():
     assert metrics["train_step"] == 3  # 2 restored + 1 new, not 1
     assert metrics["consumed_samples"] == 24  # 16 restored + 8 new, not 8
     assert built[0].policy_version == 3 and built[0].consumed_samples == 24
+    # LR progress continues from the restored budget, not from the schedule start.
+    assert metrics["progress"] == pytest.approx(0.4)
+    assert metrics["lr"] == pytest.approx(algo_cfg.learning_rate * 0.6)
+
+
+def test_resumed_learner_lr_follows_restored_progress():
+    """Before any new step, the resumed algorithm's LR is the schedule at the restored progress."""
+    from colosseum.algorithms.appo import APPO
+    from colosseum.core.config import AlgorithmConfig, LearnerConfig
+    from colosseum.core.types import TrajectoryChunk
+    from colosseum.learner.learner import learner_process
+    from dataflow_helpers import CheckedQueue, TinyModel, chunk_payload
+
+    algo_cfg = AlgorithmConfig(lr_schedule="linear")
+    source = APPO(TinyModel(), algo_cfg, device="cpu")
+    source.set_progress(0.4)
+    source.train_step([TrajectoryChunk.from_payload(chunk_payload(T=4, version=v)) for v in range(2)])
+    payload = make_checkpoint_payload("a", source)
+    built: list[APPO] = []
+
+    def factory() -> APPO:
+        built.append(APPO(TinyModel(), algo_cfg, device="cpu"))
+        return built[-1]
+
+    stop = threading.Event()
+    stop.set()
+    learner_process(
+        agent_id="a", algorithm_factory=factory, trajectory_queue=CheckedQueue(),
+        weight_queues=[CheckedQueue(maxsize=1)], config=LearnerConfig(batch_chunks=2, device="cpu"),
+        stop_event=stop,
+        resume_state={"model_state": payload["model_state"], "trainer_state": payload["trainer_state_bytes"],
+                      "policy_version": 1, "env_steps": 400, "source": "test"},
+    )
+    state = built[0].state_dict()
+    assert state["progress"] == pytest.approx(0.4)
+    assert state["optimizer"]["param_groups"][0]["lr"] == pytest.approx(algo_cfg.learning_rate * 0.6)
 
 
 def _old_run_with_checkpoint(tmp_path: Path, cfg: ColosseumConfig, version: int, env_steps: int) -> Path:
@@ -420,6 +595,70 @@ def test_shutdown_saves_checkpoints_still_queued(tmp_path):
     assert infos[-1].meta["final"] is True and infos[0].meta["final"] is False
     assert infos[-1].meta["env_steps"] == 777
     assert infos[-1].meta["config_hash"] == config_hash(cfg)
+
+
+def test_drain_saves_remaining_payloads_after_a_failed_save(tmp_path, caplog):
+    from colosseum.launcher import Launcher
+
+    cfg = make_config()
+    launcher = Launcher(cfg)
+    launcher._coordinator = Coordinator(cfg, checkpoint_dir=tmp_path / "ckpt")
+    q = queue.Queue()
+    launcher._checkpoint_queues = {"agent_0": q}
+    algo = FakeAlgorithm()
+    for _ in range(2):
+        algo.train_once()
+        q.put(make_checkpoint_payload("agent_0", algo))
+    real_save = launcher._save_checkpoint
+
+    def save(payload):
+        if payload["policy_version"] == 1:
+            raise OSError("disk full")
+        real_save(payload)
+
+    launcher._save_checkpoint = save
+    with pytest.raises(OSError, match="disk full"):
+        launcher._drain_all_checkpoints()
+    assert [c.checkpoint_id for c in launcher._coordinator.checkpoint_manager.list_checkpoints("agent_0")] == [
+        "ckpt_v2"]
+    assert "Failed to save checkpoint v1" in caplog.text and "Traceback" in caplog.text
+
+
+def test_shutdown_tears_children_down_even_if_a_save_fails(tmp_path):
+    from colosseum.launcher import Launcher
+
+    cfg = make_config()
+    launcher = Launcher(cfg)
+    launcher._coordinator = Coordinator(cfg, checkpoint_dir=tmp_path / "ckpt")
+    launcher._agent_ids = ["agent_0"]
+    cq = mp.get_context("spawn").Queue(maxsize=4)
+    launcher._checkpoint_queues = {"agent_0": cq}
+    launcher._all_queues = [cq]
+    calls: list[int] = []
+
+    def failing_save(payload):
+        calls.append(payload["policy_version"])
+        raise OSError("disk full")
+
+    launcher._save_checkpoint = failing_save
+    algo = FakeAlgorithm()
+    algo.train_once()
+    periodic = make_checkpoint_payload("agent_0", algo)
+    final = make_checkpoint_payload("agent_0", algo, final=True)
+    proc = mp.get_context("spawn").Process(
+        target=_learner_like_checkpoint_sender, args=(cq, launcher._stop_event, periodic, final), daemon=True,
+    )
+    proc.start()
+    launcher._processes = [proc]
+    deadline = time.monotonic() + 60
+    while cq.empty() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not cq.empty()
+
+    with pytest.raises(OSError, match="disk full"):
+        launcher._shutdown()
+    assert calls  # the save was attempted ...
+    assert not proc.is_alive() and proc.exitcode is not None  # ... and the child was still torn down
 
 
 def test_learner_sends_final_checkpoint_on_stop():

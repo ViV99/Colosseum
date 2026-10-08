@@ -169,15 +169,14 @@ def run_distributed_learner(
     store = GRPCWeightStore(weight_store_address, max_message_mb=max_mb)
     weight_sink = [GRPCWeightSink(store, agent_id)]
 
-    # Optional checkpoint persistence (drained off-thread so training never blocks).
+    # Checkpoint persistence (drained off-thread so training never blocks). Always on:
+    # the learner's final snapshot is saved even without periodic checkpoints.
+    from colosseum.coordinator.checkpoint_manager import CheckpointManager
     checkpoint_queue: queue.Queue = queue.Queue(maxsize=16)
-    coordinator_ckpt = None
-    if config.self_play.checkpoint_interval > 0:
-        from colosseum.coordinator.checkpoint_manager import CheckpointManager
-        coordinator_ckpt = CheckpointManager(
-            base_dir=config.checkpoint.dir,
-            pool_size=config.self_play.pool_size,
-        )
+    coordinator_ckpt = CheckpointManager(
+        base_dir=config.checkpoint.dir,
+        pool_size=config.self_play.pool_size,
+    )
 
     algo_class_path = acfg.algorithm.algorithm_class
     algo_cls = import_class(algo_class_path)
@@ -209,18 +208,25 @@ def run_distributed_learner(
     cfg_hash = config_hash(config)
 
     def _save(data: dict) -> None:
-        if coordinator_ckpt is None:
-            return
+        """Persist one payload; a failure is logged and never kills the caller."""
         trainer_state = data.get("trainer_state_bytes") if config.checkpoint.save_optimizer else None
-        coordinator_ckpt.save(
-            agent_id=agent_id,
-            policy_version=int(data["policy_version"]),
-            model_state=data["model_state"],
-            trainer_state=trainer_state,
-            meta_extra={"final": bool(data.get("final", False)),
-                        "networks": acfg.networks.model_dump(mode="json", by_alias=True),
-                        "config_hash": cfg_hash},
-        )
+        try:
+            coordinator_ckpt.save(
+                agent_id=agent_id,
+                policy_version=int(data["policy_version"]),
+                model_state=data["model_state"],
+                trainer_state=trainer_state,
+                # env_steps is null: a distributed learner has no global env-step count
+                # (its consumed_samples counts transitions of its own seats, a different
+                # quantity), so a resume from it does not seed the env-step budget.
+                meta_extra={"final": bool(data.get("final", False)),
+                            "networks": acfg.networks.model_dump(mode="json", by_alias=True),
+                            "config_hash": cfg_hash,
+                            "env_steps": None},
+            )
+        except Exception:  # noqa: BLE001 - one failed save must not stop checkpointing
+            logger.exception(f"Distributed learner [{agent_id}]: failed to save checkpoint "
+                             f"v{data.get('policy_version')}")
 
     def _drain_checkpoints():
         while not stop_event.is_set():
@@ -248,7 +254,7 @@ def run_distributed_learner(
             metrics_queue=None,
             progress_counter=None,
             total_timesteps=config.training.total_timesteps,
-            checkpoint_queue=checkpoint_queue if coordinator_ckpt is not None else None,
+            checkpoint_queue=checkpoint_queue,
             checkpoint_interval=config.self_play.checkpoint_interval,
             weight_sync_interval=acfg.rollout.weight_sync_interval_sec,
         )

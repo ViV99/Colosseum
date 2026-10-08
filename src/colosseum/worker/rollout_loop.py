@@ -165,6 +165,10 @@ class RolloutLoop:
         self._slot_agent_map = [list(r) for r in slot_agent_map]
         self._slot_network_map = [list(r) for r in slot_network_map]
         self._collect_mask = [[bool(c) for c in r] for r in collect_mask]
+        for e in range(E):
+            for p in range(P):
+                self._slot_network_map[e][p], self._collect_mask[e][p] = self._seat_network(
+                    self._slot_agent_map[e][p], self._slot_network_map[e][p], self._collect_mask[e][p])
         self._pending_maps: tuple[list, list, list] | None = None
 
         self._obs, self._infos = self._vec_env.reset_all(seed=seed)
@@ -265,19 +269,26 @@ class RolloutLoop:
         self._models[aid][ckpt_id] = model
         logger.info(f"Worker {self.worker_id}: agent {aid}: loaded checkpoint {ckpt_id}")
 
+    def _seat_network(self, aid: str, net_id: str, collect: bool) -> tuple[str, bool]:
+        """The (network id, collect) actually seated for an assigned slot.
+
+        A network that is not loaded is replaced by the latest weights, which then
+        collect trajectories (as the launcher's missing-checkpoint fallback does), so
+        the slot maps, chunks and ``SeatResult.network_id`` all name what really played.
+        """
+        if net_id in self._models[aid]:
+            return net_id, collect
+        if (aid, net_id) not in self._warned_missing:
+            self._warned_missing.add((aid, net_id))
+            logger.warning(
+                f"Worker {self.worker_id}: network {net_id!r} of {aid!r} is not loaded; "
+                f"seating {LATEST_NETWORK_ID!r} (collecting) instead"
+            )
+        return LATEST_NETWORK_ID, True
+
     def _resolve_model(self, aid: str, net_id: str) -> PolicyModel:
-        """The model seated for (agent, network id); falls back to latest if not loaded."""
-        models = self._models[aid]
-        model = models.get(net_id)
-        if model is None:
-            if (aid, net_id) not in self._warned_missing:
-                self._warned_missing.add((aid, net_id))
-                logger.warning(
-                    f"Worker {self.worker_id}: network {net_id!r} of {aid!r} is not loaded; "
-                    f"using {LATEST_NETWORK_ID!r}"
-                )
-            model = models[LATEST_NETWORK_ID]
-        return model
+        """The model seated for (agent, network id); slot maps only hold loaded networks."""
+        return self._models[aid][net_id]
 
     def _initial_state(self, e: int, p: int) -> State:
         """Episode-start state of the model actually seated in slot (e, p)."""
@@ -321,12 +332,12 @@ class RolloutLoop:
             track = self._tracks[e][p]
             old_aid = self._slot_agent_map[e][p]
             new_aid = agents[e][p]
-            new_collect = collect[e][p]
+            new_net, new_collect = self._seat_network(new_aid, nets[e][p], collect[e][p])
             if track.buffer is not None and (not new_collect or new_aid != old_aid):
                 self._pool.park(old_aid, track.buffer)
                 track.buffer = None
             self._slot_agent_map[e][p] = new_aid
-            self._slot_network_map[e][p] = nets[e][p]
+            self._slot_network_map[e][p] = new_net
             self._collect_mask[e][p] = new_collect
             if new_collect and track.buffer is None:
                 track.buffer = self._pool.acquire(new_aid)

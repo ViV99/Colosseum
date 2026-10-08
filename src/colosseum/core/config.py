@@ -10,12 +10,36 @@ from __future__ import annotations
 
 import hashlib
 import json
+import re
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
+
+from colosseum.core.errors import ConfigError
+
+# ---------------------------------------------------------------------------
+# Ids used as path components
+# ---------------------------------------------------------------------------
+
+_PATH_COMPONENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]*")
+
+
+def check_path_component(value: str, what: str) -> str:
+    """Return ``value`` if it is safe as one path component, else raise ConfigError.
+
+    Agent ids and checkpoint ids name directories (``<checkpoints>/<agent_id>/<ckpt_id>``).
+    Allowed: letters, digits, ``_``, ``.`` and ``-``, not starting with ``.`` or ``-``.
+    This rejects empty ids, ``.``/``..``, hidden names, separators and absolute paths.
+    """
+    if not isinstance(value, str) or _PATH_COMPONENT_RE.fullmatch(value) is None:
+        raise ConfigError(
+            f"Invalid {what} {value!r}: use letters, digits, '_', '.' and '-' "
+            f"(not starting with '.' or '-'); it is used as a directory name"
+        )
+    return value
 
 # ---------------------------------------------------------------------------
 # Enums
@@ -385,6 +409,16 @@ class ColosseumConfig(BaseModel):
         description="Per-agent config overrides. Keys are agent IDs. "
                     "Empty = single agent_0 using global config.",
     )
+
+    @field_validator("agents")
+    @classmethod
+    def _check_agent_ids(cls, agents: dict[str, AgentConfig]) -> dict[str, AgentConfig]:
+        for agent_id in agents:
+            try:
+                check_path_component(agent_id, "agent id")
+            except ConfigError as e:
+                raise ValueError(str(e)) from e
+        return agents
 
     def get_agent_config(self, agent_id: str) -> ColosseumConfig:
         """Return an effective config for a specific agent.
