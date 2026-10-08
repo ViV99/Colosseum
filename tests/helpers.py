@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import copy
 from collections import namedtuple
 from pathlib import Path
 
@@ -10,12 +11,14 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from colosseum.core.types import TrajectoryChunk
 from colosseum.envs.base_env import BaseEnv
 from colosseum.networks.base import BaseEncoder, BasePolicy, BaseValue
 from colosseum.networks.composed import ComposedModel
 from colosseum.networks.cores import Core, GRUCore, LSTMCore, NoCore, WindowAttentionCore
 from colosseum.networks.distributions import CategoricalDist, DiagGaussianDist
 from colosseum.networks.model import PolicyModel, StepOutput, UnrollOutput
+from colosseum.networks.normalization import NormalizeObs
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
@@ -31,9 +34,12 @@ def example_config(name: str) -> Path:
 
 
 class SimpleEncoder(BaseEncoder):
-    def __init__(self, obs_dim: int = 8, hidden_dim: int = 16) -> None:
+    """[B, obs_dim] -> optional NormalizeObs -> Linear -> relu -> [B, hidden_dim]."""
+
+    def __init__(self, obs_dim: int = 8, hidden_dim: int = 16, normalize: bool = False) -> None:
         super().__init__()
         self._latent_dim = hidden_dim
+        self.norm = NormalizeObs(shape=(obs_dim,)) if normalize else None
         self.fc = nn.Linear(obs_dim, hidden_dim)
 
     @property
@@ -41,6 +47,8 @@ class SimpleEncoder(BaseEncoder):
         return self._latent_dim
 
     def forward(self, obs):
+        if self.norm is not None:
+            obs = self.norm(obs)
         return torch.relu(self.fc(obs))
 
 
@@ -182,9 +190,17 @@ def make_core(kind: str, input_dim: int) -> Core:
 
 
 def make_simple_model(obs_dim: int = 8, hidden_dim: int = 16, num_actions: int = 4,
-                      core: str = "none") -> ComposedModel:
-    """ComposedModel: SimpleEncoder -> core -> SimplePolicy / SimpleValue."""
-    encoder = SimpleEncoder(obs_dim, hidden_dim)
+                      core: str = "none", normalize: bool = False,
+                      seed: int | None = None) -> ComposedModel:
+    """ComposedModel: SimpleEncoder -> core -> SimplePolicy / SimpleValue.
+
+    ``core`` is one of ``CORE_KINDS``. ``normalize`` puts a ``NormalizeObs`` in
+    front of the encoder. ``seed`` (if given) seeds torch first, so two calls
+    with the same seed build identical weights.
+    """
+    if seed is not None:
+        torch.manual_seed(seed)
+    encoder = SimpleEncoder(obs_dim, hidden_dim, normalize)
     trunk = make_core(core, encoder.latent_dim)
     return ComposedModel(encoder, trunk, SimplePolicy(trunk.output_dim, num_actions),
                          SimpleValue(trunk.output_dim))
@@ -270,3 +286,94 @@ class ResetFailsEnv(CountingEnv):
 
     def reset(self, seed=None):
         raise RuntimeError("reset exploded")
+
+
+# ---------------------------------------------------------------------------
+# Algorithm / eval test kit (SP1 blocks 4 and 7)
+# ---------------------------------------------------------------------------
+
+
+class MaskedToyEnv(BaseEnv):
+    """Solo env: random 4-vector observation, Discrete(4), two random legal actions.
+
+    Each step exposes ``info["action_mask"]`` (if ``use_mask``) with exactly two
+    legal actions. Episodes last ``EPISODE_LENGTH`` steps. The reward is 1 for the
+    scripted expert's choice (the legal action with the largest observation
+    entry), else 0. Every received action is appended to ``self.received``.
+    """
+
+    EPISODE_LENGTH = 5
+
+    def __init__(self, use_mask: bool = True) -> None:
+        self._use_mask = use_mask
+        self._rng = np.random.default_rng(0)
+        self._t = 0
+        self._obs = np.zeros(4, dtype=np.float32)
+        self._mask = np.ones(4, dtype=bool)
+        self.received: list[int] = []
+
+    @property
+    def num_players(self) -> int:
+        return 1
+
+    @property
+    def observation_space(self) -> gymnasium.spaces.Space:
+        return gymnasium.spaces.Box(-1.0, 1.0, (4,), np.float32)
+
+    @property
+    def action_space(self) -> gymnasium.spaces.Space:
+        return gymnasium.spaces.Discrete(4)
+
+    def expert_action(self) -> int:
+        return int(np.argmax(np.where(self._mask, self._obs, -np.inf)))
+
+    def _draw(self) -> tuple[dict[int, np.ndarray], dict[int, dict]]:
+        self._obs = self._rng.uniform(-1.0, 1.0, 4).astype(np.float32)
+        self._mask = np.zeros(4, dtype=bool)
+        self._mask[self._rng.choice(4, size=2, replace=False)] = True
+        info = {"action_mask": self._mask.copy()} if self._use_mask else {}
+        return {0: self._obs.copy()}, {0: info}
+
+    def reset(self, seed=None):
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        self._t = 0
+        return self._draw()
+
+    def step(self, actions):
+        action = int(np.asarray(actions[0]).reshape(-1)[0])
+        self.received.append(action)
+        reward = 1.0 if action == self.expert_action() else 0.0
+        self._t += 1
+        done = self._t >= self.EPISODE_LENGTH
+        obs, info = self._draw()
+        return obs, {0: reward}, {0: done}, {0: False}, info
+
+
+def rollout_chunks(
+    model: PolicyModel,
+    env_fn,
+    num_chunks: int,
+    chunk_length: int = 8,
+    num_envs: int = 2,
+    seed: int = 0,
+) -> list[TrajectoryChunk]:
+    """Collect ``num_chunks`` real chunks for agent "a" with an in-process RolloutLoop.
+
+    The loop acts with a deep copy of ``model`` (same weights). Chunks go through
+    ``to_payload()``/``from_payload()`` exactly as they would across processes.
+    """
+    # Local import: dataflow_helpers imports this module.
+    from dataflow_helpers import make_loop
+
+    loop, collected = make_loop(env_fn, lambda: copy.deepcopy(model), agent_ids=("a",),
+                                num_envs=num_envs, chunk_length=chunk_length, seed=seed)
+    try:
+        for _ in range(100_000):
+            if len(collected.chunks) >= num_chunks:
+                break
+            loop.step()
+    finally:
+        loop.close()
+    assert len(collected.chunks) >= num_chunks, f"RolloutLoop produced only {len(collected.chunks)} chunks"
+    return [TrajectoryChunk.from_payload(c.to_payload()) for c in collected.chunks[:num_chunks]]

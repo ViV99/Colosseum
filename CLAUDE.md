@@ -37,7 +37,7 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
 **Tier 1 (implemented):**
 - **APPO** (Async PPO with V-trace) — primary algorithm
   - PPO clipped surrogate loss + V-trace importance weights
-  - GAE for advantage estimation
+  - V-trace(λ) targets and advantages (`algorithm.vtrace_lambda`; GAE is not used)
   - LSTM/GRU support for partial observability
   - Action masking for constrained action spaces
   - AMP (mixed precision) training support
@@ -77,7 +77,7 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
 ### Trajectory Handling
 
 - Fixed-length rollout chunks of T steps (T=128-512, configurable)
-- Episode boundaries handled within chunks (GAE/V-trace reset at done, new episode starts in same chunk)
+- Episode boundaries handled within chunks (V-trace traces are cut at done, new episode starts in same chunk)
 - For LSTM: hidden state carried across chunks within episode, reset at done. Stored state approach: h_init saved at chunk start, replayed during training.
 - One chunk ≈ 300KB per agent per chunk (for obs_dim=256, T=256)
 - At 100 workers × 10 chunks/sec = 300 MB/sec total throughput — manageable for 10Gbit or shared mem

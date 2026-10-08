@@ -460,7 +460,7 @@ Worker pods auto-scale via HPA based on CPU utilization. See `deployment/k8s/` f
 | `name` | `"appo"` | Algorithm name (cosmetic) |
 | `algorithm_class` | `"colosseum.algorithms.appo.APPO"` | Dotted import path to algorithm class |
 | `gamma` | `0.99` | Discount factor |
-| `gae_lambda` | `0.95` | GAE lambda |
+| `vtrace_lambda` | `1.0` | V-trace λ: trace coefficients c_t = λ·min(c̄, ρ_t); 1.0 = plain V-trace (GAE is not used) |
 | `eps_clip` | `0.2` | PPO clipping epsilon |
 | `value_loss_coeff` | `0.5` | Value-function loss coefficient |
 | `entropy_coeff` | `0.01` | Entropy bonus coefficient |

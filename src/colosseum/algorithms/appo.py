@@ -193,6 +193,7 @@ class APPO(BaseAlgorithm):
                 gamma=cfg.gamma,
                 rho_bar=cfg.vtrace_rho_bar,
                 c_bar=cfg.vtrace_c_bar,
+                lam=cfg.vtrace_lambda,
             )
 
         # PPO clipped surrogate loss

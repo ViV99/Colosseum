@@ -57,7 +57,12 @@ class AlgorithmConfig(BaseModel):
         description="Dotted import path to algorithm class.",
     )
     gamma: float = Field(default=0.99, ge=0.0, le=1.0, description="Discount factor.")
-    gae_lambda: float = Field(default=0.95, ge=0.0, le=1.0, description="GAE lambda.")
+    vtrace_lambda: float = Field(
+        default=1.0, ge=0.0, le=1.0,
+        description="V-trace lambda: trace coefficients c_t = lambda * min(c_bar, rho_t). "
+                    "1.0 = plain V-trace; ~0.9-0.95 trades bias for lower variance "
+                    "(on-policy it equals GAE(lambda)). GAE itself is not used.",
+    )
     eps_clip: float = Field(default=0.2, gt=0.0, description="PPO clipping epsilon.")
     value_loss_coeff: float = Field(default=0.5, ge=0.0, description="Coefficient for value-function loss.")
     entropy_coeff: float = Field(default=0.01, ge=0.0, description="Entropy bonus coefficient.")

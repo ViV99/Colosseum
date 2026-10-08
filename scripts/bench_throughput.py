@@ -105,7 +105,7 @@ def _make_config(num_workers: int, checkpoint_dir: str):
         algorithm={
             "algorithm_class": "colosseum.algorithms.appo.APPO",
             "gamma": 0.99,
-            "gae_lambda": 0.95,
+            "vtrace_lambda": 1.0,
             "eps_clip": 0.2,
             "value_loss_coeff": 0.5,
             "entropy_coeff": 0.01,
