@@ -29,11 +29,15 @@ scripts/setup-dev.sh --gpu          # ставит сборку torch с CUDA в
 
 ## Список тестов
 
-Каждая строка — один node id из `.venv/bin/python -m pytest -m gpu --collect-only -q`.
+Каждая строка — один node id из `.venv/bin/python -m pytest -m gpu --collect-only -q`. Для каждой строки ожидается `passed`.
+
+Известная нестабильность: в тесте сохранения GradScaler (первая строка, AMP float16) проверка `_growth_tracker > 0` может
+не пройти, если последний шаг fp16 был пропущен GradScaler'ом (переполнение, бывает редко). Тогда тест надо просто
+перезапустить; это не ошибка кода. Повторное падение — уже повод разбираться.
 
 | Тест | Что проверяет | Команда |
 |---|---|---|
-| `tests/unit/test_algorithm_state.py::test_grad_scaler_state_round_trips_on_cuda` | AMP float16 на CUDA: состояние GradScaler после трёх шагов сохраняется в `state_dict` и восстанавливается в новом APPO. Смотреть: `passed` | `.venv/bin/python -m pytest -v tests/unit/test_algorithm_state.py -k test_grad_scaler_state_round_trips_on_cuda` |
+| `tests/unit/test_algorithm_state.py::test_grad_scaler_state_round_trips_on_cuda` | AMP float16 на CUDA: состояние GradScaler после трёх шагов сохраняется в `state_dict` и восстанавливается в новом APPO | `.venv/bin/python -m pytest -v tests/unit/test_algorithm_state.py -k test_grad_scaler_state_round_trips_on_cuda` |
 | `tests/unit/test_algorithm_state.py::test_state_dict_round_trip_with_model_on_cuda` | `APPO.state_dict()` с LSTM-моделью на CUDA: сохранённые тензоры на CPU, после загрузки состояние оптимизатора снова на CUDA, LR/версия/`consumed_samples` совпадают, следующий шаг даёт версию 2 | `.venv/bin/python -m pytest -v tests/unit/test_algorithm_state.py -k test_state_dict_round_trip_with_model_on_cuda` |
 | `tests/unit/test_appo_metrics.py::test_amp_train_step_on_cuda[none-float16]` | AMP `float16` (модель `none`): три шага APPO на CUDA, метрики конечны, веса изменились и остались float32 без NaN/inf, масштаб GradScaler конечен и > 0 | `.venv/bin/python -m pytest -v tests/unit/test_appo_metrics.py -k test_amp_train_step_on_cuda` |
 | `tests/unit/test_appo_metrics.py::test_amp_train_step_on_cuda[none-bfloat16]` | AMP `bfloat16` (модель `none`): три шага APPO на CUDA, метрики конечны, веса изменились и остались float32 без NaN/inf | `.venv/bin/python -m pytest -v tests/unit/test_appo_metrics.py -k test_amp_train_step_on_cuda` |

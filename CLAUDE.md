@@ -63,15 +63,15 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
 ### No Ray — Custom Distribution Layer
 
 **Transport: gRPC**
-- Control plane (coordinator ↔ workers/learners): gRPC unary RPCs (RegisterWorker, RequestMatch, ReportResult, etc.)
+- Control plane (coordinator ↔ workers/learners): gRPC unary RPCs (RegisterWorker, RequestMatch, ReportResult, etc.) (target; see Roadmap)
 - Data plane (workers → learners): gRPC client streaming for trajectory chunks
 - Weight sync: Weight Store service (gRPC or shared memory)
 - Serialization: protobuf for metadata, raw bytes + lz4 compression for tensors
 
 **Single-machine fallback:**
 - multiprocessing.Queue for control
-- multiprocessing.shared_memory for weights (zero-copy)
-- Shared memory ring buffer for trajectories (Sample Factory style)
+- multiprocessing.shared_memory for weights (zero-copy) (target; see Roadmap — today: newest-wins mp.Queue of numpy payloads)
+- Shared memory ring buffer for trajectories (Sample Factory style) (target; see Roadmap — today: mp.Queue of numpy chunk payloads)
 - Same interfaces, different transport backend
 
 ### Trajectory Handling
@@ -111,8 +111,8 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
 - If arena match has fewer agents than player slots → duplicate agents to fill
 - ALL trainable agents in arena match collect trajectories → one env step feeds multiple learners
 - PFSP priority function: `f(win_rate) = (1 - win_rate)^p` (focus on hard opponents) or `f(x) = x*(1-x)` (balanced)
-- ELO/TrueSkill tracking for all agents
-- Dynamic: add/remove agents and machines at any time without stopping
+- ELO/TrueSkill tracking for all agents (ELO implemented; TrueSkill-type ratings are a target; see Roadmap)
+- Dynamic: add/remove agents and machines at any time without stopping (target; see Roadmap)
 
 ### Eval Mode
 - Inference-only matchups between any set of checkpoints / `.pt` state dicts (`colosseum.eval`); no training
@@ -298,6 +298,7 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
 ### Partial
 - **Distributed mode** (`serve-weight-store`, `run-learner`, `run-workers`) works for latest-weights self-play only: no coordinator, league, ratings, `metrics.jsonl` or WandB; per-worker budgets; `run-learner` ignores `training.resume_from`.
 - **`deployment/`** (Docker, K8s) is not tested.
+- **GPU:** never run on CUDA during SP1. All CUDA paths (learner device, AMP fp16/bf16, `pin_memory`, kickstart/BC on CUDA) are covered only by `gpu`-marked tests that have not been executed yet; see `docs/GPU_CHECKS.md`.
 
 ### Not implemented (see Roadmap)
 - Scripted, frozen and external players.
@@ -305,6 +306,10 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
 - Snapshot-level PFSP, OpenSkill / Bradley–Terry ratings, a tournament command.
 - Off-policy algorithms (R2D2/DQN, replay buffer), SAC, AlphaZero/MuZero.
 - GPU inference on workers.
+- Shared-memory zero-copy weight store and shared-memory trajectory ring buffer (single machine uses `mp.Queue` with numpy payloads).
+- Adding or removing agents and machines while a run is going (agents and workers are fixed at start).
+- gRPC control plane between a coordinator and workers/learners (SP5).
+- TrueSkill-type ratings (SP4: OpenSkill / Bradley–Terry).
 
 ## Roadmap
 
@@ -335,7 +340,9 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
 - **Minor, unscheduled:**
   - `--set` lists follow YAML 1.1, so `--set x=[1e-4,2]` keeps `1e-4` as a string (scalars are parsed correctly; write `1.0e-4` in lists);
   - the main process builds a ratings snapshot on every monitor pass (negligible cost);
-  - stale parked rollout buffers have no age limit (bounded by agents × envs × players).
+  - stale parked rollout buffers have no age limit (bounded by agents × envs × players);
+  - SharedMemory zero-copy weight store (raw `shared_memory` instead of queue payloads);
+  - dynamic add/remove of agents and machines during a run;
   - config inheritance / profiles (`extends: base.yaml`).
 
 ## Tech Stack

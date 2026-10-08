@@ -110,7 +110,7 @@ Without an interactive `wandb login`, set `WANDB_API_KEY`, or `WANDB_MODE=offlin
   grace of 7 seconds; then any remaining child is terminated, so no process is left after 10 seconds. The exit codes
   are 130 (SIGINT) and 143 (SIGTERM). Child processes ignore Ctrl-C themselves (the main process stops them) and die
   with the main process if it is killed.
-- An invalid config exits with code 1 and a one-line `Config error: ...`, without a traceback.
+- An invalid config exits with code 1 and a `Config error: ...` message without a traceback.
 - `colosseum eval` uses the same codes (0 / 1 / 130 / 143), plus 2 for bad command-line arguments.
 
 ## Writing your own game
@@ -228,9 +228,9 @@ Inside a list, YAML 1.1 rules apply: `--set x=[1e-4,2]` keeps `1e-4` as a string
 | `run` | `name` (null → `<config stem>-<YYYYmmdd-HHMMSS>`; an existing explicit name is an error), `dir` (`runs`) |
 | `env` | `env_class`, `num_players` (2; must equal the env's), `kwargs` |
 | `networks` | `model_class` (null) or `encoder_class` + `core` (`{class, kwargs}` or null) + `policy_class` + `value_class`; `kwargs` (passed to every constructor) |
-| `algorithm` | `algorithm_class` (APPO), `gamma` 0.99, `vtrace_lambda` 1.0, `vtrace_rho_bar` 1.0, `vtrace_c_bar` 1.0, `eps_clip` 0.2, `value_loss_coeff` 0.5, `entropy_coeff` 0.01, `max_grad_norm` 0.5, `num_epochs` 1, `minibatch_chunks` 0, `learning_rate` 3e-4, `lr_schedule` (`linear`; also `constant`, `cosine`; follows the share of `total_timesteps` done), `normalize_advantages` (true), `use_amp` (false), `amp_dtype` (`float16` / `bfloat16`), `use_torch_compile` (false) |
+| `algorithm` | `algorithm_class` (APPO), `gamma` 0.99, `vtrace_lambda` 1.0, `vtrace_rho_bar` 1.0, `vtrace_c_bar` 1.0, `eps_clip` 0.2, `value_loss_coeff` 0.5, `entropy_coeff` 0.01, `max_grad_norm` 0.5, `num_epochs` 1, `minibatch_chunks` 0, `learning_rate` 3e-4, `lr_schedule` (`linear`; also `constant`, `cosine`; follows the share of `total_timesteps` done), `normalize_advantages` (true), `use_amp` (false), `amp_dtype` (`float16` / `bfloat16`), `use_torch_compile` (false). AMP is CUDA-only and has not been run on a GPU yet (see Known limitations) |
 | `rollout` | `chunk_length` 256, `num_workers` 4, `envs_per_worker` 8, `torch_threads` 1, `weight_sync_interval_sec` 5, `vec_env` (`sync`/`subprocess`), `subproc_workers`, `match_refresh_interval_sec` 30 |
-| `learner` | `device` (`auto`), `batch_chunks` 16 (every update uses exactly this many chunks), `queue_size` 64, `weight_push_interval` 5, `torch_threads` (auto), `pin_memory` (false) |
+| `learner` | `device` (`auto`), `batch_chunks` 16 (every update uses exactly this many chunks), `queue_size` 64, `weight_push_interval` 5, `torch_threads` (auto), `pin_memory` (false). A CUDA `device` and `pin_memory` have not been run on a GPU yet (see Known limitations) |
 | `training` | `phase` (`self_play` / `league`), `total_timesteps` (global env steps), `seed`, `resume_from`, `kickstart_teacher`, `kickstart_lambda` 1.0, `kickstart_decay_steps` 50000, `kickstart_kl` (`forward` = KL(teacher‖student), or `reverse`) |
 | `self_play` | `checkpoint_interval` (train steps), `pool_size` (FIFO per agent), `latest_prob`, `self_play_ratio` (league: share of self-play matches), `pfsp_exponent`, `shuffle_seats` (true) |
 | `checkpoint` | `save_optimizer` (true: also save `trainer_state.pt`) |
@@ -347,6 +347,9 @@ Known limitations today:
   Online ELO is a progress indicator, not a selection-grade rating.
 - **Speed:** recurrent and attention cores unroll step by step on the learner. Worker inference is CPU only.
 - **Distributed:** see above.
+- **GPU:** never run on CUDA during SP1. All CUDA paths (learner device, AMP fp16/bf16, `pin_memory`,
+  kickstart/BC on CUDA) are covered only by `gpu`-marked tests that have not been executed yet; see
+  [`docs/GPU_CHECKS.md`](docs/GPU_CHECKS.md).
 
 ## Tests
 
