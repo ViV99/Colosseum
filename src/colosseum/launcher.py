@@ -31,6 +31,7 @@ from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.ipc import SharedCounter
 from colosseum.core.run_dir import RunDir
 from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig
+from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import run_child
 
@@ -372,6 +373,7 @@ class Launcher:
         # Set by launch(): the main process's single metrics sink (T6.3) and its queue-depth source.
         self._hub = None
         self._metrics_writer = None
+        self._wandb: WandBLogger | None = None
         self._trajectory_queues: dict[str, mp.Queue] = {}
 
     @property
@@ -457,6 +459,12 @@ class Launcher:
         from colosseum.metrics.jsonl import MetricsWriter
 
         self._metrics_writer = MetricsWriter(self._run_dir.metrics_path)
+        # Optional viewer of the same records (metrics.jsonl stays the source of truth, T6.4).
+        self._wandb = WandBLogger(
+            cfg.metrics,
+            run_name=self._run_dir.run_name or self._run_dir.root.name,
+            run_config=cfg.model_dump(mode="json", by_alias=True),
+        )
         self._hub = MetricsHub(
             writer=self._metrics_writer,
             ratings_path=self._run_dir.ratings_path,
@@ -466,6 +474,7 @@ class Launcher:
             console_interval_sec=cfg.metrics.console_interval_sec,
             initial_env_steps=int(self._env_step_counter.value),
             initial_train_steps={aid: int(s["policy_version"]) if s else 0 for aid, s in resume_states.items()},
+            wandb_logger=self._wandb,
         )
 
         # Start one learner per agent
@@ -647,14 +656,19 @@ class Launcher:
     def _finish_metrics(self, results_queue: mp.Queue, metrics_queue: mp.Queue,
                         coordinator: Coordinator) -> None:
         """Record what arrived during shutdown (final train metrics, last results), write the
-        final records and ratings.json; the metrics file is closed even if any of that fails."""
+        final records and ratings.json; the metrics file is closed and the WandB run finished
+        even if any of that fails."""
         try:
             self._drain_results_and_metrics(results_queue, metrics_queue, coordinator)
             self._hub.close(env_steps=int(self._env_step_counter.value),
                             ratings=coordinator.ratings_snapshot(),
                             queue_depths=_queue_depths(self._trajectory_queues))
         finally:
-            self._metrics_writer.close()
+            try:
+                self._metrics_writer.close()
+            finally:
+                if self._wandb is not None:
+                    self._wandb.finish()
 
     def _drain_results_and_metrics(self, results_queue: mp.Queue, metrics_queue: mp.Queue,
                                    coordinator: Coordinator) -> None:
