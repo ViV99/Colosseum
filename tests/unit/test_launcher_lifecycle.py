@@ -306,9 +306,13 @@ def test_drain_skips_checkpoint_queue_of_a_learner_killed_mid_message(tmp_path, 
     assert proc.exitcode == -signal.SIGKILL
 
     done = threading.Event()
+    repoll_seconds = []
 
     def drain_and_shutdown():
-        launcher._drain_all_checkpoints()
+        launcher._drain_all_checkpoints()  # starts the read, which gets stuck
+        t0 = time.monotonic()
+        launcher._drain_all_checkpoints()  # an in-progress read is only checked, not waited for
+        repoll_seconds.append(time.monotonic() - t0)
         launcher._shutdown()
         done.set()
 
@@ -317,6 +321,7 @@ def test_drain_skips_checkpoint_queue_of_a_learner_killed_mid_message(tmp_path, 
         threading.Thread(target=drain_and_shutdown, daemon=True).start()
         assert done.wait(20), "the main process blocked on a partial checkpoint payload"
     assert time.monotonic() - start < 1.0 + 3.0  # given up at the (patched) grace deadline
+    assert repoll_seconds and repoll_seconds[0] < 0.05
     assert ("An incomplete item on the checkpoint-agent_0 queue was never completed "
             "(learner-agent_0 died while sending)") in caplog.text
     assert saved == [{"agent_id": "agent_0", "policy_version": 1}]  # the complete item is kept
@@ -447,10 +452,9 @@ def test_run_workers_returns_an_exit_code(worker_exit, expected, tmp_path, monke
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
-def test_run_learner_returns_128_plus_signum(sig, tmp_path, monkeypatch, restore_root_logging):
-    import colosseum.distributed as distributed
-    import colosseum.learner.learner as learner_module
+@pytest.fixture
+def fake_learner_role(tmp_path, monkeypatch):
+    """run_distributed_learner without gRPC: returns the config path."""
     import colosseum.transport.grpc_transport as grpc_transport
     import colosseum.weight_store.grpc_store as grpc_store
 
@@ -465,20 +469,42 @@ def test_run_learner_returns_128_plus_signum(sig, tmp_path, monkeypatch, restore
         def close(self):
             pass
 
-    def fake_learner_process(*, stop_event, **kwargs):
-        os.kill(os.getpid(), sig)
-        assert stop_event.wait(10)
-
     monkeypatch.setattr(grpc_transport, "serve_trajectory_receiver", lambda *a, **k: FakeServer())
     monkeypatch.setattr(grpc_store, "GRPCWeightStore", FakeStore)
-    monkeypatch.setattr(learner_module, "learner_process", fake_learner_process)
     data = ttt_data()
     data["run"] = {"dir": str(tmp_path / "runs")}
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump(data))
+    return path
+
+
+@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
+def test_run_learner_returns_128_plus_signum(sig, fake_learner_role, monkeypatch, restore_root_logging):
+    import colosseum.distributed as distributed
+    import colosseum.learner.learner as learner_module
+
+    def fake_learner_process(*, stop_event, **kwargs):
+        os.kill(os.getpid(), sig)
+        assert stop_event.wait(10)
+
+    monkeypatch.setattr(learner_module, "learner_process", fake_learner_process)
     before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
-    assert distributed.run_distributed_learner(str(path), "agent_0", 0, "localhost:1") == 128 + sig
+    assert distributed.run_distributed_learner(str(fake_learner_role), "agent_0", 0, "localhost:1") == 128 + sig
     assert {s: signal.getsignal(s) for s in before} == before  # handlers restored
+
+
+def test_run_learner_setup_failure_leaves_signal_handlers_untouched(fake_learner_role, monkeypatch,
+                                                                     restore_root_logging, restore_global_rng):
+    import colosseum.distributed as distributed
+
+    def failing_seed(seed):
+        raise RuntimeError("seeding failed")
+
+    monkeypatch.setattr(distributed, "apply_global_seed", failing_seed)
+    before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
+    with pytest.raises(RuntimeError, match="seeding failed"):
+        distributed.run_distributed_learner(str(fake_learner_role), "agent_0", 0, "localhost:1")
+    assert {s: signal.getsignal(s) for s in before} == before
 
 
 def _raise_keyboard_interrupt(*args, **kwargs):

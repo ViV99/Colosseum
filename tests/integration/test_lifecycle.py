@@ -145,6 +145,22 @@ def test_sigint_to_process_group_exits_130_with_final_checkpoint(tmp_path):
     assert final_checkpoints(root), "final checkpoint not saved on Ctrl-C"
 
 
+def test_sigint_during_startup_exits_130_not_aborted(tmp_path):
+    """Ctrl-C while the CLI is still importing torch / loading the config (before the run's
+    signal handling exists): "Interrupted" and 130, never click's "Aborted!" with 1."""
+    marker = tmp_path / "entered"
+    with training_process(TTT_CONFIG, tmp_path, name="early", overrides=FOREVER,
+                          env={"COLOSSEUM_TEST_STARTUP_MARKER": str(marker)}) as (proc, _root):
+        assert wait_for(marker.exists, 60, interval=0.01)
+        os.killpg(proc.pid, signal.SIGINT)
+        assert proc.wait(30) == 130
+    stderr = (tmp_path / "early.stderr").read_text()
+    assert "Aborted" not in stderr and "Traceback" not in stderr
+    # Normally it lands in the imports ("Interrupted"); on a very fast start the run's own
+    # handler may already have taken over - both are a clean 130.
+    assert "Interrupted" in stderr or "Received SIGINT" in stderr
+
+
 def test_config_error_exit_1_without_traceback(tmp_path):
     bad = tmp_path / "bad.yaml"
     data = yaml.safe_load(TTT_CONFIG.read_text())

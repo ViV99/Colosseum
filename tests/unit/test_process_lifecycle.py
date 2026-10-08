@@ -223,19 +223,113 @@ def test_init_child_process_exits_if_the_parent_already_died(monkeypatch):
     assert exits == [1]
 
 
-def _report_sigint_disposition(out_dir: str) -> None:
-    """First statement of the child: what SIGINT does before any child init ran."""
-    Path(out_dir, "sigint").write_text("ignored" if signal.getsignal(signal.SIGINT) is signal.SIG_IGN else "not")
+def _sigint_blocked() -> bool:
+    return signal.SIGINT in signal.pthread_sigmask(signal.SIG_BLOCK, [])
 
 
-def test_start_process_starts_children_with_sigint_ignored(tmp_path):
-    before = signal.getsignal(signal.SIGINT)
-    proc = mp.get_context("spawn").Process(target=_report_sigint_disposition, args=(str(tmp_path),), daemon=True)
+def _report_sigint_state(out_dir: str) -> None:
+    """The child's SIGINT state at its first statement and after ``init_child_process``."""
+    import json
+
+    first = {"blocked": _sigint_blocked()}
+    init_child_process()
+    after = {"blocked": _sigint_blocked(), "ignored": signal.getsignal(signal.SIGINT) is signal.SIG_IGN}
+    Path(out_dir, "sigint.json").write_text(json.dumps({"first": first, "after": after}))
+
+
+def test_start_process_children_block_sigint_until_init(tmp_path):
+    """Blocked from the child's first instruction; after init ignored with a normal mask."""
+    import json
+
+    before_handler, before_blocked = signal.getsignal(signal.SIGINT), _sigint_blocked()
+    proc = mp.get_context("spawn").Process(target=_report_sigint_state, args=(str(tmp_path),), daemon=True)
     process_module.start_process(proc)
-    assert signal.getsignal(signal.SIGINT) is before  # the parent's handler is back right away
+    assert signal.getsignal(signal.SIGINT) is before_handler and _sigint_blocked() == before_blocked
     proc.join(60)
     assert proc.exitcode == 0
-    assert (tmp_path / "sigint").read_text() == "ignored"
+    state = json.loads((tmp_path / "sigint.json").read_text())
+    assert state == {"first": {"blocked": True}, "after": {"blocked": False, "ignored": True}}
+
+
+def test_sigint_during_start_reaches_the_parent_handler_afterwards():
+    """A Ctrl-C arriving while a child starts is delivered once the start is over, not lost."""
+    received = []
+
+    class SignallingProcess:
+        def start(self):
+            os.kill(os.getpid(), signal.SIGINT)
+
+    old = signal.signal(signal.SIGINT, lambda signum, frame: received.append(signum))
+    try:
+        process_module.start_process(SignallingProcess())
+        deadline = time.monotonic() + 5
+        while not received and time.monotonic() < deadline:
+            time.sleep(0.01)
+    finally:
+        signal.signal(signal.SIGINT, old)
+    assert received == [signal.SIGINT]
+
+
+def _ignore_sigterm_until_killed(ready) -> None:
+    signal.signal(signal.SIGTERM, signal.SIG_IGN)
+    ready.set()
+    time.sleep(120)
+
+
+def test_kill_remaining_stops_many_stragglers_in_shared_time():
+    ctx = mp.get_context("spawn")
+    sup = ProcessSupervisor(ctx.Event())
+    readies = []
+    for i in range(3):
+        ready = ctx.Event()
+        readies.append(ready)
+        proc = ctx.Process(target=_ignore_sigterm_until_killed, args=(ready,), daemon=True)
+        proc.start()
+        sup.add(f"worker-{i}", proc)
+    assert all(r.wait(60) for r in readies)
+    start = time.monotonic()
+    assert sup.kill_remaining() == ["worker-0", "worker-1", "worker-2"]
+    assert time.monotonic() - start < 2.5  # one shared terminate wait, then kill: not 1 s per child
+    assert sup.alive() == []
+
+
+def test_install_signal_handlers_twice_is_a_noop():
+    stop = mp.get_context("spawn").Event()
+    sup = ProcessSupervisor(stop)
+    before = signal.getsignal(signal.SIGTERM)
+    sup.install_signal_handlers()
+    try:
+        pipe, watcher = sup._pipe, sup._watcher
+        sup.install_signal_handlers()
+        assert (sup._pipe, sup._watcher) == (pipe, watcher)
+    finally:
+        sup.restore_signal_handlers()
+    assert signal.getsignal(signal.SIGTERM) == before  # one restore undoes the single install
+
+
+def test_restore_keeps_the_pipe_open_if_the_watcher_does_not_exit(caplog):
+    stop = mp.get_context("spawn").Event()
+    sup = ProcessSupervisor(stop)
+    sup.install_signal_handlers()
+    read_fd = sup._pipe[0]
+    real_watcher = sup._watcher
+
+    class StuckWatcher:
+        def join(self, timeout=None):
+            pass
+
+        def is_alive(self):
+            return True
+
+    sup._watcher = StuckWatcher()
+    with caplog.at_level(logging.WARNING, logger="colosseum.utils.process"):
+        sup.restore_signal_handlers()
+    try:
+        os.fstat(read_fd)  # still open: never closed under a (possibly) reading thread
+        assert "did not exit" in caplog.text
+    finally:
+        real_watcher.join(5)  # the real one saw EOF
+        os.close(read_fd)
 
 
 def test_signal_handler_cannot_deadlock_on_the_stop_event_lock():

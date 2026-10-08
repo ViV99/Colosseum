@@ -209,9 +209,7 @@ def run_distributed_learner(
         return algo_cls(model, acfg.algorithm, **kwargs)
 
     stop_event = threading.Event()
-    # SIGINT / SIGTERM set stop_event (and are remembered for the exit code).
     supervisor = ProcessSupervisor(stop_event)
-    supervisor.install_signal_handlers()
 
     # Seed right before learner_process builds the model (validate_config above also draws
     # from the RNGs). Same per-agent stream as a local-mode learner.
@@ -258,6 +256,9 @@ def run_distributed_learner(
         f"weights -> {weight_store_address}"
     )
     try:
+        # SIGINT / SIGTERM set stop_event (and are remembered for the exit code); installed
+        # inside the try so the finally always restores them.
+        supervisor.install_signal_handlers()
         learner_process(
             agent_id=agent_id,
             algorithm_factory=algorithm_factory,

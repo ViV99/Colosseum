@@ -97,23 +97,24 @@ def _kill_group(proc: subprocess.Popen) -> None:
     proc.wait()
 
 
-def start_train(config: Path, tmp_path: Path, name: str = "run",
-                overrides: dict[str, str] | None = None) -> tuple[subprocess.Popen, Path]:
+def start_train(config: Path, tmp_path: Path, name: str = "run", overrides: dict[str, str] | None = None,
+                env: dict[str, str] | None = None) -> tuple[subprocess.Popen, Path]:
     """Start training in its own session; stdout/stderr go to files next to the run dir."""
     run_parent = tmp_path / "runs"
     # The child keeps its own copies of the descriptors; the parent's handles close here.
     with open(tmp_path / f"{name}.stdout", "w") as out, open(tmp_path / f"{name}.stderr", "w") as err:
-        proc = subprocess.Popen(train_cmd(config, run_parent, name, overrides), cwd=REPO_ROOT, env=child_env(),
+        proc = subprocess.Popen(train_cmd(config, run_parent, name, overrides), cwd=REPO_ROOT,
+                                env={**child_env(), **(env or {})},
                                 stdout=out, stderr=err, text=True, start_new_session=True)
     return proc, run_parent / name
 
 
 @contextmanager
-def training_process(config: Path, tmp_path: Path, name: str = "run",
-                     overrides: dict[str, str] | None = None) -> Iterator[tuple[subprocess.Popen, Path]]:
+def training_process(config: Path, tmp_path: Path, name: str = "run", overrides: dict[str, str] | None = None,
+                     env: dict[str, str] | None = None) -> Iterator[tuple[subprocess.Popen, Path]]:
     """``start_train`` whose whole process group (main, children, env grandchildren) is
     SIGKILLed and reaped on exit, so a failing test leaves no orphans behind."""
-    proc, root = start_train(config, tmp_path, name, overrides)
+    proc, root = start_train(config, tmp_path, name, overrides, env)
     try:
         yield proc, root
     finally:

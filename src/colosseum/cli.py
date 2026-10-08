@@ -9,8 +9,36 @@ from contextlib import contextmanager
 
 import click
 
+# Test hook: when set, the CLI touches this file as soon as Ctrl-C is handled by
+# ``_interrupts`` (lifecycle tests send SIGINT during startup only after it exists).
+_STARTUP_MARKER_ENV = "COLOSSEUM_TEST_STARTUP_MARKER"
 
-@click.group()
+
+@contextmanager
+def _interrupts() -> Iterator[None]:
+    """Ctrl-C before the run installs its own signal handling (imports, config loading,
+    validation): one line on stderr and exit code 130, as after a handled SIGINT (click
+    would turn it into "Aborted!" with exit code 1). Wraps every command (see
+    ``_InterruptibleGroup``), so each command's imports and work are inside it."""
+    try:
+        marker = os.environ.get(_STARTUP_MARKER_ENV)
+        if marker:
+            open(marker, "a").close()
+        yield
+    except KeyboardInterrupt:
+        click.echo("Interrupted", err=True)
+        sys.exit(130)
+
+
+class _InterruptibleGroup(click.Group):
+    """Runs the group callback and the chosen command inside ``_interrupts``."""
+
+    def invoke(self, ctx: click.Context):
+        with _interrupts():
+            return super().invoke(ctx)
+
+
+@click.group(cls=_InterruptibleGroup)
 def main() -> None:
     """Colosseum — Distributed RL Training Framework."""
     # User code (e.g. ``examples.*`` or ``my_game.*``) is imported relative to the cwd.
@@ -31,18 +59,6 @@ def _config_errors() -> Iterator[None]:
     except (ConfigError, EnvContractError) as e:
         click.echo(f"Config error: {e}", err=True)
         sys.exit(1)
-
-
-@contextmanager
-def _interrupts() -> Iterator[None]:
-    """Ctrl-C before the run installs its own signal handling (config loading, validation):
-    one line on stderr and exit code 130, as after a handled SIGINT (click would turn it
-    into "Aborted!" with exit code 1)."""
-    try:
-        yield
-    except KeyboardInterrupt:
-        click.echo("Interrupted", err=True)
-        sys.exit(130)
 
 
 _SET_HELP_YAML = (
@@ -74,11 +90,10 @@ def train(config: str, overrides: tuple[str, ...]) -> None:
 
     Exit code: 0 budget reached, 1 config error or a child process died, 130 SIGINT, 143 SIGTERM.
     """
-    from colosseum.launcher import run_training
+    with _config_errors():
+        from colosseum.launcher import run_training  # imports torch: about a second
 
-    override_dict = _parse_overrides(overrides)
-    with _interrupts(), _config_errors():
-        code = run_training(config, overrides=override_dict or None)
+        code = run_training(config, overrides=_parse_overrides(overrides) or None)
     sys.exit(code)
 
 
@@ -212,11 +227,11 @@ def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
               help="Override config values (e.g., --set rollout.num_workers=8)." + _SET_HELP_YAML)
 def run_learner_cmd(config: str, agent: str, traj_port: int, weight_store: str, overrides: tuple[str, ...]) -> None:
     """Run one agent's learner as a gRPC service (distributed mode)."""
-    from colosseum.distributed import run_distributed_learner
+    with _config_errors():
+        from colosseum.distributed import run_distributed_learner
 
-    override_dict = _parse_overrides(overrides)
-    with _interrupts(), _config_errors():
-        code = run_distributed_learner(config, agent, traj_port, weight_store, overrides=override_dict or None)
+        code = run_distributed_learner(config, agent, traj_port, weight_store,
+                                       overrides=_parse_overrides(overrides) or None)
     sys.exit(code)
 
 
@@ -229,8 +244,6 @@ def run_learner_cmd(config: str, agent: str, traj_port: int, weight_store: str, 
               help="Override config values." + _SET_HELP_YAML)
 def run_workers_cmd(config: str, weight_store: str, learners: tuple[str, ...], overrides: tuple[str, ...]) -> None:
     """Run rollout workers feeding remote learners over gRPC (distributed mode)."""
-    from colosseum.distributed import run_distributed_workers
-
     learner_addresses: dict[str, str] = {}
     for spec in learners:
         if "=" not in spec:
@@ -238,9 +251,11 @@ def run_workers_cmd(config: str, weight_store: str, learners: tuple[str, ...], o
         aid, addr = spec.split("=", 1)
         learner_addresses[aid] = addr
 
-    override_dict = _parse_overrides(overrides)
-    with _interrupts(), _config_errors():
-        code = run_distributed_workers(config, weight_store, learner_addresses, overrides=override_dict or None)
+    with _config_errors():
+        from colosseum.distributed import run_distributed_workers
+
+        code = run_distributed_workers(config, weight_store, learner_addresses,
+                                       overrides=_parse_overrides(overrides) or None)
     sys.exit(code)
 
 

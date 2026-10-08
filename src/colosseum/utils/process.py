@@ -42,32 +42,38 @@ def init_child_process() -> None:
     """Signal policy for every child: ignore Ctrl-C (the main process coordinates the stop)
     and die if the main process disappears (R3-17, R6-07).
 
-    ``start_process`` already starts children with SIGINT ignored; this keeps it so for
-    processes started otherwise. A parent that died before ``PR_SET_PDEATHSIG`` was set
+    ``start_process`` starts children with SIGINT blocked; ignoring it first discards a
+    Ctrl-C that is pending since then, and only then is it unblocked (CPython's
+    resource_tracker pattern), so this process and its own children have SIGINT ignored
+    with a normal signal mask. A parent that died before ``PR_SET_PDEATHSIG`` was set
     sends no signal any more, so that case exits right here.
     """
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    if hasattr(signal, "pthread_sigmask"):
+        signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
     set_parent_death_signal(signal.SIGTERM)
     if not parent_alive():
         os._exit(1)
 
 
 def start_process(proc: Any) -> None:
-    """``proc.start()`` with SIGINT ignored meanwhile, so the child inherits the ignored
-    disposition and ignores Ctrl-C from its first instruction (spawn bootstrap and imports
-    included), before ``init_child_process`` runs.
+    """``proc.start()`` with SIGINT blocked in this thread meanwhile.
 
-    A Ctrl-C to this process during the start itself is lost (pressing it again works).
-    Off the main thread signal dispositions cannot change, so the child is just started.
+    The child inherits the blocked mask, so a Ctrl-C cannot interrupt it from its first
+    instruction (spawn bootstrap and imports included) until ``init_child_process`` ignores
+    SIGINT and unblocks it. The target of every process started this way must therefore
+    run ``init_child_process`` (``run_child`` and the subprocess-env loop do). A Ctrl-C
+    reaching this process during the start stays pending and is delivered to its handler
+    after the unblock, so it is not lost.
     """
-    if threading.current_thread() is not threading.main_thread():
+    if not hasattr(signal, "pthread_sigmask"):
         proc.start()
         return
-    previous = signal.signal(signal.SIGINT, signal.SIG_IGN)
+    previous_mask = signal.pthread_sigmask(signal.SIG_BLOCK, {signal.SIGINT})
     try:
         proc.start()
     finally:
-        signal.signal(signal.SIGINT, previous)
+        signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
 
 
 def parent_alive() -> bool:
@@ -175,6 +181,9 @@ class ProcessSupervisor:
         if threading.current_thread() is not threading.main_thread():
             logger.debug("Not on the main thread; signal handlers not installed")
             return
+        if self._pipe is not None:
+            logger.debug("Signal handlers already installed")
+            return
         read_fd, write_fd = os.pipe()
         os.set_blocking(write_fd, False)
         self._pipe = (read_fd, write_fd)
@@ -210,10 +219,15 @@ class ProcessSupervisor:
             read_fd, write_fd = self._pipe
             self._pipe = None
             os.close(write_fd)  # the watcher reads EOF and exits
-            if self._watcher is not None:
-                self._watcher.join(1.0)
-                self._watcher = None
-            os.close(read_fd)
+            watcher, self._watcher = self._watcher, None
+            if watcher is not None:
+                watcher.join(1.0)
+            if watcher is not None and watcher.is_alive():
+                # Closing the fd under a still-reading thread could hand its number to an
+                # unrelated file the thread would then read from; leave it open instead.
+                logger.warning("Signal watcher thread did not exit; leaving its pipe open")
+            else:
+                os.close(read_fd)
 
     def first_failure(self, nonzero_only: bool = False) -> ChildFailure | None:
         """The first child that has exited (with a non-zero code if ``nonzero_only``)."""
@@ -241,17 +255,24 @@ class ProcessSupervisor:
                 poll()
             if not self.alive():
                 return True
-            time.sleep(0.05)
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         return not self.alive()
 
-    def kill_remaining(self) -> list[str]:
-        """terminate(), then kill() whatever is still alive. Returns the names that had to be stopped."""
+    def kill_remaining(self, timeout: float = 1.0) -> list[str]:
+        """terminate() every live child, wait up to ``timeout`` for all of them together, then
+        kill() the survivors and wait up to ``timeout`` again: about 2 x ``timeout`` at most,
+        however many stragglers. Returns the names that had to be stopped."""
         remaining = self.alive()
         for name in remaining:
             self._procs[name].terminate()
-        for name in remaining:
-            self._procs[name].join(1.0)
-        for name in self.alive():
+        self._join_all(remaining, timeout)
+        survivors = self.alive()
+        for name in survivors:
             self._procs[name].kill()
-            self._procs[name].join(1.0)
+        self._join_all(survivors, timeout)
         return remaining
+
+    def _join_all(self, names: list[str], timeout: float) -> None:
+        deadline = time.monotonic() + timeout
+        for name in names:
+            self._procs[name].join(max(0.0, deadline - time.monotonic()))

@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import multiprocessing.queues
 import queue
 import signal
 import threading
@@ -377,20 +378,29 @@ class _QueueReader:
         items, self._items = self._items, []
         return items
 
-    def drain(self, wait: float = 0.5) -> list:
-        """Items read so far; starts a read when the queue has data. Never blocks longer than ``wait``."""
+    def drain(self, wait: float = 0.05) -> list:
+        """Items read so far; starts a read when the queue has data.
+
+        A new read gets up to ``wait`` seconds to finish, so small items come back from this
+        call; a read already in progress is only checked, never waited for, so a stuck
+        reader costs nothing per poll. Non-``mp.Queue`` objects (e.g. ``queue.Queue``),
+        whose ``get_nowait`` never blocks, are read synchronously.
+        """
         if self.abandoned:
             salvaged, self._salvaged = self._salvaged, []
             return salvaged  # complete items read before the stuck message
-        if self._thread is None:
-            if self._q.empty():
-                return []
-            self._thread = threading.Thread(target=self._read, name=f"drain-{self._label}", daemon=True)
-            self._thread.start()
-        self._thread.join(wait)
-        if self._thread.is_alive():
-            return []  # still reading: a large item is arriving, or the message is incomplete
-        self._thread = None
+        if not isinstance(self._q, mp.queues.Queue):
+            self._read()
+        else:
+            if self._thread is None:
+                if self._q.empty():
+                    return []
+                self._thread = threading.Thread(target=self._read, name=f"drain-{self._label}", daemon=True)
+                self._thread.start()
+                self._thread.join(wait)
+            if self._thread.is_alive():
+                return []  # still reading: a large item is arriving, or the message is incomplete
+            self._thread = None
         error, self._error = self._error, None
         items = self._take()
         if error is not None:
@@ -986,12 +996,11 @@ class Launcher:
         abandon the stuck ones (a producer died mid-message) and take what they read before."""
         while any(r.busy for r in self._readers.values()) and time.monotonic() < deadline:
             poll()
-            time.sleep(0.05)
+            time.sleep(min(0.05, max(0.0, deadline - time.monotonic())))
         stuck = [r for r in self._readers.values() if r.busy and not r.abandoned]
         for reader in stuck:
             reader.abandon()
-        if stuck:
-            poll()
+        poll()  # what the finished reads got (and the abandoned ones' complete items)
 
 
 def run_training(config_path: str, overrides: dict | None = None) -> int:
