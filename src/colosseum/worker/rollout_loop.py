@@ -574,7 +574,7 @@ class RolloutLoop:
                 network_id=self._slot_network_map[e][p],
                 outcome=float(outcomes[p]),
                 reward=float(rewards[p]),
-                rank=None if rank is None else int(rank),
+                rank=None if rank is None else float(rank),
             ))
         self._io.report_result(MatchResult(
             match_id=f"w{self.worker_id}_e{e}_ep{int(self._ep_counter[e])}",

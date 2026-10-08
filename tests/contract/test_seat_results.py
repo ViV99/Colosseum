@@ -9,6 +9,8 @@ import pytest
 
 from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
+from colosseum.core.errors import EnvContractError
+from colosseum.core.outcomes import outcomes_from_rewards
 from dataflow_helpers import EnvFactory, FFA4Env, ProbeModel, make_loop, two_seat_result
 
 REPO = Path(__file__).resolve().parents[2]
@@ -46,15 +48,16 @@ def test_coordinator_consumes_seats_without_collisions(tmp_path):
     loop.step()
     loop.step()
     result = col.results[0]
-    by_agent = Coordinator._seat_outcomes_by_agent(result)
-    assert set(by_agent) == {"a", "b", "c"}
-    assert by_agent["a"] == pytest.approx([1.0, 1 / 3])
-    assert by_agent["b"] == pytest.approx([2 / 3])
-    assert by_agent["c"] == pytest.approx([0.0])
     coord = _coordinator(tmp_path, ("a", "b", "c"))
     coord.report_match_result(result)
     assert len(coord.match_results[-1].seats) == 4
-    assert coord.elo.get("a") > coord.elo.get("c")   # a averages 2/3 over its two seats
+    # Every cross-agent seat pair counts: a holds seats 0 (1st) and 2 (3rd).
+    wr = coord.win_rates
+    assert (wr.games("a", "b"), wr.games("a", "c"), wr.games("b", "c")) == (2, 2, 1)
+    assert wr.get_win_rate("a", "b") == 0.5   # a0 > b1, a2 < b1
+    assert wr.get_win_rate("a", "c") == 1.0
+    assert wr.get_win_rate("b", "c") == 1.0
+    assert coord.elo.get("a") > coord.elo.get("c")
     assert coord.elo.get("b") > coord.elo.get("c")
 
 
@@ -63,3 +66,41 @@ def test_same_agent_seats_carry_no_cross_agent_signal(tmp_path):
     coord.report_match_result(two_seat_result("a", 1.0, "a", 0.0, network_b="ckpt_v1"))
     assert coord.win_rates.get_win_rate("a", "a") == 0.5
     assert coord.elo.get("a") == coord.elo.initial_rating
+    assert coord.past_win_rate.get("a") == 1.0
+
+
+def _ffa_result(terminal_info):
+    loop, col = make_loop(EnvFactory(FFA4Env, terminal_info=terminal_info), ProbeModel,
+                          agent_ids=("a", "b", "c", "d"), num_envs=1,
+                          slot_agent_map=[["a", "b", "c", "d"]],
+                          collect_mask=[[True, True, True, True]])
+    loop.step()
+    loop.step()
+    assert len(col.results) == 1
+    return col.results[0]
+
+
+def test_worker_falls_back_to_reward_outcomes_without_env_signal():
+    result = _ffa_result(lambda p: {})
+    assert [s.rank for s in result.seats] == [None] * 4
+    assert [s.reward for s in result.seats] == pytest.approx([3.0, 2.0, 1.0, 0.0])
+    assert [s.outcome for s in result.seats] == outcomes_from_rewards([3.0, 2.0, 1.0, 0.0])
+    assert [s.outcome for s in result.seats] == [1.0, 0.0, 0.0, 0.0]
+
+
+def test_worker_keeps_fractional_ranks():
+    ranks = [1, 2.5, 2.5, 4]
+    result = _ffa_result(lambda p: {"rank": ranks[p]})
+    assert [s.rank for s in result.seats] == [1.0, 2.5, 2.5, 4.0]
+    assert [s.outcome for s in result.seats] == pytest.approx([1.0, 0.5, 0.5, 0.0])
+
+
+@pytest.mark.parametrize("bad", [1.5, -0.1, float("nan")])
+def test_worker_rejects_env_outcome_outside_unit_interval(bad):
+    with pytest.raises(EnvContractError, match="outcome"):
+        _ffa_result(lambda p: {"outcome": bad if p == 0 else 0.0})
+
+
+def test_worker_rejects_non_finite_rank():
+    with pytest.raises(EnvContractError, match="rank"):
+        _ffa_result(lambda p: {"rank": float("inf") if p == 0 else p + 1})

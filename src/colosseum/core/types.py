@@ -195,6 +195,7 @@ class SeatResult:
             derived from episode rewards.
         reward: Undiscounted episode return of the seat.
         rank: The env's terminal ``rank`` for the seat (1 = best), if provided.
+            Kept as a float: ties may be reported as fractional ranks (e.g. 2.5).
     """
 
     seat: int
@@ -202,7 +203,7 @@ class SeatResult:
     network_id: str
     outcome: float
     reward: float
-    rank: int | None = None
+    rank: float | None = None
 
 
 @dataclass

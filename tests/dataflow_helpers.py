@@ -486,9 +486,16 @@ class InfoLeakEnv(_Base):
 
 
 class FFA4Env(_Base):
-    """4-player simultaneous FFA, 2 steps per episode; terminal rank of seat p is p + 1."""
+    """4-player simultaneous FFA, 2 steps per episode; seat p's episode reward is 3 - p.
+
+    ``terminal_info(p)`` gives seat p's terminal info; the default reports rank p + 1.
+    """
 
     NUM_PLAYERS = 4
+
+    def __init__(self, env_id: int = 0, terminal_info: Callable[[int], dict] | None = None) -> None:
+        super().__init__(env_id)
+        self.terminal_info = terminal_info or (lambda p: {"rank": p + 1})
 
     def reset(self, seed=None):
         self.ep += 1
@@ -499,7 +506,7 @@ class FFA4Env(_Base):
         self.t += 1
         done = self.t >= 2
         rew = {p: (float(3 - p) if done else 0.0) for p in range(4)}
-        info = {p: ({"rank": p + 1} if done else {}) for p in range(4)}
+        info = {p: (self.terminal_info(p) if done else {}) for p in range(4)}
         return self._obs(), rew, {p: done for p in range(4)}, {p: False for p in range(4)}, info
 
 

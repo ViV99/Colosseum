@@ -5,7 +5,7 @@ Manages:
 - Matchmaking (self-play, PFSP)
 - Checkpoint scheduling
 - Match result tracking
-- ELO ratings and win rate tracking
+- Pairwise ELO, win-rate matrix and latest-vs-past win rate (from per-seat results)
 """
 
 from __future__ import annotations
@@ -18,9 +18,10 @@ from pathlib import Path
 from colosseum.coordinator.agent_pool import AgentPool
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.coordinator.matchmaker import BaseMatchmaker, PFSPMatchmaker, SelfPlayMatchmaker
-from colosseum.coordinator.ratings import EloRating, WinRateTracker
+from colosseum.coordinator.ratings import EloRating, PastWinRate, WinRateTracker, pairwise_score
 from colosseum.core.config import ColosseumConfig, TrainingPhase
 from colosseum.core.types import MatchConfig, MatchResult
+from colosseum.worker.rollout_loop import LATEST_NETWORK_ID
 
 logger = logging.getLogger(__name__)
 
@@ -43,6 +44,7 @@ class Coordinator:
         self._match_results: deque[MatchResult] = deque(maxlen=10000)
         self._elo = EloRating()
         self._win_rates = WinRateTracker()
+        self._past = PastWinRate()
         self._refresh_round = 0
         self._matchmaker: BaseMatchmaker = self._build_matchmaker()
 
@@ -61,6 +63,10 @@ class Coordinator:
     @property
     def win_rates(self) -> WinRateTracker:
         return self._win_rates
+
+    @property
+    def past_win_rate(self) -> PastWinRate:
+        return self._past
 
     @property
     def refresh_round(self) -> int:
@@ -129,58 +135,48 @@ class Coordinator:
             return ckpt_id
         return None
 
-    @staticmethod
-    def _seat_outcomes_by_agent(result: MatchResult) -> dict[str, list[float]]:
-        """Every seat's outcome, grouped by base agent id (no seat is dropped).
-
-        One agent may hold several seats (self-play latest vs latest, an N-player
-        arena that repeats agents); each seat contributes its own outcome.
-        """
-        by_agent: dict[str, list[float]] = {}
-        for seat in result.seats:
-            by_agent.setdefault(seat.agent_id, []).append(float(seat.outcome))
-        return by_agent
-
     def report_match_result(self, result: MatchResult) -> None:
-        """Record a per-seat result and update ratings.
+        """Update ratings from one finished match.
 
-        Seat outcomes are averaged per base agent (the unit PFSP selects over),
-        then every pair of DIFFERENT agents updates the win-rate matrix and ELO.
-        Same-agent pairs (latest vs its own checkpoint, or two seats of one
-        agent) carry no cross-agent signal and are skipped. Pairwise seat
-        ratings replace this in T5.2.
+        Every pair of seats is compared by ``outcome`` (higher 1, equal 0.5, lower 0).
+        - Different base agents: update the win-rate matrix and ELO. ELO deltas are
+          computed from the pre-match ratings with K scaled by 1/(N-1).
+        - Same agent, one seat ``latest`` and the other a checkpoint: update
+          ``wr_vs_past`` from the latest seat's point of view.
+        - Two ``latest`` seats of one agent carry no signal and are skipped.
         """
         self._match_results.append(result)
-
-        by_agent = self._seat_outcomes_by_agent(result)
-        agg = {a: sum(v) / len(v) for a, v in by_agent.items()}
-
-        agents = list(agg.keys())
-        for i, a in enumerate(agents):
-            for j, b in enumerate(agents):
-                if i >= j:
-                    continue  # each unordered pair once; skips same-agent
-                outcome_a = agg[a]
-                outcome_b = agg[b]
-
-                self._win_rates.record(a, b, outcome_a)
-
-                if outcome_a > outcome_b:
-                    self._elo.update(a, b, draw=False)
-                elif outcome_b > outcome_a:
-                    self._elo.update(b, a, draw=False)
-                else:
-                    self._elo.update(a, b, draw=True)
+        seats = result.seats
+        n = len(seats)
+        if n < 2:
+            return
+        cross: list[tuple[str, str, float]] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, b = seats[i], seats[j]
+                score = pairwise_score(a.outcome, b.outcome)
+                if a.agent_id != b.agent_id:
+                    cross.append((a.agent_id, b.agent_id, score))
+                elif a.network_id == LATEST_NETWORK_ID and b.network_id != LATEST_NETWORK_ID:
+                    self._past.record(a.agent_id, score)
+                elif b.network_id == LATEST_NETWORK_ID and a.network_id != LATEST_NETWORK_ID:
+                    self._past.record(b.agent_id, 1.0 - score)
+        for a_id, b_id, score in cross:
+            self._win_rates.record_pair(a_id, b_id, score)
+        if cross:
+            self._elo.update_pairs(cross, k_scale=1.0 / (n - 1))
 
     @property
     def match_results(self) -> list[MatchResult]:
         return self._match_results
 
-    def get_ratings_summary(self) -> dict:
-        """Get a summary of all agent ratings."""
-        trainable = self._agent_pool.list_trainable()
-        agent_ids = [a.agent_id for a in trainable]
+    def ratings_snapshot(self) -> dict:
+        """JSON-serializable ratings of all trainable agents (persisted by the metrics hub)."""
+        ids = [a.agent_id for a in self._agent_pool.list_trainable()]
         return {
-            "elo": {aid: self._elo.get(aid) for aid in agent_ids},
-            "win_rates": self._win_rates.get_win_rate_matrix(agent_ids),
+            "elo": {a: self._elo.get(a) for a in ids},
+            "win_rates": self._win_rates.get_win_rate_matrix(ids),
+            "games": self._win_rates.get_games_matrix(ids),
+            "wr_vs_past": {a: self._past.get(a) for a in ids},
+            "past_games": {a: self._past.games(a) for a in ids},
         }

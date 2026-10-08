@@ -1,8 +1,7 @@
 """Regression tests for fixes from the critical review (КРИТИЧЕСКИЙ_ОБЗОР.md).
 
 Covers:
-  C4  — coordinator aggregates per-seat outcomes to the base agent_id so
-        ELO / win-rate / PFSP actually see cross-agent results.
+  C4  — PFSP sees real cross-agent win rates from reported match results.
   C9  — action_masks survive chunk serialization (gRPC path).
   C14 — match outcomes prefer the env's authoritative rank/outcome signal.
 """
@@ -49,7 +48,7 @@ def test_outcomes_fall_back_when_signal_incomplete():
 
 
 # ---------------------------------------------------------------------------
-# C4: coordinator key aggregation + PFSP using real win rates
+# C4: PFSP using real win rates
 # ---------------------------------------------------------------------------
 
 def _make_cfg(tmpdir, phase="league", latest_prob=0.5, envs_per_worker=8):
@@ -83,34 +82,6 @@ def _make_coordinator(tmpdir, phase="league"):
     return Coordinator(_make_cfg(tmpdir, phase=phase))
 
 
-def test_coordinator_aggregates_composite_keys():
-    with tempfile.TemporaryDirectory() as tmp:
-        coord = _make_coordinator(tmp)
-        coord.agent_pool.register_trainable("agent_alpha")
-        coord.agent_pool.register_trainable("agent_beta")
-
-        # Worker reports one seat per player, each with its base agent_id.
-        for _ in range(5):
-            coord.report_match_result(two_seat_result("agent_alpha", 1.0, "agent_beta", 0.0))
-
-        # Win rate must be queryable by BASE agent_id (what PFSP uses), not 0.5 default.
-        wr = coord.win_rates.get_win_rate("agent_alpha", "agent_beta")
-        assert wr == 1.0, f"expected 1.0, got {wr}"
-        assert coord.elo.get("agent_alpha") > coord.elo.get("agent_beta")
-
-
-def test_coordinator_skips_same_agent_pairs():
-    with tempfile.TemporaryDirectory() as tmp:
-        coord = _make_coordinator(tmp)
-        coord.agent_pool.register_trainable("agent_alpha")
-
-        # Solo self-play: latest vs a historical checkpoint of the SAME agent.
-        coord.report_match_result(
-            two_seat_result("agent_alpha", 1.0, "agent_alpha", 0.0, network_b="ckpt_v1"))
-        # No cross-agent signal should be recorded.
-        assert coord.win_rates.get_win_rate("agent_alpha", "agent_alpha") == 0.5
-
-
 def test_pfsp_uses_win_rates():
     """PFSP should prioritize the harder opponent (lower win rate)."""
     with tempfile.TemporaryDirectory() as tmp:
@@ -124,6 +95,10 @@ def test_pfsp_uses_win_rates():
             coord.report_match_result(two_seat_result("alpha", 0.0, "gamma", 1.0, match_id="m2"))
 
         import collections
+
+        from colosseum.coordinator.matchmaker import PFSPMatchmaker
+
+        assert isinstance(coord._matchmaker, PFSPMatchmaker)
         picks = collections.Counter(
             coord._matchmaker.select_opponents("alpha", ["beta", "gamma"], k=400))
 

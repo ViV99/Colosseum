@@ -139,3 +139,33 @@ def test_single_player_env_gets_solo_matches(tmp_path):
     coord = make_coordinator(tmp_path, ["a", "b"], phase="league", num_players=1, self_play_ratio=0.0)
     matches = coord.generate_match_configs(4, env_offset=0)
     assert all(len(m.player_slots) == 1 and m.player_slots[0].collect_trajectories for m in matches)
+
+
+def test_league_self_play_ratio_one_gives_only_solo_matches(tmp_path, monkeypatch):
+    coord = make_coordinator(tmp_path, ["a", "b", "c"], phase="league", self_play_ratio=1.0)
+    fake_checkpoints(monkeypatch, coord)
+    matches = run_rounds(coord, workers=2, envs_per_worker=4, rounds=20)
+    assert all(len({s.agent_id for s in m.player_slots}) == 1 for m in matches)
+    assert Counter(m.player_slots[0].agent_id for m in matches).keys() == {"a", "b", "c"}
+
+
+def test_league_single_agent_falls_back_to_solo(tmp_path, monkeypatch):
+    coord = make_coordinator(tmp_path, ["solo"], phase="league", self_play_ratio=0.0)
+    fake_checkpoints(monkeypatch, coord)
+    matches = run_rounds(coord, workers=1, envs_per_worker=4, rounds=10)
+    assert len(matches) == 40
+    for m in matches:
+        assert len(m.player_slots) == 2 and {s.agent_id for s in m.player_slots} == {"solo"}
+        assert any(s.collect_trajectories and s.checkpoint_id is None for s in m.player_slots)
+
+
+def test_four_player_arena_seats_balanced_within_5_percent(tmp_path):
+    agents = ["a", "b", "c"]
+    coord = make_coordinator(tmp_path, agents, phase="league", num_players=4, self_play_ratio=0.0, seed=3)
+    matches = run_rounds(coord, workers=2, envs_per_worker=8, rounds=200)
+    for agent in agents:
+        seats = Counter(i for m in matches for i, s in enumerate(m.player_slots) if s.agent_id == agent)
+        total = sum(seats.values())
+        assert total > 2000
+        for i in range(4):
+            assert abs(seats[i] / total - 0.25) <= 0.05, (agent, seats)
