@@ -203,3 +203,17 @@ def test_weights_payload_rejects_non_numeric_dtypes(value):
     validate_state_dict_payload(numeric)  # bool/int/uint/float/complex are accepted
     with pytest.raises(ValueError, match="'bad'.*dtype"):
         validate_state_dict_payload({"w": np.zeros(2, np.float32), "bad": value})
+
+
+def test_dimension_too_large_for_numpy_raises_value_error():
+    """(0, 10**30) declares 0 bytes, but numpy cannot represent the dim (OverflowError)."""
+    import io
+    import zipfile
+
+    npy = io.BytesIO()
+    np.lib.format.write_array_header_1_0(npy, {"descr": "<f4", "fortran_order": False, "shape": (0, 10**30)})
+    blob = io.BytesIO()
+    with zipfile.ZipFile(blob, "w") as zf:
+        zf.writestr("arr_0.npy", npy.getvalue())
+    with pytest.raises(ValueError):
+        unpack_payload(_raw_payload({"__nd__": 0}, blob.getvalue()), False)

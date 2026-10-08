@@ -35,7 +35,7 @@ logger = logging.getLogger(__name__)
 
 
 # Queue size constants
-_WEIGHT_QUEUE_SIZE = 2
+_WEIGHT_QUEUE_SIZE = 1  # newest-wins mailbox per (agent, worker); see core.ipc.put_latest
 _CHECKPOINT_QUEUE_SIZE = 16
 _METRICS_QUEUE_SIZE = 100
 _RESULTS_QUEUE_SIZE = 1000

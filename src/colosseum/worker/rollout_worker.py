@@ -15,6 +15,7 @@ from typing import Any
 
 import numpy as np
 
+from colosseum.core.ipc import drain_latest
 from colosseum.core.threads import configure_torch_threads
 from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
 from colosseum.envs.base_env import BaseEnv
@@ -95,13 +96,7 @@ def rollout_worker_process(
                 continue
 
     def poll_weights(agent_id: str) -> WeightPayload | None:
-        latest = None
-        q = weight_queues[agent_id]
-        while True:
-            try:
-                latest = q.get_nowait()
-            except queue.Empty:
-                return latest
+        return drain_latest(weight_queues[agent_id])
 
     def report_result(result: MatchResult) -> None:
         try:

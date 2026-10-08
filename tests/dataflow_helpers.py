@@ -14,7 +14,8 @@ import gymnasium
 import numpy as np
 import torch
 
-from colosseum.core.ipc import assert_no_tensors
+from colosseum.core.ipc import assert_no_tensors, put_latest
+from colosseum.core.types import WeightPayload
 from colosseum.envs.base_env import BaseEnv
 from helpers import TinyMonolithicModel
 
@@ -172,3 +173,10 @@ class EnvFactory:
         env = self.cls(env_id=len(self.created), **self.kwargs)
         self.created.append(env)
         return env
+
+
+def publish_versions(q, n: int, done) -> None:
+    """Spawn target: publish WeightPayload v1..vn into a size-1 mailbox as fast as possible."""
+    for version in range(1, n + 1):
+        put_latest(q, WeightPayload("a", version, {"w": np.full(64, version, dtype=np.float32)}))
+    done.set()

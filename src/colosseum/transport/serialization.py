@@ -188,14 +188,14 @@ def _load_arrays(blob: bytes, max_bytes: int) -> list[np.ndarray]:
                     shape, dtype = _read_npy_header(f)
                 if dtype.hasobject:
                     raise ValueError("object arrays are not allowed in a payload")
-                if not (isinstance(shape, tuple) and all(type(d) is int and d >= 0 for d in shape)):
+                if not (isinstance(shape, tuple) and all(type(d) is int and 0 <= d <= sys.maxsize for d in shape)):
                     raise ValueError(f"invalid array shape {shape!r} in {name}")
                 total += math.prod(shape) * dtype.itemsize
                 if total > max_bytes:
                     raise ValueError(f"payload arrays declare {total} bytes, over the cap of {max_bytes} bytes")
         with np.load(io.BytesIO(blob), allow_pickle=False) as npz:
             return [npz[f"arr_{i}"] for i in range(len(names))]
-    except (zipfile.BadZipFile, EOFError, OSError, MemoryError) as e:
+    except (zipfile.BadZipFile, EOFError, OSError, MemoryError, OverflowError) as e:
         # Whatever a malformed archive triggers surfaces as ValueError (INVALID_ARGUMENT).
         raise ValueError(f"malformed payload array archive: {type(e).__name__}: {e}") from e
 

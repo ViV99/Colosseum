@@ -25,7 +25,7 @@ import torch
 
 from colosseum.algorithms.base import BaseAlgorithm
 from colosseum.core.config import LearnerConfig
-from colosseum.core.ipc import from_numpy_tree, to_numpy_tree
+from colosseum.core.ipc import from_numpy_tree, put_latest, to_numpy_tree
 from colosseum.core.types import TrajectoryChunk, WeightPayload, state_dict_from_numpy, state_dict_to_numpy
 
 logger = logging.getLogger(__name__)
@@ -261,10 +261,8 @@ def _push_weights(
     agent_id: str,
     weight_queues: list,
 ) -> None:
-    """Push current model weights (a numpy WeightPayload) to all worker weight queues."""
+    """Publish the current weights to every worker mailbox (newest wins)."""
     payload = WeightPayload.from_model(agent_id, algorithm.policy_version, algorithm.model)
     for wq in weight_queues:
-        try:
-            wq.put_nowait(payload)
-        except Full:
-            pass  # workers will get the next weight update
+        if not put_latest(wq, payload):
+            logger.debug(f"Learner [{agent_id}]: weight mailbox busy, v{payload.policy_version} not delivered")

@@ -26,10 +26,50 @@ Conversion rules:
 from __future__ import annotations
 
 import dataclasses
+import queue
+import time
 from typing import Any
 
 import numpy as np
 import torch
+
+
+def put_latest(q: Any, item: Any, timeout: float = 1.0) -> bool:
+    """Publish ``item`` into a ``maxsize=1`` queue, replacing a stale item.
+
+    Never blocks for longer than ``timeout`` seconds. Returns ``False`` only if
+    the item could not be delivered within ``timeout`` (sustained contention).
+
+    ``mp.Queue.put`` returns before its feeder thread has written the item into
+    the pipe, so ``get_nowait`` can miss an item that is still in flight and the
+    queue keeps reporting ``Full``. A short blocking ``get`` waits for that flush.
+
+    Only for newest-wins data (weights); worker commands must never go through it.
+    """
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            q.put_nowait(item)
+            return True
+        except queue.Full:
+            pass
+        try:
+            q.get(timeout=0.01)  # evict the stale item (it may still be in flight)
+        except queue.Empty:
+            pass
+        if time.monotonic() >= deadline:
+            return False
+
+
+def drain_latest(q: Any) -> Any | None:
+    """Return the newest item available in ``q`` (draining older ones), or None."""
+    latest = None
+    while True:
+        try:
+            latest = q.get_nowait()
+        except queue.Empty:
+            return latest
+
 
 # torch float dtypes without a numpy equivalent; upcast to float32 on export.
 _UPCAST_DTYPES = {torch.bfloat16}
