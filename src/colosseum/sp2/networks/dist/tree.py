@@ -16,6 +16,7 @@ from colosseum.sp2.core.specs import ActionGroup, ActionSpec
 from colosseum.sp2.core.tree import Tree, tree_get
 from colosseum.sp2.networks.dist.base import Distribution
 from colosseum.sp2.networks.dist.leaf import CategoricalDist, DiagGaussianDist, MultiCategoricalDist
+from colosseum.sp2.networks.dist.units import UnitsDist
 
 
 def _fmt(path: tuple[str, ...]) -> str:
@@ -166,5 +167,5 @@ def make_distribution(spec: ActionSpec, params: Tree) -> TreeDist:
         elif group.kind == "box":
             parts[group.path] = DiagGaussianDist(p["mean"], p["log_std"])
         else:
-            raise NotImplementedError("Units action groups need UnitsDist (added in T2.2)")
+            parts[group.path] = UnitsDist(group, p)
     return TreeDist(spec, parts)
