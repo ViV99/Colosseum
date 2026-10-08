@@ -245,7 +245,7 @@ User writes env + encoder + networks → selects algorithm + matchmaking via con
 
 ## Implementation Status
 
-State after SP1 (foundation and stabilization, branch `sp1-stabilization`). Test suite: **868** fast tests, **3** slow, **16** GPU-only (`pytest -m "not gpu and not slow"` is the CI suite). The full review that motivated SP1 is `review/README.md` (a frozen snapshot of the pre-SP1 code; never edit it); the SP1 spec is `docs/superpowers/specs/2026-10-08-sp1-stabilization-design.md`.
+State after SP1 (foundation and stabilization, branch `sp1-stabilization`). Test suite: **873** fast tests, **3** slow, **16** GPU-only (`pytest -m "not gpu and not slow"` is the CI suite). The full review that motivated SP1 is `review/README.md` (a frozen snapshot of the pre-SP1 code; never edit it); the SP1 spec is `docs/superpowers/specs/2026-10-08-sp1-stabilization-design.md`.
 
 Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on `sys.path`, also for spawned children):
 - `colosseum validate -c cfg.yaml [--set k=v ...]`: schema, env `num_players`, a dummy step/unroll of every agent's model.
