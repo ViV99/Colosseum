@@ -93,6 +93,8 @@ def test_launcher_gives_each_learner_its_own_seed_stream(tmp_path, monkeypatch, 
         pass
 
     class FakeProcess:
+        exitcode = 0  # a started fake has already stopped: the partial-start teardown is instant
+
         def __init__(self, target, kwargs, name=None, daemon=None):
             self.target, self.kwargs = target, kwargs
 
@@ -101,6 +103,12 @@ def test_launcher_gives_each_learner_its_own_seed_stream(tmp_path, monkeypatch, 
                 learner_kwargs.append(self.kwargs)
             else:
                 raise _Stop  # first worker: every learner has been started
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
 
     monkeypatch.setattr(launcher_module.mp, "Process", FakeProcess)
     cfg = ColosseumConfig.model_validate(cfg_data(seed=11, agents=["alpha", "beta"]))

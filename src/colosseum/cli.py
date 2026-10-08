@@ -2,13 +2,35 @@
 
 from __future__ import annotations
 
+import os
+import sys
+from collections.abc import Iterator
+from contextlib import contextmanager
+
 import click
 
 
 @click.group()
 def main() -> None:
     """Colosseum — Distributed RL Training Framework."""
-    pass
+    # User code (e.g. ``examples.*`` or ``my_game.*``) is imported relative to the cwd.
+    # Spawned children inherit sys.path (R5-19).
+    cwd = os.getcwd()
+    if cwd not in sys.path:
+        sys.path.insert(0, cwd)
+
+
+@contextmanager
+def _config_errors() -> Iterator[None]:
+    """A config (or env contract) problem found at startup: one line on stderr, exit code 1,
+    no traceback (D10)."""
+    from colosseum.core.errors import ConfigError, EnvContractError
+
+    try:
+        yield
+    except (ConfigError, EnvContractError) as e:
+        click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
 
 
 _SET_HELP_YAML = (
@@ -36,11 +58,16 @@ def _parse_overrides(overrides: tuple[str, ...]) -> dict:
 @click.option("--set", "overrides", multiple=True,
               help="Override config values (e.g., --set rollout.num_workers=8)." + _SET_HELP_YAML)
 def train(config: str, overrides: tuple[str, ...]) -> None:
-    """Train an agent using the specified configuration."""
+    """Train an agent using the specified configuration.
+
+    Exit code: 0 budget reached, 1 config error or a child process died, 130 SIGINT, 143 SIGTERM.
+    """
     from colosseum.launcher import run_training
 
     override_dict = _parse_overrides(overrides)
-    run_training(config, overrides=override_dict if override_dict else None)
+    with _config_errors():
+        code = run_training(config, overrides=override_dict or None)
+    sys.exit(code)
 
 
 @main.command()
@@ -74,8 +101,9 @@ def bc(
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
-    cfg = load_config(config)
-    validate_config(cfg)
+    with _config_errors():
+        cfg = load_config(config)
+        validate_config(cfg)
     model = build_model(cfg)
     device = cfg.learner.device
     if device == "auto":
@@ -119,8 +147,9 @@ def eval_cmd(config: str, agents: tuple[str, ...], num_matches: int, num_envs: i
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    cfg = load_config(config)
-    validate_config(cfg)
+    with _config_errors():
+        cfg = load_config(config)
+        validate_config(cfg)
 
     # Parse agent specs: "name:path.pt"
     agent_configs = {}
@@ -151,20 +180,14 @@ def eval_cmd(config: str, agents: tuple[str, ...], num_matches: int, num_envs: i
               help="Override config values (e.g., --set env.num_players=2)." + _SET_HELP_YAML)
 def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
     """Validate a config: schema, env num_players, and a dummy forward of every agent's model."""
-    import sys
-
     from colosseum.core.config import load_config
-    from colosseum.core.errors import ConfigError
     from colosseum.core.registry import validate_config
 
-    try:
+    with _config_errors():
         cfg = load_config(config, _parse_overrides(overrides) or None)
         for aid in cfg.get_trainable_agent_ids():
             validate_config(cfg.get_agent_config(aid))
             click.echo(f"  OK: agent '{aid}'")
-    except ConfigError as e:
-        click.echo(f"Config error: {e}", err=True)
-        sys.exit(1)
     click.echo("Config is valid.")
 
 
@@ -180,10 +203,8 @@ def run_learner_cmd(config: str, agent: str, traj_port: int, weight_store: str, 
     from colosseum.distributed import run_distributed_learner
 
     override_dict = _parse_overrides(overrides)
-    run_distributed_learner(
-        config, agent, traj_port, weight_store,
-        overrides=override_dict if override_dict else None,
-    )
+    with _config_errors():
+        run_distributed_learner(config, agent, traj_port, weight_store, overrides=override_dict or None)
 
 
 @main.command("run-workers")
@@ -205,10 +226,9 @@ def run_workers_cmd(config: str, weight_store: str, learners: tuple[str, ...], o
         learner_addresses[aid] = addr
 
     override_dict = _parse_overrides(overrides)
-    run_distributed_workers(
-        config, weight_store, learner_addresses,
-        overrides=override_dict if override_dict else None,
-    )
+    with _config_errors():
+        code = run_distributed_workers(config, weight_store, learner_addresses, overrides=override_dict or None)
+    sys.exit(code)
 
 
 @main.command("serve-weight-store")
@@ -226,29 +246,6 @@ def serve_weight_store_cmd(port: int, max_message_mb: int) -> None:
     )
     server = serve_weight_store(port=port, max_message_mb=max_message_mb)
     click.echo(f"Weight store serving on port {port}. Press Ctrl+C to stop.")
-    try:
-        server.wait_for_termination()
-    except KeyboardInterrupt:
-        server.stop(0)
-
-
-@main.command("serve-trajectory")
-@click.option("--port", default=50052, type=int, help="gRPC port")
-@click.option("--max-message-mb", default=64, type=int, help="Max gRPC message size in MiB")
-def serve_trajectory_cmd(port: int, max_message_mb: int) -> None:
-    """Start a gRPC trajectory receiver server (for learner)."""
-    import logging
-    import queue
-
-    from colosseum.transport.grpc_transport import serve_trajectory_receiver
-
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-    chunk_queue = queue.Queue(maxsize=256)
-    server = serve_trajectory_receiver(chunk_queue, port=port, max_message_mb=max_message_mb)
-    click.echo(f"Trajectory receiver serving on port {port}. Press Ctrl+C to stop.")
     try:
         server.wait_for_termination()
     except KeyboardInterrupt:

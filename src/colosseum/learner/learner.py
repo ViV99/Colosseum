@@ -39,10 +39,13 @@ from colosseum.algorithms.base import BaseAlgorithm
 from colosseum.core.config import LearnerConfig
 from colosseum.core.ipc import SharedCounter, put_latest
 from colosseum.core.types import TrajectoryChunk, WeightPayload, state_dict_from_numpy, state_dict_to_numpy
+from colosseum.utils.process import SHUTDOWN_GRACE_SEC, flush_queue, parent_alive
 
 logger = logging.getLogger(__name__)
 
-FINAL_CHECKPOINT_TIMEOUT_SEC = 30.0
+# The final snapshot must be on the queue before the main process stops waiting for the
+# children (SHUTDOWN_GRACE_SEC after stop_event) and starts terminating them.
+FINAL_CHECKPOINT_TIMEOUT_SEC = SHUTDOWN_GRACE_SEC - 2.0
 
 
 def make_checkpoint_payload(agent_id: str, algorithm: BaseAlgorithm, final: bool = False) -> dict:
@@ -225,10 +228,9 @@ def learner_process(
         if send_checkpoint(checkpoint_queue, make_checkpoint_payload(agent_id, algorithm, final=True),
                            block=True, timeout=FINAL_CHECKPOINT_TIMEOUT_SEC):
             logger.info(f"Learner [{agent_id}]: sent final checkpoint v{algorithm.policy_version}")
-        if hasattr(checkpoint_queue, "join_thread"):
-            # Wait until the snapshot is flushed into the pipe; never cancel_join_thread here.
-            checkpoint_queue.close()
-            checkpoint_queue.join_thread()
+        # Wait until the snapshot is flushed into the pipe while the main process reads it;
+        # bounded, and given up once the main process is gone, so this process never hangs.
+        flush_queue(checkpoint_queue, timeout=SHUTDOWN_GRACE_SEC)
 
     logger.info(f"Learner [{agent_id}]: finished. Total train_steps={train_step}")
 
@@ -294,6 +296,9 @@ def _release_weight_queues(
             joiners.append(joiner)
         deadline = time.monotonic() + timeout
         while any(j.is_alive() for j in joiners) and not stop_event.is_set():
+            if not parent_alive():
+                logger.warning("Learner: main process is gone; abandoning unread weight payloads")
+                break
             if time.monotonic() > deadline:
                 logger.warning(f"Learner: weight payloads unread after {timeout:.0f} s; abandoning them")
                 break

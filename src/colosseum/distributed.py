@@ -47,7 +47,7 @@ from colosseum.core.config import ColosseumConfig, config_hash, load_config
 from colosseum.core.run_dir import RunDir, safe_path_component
 from colosseum.core.types import WeightPayload
 from colosseum.utils.logging import setup_process_logging
-from colosseum.utils.process import run_child
+from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child
 from colosseum.utils.seeding import apply_global_seed, learner_seed
 
 logger = logging.getLogger(__name__)
@@ -305,9 +305,6 @@ def _dist_worker_main(
     slot_agent_map: list[list[str]],
 ) -> None:
     """Worker process body: gRPC clients in, rollout_worker_process unchanged."""
-    import sys
-    sys.path.insert(0, ".")
-
     from colosseum.core.registry import build_model
     from colosseum.launcher import _create_env
     from colosseum.transport.grpc_transport import GRPCTransport
@@ -351,8 +348,11 @@ def run_distributed_workers(
     weight_store_address: str,
     learner_addresses: dict[str, str],
     overrides: dict | None = None,
-) -> None:
-    """Launch rollout workers that feed remote learners over gRPC.
+) -> int:
+    """Launch rollout workers that feed remote learners over gRPC; returns the exit code.
+
+    Workers stop by themselves after their share of the budget (exit 0). A worker exiting
+    non-zero stops the others (exit code 1); SIGINT / SIGTERM stop all of them (128 + signum).
 
     Args:
         config_path: path to the YAML config.
@@ -385,49 +385,58 @@ def run_distributed_workers(
     ]
 
     stop_event = mp.Event()
-    procs: list[mp.Process] = []
+    supervisor = ProcessSupervisor(stop_event, log_dir=run_dir.logs)
+    supervisor.install_signal_handlers()
     worker_daemon = config.rollout.vec_env != "subprocess"
     per_worker_steps = config.training.total_timesteps // config.rollout.num_workers
 
-    for worker_id in range(config.rollout.num_workers):
-        p = mp.Process(
-            target=_dist_worker_target,
-            name=f"worker-{worker_id}",
-            kwargs=dict(
-                worker_id=worker_id,
-                log_dir=str(run_dir.logs),
-                config=config,
-                agent_ids=agent_ids,
-                agent_configs=agent_configs,
-                weight_store_address=weight_store_address,
-                learner_addresses=learner_addresses,
-                stop_event=stop_event,
-                total_timesteps=per_worker_steps,
-                slot_agent_map=slot_agent_map,
-            ),
-            daemon=worker_daemon,
-        )
-        p.start()
-        procs.append(p)
-
-    logger.info(
-        f"Started {len(procs)} distributed workers -> learners {learner_addresses}, "
-        f"weights <- {weight_store_address}"
-    )
+    code = 0
     try:
-        while any(p.is_alive() for p in procs):
+        for worker_id in range(config.rollout.num_workers):
+            proc = mp.Process(
+                target=_dist_worker_target,
+                name=f"worker-{worker_id}",
+                kwargs=dict(
+                    worker_id=worker_id,
+                    log_dir=str(run_dir.logs),
+                    config=config,
+                    agent_ids=agent_ids,
+                    agent_configs=agent_configs,
+                    weight_store_address=weight_store_address,
+                    learner_addresses=learner_addresses,
+                    stop_event=stop_event,
+                    total_timesteps=per_worker_steps,
+                    slot_agent_map=slot_agent_map,
+                ),
+                daemon=worker_daemon,
+            )
+            proc.start()
+            supervisor.add(f"worker-{worker_id}", proc)
+
+        logger.info(f"Started {config.rollout.num_workers} distributed workers -> learners "
+                    f"{learner_addresses}, weights <- {weight_store_address}")
+        while not stop_event.is_set() and supervisor.alive():
+            failure = supervisor.first_failure(nonzero_only=True)
+            if failure is not None:
+                logger.error(failure.message())
+                code = 1
+                break
             time.sleep(0.5)
-    except KeyboardInterrupt:
-        logger.info("Interrupt — stopping workers")
     finally:
         stop_event.set()
-        time.sleep(1.0)
-        for p in procs:
-            p.join(timeout=3)
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=2)
+        supervisor.wait_all(SHUTDOWN_GRACE_SEC)
+        killed = supervisor.kill_remaining()
+        supervisor.restore_signal_handlers()
         logger.info("Distributed workers stopped.")
+    if supervisor.received_signal is not None:
+        return 128 + int(supervisor.received_signal)
+    if code == 0:
+        # Exits after the loop ended (e.g. one worker finished, another crashed meanwhile).
+        failures = supervisor.failures(exclude=set(killed))
+        for failure in failures:
+            logger.error(failure.message())
+        code = 1 if failures else 0
+    return code
 
 
 # =====================================================================

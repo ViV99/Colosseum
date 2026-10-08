@@ -71,6 +71,12 @@ def _worker_loop(
 
     setup_process_logging(inherited_log_dir(), f"{os.environ.get(ENV_PROCESS_NAME, 'envproc')}-env{global_offset}")
 
+    from colosseum.utils.process import init_child_process
+
+    # Same policy as the worker: Ctrl-C is coordinated by the main process, and the
+    # env process dies with its worker.
+    init_child_process()
+
     import torch
 
     # Env children only step envs: one torch thread each (R2-04). OMP_NUM_THREADS=1

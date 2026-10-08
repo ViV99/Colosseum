@@ -160,6 +160,7 @@ def test_setup_process_logging_main_console_info(tmp_path, capsys, restore_root_
 
 
 def test_run_child_logs_finish_and_crash(tmp_path, monkeypatch, restore_root_logging):
+    monkeypatch.setattr("colosseum.utils.process.init_child_process", lambda: None)
     # setenv first so monkeypatch removes the variables run_child exports after the test.
     for var in (ENV_LOG_DIR, ENV_PROCESS_NAME):
         monkeypatch.setenv(var, "")
@@ -233,6 +234,8 @@ def test_distributed_workers_entry_point_records_the_base_run_name(tmp_path, mon
     import colosseum.distributed as distributed
 
     class NeverStartedProcess:
+        exitcode = 0  # finished cleanly as soon as started
+
         def __init__(self, *args, **kwargs):
             pass
 
@@ -251,7 +254,7 @@ def test_distributed_workers_entry_point_records_the_base_run_name(tmp_path, mon
     monkeypatch.setattr(distributed.socket, "gethostname", lambda: "node 7")
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump(make_config(tmp_path).model_dump(mode="json", by_alias=True)))
-    distributed.run_distributed_workers(str(path), "localhost:1", {"alpha": "localhost:2"})
+    assert distributed.run_distributed_workers(str(path), "localhost:1", {"alpha": "localhost:2"}) == 0
     (root,) = (tmp_path / "runs").iterdir()
     resolved = load_config(root / "config.resolved.yaml")
     assert re.fullmatch(r"cfg-\d{8}-\d{6}", resolved.run.name)

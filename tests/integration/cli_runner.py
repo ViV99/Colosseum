@@ -67,10 +67,11 @@ class TrainRun:
 
 
 def run_train(config: Path, tmp_path: Path, name: str = "run", overrides: dict[str, str] | None = None,
-              timeout: float = 240.0) -> TrainRun:
+              timeout: float = 240.0, env: dict[str, str] | None = None) -> TrainRun:
+    """``env`` entries are added to ``child_env()``."""
     run_parent = tmp_path / "runs"
-    proc = subprocess.run(train_cmd(config, run_parent, name, overrides), cwd=REPO_ROOT, env=child_env(),
-                          capture_output=True, text=True, timeout=timeout)
+    proc = subprocess.run(train_cmd(config, run_parent, name, overrides), cwd=REPO_ROOT,
+                          env={**child_env(), **(env or {})}, capture_output=True, text=True, timeout=timeout)
     return TrainRun(proc.returncode, proc.stdout, proc.stderr, run_parent / name)
 
 

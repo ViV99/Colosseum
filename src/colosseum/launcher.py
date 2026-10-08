@@ -20,7 +20,9 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import queue
+import threading
 import time
+from collections.abc import Callable
 from typing import Any
 
 import numpy as np
@@ -33,7 +35,7 @@ from colosseum.core.run_dir import RunDir
 from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.utils.logging import setup_process_logging
-from colosseum.utils.process import run_child
+from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,11 @@ def warn_static_ownership_skew(config: ColosseumConfig) -> None:
         )
 
 
+def trainable_agent_configs(config: ColosseumConfig) -> dict[str, ColosseumConfig]:
+    """Effective config (overrides merged) of every trainable agent, without validation."""
+    return {aid: config.get_agent_config(aid) for aid in config.get_trainable_agent_ids()}
+
+
 def validate_agent_configs(config: ColosseumConfig) -> dict[str, ColosseumConfig]:
     """Effective config of every trainable agent, each checked by ``validate_config``.
 
@@ -86,7 +93,7 @@ def validate_agent_configs(config: ColosseumConfig) -> dict[str, ColosseumConfig
     """
     from colosseum.core.registry import validate_config
 
-    agent_configs = {aid: config.get_agent_config(aid) for aid in config.get_trainable_agent_ids()}
+    agent_configs = trainable_agent_configs(config)
     for acfg in agent_configs.values():
         validate_config(acfg)
     return agent_configs
@@ -127,9 +134,7 @@ def _worker_main(
     over top-level functions is picklable under spawn, which the subprocess
     vec_env needs to ship ``env_fn`` to its children).
     """
-    import sys
     from functools import partial
-    sys.path.insert(0, ".")
 
     from colosseum.core.registry import build_model
     from colosseum.worker.rollout_worker import rollout_worker_process
@@ -192,9 +197,6 @@ def _learner_main(
     torch thread count when ``learner.torch_threads`` is unset. ``seed`` (from
     ``utils.seeding.learner_seed``) seeds this process before the model is built.
     """
-    import sys
-    sys.path.insert(0, ".")
-
     from colosseum.core.registry import import_class
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
     from colosseum.learner.learner import learner_process, resolve_device
@@ -322,17 +324,69 @@ def _derive_worker_configs(
     return new_ckpts, slot_network_map, collect_mask, slot_agent_map
 
 
-def _drain_queue(q) -> list:
-    """Everything currently in ``q``. A broken item (dead producer) ends the drain with a warning."""
-    items = []
-    while True:
+class _QueueReader:
+    """Drains one ``mp.Queue`` on a helper thread, so the main process never blocks on it.
+
+    ``mp.Queue.get`` reads a whole message in ``recv_bytes`` and ignores any timeout once
+    the first bytes are there. A producer killed mid-message (OOM, SIGKILL) therefore
+    blocks the reader forever: the main process holds the pipe's write end too, so no EOF
+    ever arrives. Here a read still in progress after ``wait`` seconds is collected by a
+    later call while the producers live. Once one of them has died, the items read so far
+    are returned and the rest of the queue is abandoned with an error.
+    """
+
+    def __init__(self, q: Any, label: str, dead_producers: Callable[[], list[str]]) -> None:
+        self._q = q
+        self._label = label
+        self._dead_producers = dead_producers
+        self._thread: threading.Thread | None = None
+        self._items: list = []
+        self._error: BaseException | None = None
+        self.abandoned = False
+
+    def _read(self) -> None:
         try:
-            items.append(q.get_nowait())
-        except queue.Empty:
-            return items
-        except (EOFError, OSError) as e:
-            logger.warning(f"Dropped an unreadable queue item: {e!r}")
-            return items
+            while True:
+                try:
+                    item = self._q.get_nowait()
+                except queue.Empty:
+                    return
+                except (EOFError, OSError) as e:
+                    logger.warning(f"Dropped an unreadable {self._label} queue item: {e!r}")
+                    return
+                self._items.append(item)
+        except BaseException as e:  # noqa: BLE001 - re-raised by drain() in the main thread
+            self._error = e
+
+    def _take(self) -> list:
+        items, self._items = self._items, []
+        return items
+
+    def drain(self, wait: float = 0.5) -> list:
+        if self.abandoned:
+            return []
+        if self._thread is None:
+            if self._q.empty():
+                return []
+            self._thread = threading.Thread(target=self._read, name=f"drain-{self._label}", daemon=True)
+            self._thread.start()
+        self._thread.join(wait)
+        if self._thread.is_alive():
+            dead = self._dead_producers()
+            if not dead:
+                return []  # a large item from a live producer is still arriving
+            self._thread.join(1.0)
+            if self._thread.is_alive():
+                self.abandoned = True
+                logger.error(f"{', '.join(dead)} died while sending on the {self._label} queue; "
+                             f"its incomplete item and the rest of that queue are skipped")
+                return self._take()
+        self._thread = None
+        error, self._error = self._error, None
+        items = self._take()
+        if error is not None:
+            raise error
+        return items
 
 
 def _queue_depths(queues: dict[str, Any]) -> dict[str, int]:
@@ -357,11 +411,18 @@ class Launcher:
     trajectory chunks to the correct agent's learner.
     """
 
-    def __init__(self, config: ColosseumConfig, run_dir: RunDir) -> None:
+    def __init__(self, config: ColosseumConfig, run_dir: RunDir, validated: bool = False) -> None:
+        """``validated``: the trainable agent configs were already checked by
+        ``validate_agent_configs`` (``run_training`` does it before the run dir exists),
+        so ``launch`` does not repeat the dummy forward passes."""
         self._config = config
         self._run_dir = run_dir
-        self._processes: list[mp.Process] = []
+        self._validated = validated
         self._stop_event = mp.Event()
+        # Named children (learner-<agent>, worker-<id>), signals and teardown (T6.5).
+        self._supervisor = ProcessSupervisor(self._stop_event, log_dir=run_dir.logs)
+        self._readers: dict[int, _QueueReader] = {}
+        self._reported_failures: set[str] = set()
         self._all_queues: list[mp.Queue] = []
         # Env steps taken by all workers together (spec block 2: global budget).
         self._env_step_counter = SharedCounter()
@@ -375,14 +436,20 @@ class Launcher:
         self._metrics_writer = None
         self._wandb: WandBLogger | None = None
         self._trajectory_queues: dict[str, mp.Queue] = {}
+        self._results_queue: mp.Queue | None = None
+        self._metrics_queue: mp.Queue | None = None
 
     @property
     def env_steps_done(self) -> int:
         """Env steps taken by all workers so far (the global budget counter)."""
         return self._env_step_counter.value
 
-    def launch(self) -> None:
-        """Launch the full training pipeline."""
+    def launch(self) -> int:
+        """Run the full training pipeline; returns the process exit code.
+
+        0: the env-step budget was reached and every child stopped cleanly; 1: a child
+        died (or exited non-zero on its own); 128 + signum after SIGINT / SIGTERM.
+        """
         cfg = self._config
         trainable_agents = cfg.get_trainable_agent_ids()
 
@@ -393,8 +460,9 @@ class Launcher:
         logger.info(f"  Envs per worker: {cfg.rollout.envs_per_worker}")
         logger.info(f"  Chunk length: {cfg.rollout.chunk_length}")
 
-        # Per-agent effective configs (overrides merged), validated before any process starts.
-        agent_configs = validate_agent_configs(cfg)
+        # Per-agent effective configs (overrides merged), validated before any process starts
+        # (run_training validates them before the run dir exists and passes validated=True).
+        agent_configs = trainable_agent_configs(cfg) if self._validated else validate_agent_configs(cfg)
         warn_static_ownership_skew(cfg)
 
         # Initialize coordinator
@@ -410,8 +478,6 @@ class Launcher:
                   "config_hash": cfg_hash}
             for aid in trainable_agents
         }
-
-        checkpoint_interval = cfg.self_play.checkpoint_interval
 
         # Per-agent queues
         trajectory_queues: dict[str, mp.Queue] = {}
@@ -451,13 +517,52 @@ class Launcher:
         self._agent_ids = list(trainable_agents)
         self._checkpoint_queues = checkpoint_queues
         self._trajectory_queues = trajectory_queues
+        self._results_queue = results_queue
+        self._metrics_queue = metrics_queue
 
-        # The metrics hub (and its file) exists before any child starts: an open failure
-        # here cannot orphan children (T6.3). Resumed runs start the rate baselines at the
-        # resumed counters, so the first system record has no resume spike.
+        code = 1
+        try:
+            # SIGINT / SIGTERM only set stop_event from here on: children ignore SIGINT and the
+            # shutdown below saves their final checkpoints (T6.5).
+            self._supervisor.install_signal_handlers()
+            # The metrics hub (and its file) exists before any child starts: an open failure
+            # here cannot orphan children (T6.3). _finish_metrics closes whatever was opened.
+            self._open_metrics(resume_states)
+            try:
+                try:
+                    self._start_children(
+                        agent_configs, resume_states, trajectory_queues, checkpoint_queues,
+                        weight_queues_per_agent, metrics_queue, results_queue, command_queues,
+                        worker_sent_ckpts,
+                    )
+                except BaseException:
+                    logger.error(f"Starting the child processes failed; stopping the "
+                                 f"{len(self._supervisor.names)} already started")
+                    raise
+                logger.info("Training started. Press Ctrl+C to stop.")
+                code = self._monitor_loop(coordinator, trainable_agents, command_queues, worker_sent_ckpts)
+            finally:
+                # Also after a failed start or a monitor error: the started children are
+                # stopped (final checkpoints saved), then the error propagates.
+                killed = self._shutdown()
+            code = self._exit_code_after_shutdown(code, killed)
+        finally:
+            try:
+                self._finish_metrics()
+            finally:
+                self._supervisor.restore_signal_handlers()
+        return code
+
+    def _open_metrics(self, resume_states: dict[str, dict | None]) -> None:
+        """metrics.jsonl writer, optional WandB viewer and the hub that feeds both (T6.3/T6.4).
+
+        Resumed runs start the rate baselines at the resumed counters, so the first system
+        record has no resume spike.
+        """
         from colosseum.metrics.hub import MetricsHub
         from colosseum.metrics.jsonl import MetricsWriter
 
+        cfg = self._config
         self._metrics_writer = MetricsWriter(self._run_dir.metrics_path)
         # Optional viewer of the same records (metrics.jsonl stays the source of truth, T6.4).
         self._wandb = WandBLogger(
@@ -468,7 +573,7 @@ class Launcher:
         self._hub = MetricsHub(
             writer=self._metrics_writer,
             ratings_path=self._run_dir.ratings_path,
-            agent_ids=trainable_agents,
+            agent_ids=self._agent_ids,
             total_timesteps=cfg.training.total_timesteps,
             log_interval=cfg.metrics.log_interval,
             console_interval_sec=cfg.metrics.console_interval_sec,
@@ -477,12 +582,31 @@ class Launcher:
             wandb_logger=self._wandb,
         )
 
-        # Start one learner per agent
+    def _start_children(
+        self,
+        agent_configs: dict[str, ColosseumConfig],
+        resume_states: dict[str, dict | None],
+        trajectory_queues: dict[str, mp.Queue],
+        checkpoint_queues: dict[str, mp.Queue],
+        weight_queues_per_agent: dict[str, list[mp.Queue]],
+        metrics_queue: mp.Queue,
+        results_queue: mp.Queue,
+        command_queues: list[mp.Queue],
+        worker_sent_ckpts: list[dict[str, set]],
+    ) -> None:
+        """Start one learner per trainable agent, then the workers shared by all agents.
+
+        Every started child is registered with the supervisor right away, so a failure
+        part-way through tears down exactly the children that exist.
+        """
         from colosseum.utils.seeding import learner_seed
+
+        cfg = self._config
+        trainable_agents = self._agent_ids
+        coordinator = self._coordinator
         for agent_index, aid in enumerate(trainable_agents):
             acfg = agent_configs[aid]
             # numpy + bytes only: Process arguments cross the process boundary (R6-02).
-            resume_state = resume_states[aid]
             learner_proc = mp.Process(
                 target=_learner_target,
                 name=f"learner-{aid}",
@@ -495,8 +619,8 @@ class Launcher:
                     stop_event=self._stop_event,
                     metrics_queue=metrics_queue,
                     checkpoint_queue=checkpoint_queues[aid],
-                    checkpoint_interval=checkpoint_interval,
-                    resume_state=resume_state,
+                    checkpoint_interval=cfg.self_play.checkpoint_interval,
+                    resume_state=resume_states[aid],
                     progress_counter=self._env_step_counter,
                     total_timesteps=cfg.training.total_timesteps,
                     num_learners=len(trainable_agents),
@@ -505,10 +629,10 @@ class Launcher:
                 daemon=True,
             )
             learner_proc.start()
-            self._processes.append(learner_proc)
+            self._supervisor.add(f"learner-{aid}", learner_proc)
             logger.info(f"Learner started for agent {aid}")
 
-        # Start workers (shared across all agents)
+        # Workers (shared across all agents)
         for worker_id in range(cfg.rollout.num_workers):
             match_configs = coordinator.generate_match_configs(
                 cfg.rollout.envs_per_worker,
@@ -558,130 +682,122 @@ class Launcher:
                 daemon=worker_daemon,
             )
             worker_proc.start()
-            self._processes.append(worker_proc)
-
-        # Monitor loop
-        logger.info("Training started. Press Ctrl+C to stop.")
-        try:
-            self._monitor_loop(
-                metrics_queue,
-                results_queue,
-                coordinator,
-                trainable_agents,
-                command_queues,
-                worker_sent_ckpts,
-            )
-        except KeyboardInterrupt:
-            logger.info("Received interrupt, stopping...")
-        finally:
-            try:
-                self._shutdown()
-            finally:
-                self._finish_metrics(results_queue, metrics_queue, coordinator)
+            self._supervisor.add(f"worker-{worker_id}", worker_proc)
 
     def _monitor_loop(
         self,
-        metrics_queue: mp.Queue,
-        results_queue: mp.Queue,
         coordinator: Coordinator,
         agent_ids: list[str],
-        command_queues: list[mp.Queue] | None = None,
-        worker_sent_ckpts: list[dict[str, set]] | None = None,
-    ) -> None:
-        """Main process monitors metrics, saves checkpoints, checks for completion.
+        command_queues: list[mp.Queue],
+        worker_sent_ckpts: list[dict[str, set]],
+    ) -> int:
+        """Run until the budget is reached, a signal arrives, or a child dies.
 
-        Also periodically re-generates match assignments and pushes them (plus
-        any newly-saved checkpoints) to workers (C1), so self-play-vs-history
-        and PFSP opponent selection evolve during training.
+        Saves checkpoints, feeds results and metrics to the coordinator and the hub, and
+        periodically re-generates match assignments for the workers (C1), so
+        self-play-vs-history and PFSP opponent selection evolve during training.
 
-        The main process is the only budget authority: it sets ``stop_event``
-        once all workers together have taken ``training.total_timesteps`` env
-        steps. Learners and workers run until ``stop_event``, so any of them
-        exiting earlier is unexpected. A dead learner stops the run: workers
-        would block on its full trajectory queue and starve the other agents.
-        (Learners are the first ``len(agent_ids)`` entries of ``self._processes``.)
+        The main process is the only budget authority: learners and workers run until
+        ``stop_event``, so any child exiting earlier is a failure (a dead learner would
+        also leave the workers blocked on its full trajectory queue).
+
+        Returns the exit code: 0 budget reached (or ``stop_event`` set by the caller), 1 child
+        failure, 128+signum on SIGINT/SIGTERM.
         """
-        num_learners = len(agent_ids)
-        learner_procs = dict(zip(agent_ids, self._processes[:num_learners], strict=True))
-
+        total = self._config.training.total_timesteps
         refresh_interval = self._config.rollout.match_refresh_interval_sec
-        last_refresh = time.time()
-
-        while not self._stop_event.is_set():
-            dead_learners = [aid for aid, p in learner_procs.items() if not p.is_alive()]
-            if dead_learners and not self._stop_event.is_set():
-                logger.error(
-                    f"Learner process(es) for {dead_learners} exited unexpectedly "
-                    f"(exit codes {[learner_procs[a].exitcode for a in dead_learners]}); stopping."
-                )
-                self._stop_event.set()
-                break
-
-            # If every worker has died, learners would starve forever — stop.
-            worker_procs = self._processes[num_learners:]
-            if worker_procs and not any(p.is_alive() for p in worker_procs):
-                logger.error("All worker processes exited unexpectedly; stopping.")
-                self._stop_event.set()
-                break
-
-            # Process per-agent checkpoint saves
+        last_refresh = time.monotonic()
+        while True:
             self._drain_all_checkpoints()
-
-            self._drain_results_and_metrics(results_queue, metrics_queue, coordinator)
-            self._hub.maybe_tick(env_steps=int(self._env_step_counter.value),
-                                 ratings=coordinator.ratings_snapshot(),
+            self._drain_results()
+            self._drain_metrics()
+            env_steps = int(self._env_step_counter.value)
+            self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot(),
                                  queue_depths=_queue_depths(self._trajectory_queues))
+            if self._supervisor.received_signal is not None:
+                return 128 + int(self._supervisor.received_signal)
+            if self._stop_event.is_set():
+                # Set by the caller (e.g. scripts/bench_throughput.py stops after a time window).
+                logger.info(f"Stop requested after {env_steps} env steps (budget {total})")
+                return 0
+            if env_steps >= total:
+                logger.info(f"Training budget reached: {env_steps} env steps (budget {total})")
+                return 0
+            failure = self._supervisor.first_failure()
+            if failure is not None:
+                logger.error(failure.message())
+                self._reported_failures.add(failure.name)
+                return 1
+            if refresh_interval > 0 and time.monotonic() - last_refresh >= refresh_interval:
+                self._refresh_worker_matches(coordinator, agent_ids, command_queues, worker_sent_ckpts)
+                last_refresh = time.monotonic()
+            time.sleep(0.2)
 
-            # Periodically refresh worker match assignments (C1).
-            if (command_queues is not None
-                    and refresh_interval > 0
-                    and time.time() - last_refresh >= refresh_interval):
-                self._refresh_worker_matches(
-                    coordinator, agent_ids, command_queues, worker_sent_ckpts,
-                )
-                last_refresh = time.time()
+    def _exit_code_after_shutdown(self, code: int, killed: list[str]) -> int:
+        """A child that exited non-zero on its own (not terminated by the shutdown) fails the
+        run, even if the budget was reached (R3-08). After a signal the signal's code stays
+        and such exits are only warned about."""
+        for failure in self._supervisor.failures(exclude=set(killed) | self._reported_failures):
+            self._reported_failures.add(failure.name)
+            if code in (0, 1):
+                logger.error(failure.message())
+                code = 1
+            else:
+                logger.warning(failure.message())
+        return code
 
-            # Global env-step budget (spec block 2): all workers together have
-            # taken training.total_timesteps env steps -> stop everything.
-            if self.env_steps_done >= self._config.training.total_timesteps:
-                logger.info(
-                    f"Env-step budget reached ({self.env_steps_done} >= "
-                    f"{self._config.training.total_timesteps}); stopping."
-                )
-                self._stop_event.set()
-                break
+    def _dead_producers(self, names: list[str]) -> list[str]:
+        dead = []
+        for name in names:
+            proc = self._supervisor.get(name)
+            if proc is not None and proc.exitcode is not None:
+                dead.append(name)
+        return dead
 
-            time.sleep(0.5)
+    def _drain(self, q: Any, label: str, producers: Callable[[], list[str]]) -> list:
+        """Everything currently in ``q``, read without ever blocking on a dead producer."""
+        reader = self._readers.get(id(q))
+        if reader is None:
+            reader = self._readers[id(q)] = _QueueReader(q, label, lambda: self._dead_producers(producers()))
+        return reader.drain()
 
-    def _finish_metrics(self, results_queue: mp.Queue, metrics_queue: mp.Queue,
-                        coordinator: Coordinator) -> None:
-        """Record what arrived during shutdown (final train metrics, last results), write the
-        final records and ratings.json; the metrics file is closed and the WandB run finished
-        even if any of that fails."""
-        try:
-            self._drain_results_and_metrics(results_queue, metrics_queue, coordinator)
-            self._hub.close(env_steps=int(self._env_step_counter.value),
-                            ratings=coordinator.ratings_snapshot(),
-                            queue_depths=_queue_depths(self._trajectory_queues))
-        finally:
-            try:
-                self._metrics_writer.close()
-            finally:
-                if self._wandb is not None:
-                    self._wandb.finish()
-
-    def _drain_results_and_metrics(self, results_queue: mp.Queue, metrics_queue: mp.Queue,
-                                   coordinator: Coordinator) -> None:
-        """Feed queued match results (coordinator + hub) and metrics items to the hub."""
-        for result in _drain_queue(results_queue):
-            coordinator.report_match_result(result)
+    def _drain_results(self) -> None:
+        """Feed queued match results to the coordinator (ratings, PFSP) and the hub."""
+        if self._results_queue is None:
+            return
+        workers = lambda: [n for n in self._supervisor.names if n.startswith("worker-")]  # noqa: E731
+        for result in self._drain(self._results_queue, "results", workers):
+            self._coordinator.report_match_result(result)
             self._hub.on_match_result(result)
-        # Learner train metrics and worker stats share the metrics queue.
-        for item in _drain_queue(metrics_queue):
+
+    def _drain_metrics(self) -> None:
+        """Learner train metrics and worker stats share the metrics queue."""
+        if self._metrics_queue is None:
+            return
+        for item in self._drain(self._metrics_queue, "metrics", lambda: self._supervisor.names):
             if item.get("kind") == "worker_stats":
                 self._hub.on_worker_stats(item)
             else:
                 self._hub.on_train_metrics(item)
+
+    def _finish_metrics(self) -> None:
+        """Record what arrived during shutdown (final train metrics, last results), write the
+        final records and ratings.json; the metrics file is closed and the WandB run finished
+        even if any of that fails (or if the hub was never built)."""
+        try:
+            if self._hub is not None:
+                self._drain_results()
+                self._drain_metrics()
+                self._hub.close(env_steps=int(self._env_step_counter.value),
+                                ratings=self._coordinator.ratings_snapshot(),
+                                queue_depths=_queue_depths(self._trajectory_queues))
+        finally:
+            try:
+                if self._metrics_writer is not None:
+                    self._metrics_writer.close()
+            finally:
+                if self._wandb is not None:
+                    self._wandb.finish()
 
     def _resolve_resume(self, agent_configs: dict[str, ColosseumConfig]) -> dict[str, dict | None]:
         """Resolve ``training.resume_from`` for every trainable agent (see ``resolve_resume``).
@@ -721,8 +837,9 @@ class Launcher:
         ones are still saved; the first error is re-raised at the end.
         """
         first_error: Exception | None = None
-        for cq in self._checkpoint_queues.values():
-            for payload in _drain_queue(cq):
+        for aid, cq in self._checkpoint_queues.items():
+            # A learner killed mid-flush (OOM, SIGKILL) leaves a partial payload: skipped (T5.3).
+            for payload in self._drain(cq, f"checkpoint-{aid}", lambda aid=aid: [f"learner-{aid}"]):
                 try:
                     self._save_checkpoint(payload)
                 except Exception as e:  # noqa: BLE001 - keep saving the others, re-raise below
@@ -772,56 +889,64 @@ class Launcher:
             for aid, ckpts in new_ckpts.items():
                 sent.setdefault(aid, set()).update(ckpts)
 
-    def _shutdown(self) -> None:
-        """Stop children; save every learner's final checkpoint before tearing them down."""
+    def _shutdown(self) -> list[str]:
+        """Stop every child within SHUTDOWN_GRACE_SEC; returns the names that had to be terminated.
+
+        While the children wind down, their final checkpoints are saved and results and
+        metrics drained (so no child blocks on a full queue). A failed save neither ends the
+        grace window (other learners' final snapshots still arrive) nor skips the teardown;
+        the first error is raised after both. Stragglers are then terminated and killed.
+        """
         self._stop_event.set()
-        learner_procs = self._processes[: len(self._agent_ids)]
-        # A failed save neither ends the grace window (other learners' final snapshots
-        # still arrive) nor skips teardown; the first error is raised after both.
         first_error: Exception | None = None
 
-        def drain() -> None:
+        def poll() -> None:
             nonlocal first_error
-            try:
-                self._drain_all_checkpoints()
-            except Exception as e:  # noqa: BLE001 - logged by _drain_all_checkpoints, re-raised below
-                first_error = first_error or e
+            for drain in (self._drain_all_checkpoints, self._drain_results, self._drain_metrics):
+                try:
+                    drain()
+                except Exception as e:  # noqa: BLE001 - re-raised after the teardown
+                    if first_error is None and drain is not self._drain_all_checkpoints:
+                        logger.exception("Draining queues during shutdown failed")  # checkpoints log their own
+                    first_error = first_error or e
 
+        killed: list[str] = []
         try:
-            deadline = time.monotonic() + 10.0
-            while time.monotonic() < deadline and any(p.is_alive() for p in learner_procs):
-                drain()
-                time.sleep(0.1)
-            drain()
+            self._supervisor.wait_all(SHUTDOWN_GRACE_SEC, poll=poll)
+            poll()
         finally:
-            # Teardown runs even if a checkpoint save failed (the error propagates after it).
+            # Teardown runs even if the wait was interrupted (the error propagates after it).
+            killed = self._supervisor.kill_remaining()
+            if killed:
+                logger.warning(f"Terminated processes that did not stop within {SHUTDOWN_GRACE_SEC:.0f}s: "
+                               f"{', '.join(killed)}")
+                poll()
             # Detach queue feeder threads so a queue still holding undrained data
             # (e.g. trajectory chunks a now-dead learner never consumed, or large
-            # WorkerCommands) cannot block this process from exiting on join.
+            # WorkerCommands) cannot block this process from exiting.
             for q in self._all_queues:
                 try:
                     q.cancel_join_thread()
                 except (AttributeError, OSError):
                     pass
-            for proc in self._processes:
-                proc.join(timeout=3)
-                if proc.is_alive():
-                    proc.terminate()
-                    proc.join(timeout=2)
             logger.info("All processes stopped")
         if first_error is not None:
             raise first_error
+        return killed
 
 
-def run_training(config_path: str, overrides: dict | None = None) -> RunDir:
-    """Entry point: load config, create the run dir, log to it, launch training."""
+def run_training(config_path: str, overrides: dict | None = None) -> int:
+    """Entry point of ``colosseum train``. Returns the process exit code (D10).
+
+    The run directory is printed (and logged) once it exists.
+    """
     from colosseum.utils.seeding import apply_global_seed
 
     mp.set_start_method("spawn", force=True)
     setup_process_logging(None, "main", console_level=logging.INFO)
     config = load_config(config_path, overrides)
     # Before the run dir exists: an invalid config leaves nothing behind, so a corrected
-    # retry with the same run.name works.
+    # retry with the same run.name works. Launcher.launch does not validate again.
     validate_agent_configs(config)
     if config.training.resume_from:
         from colosseum.coordinator.checkpoint_manager import classify_resume_source
@@ -832,5 +957,7 @@ def run_training(config_path: str, overrides: dict | None = None) -> RunDir:
     setup_process_logging(run_dir.logs, "main", console_level=logging.INFO)
     run_dir.write_resolved_config(config)
     print(f"Run directory: {run_dir.root}", flush=True)
-    Launcher(config, run_dir).launch()
-    return run_dir
+    code = Launcher(config, run_dir, validated=True).launch()
+    if code == 0:
+        logger.info(f"Training finished; outputs in {run_dir.root}")
+    return code

@@ -106,9 +106,9 @@ def rollout_worker_process(
     def send_chunk(chunk: TrajectoryChunk) -> None:
         payload = chunk.to_payload()  # numpy only across processes (R6-02)
         q = trajectory_queues[chunk.agent_id]
-        while not stop_event.is_set():
+        while not stop_event.is_set():  # waits in short slices so a stop is seen quickly
             try:
-                q.put(payload, timeout=1.0)
+                q.put(payload, timeout=0.5)
                 return
             except queue.Full:
                 continue

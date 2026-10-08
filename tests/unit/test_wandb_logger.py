@@ -173,7 +173,9 @@ def test_launcher_finishes_wandb_when_final_metrics_fail(monkeypatch, tmp_path):
         def ratings_snapshot(self):
             raise RuntimeError("boom")
 
+    launcher._coordinator = FailingCoordinator()
+    launcher._results_queue, launcher._metrics_queue = queue.Queue(), queue.Queue()
     with pytest.raises(RuntimeError, match="boom"):
-        launcher._finish_metrics(queue.Queue(), queue.Queue(), FailingCoordinator())
+        launcher._finish_metrics()
     assert launcher._metrics_writer.closed
     assert fake.finished

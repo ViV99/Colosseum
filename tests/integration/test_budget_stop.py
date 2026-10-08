@@ -22,7 +22,7 @@ def test_launch_stops_at_the_env_step_budget(tmp_path):
     config = ColosseumConfig(**data)
     launcher = Launcher(config, make_test_run_dir(config, tmp_path))
     start = time.monotonic()
-    launcher.launch()
+    assert launcher.launch() == 0
     assert launcher.env_steps_done >= 400
     assert time.monotonic() - start < 120
 
@@ -46,11 +46,12 @@ def test_a_dead_learner_stops_the_run(tmp_path, caplog):
     launcher = Launcher(config, run)
     start = time.monotonic()
     with caplog.at_level("ERROR", logger="colosseum.launcher"):
-        launcher.launch()
+        assert launcher.launch() == 1
     assert time.monotonic() - start < 120
     assert launcher.env_steps_done < 10**9
-    assert any("agent_beta" in r.getMessage() and "exited unexpectedly" in r.getMessage()
-               for r in caplog.records)
+    # The failure names the dead process and points to its log (T6.5).
+    expected = f"learner-agent_beta died (exit 1), see {run.logs / 'learner-agent_beta.log'}"
+    assert any(r.levelname == "ERROR" and r.getMessage() == expected for r in caplog.records)
     # The crash and its traceback are in the dead learner's own log file (T6.2).
     crash_log = (run.logs / "learner-agent_beta.log").read_text()
     assert "learner-agent_beta crashed" in crash_log and "NoSuchAlgorithm" in crash_log

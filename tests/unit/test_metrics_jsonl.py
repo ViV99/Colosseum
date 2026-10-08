@@ -268,6 +268,8 @@ def test_launcher_closes_metrics_file_when_final_drain_fails(tmp_path):
 
     results = queue.Queue()
     results.put(result(seat(0, "agent_0", 1.0)))
+    launcher._coordinator = FailingCoordinator()
+    launcher._results_queue, launcher._metrics_queue = results, queue.Queue()
     with pytest.raises(RuntimeError, match="boom"):
-        launcher._finish_metrics(results, queue.Queue(), FailingCoordinator())
+        launcher._finish_metrics()
     assert writer.closed

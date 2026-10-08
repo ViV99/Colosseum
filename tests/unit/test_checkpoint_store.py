@@ -705,7 +705,7 @@ def test_shutdown_saves_checkpoints_still_queued(tmp_path):
         target=_learner_like_checkpoint_sender, args=(cq, launcher._stop_event, periodic, final), daemon=True,
     )
     proc.start()
-    launcher._processes = [proc]
+    launcher._supervisor.add("learner-agent_0", proc)
     deadline = time.monotonic() + 60
     while cq.empty() and time.monotonic() < deadline:  # the periodic snapshot is queued
         time.sleep(0.05)
@@ -773,7 +773,7 @@ def test_shutdown_tears_children_down_even_if_a_save_fails(tmp_path):
         target=_learner_like_checkpoint_sender, args=(cq, launcher._stop_event, periodic, final), daemon=True,
     )
     proc.start()
-    launcher._processes = [proc]
+    launcher._supervisor.add("learner-agent_0", proc)
     deadline = time.monotonic() + 60
     while cq.empty() and time.monotonic() < deadline:
         time.sleep(0.05)
@@ -817,7 +817,8 @@ def test_shutdown_keeps_draining_after_a_failed_save(tmp_path):
     ]
     for proc in procs:
         proc.start()
-    launcher._processes = procs
+    for aid, proc in zip(launcher._agent_ids, procs, strict=True):
+        launcher._supervisor.add(f"learner-{aid}", proc)
     deadline = time.monotonic() + 60
     while queues["a0"].empty() and time.monotonic() < deadline:
         time.sleep(0.05)

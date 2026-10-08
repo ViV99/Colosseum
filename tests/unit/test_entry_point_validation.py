@@ -34,8 +34,10 @@ def test_bc_cli_rejects_misordered_policy(tmp_path):
     out = tmp_path / "out.pt"
     result = CliRunner().invoke(main, ["bc", "-c", str(_misordered_config(tmp_path)),
                                        "-d", str(data), "-o", str(out)])
-    assert isinstance(result.exception, ConfigError), result.output
-    assert "action space" in str(result.exception)
+    # One line on stderr, exit code 1, no traceback (D10).
+    assert result.exit_code == 1, result.output
+    assert result.stderr.startswith("Config error:") and "action space" in result.stderr
+    assert "Traceback" not in result.output
     assert not out.exists()
 
 
@@ -43,8 +45,9 @@ def test_eval_cli_rejects_misordered_policy(tmp_path):
     missing = tmp_path / "never_loaded.pt"
     result = CliRunner().invoke(main, ["eval", "-c", str(_misordered_config(tmp_path)),
                                        "-a", f"x:{missing}", "-a", f"y:{missing}"])
-    assert isinstance(result.exception, ConfigError), result.output
-    assert "action space" in str(result.exception)
+    assert result.exit_code == 1, result.output
+    assert result.stderr.startswith("Config error:") and "action space" in result.stderr
+    assert "Traceback" not in result.output
 
 
 def test_distributed_learner_rejects_misordered_policy_before_serving(tmp_path, monkeypatch, restore_root_logging):
@@ -77,7 +80,8 @@ def test_train_rejects_invalid_config_without_creating_a_run_dir(tmp_path, monke
     launched = []
 
     class FakeLauncher:
-        def __init__(self, config, run_dir):
+        def __init__(self, config, run_dir, validated=False):
+            assert validated  # run_training validated the agent configs already
             launched.append(run_dir)
 
         def launch(self):
@@ -91,8 +95,9 @@ def test_train_rejects_invalid_config_without_creating_a_run_dir(tmp_path, monke
     assert not runs.exists() and not launched
 
     fixed = {**overrides, "networks.policy_class": "helpers.TwelveHeadPolicy"}
-    run_dir = launcher_module.run_training(str(_misordered_config(tmp_path)), fixed)
-    assert run_dir.root == runs / "retry" and launched == [run_dir]
+    assert launcher_module.run_training(str(_misordered_config(tmp_path)), fixed) == 0  # exit code (D10)
+    [run_dir] = launched
+    assert run_dir.root == runs / "retry"
     assert run_dir.resolved_config_path.is_file()
 
 
