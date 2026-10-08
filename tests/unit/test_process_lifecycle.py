@@ -174,6 +174,8 @@ def test_flush_queue_returns_true_once_the_payload_is_read(tmp_path):
     assert process_module.flush_queue(q, warn_after=60.0)
     reader.join(60)
     assert reader.exitcode == 0 and (tmp_path / "read").read_text() == str(1 << 20)
+    q.close()
+    q.join_thread()  # flushed: the feeder exits now, not at the next GC
 
 
 def test_flush_queue_never_abandons_items_while_the_parent_lives(tmp_path, caplog):
@@ -199,6 +201,8 @@ def test_flush_queue_never_abandons_items_while_the_parent_lives(tmp_path, caplo
     assert result == [True]
     reader.join(60)
     assert reader.exitcode == 0 and (tmp_path / "read").read_text() == str(1 << 20)
+    q.close()
+    q.join_thread()
 
 
 def test_init_child_process_exits_if_the_parent_already_died(monkeypatch):

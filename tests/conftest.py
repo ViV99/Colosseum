@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+import gc
 import logging
 import multiprocessing as mp
+import multiprocessing.util as mp_util
 import os
 import sys
 import tempfile
@@ -88,6 +90,30 @@ def _repo_root_stays_clean():
     yield
     created = {p.name for p in REPO_ROOT.iterdir()} - before - _ALLOWED_NEW_ROOT_ENTRIES
     assert not created, f"tests wrote into the repo root: {sorted(created)}"
+
+
+@pytest.hookimpl(wrapper=True)
+def pytest_runtest_protocol(item: pytest.Item, nextitem: pytest.Item | None):
+    """Free multiprocessing objects a test left in reference cycles right after it, at a safe point.
+
+    Queues, events and counters that end up in a cycle (e.g. a Launcher kept alive by a
+    traceback, also one held by a captured log record) are otherwise finalized by whatever
+    cyclic GC runs next. If that GC runs inside the resource tracker (while another
+    semaphore is registered), every semaphore finalized there warns "ResourceTracker called
+    reentrantly ... might leak" (gh-109629).
+
+    This wraps the whole protocol, so it runs after teardown, once pytest has dropped the
+    test's captured log records. Each live semaphore and queue feeder holds an entry in
+    ``multiprocessing.util._finalizer_registry``; collecting only when an entry added during
+    the test is still there keeps it cheap (``dict.copy`` is atomic, unlike iterating while
+    feeder threads finalize).
+    """
+    before = mp_util._finalizer_registry.copy().keys()
+    try:
+        return (yield)
+    finally:
+        if mp_util._finalizer_registry.copy().keys() - before:
+            gc.collect()
 
 
 @pytest.fixture

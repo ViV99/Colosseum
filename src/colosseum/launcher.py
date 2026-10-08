@@ -465,6 +465,7 @@ class Launcher:
         self._metrics_writer = None
         self._wandb: WandBLogger | None = None
         self._trajectory_queues: dict[str, mp.Queue] = {}
+        self._command_queues: list[mp.Queue] = []
         self._results_queue: mp.Queue | None = None
         self._metrics_queue: mp.Queue | None = None
 
@@ -546,6 +547,7 @@ class Launcher:
         self._agent_ids = list(trainable_agents)
         self._checkpoint_queues = checkpoint_queues
         self._trajectory_queues = trajectory_queues
+        self._command_queues = command_queues
         self._results_queue = results_queue
         self._metrics_queue = metrics_queue
 
@@ -581,7 +583,10 @@ class Launcher:
             try:
                 self._finish_metrics()
             finally:
-                self._supervisor.restore_signal_handlers()
+                try:
+                    self._supervisor.restore_signal_handlers()
+                finally:
+                    self._release_queues()
         return code
 
     def _open_metrics(self, resume_states: dict[str, dict | None]) -> None:
@@ -990,6 +995,34 @@ class Launcher:
         if first_error is not None:
             raise first_error
         return killed
+
+    def _release_queues(self) -> None:
+        """After the teardown and the final drains: close the queues and drop the references.
+
+        Without this, the queues (and their semaphores) outlive ``launch`` until the cyclic
+        GC frees them, e.g. along with a traceback; a GC that runs inside the
+        multiprocessing resource tracker then warns that they "might leak" (gh-109629).
+        - A queue still being read by a helper thread (a read abandoned on an incomplete
+          message) stays open: closing its pipe under that thread is unsafe.
+        - Command queues (the main process is their producer) are not closed: closing the
+          read end would turn a feeder blocked on an unread command into a BrokenPipeError
+          traceback. Their feeders exit once the queue objects are freed.
+        """
+        busy = {key: reader for key, reader in self._readers.items() if reader.busy}
+        produced_here = {id(q) for q in self._command_queues}
+        for q in self._all_queues:
+            try:
+                q.cancel_join_thread()  # idempotent; also when _shutdown never got this far
+                if id(q) not in busy and id(q) not in produced_here:
+                    q.close()
+            except (AttributeError, OSError):
+                pass
+        self._readers = busy
+        self._all_queues = []
+        self._command_queues = []
+        self._trajectory_queues = {}
+        self._checkpoint_queues = {}
+        self._results_queue = self._metrics_queue = None
 
     def _finish_reads(self, deadline: float, poll: Callable[[], None]) -> None:
         """All children are gone: let in-progress reads complete until ``deadline``, then

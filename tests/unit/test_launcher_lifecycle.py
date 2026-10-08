@@ -201,6 +201,33 @@ def test_failed_start_error_is_not_hidden_by_a_failing_teardown(tmp_path, monkey
     assert launcher._metrics_writer.closed
 
 
+def test_launch_closes_and_releases_its_queues(tmp_path, monkeypatch):
+    """After launch() every queue it created is released, not left to the cyclic GC (gh-109629):
+    queues the main process only reads are closed; command queues (it writes them) are not."""
+    created: list = []
+    real_queue = mp.Queue
+
+    def recording_queue(*args, **kwargs):
+        q = real_queue(*args, **kwargs)
+        created.append(q)
+        return q
+
+    monkeypatch.setattr(launcher_module.mp, "Queue", recording_queue)
+    monkeypatch.setattr(launcher_module.mp, "Process", fake_process_class([]))
+    data = ttt_data()
+    data["rollout"]["num_workers"] = 2
+    cfg = ColosseumConfig.model_validate(data)
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
+    with pytest.raises(_Stop):
+        launcher.launch()
+    # 1 agent x (trajectory + checkpoint + 2 weight queues) + metrics + results + 2 command queues
+    assert len(created) == 8
+    assert [q._closed for q in created].count(False) == 2  # the two command queues
+    assert launcher._all_queues == [] and launcher._command_queues == []
+    assert launcher._trajectory_queues == {} and launcher._checkpoint_queues == {}
+    assert launcher._results_queue is None and launcher._metrics_queue is None
+
+
 # ---------------------------------------------------------------------------
 # Exit codes from child exits (carried T2.5 item a) and the single grace constant
 # ---------------------------------------------------------------------------
@@ -325,6 +352,9 @@ def test_drain_skips_checkpoint_queue_of_a_learner_killed_mid_message(tmp_path, 
     assert ("An incomplete item on the checkpoint-agent_0 queue was never completed "
             "(learner-agent_0 died while sending)") in caplog.text
     assert saved == [{"agent_id": "agent_0", "policy_version": 1}]  # the complete item is kept
+    launcher._release_queues()
+    assert not cq._closed  # its read is stuck on the partial message: the pipe stays open under it
+    assert launcher._all_queues == [] and list(launcher._readers.values())  # only the busy reader is kept
 
 
 def _slow_to_unpickle() -> dict:
