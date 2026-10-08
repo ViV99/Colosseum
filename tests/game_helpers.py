@@ -7,7 +7,8 @@ top-level classes, so ``functools.partial(Game, ...)`` or the class itself is a 
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Mapping, Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 import gymnasium
@@ -648,3 +649,142 @@ class RandomPolicy(PolicyModel):
         if action_mask is not None:
             dist = dist.apply_mask(tree_map(lambda m: m.reshape(S * B, *m.shape[2:]), action_mask))
         return UnrollOutput(dist=dist, value=torch.zeros(S * B, device=first.device) if with_value else None)
+
+
+# ---------------------------------------------------------------------------
+# Part B (T3.3): scripted game, dict model pool, recording observer
+# ---------------------------------------------------------------------------
+
+
+SCRIPT_OBS_SPACE = gymnasium.spaces.Box(-1e6, 1e6, (5,), np.float32)
+SCRIPT_GS_SPACE = gymnasium.spaces.Box(-1e6, 1e6, (2,), np.float32)
+
+
+@dataclass
+class Tick:
+    """What a TickGame returns at one episode step (tick 0 = the reset result)."""
+
+    acting: Collection[int] = ()
+    rewards: Mapping[int, float] = field(default_factory=dict)
+    terminated: Collection[int] = ()
+    over: bool = False
+    truncated: bool = False
+    outcome: Outcome | None = None
+
+
+class TickGame(MultiAgentEnv):
+    """Replays a fixed script of Ticks every episode (or cycles through several scripts).
+
+    Observation of seat ``s`` at step ``t`` of episode ``k`` (``k`` counts this env's
+    resets from 0): ``[tag, k, t, s, 0]``; its truncation ``final_obs`` is ``[tag, k, t, s, 1]``;
+    ``global_state`` (if enabled) is ``[k, t + 0.5 * s]``. ``obs_dtype`` sets the observation
+    Box dtype (e.g. ``np.uint8``). ``mask_fn(k, t, seat)`` gives the
+    acting seats' masks (``None`` = no masks). ``log`` records ``(k, t, seed, actions)``
+    for every reset (``actions`` None) and step.
+    """
+
+    def __init__(
+        self,
+        script: Sequence[Tick] | Sequence[Sequence[Tick]],
+        num_seats: int = 1,
+        *,
+        action_space: gymnasium.Space | None = None,
+        global_state: bool = False,
+        mask_fn: Callable[[int, int, int], Any] | None = None,
+        tag: int = 0,
+        obs_dtype: Any = np.float32,
+    ) -> None:
+        self.scripts = [list(script)] if isinstance(script[0], Tick) else [list(s) for s in script]
+        act = action_space if action_space is not None else gymnasium.spaces.Discrete(3)
+        gs = SCRIPT_GS_SPACE if global_state else None
+        self.obs_dtype = np.dtype(obs_dtype)
+        obs = SCRIPT_OBS_SPACE if self.obs_dtype == np.float32 else gymnasium.spaces.Box(
+            0, 255, (5,), self.obs_dtype)
+        if num_seats == 1:
+            self.spec = GameSpec.solo(obs, act, gs)
+        else:
+            self.spec = GameSpec.symmetric(num_seats, obs, act, gs)
+        self.layout = next(iter(self.spec.layouts))
+        self.num_seats = num_seats
+        self.global_state_enabled = global_state
+        self.mask_fn = mask_fn
+        self.tag = tag
+        self.k = -1
+        self.t = 0
+        self.eliminated: set[int] = set()
+        self.log: list[tuple[int, int, int | None, dict | None]] = []
+
+    def _obs(self, seat: int, final: bool = False) -> np.ndarray:
+        return np.array([self.tag, self.k, self.t, seat, 1.0 if final else 0.0], self.obs_dtype)
+
+    def _gs(self, seat: int) -> np.ndarray:
+        return np.array([self.k, self.t + 0.5 * seat], np.float32)
+
+    def _result(self, tick: Tick) -> StepResult:
+        acting = set(tick.acting)
+        res = StepResult(acting=acting, obs={s: self._obs(s) for s in acting})
+        if self.mask_fn is not None:
+            res.action_masks = {s: self.mask_fn(self.k, self.t, s) for s in acting}
+        if self.global_state_enabled:
+            res.global_state = {s: self._gs(s) for s in acting}
+        return res
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.k += 1
+        self.t = 0
+        self.eliminated = set()
+        self.log.append((self.k, 0, seed, None))
+        return self._result(self.scripts[self.k % len(self.scripts)][0])
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        self.t += 1
+        self.log.append((self.k, self.t, None, dict(actions)))
+        tick = self.scripts[self.k % len(self.scripts)][self.t]
+        res = self._result(tick)
+        res.rewards = dict(tick.rewards)
+        res.terminated = set(tick.terminated)
+        res.episode_over = tick.over
+        res.truncated = tick.truncated
+        res.outcome = tick.outcome
+        self.eliminated |= res.terminated
+        if tick.truncated:
+            live = [s for s in range(self.num_seats) if s not in self.eliminated]
+            res.final_obs = {s: self._obs(s, final=True) for s in live}
+            if self.global_state_enabled:
+                res.global_state = {s: self._gs(s) for s in live}
+        return res
+
+
+class DictModelPool:
+    """ModelPool over a plain ``{(agent_id, network_id): model}`` dict."""
+
+    def __init__(self, models: Mapping[tuple[str, str], Any]) -> None:
+        self.models = dict(models)
+
+    def get(self, agent_id: str, network_id: str):
+        return self.models.get((agent_id, network_id))
+
+
+class RecordingObserver:
+    """MatchObserver that appends every event to ``events`` as a tuple."""
+
+    def __init__(self) -> None:
+        self.events: list[tuple] = []
+
+    def on_act(self, env, seat, record):
+        self.events.append(("act", env, seat, record))
+
+    def on_rewards(self, env, rewards):
+        self.events.append(("rewards", env, dict(rewards)))
+
+    def on_terminated(self, env, seats):
+        self.events.append(("terminated", env, list(seats)))
+
+    def on_episode_end(self, env, end):
+        self.events.append(("end", env, end))
+
+    def on_lineup_applied(self, env, old, new):
+        self.events.append(("lineup", env, old, new))
+
+    def kinds(self, env: int | None = None) -> list[str]:
+        return [e[0] for e in self.events if env is None or e[1] == env]
