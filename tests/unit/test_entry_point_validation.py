@@ -44,7 +44,7 @@ def test_bc_cli_rejects_misordered_policy(tmp_path):
 def test_eval_cli_rejects_misordered_policy(tmp_path):
     missing = tmp_path / "never_loaded.pt"
     result = CliRunner().invoke(main, ["eval", "-c", str(_misordered_config(tmp_path)),
-                                       "-a", f"x:{missing}", "-a", f"y:{missing}"])
+                                       "-a", f"x={missing}", "-a", f"y={missing}"])
     assert result.exit_code == 1, result.output
     assert result.stderr.startswith("Config error:") and "action space" in result.stderr
     assert "Traceback" not in result.output

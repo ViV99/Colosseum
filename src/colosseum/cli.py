@@ -81,6 +81,14 @@ def _parse_overrides(overrides: tuple[str, ...]) -> dict:
     return result
 
 
+def _parse_agent_spec(spec: str) -> tuple[str, str]:
+    """``name=path`` -> (name, path)."""
+    name, sep, path = spec.partition("=")
+    if not sep or not name or not path:
+        raise click.BadParameter(f"expected name=path, got {spec!r}", param_hint="'--agent'")
+    return name, path
+
+
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
 @click.option("--set", "overrides", multiple=True,
@@ -152,53 +160,72 @@ def bc(
 
 
 @main.command("eval")
-@click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
-@click.option("--agents", "-a", required=True, multiple=True, help="Agent checkpoint paths (name:path.pt)")
-@click.option("--num-matches", "-n", default=100, type=int, help="Matches per agent pair")
-@click.option("--num-envs", default=8, type=int, help="Parallel environments for eval")
-@click.option(
-    "--deterministic", is_flag=True, default=False, help="Act greedily (distribution mode) instead of sampling",
-)
-def eval_cmd(config: str, agents: tuple[str, ...], num_matches: int, num_envs: int, deterministic: bool) -> None:
-    """Evaluate agents/checkpoints against each other (no training)."""
+@click.option("--config", "-c", required=True, type=click.Path(exists=True),
+              help="Config YAML (env section; networks for .pt agents)")
+@click.option("--agent", "-a", "agents", required=True, multiple=True,
+              help="name=path. path is a checkpoint dir (model built from its meta.json 'networks', "
+                   "else from --config) or a .pt state_dict (model built from --config). Repeatable.")
+@click.option("--num-matches", "-n", default=100, type=click.IntRange(min=1), show_default=True,
+              help="Matches per agent pair (solo: episodes per agent). An odd pairwise count is rounded "
+                   "up to the next even number, so every agent plays every seat equally often.")
+@click.option("--num-envs", default=8, type=click.IntRange(min=1), show_default=True, help="Parallel environments")
+@click.option("--deterministic", is_flag=True, default=False, help="Act greedily (distribution mode)")
+@click.option("--seed", default=None, type=int, help="Seed for env resets and sampling")
+@click.option("--output", "-o", default=None, type=click.Path(dir_okay=False),
+              help="Write the machine-readable result as JSON")
+def eval_cmd(
+    config: str,
+    agents: tuple[str, ...],
+    num_matches: int,
+    num_envs: int,
+    deterministic: bool,
+    seed: int | None,
+    output: str | None,
+) -> None:
+    """Evaluate agents/checkpoints against each other (no training).
+
+    Exit code: 0 done, 1 config error (also a malformed checkpoint or mismatched weights),
+    2 bad command-line arguments.
+    """
     import logging
 
-    import torch
-
     from colosseum.core.config import load_config
-    from colosseum.core.registry import build_model, import_class, validate_config
-    from colosseum.eval import evaluate_agents
+    from colosseum.core.registry import import_class, validate_config
+    from colosseum.eval import evaluate, load_eval_model
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     with _config_errors():
         cfg = load_config(config)
         validate_config(cfg)
+        specs = [_parse_agent_spec(spec) for spec in agents]
+        names = [name for name, _ in specs]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise click.BadParameter(f"duplicate agent names {duplicates}", param_hint="'--agent'")
+        models = {}
+        for name, path in specs:
+            try:
+                models[name] = load_eval_model(path, cfg)
+            except FileNotFoundError as exc:
+                raise click.BadParameter(str(exc), param_hint="'--agent'") from exc
 
-    # Parse agent specs: "name:path.pt"
-    agent_configs = {}
-    for spec in agents:
-        name, path = spec.split(":", 1)
-        sd = torch.load(path, weights_only=True)
-        agent_configs[name] = {"state_dict": sd}
+        if len(models) > 1 and cfg.env.num_players > 1 and num_matches % 2:
+            click.echo(f"Note: --num-matches {num_matches} is odd; using {num_matches + 1} per pair "
+                       f"so every agent plays every seat equally often.", err=True)
+            num_matches += 1
 
-    def env_fn():
-        cls = import_class(cfg.env.env_class)
-        return cls(**cfg.env.kwargs)
+        env_cls = import_class(cfg.env.env_class)
 
-    def model_factory():
-        return build_model(cfg)
+        def env_fn():
+            return env_cls(**cfg.env.kwargs)
 
-    matrix = evaluate_agents(
-        agent_configs, env_fn, model_factory,
-        num_matches=num_matches, num_envs=num_envs,
-        deterministic=deterministic,
-    )
-
-    click.echo("\n" + matrix.summary())
+        report = evaluate(models, env_fn, num_matches=num_matches, num_envs=num_envs,
+                          deterministic=deterministic, seed=seed)
+    click.echo("\n" + report.summary())
+    if output:
+        report.write_json(output)
+        click.echo(f"Result written to {output}")
 
 
 @main.command("validate")

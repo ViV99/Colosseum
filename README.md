@@ -44,8 +44,8 @@ colosseum train --config configs/examples/tic_tac_toe_multi.yaml
 
 ```bash
 colosseum eval -c configs/examples/tic_tac_toe.yaml \
-  -a agent_a:checkpoints/agent_0/ckpt_v100/model.pt \
-  -a agent_b:checkpoints/agent_0/ckpt_v200/model.pt \
+  -a agent_a=runs/<run_name>/checkpoints/agent_0/ckpt_v100 \
+  -a agent_b=runs/<run_name>/checkpoints/agent_0/ckpt_v200 \
   --num-matches 1000
 ```
 
@@ -407,16 +407,19 @@ Inference-only matchups between any agents/checkpoints:
 
 ```bash
 colosseum eval -c config.yaml \
-  -a agent_a:checkpoints/agent_0/ckpt_v100/model.pt \
-  -a agent_b:checkpoints/agent_0/ckpt_v200/model.pt \
-  -a agent_c:checkpoints/agent_1/ckpt_v50/model.pt \
+  -a agent_a=runs/<run_name>/checkpoints/agent_0/ckpt_v100 \
+  -a agent_b=runs/<run_name>/checkpoints/agent_0/ckpt_v200 \
+  -a agent_c=runs/<run_name>/checkpoints/agent_1/ckpt_v50 \
   --num-matches 1000 \
-  --num-envs 16
+  --num-envs 16 \
+  --output result.json
 ```
 
-Supports N agents in N-player games. Agents are assigned to player slots round-robin. Pairwise results with Wilson score 95% confidence intervals.
-
-Output: win rate matrix, per-pair statistics, average episode length.
+`--num-matches` is per pair. Seats rotate, so each agent plays every seat equally often. The report gives W/D/L,
+the win rate and the score (W + D/2)/n, each with a 95% Wilson interval (the score interval is a conservative
+approximation), plus a per-seat breakdown. A checkpoint directory is built from its `meta.json` `networks`, so
+different architectures can be compared. A `.pt` file uses the config's `networks`. With one agent or a 1-player
+env the report is solo: mean return and outcome with 95% normal intervals.
 
 ---
 

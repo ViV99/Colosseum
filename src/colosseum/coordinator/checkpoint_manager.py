@@ -293,17 +293,42 @@ class CheckpointManager:
         return entries[-1] if entries else None
 
 
+def _read_checkpoint(ckpt_dir: Path) -> tuple[dict, dict[str, torch.Tensor]]:
+    """``(meta, model state_dict)`` of one checkpoint dir; any problem raises (no ConfigError
+    wrapping here: callers name their own context)."""
+    meta = _parse_meta(ckpt_dir)
+    state = torch.load(ckpt_dir / MODEL_FILE, map_location="cpu", weights_only=True)
+    if not isinstance(state, dict) or not all(isinstance(v, torch.Tensor) for v in state.values()):
+        raise ValueError(f"{MODEL_FILE} is not a state_dict of tensors")
+    return meta, state
+
+
+def load_checkpoint_dir(ckpt_dir: str | Path) -> dict[str, Any]:
+    """Read one checkpoint dir (e.g. ``<run>/checkpoints/<agent>/ckpt_v<N>``) without touching it.
+
+    Returns ``{"model_state": numpy state_dict, "meta": validated meta.json}``. Unlike
+    ``CheckpointManager`` (whose scan cleans up and restores ``.tmp-*`` dirs), nothing is
+    written, so it is safe on a live run. A missing dir or file, an invalid ``meta.json``
+    or an unreadable ``model.pt`` raises ConfigError naming the dir.
+    """
+    path = Path(ckpt_dir)
+    try:
+        if not path.is_dir():
+            raise ValueError("not a directory")
+        meta, state = _read_checkpoint(path)
+    except Exception as e:  # noqa: BLE001 - any read/parse/unpickling failure means a bad checkpoint
+        raise ConfigError(f"Malformed checkpoint {path}: {type(e).__name__}: {e}") from e
+    return {"model_state": torch_state_to_numpy(state), "meta": meta}
+
+
 def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
     """Resume state from one checkpoint dir; any unreadable part (also a missing
     ``meta.json``, the only source of the version) raises ConfigError."""
     trainer_path = ckpt_dir / TRAINER_FILE
     try:
-        meta = _parse_meta(ckpt_dir)
+        meta, state = _read_checkpoint(ckpt_dir)
         version = int(meta["policy_version"])
         env_steps = int(meta.get("env_steps") or 0)  # null: unknown (distributed learners)
-        state = torch.load(ckpt_dir / MODEL_FILE, map_location="cpu", weights_only=True)
-        if not isinstance(state, dict) or not all(isinstance(v, torch.Tensor) for v in state.values()):
-            raise ValueError(f"{MODEL_FILE} is not a state_dict of tensors")
         trainer_state = trainer_path.read_bytes() if trainer_path.is_file() else None
     except Exception as e:  # noqa: BLE001 - any read/parse/unpickling failure means a bad resume source
         raise ConfigError(

@@ -118,7 +118,7 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
 - Inference-only matchups between any set of checkpoints/agents
 - No training, just collect win rates with confidence intervals
 - Supports N-player games with round-robin agent assignment and pairwise result extraction
-- Command: `colosseum eval --agents A_ckpt_100 B_ckpt_200 --num_matches 1000 --env my_game`
+- Command: `colosseum eval -c cfg.yaml -a A=runs/<name>/checkpoints/<agent>/ckpt_v<N> -a B=runs/<name>/checkpoints/<agent>/ckpt_v<M> --num-matches 1000 --output result.json`
 
 ---
 
