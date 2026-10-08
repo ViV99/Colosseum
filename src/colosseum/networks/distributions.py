@@ -220,6 +220,11 @@ class CompositeDist(Distribution):
     def action_dim(self) -> int:
         return self._flat_size
 
+    @property
+    def components(self) -> list[tuple[str, int, int, bool]]:
+        """``(name, flat_offset, size, is_discrete)`` per component, in flat-layout order."""
+        return [(k, *self._layout[k]) for k in self._keys]
+
     def sample(self) -> torch.Tensor:
         """Sample from all sub-distributions and return ``[B, flat_size]``."""
         parts: list[torch.Tensor] = []

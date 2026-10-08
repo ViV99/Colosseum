@@ -215,6 +215,13 @@ Pre-train from expert data to bootstrap the policy:
 colosseum bc -c config.yaml --data expert_games/ --output bc_weights.pt --epochs 50
 ```
 
+Each `.pt` file is a dict with `observations` `[N, *obs_shape]`, `actions` (`[N]` int for Discrete,
+`[N, D]` float for Box, the `ActionSpec` flat layout for Dict/Tuple/MultiDiscrete), and optional
+`action_masks` `[N, mask_size]` bool and `dones` `[N]` bool. The loss is `-log pi(a|s)` with the
+masks applied; an expert action that is illegal under its mask is an error. Stateful models
+(LSTM/GRU/attention cores) train on windows of `bc.seq_len` transitions (`--seq-len`), resetting
+the state at `dones`.
+
 Use **kickstarting** during RL to regularize towards a teacher via decaying KL loss:
 
 ```yaml

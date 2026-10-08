@@ -334,6 +334,16 @@ class AgentConfig(BaseModel):
     learner: LearnerConfig | None = None
 
 
+class BCConfig(BaseModel):
+    """Offline behavioral cloning (``colosseum bc``)."""
+
+    seq_len: int = Field(
+        default=64, ge=1,
+        description="Window length (transitions) for stateful models; ignored by stateless "
+                    "ones. CLI --seq-len overrides it.",
+    )
+
+
 # ---------------------------------------------------------------------------
 # Top-level config
 # ---------------------------------------------------------------------------
@@ -354,6 +364,7 @@ class ColosseumConfig(BaseModel):
     self_play: SelfPlayConfig = Field(default_factory=SelfPlayConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    bc: BCConfig = Field(default_factory=BCConfig)
     transport: TransportConfig = Field(default_factory=TransportConfig)
     agents: dict[str, AgentConfig] = Field(
         default_factory=dict,

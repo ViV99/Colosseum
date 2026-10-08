@@ -45,14 +45,15 @@ def train(config: str, overrides: tuple[str, ...]) -> None:
 
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
-@click.option(
-    "--data", "-d", required=True, type=click.Path(exists=True), help="Path to BC data (.pt file or directory)",
-)
-@click.option("--output", "-o", required=True, type=click.Path(), help="Path to save trained model weights (.pt)")
-@click.option("--epochs", default=10, type=int, help="Number of BC training epochs")
-@click.option("--batch-size", default=256, type=int, help="BC training batch size")
-@click.option("--lr", default=1e-3, type=float, help="Learning rate for BC")
-@click.option("--action-type", default="discrete", type=click.Choice(["discrete", "continuous"]))
+@click.option("--data", "-d", required=True, type=click.Path(exists=True),
+              help="BC data: a .pt file or a directory of .pt files (keys: observations, actions, "
+                   "optional action_masks, dones)")
+@click.option("--output", "-o", required=True, type=click.Path(), help="Where to save the trained state_dict (.pt)")
+@click.option("--epochs", default=10, type=int, show_default=True, help="Number of BC epochs")
+@click.option("--batch-size", default=256, type=int, show_default=True, help="Transitions per gradient step")
+@click.option("--lr", default=1e-3, type=float, show_default=True, help="Adam learning rate")
+@click.option("--seq-len", default=None, type=int,
+              help="Window length for stateful models (default: bc.seq_len from the config, 64)")
 def bc(
     config: str,
     data: str,
@@ -60,9 +61,9 @@ def bc(
     epochs: int,
     batch_size: int,
     lr: float,
-    action_type: str,
+    seq_len: int | None,
 ) -> None:
-    """Train a policy via offline Behavioral Cloning."""
+    """Train a policy by offline behavioral cloning (loss = -log pi(a|s), masks applied)."""
     import logging
 
     import torch
@@ -71,31 +72,26 @@ def bc(
     from colosseum.core.config import load_config
     from colosseum.core.registry import build_model
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     cfg = load_config(config)
-
     model = build_model(cfg)
-
     device = cfg.learner.device
     if device == "auto":
         device = "cuda" if torch.cuda.is_available() else "cpu"
 
     trainer = OfflineBCTrainer(
-        model=model,
-        lr=lr,
-        device=device,
-        action_type=action_type,
+        model, lr=lr, device=device,
+        seq_len=seq_len if seq_len is not None else cfg.bc.seq_len,
     )
     trainer.load_data(data)
     metrics = trainer.train(num_epochs=epochs, batch_size=batch_size)
 
-    # Save trained weights
-    torch.save(model.state_dict(), output)
-    click.echo(f"BC training complete. Loss={metrics['bc_loss']:.4f}")
+    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, output)
+    message = f"BC training complete: final-epoch NLL={metrics['bc_loss']:.4f}"
+    if "accuracy" in metrics:
+        message += f", accuracy={metrics['accuracy']:.3f}"
+    click.echo(message)
     click.echo(f"Weights saved to {output}")
 
 
