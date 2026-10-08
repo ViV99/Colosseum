@@ -77,10 +77,10 @@ def start_train(config: Path, tmp_path: Path, name: str = "run",
                 overrides: dict[str, str] | None = None) -> tuple[subprocess.Popen, Path]:
     """Start training in its own session; stdout/stderr go to files next to the run dir."""
     run_parent = tmp_path / "runs"
-    out = open(tmp_path / f"{name}.stdout", "w")
-    err = open(tmp_path / f"{name}.stderr", "w")
-    proc = subprocess.Popen(train_cmd(config, run_parent, name, overrides), cwd=REPO_ROOT, env=child_env(),
-                            stdout=out, stderr=err, text=True, start_new_session=True)
+    # The child keeps its own copies of the descriptors; the parent's handles close here.
+    with open(tmp_path / f"{name}.stdout", "w") as out, open(tmp_path / f"{name}.stderr", "w") as err:
+        proc = subprocess.Popen(train_cmd(config, run_parent, name, overrides), cwd=REPO_ROOT, env=child_env(),
+                                stdout=out, stderr=err, text=True, start_new_session=True)
     return proc, run_parent / name
 
 

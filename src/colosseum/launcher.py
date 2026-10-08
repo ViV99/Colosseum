@@ -78,6 +78,19 @@ def warn_static_ownership_skew(config: ColosseumConfig) -> None:
         )
 
 
+def validate_agent_configs(config: ColosseumConfig) -> dict[str, ColosseumConfig]:
+    """Effective config of every trainable agent, each checked by ``validate_config``.
+
+    Fails fast (ConfigError) on structural errors, e.g. a head/encoder dim mismatch.
+    """
+    from colosseum.core.registry import validate_config
+
+    agent_configs = {aid: config.get_agent_config(aid) for aid in config.get_trainable_agent_ids()}
+    for acfg in agent_configs.values():
+        validate_config(acfg)
+    return agent_configs
+
+
 def _create_model(config: ColosseumConfig):
     """Create the agent's PolicyModel inside a worker/learner process."""
     from colosseum.core.registry import build_model
@@ -361,16 +374,8 @@ class Launcher:
         logger.info(f"  Envs per worker: {cfg.rollout.envs_per_worker}")
         logger.info(f"  Chunk length: {cfg.rollout.chunk_length}")
 
-        # Build per-agent effective configs (with overrides merged)
-        agent_configs: dict[str, ColosseumConfig] = {}
-        for aid in trainable_agents:
-            agent_configs[aid] = cfg.get_agent_config(aid)
-
-        # Fail fast on structural config errors (e.g. head/encoder dim mismatch)
-        # before spawning any processes.
-        from colosseum.core.registry import validate_config
-        for aid in trainable_agents:
-            validate_config(agent_configs[aid])
+        # Per-agent effective configs (overrides merged), validated before any process starts.
+        agent_configs = validate_agent_configs(cfg)
         warn_static_ownership_skew(cfg)
 
         # Initialize coordinator
@@ -768,8 +773,12 @@ def run_training(config_path: str, overrides: dict | None = None) -> RunDir:
     mp.set_start_method("spawn", force=True)
     setup_process_logging(None, "main", console_level=logging.INFO)
     config = load_config(config_path, overrides)
+    # Before the run dir exists: an invalid config leaves nothing behind, so a corrected
+    # retry with the same run.name works.
+    validate_agent_configs(config)
     apply_global_seed(config.training.seed)  # after overrides: --set training.seed works (R3-27)
     run_dir = RunDir.create(config, config_path)
+    config = run_dir.with_run_name(config)  # the resolved config and checkpoint hashes agree
     setup_process_logging(run_dir.logs, "main", console_level=logging.INFO)
     run_dir.write_resolved_config(config)
     print(f"Run directory: {run_dir.root}", flush=True)

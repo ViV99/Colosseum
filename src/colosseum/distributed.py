@@ -36,6 +36,7 @@ import logging
 import multiprocessing as mp
 import queue
 import signal
+import socket
 import threading
 import time
 from functools import partial
@@ -43,7 +44,7 @@ from functools import partial
 import torch
 
 from colosseum.core.config import ColosseumConfig, config_hash, load_config
-from colosseum.core.run_dir import RunDir
+from colosseum.core.run_dir import RunDir, safe_path_component
 from colosseum.core.types import WeightPayload
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import run_child
@@ -148,12 +149,13 @@ def run_distributed_learner(
 
     setup_process_logging(None, f"learner-{agent_id}", console_level=logging.INFO)
     config = load_config(config_path, overrides)
+    acfg = config.get_agent_config(agent_id)
+    validate_config(acfg)  # before the run dir exists: a bad config leaves nothing behind
     run_dir = RunDir.create(config, config_path, role=f"learner-{agent_id}")
+    config = run_dir.with_run_name(config)
     setup_process_logging(run_dir.logs, f"learner-{agent_id}", console_level=logging.INFO)
     run_dir.write_resolved_config(config)
     print(f"Run directory: {run_dir.root}", flush=True)
-    acfg = config.get_agent_config(agent_id)
-    validate_config(acfg)
     max_mb = config.transport.grpc_max_message_mb
 
     device = resolve_device(acfg.learner.device)
@@ -362,14 +364,16 @@ def run_distributed_workers(
 
     setup_process_logging(None, "workers-main", console_level=logging.INFO)
     config = load_config(config_path, overrides)
-    run_dir = RunDir.create(config, config_path, role="workers")
-    setup_process_logging(run_dir.logs, "workers-main", console_level=logging.INFO)
-    run_dir.write_resolved_config(config)
-    print(f"Run directory: {run_dir.root}", flush=True)
     agent_ids = list(learner_addresses.keys()) or config.get_trainable_agent_ids()
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_ids}
     for aid in agent_ids:
-        validate_config(agent_configs[aid])
+        validate_config(agent_configs[aid])  # before the run dir exists
+    # One dir per machine: worker hosts sharing a run.name on a shared filesystem never collide.
+    run_dir = RunDir.create(config, config_path, role=workers_role())
+    config = run_dir.with_run_name(config)
+    setup_process_logging(run_dir.logs, "workers-main", console_level=logging.INFO)
+    run_dir.write_resolved_config(config)
+    print(f"Run directory: {run_dir.root}", flush=True)
     mp.set_start_method("spawn", force=True)
 
     num_players = config.env.num_players
@@ -429,6 +433,11 @@ def run_distributed_workers(
 # =====================================================================
 # Helpers
 # =====================================================================
+
+
+def workers_role() -> str:
+    """Run-dir role of ``run-workers`` on this machine: ``workers-<host>``."""
+    return f"workers-{safe_path_component(socket.gethostname(), 'host')}"
 
 
 def _install_stop_signal_handlers(stop_event: threading.Event) -> None:

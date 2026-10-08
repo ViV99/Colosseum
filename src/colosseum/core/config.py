@@ -374,10 +374,20 @@ class RunConfig(StrictModel):
 
     name: str | None = Field(
         default=None,
-        description="Run name; default '<config_stem>-<YYYYmmdd-HHMMSS>'. An existing non-empty run dir "
-                    "with an explicit name is an error.",
+        description="Run name (one path component); default '<config_stem>-<YYYYmmdd-HHMMSS>'. "
+                    "An explicit name whose run dir already exists is an error.",
     )
     dir: str = Field(default="runs", description="Parent directory of all runs.")
+
+    @field_validator("name")
+    @classmethod
+    def _check_name(cls, name: str | None) -> str | None:
+        if name is not None:
+            try:
+                check_path_component(name, "run name")
+            except ConfigError as e:
+                raise ValueError(str(e)) from e
+        return name
 
 
 class TransportConfig(StrictModel):

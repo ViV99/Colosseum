@@ -38,7 +38,7 @@ def _port_open(port: int) -> bool:
 @pytest.mark.timeout(600)
 def test_distributed_grpc_pipeline(tmp_path, restore_root_logging):
     """The learner trains on chunks from gRPC workers and publishes weights (version > 0)."""
-    from colosseum.distributed import run_distributed_learner, run_distributed_workers
+    from colosseum.distributed import run_distributed_learner, run_distributed_workers, workers_role
     from colosseum.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
 
     ws_port, traj_port = _free_port(), _free_port()
@@ -59,9 +59,9 @@ def test_distributed_grpc_pipeline(tmp_path, restore_root_logging):
         "run.name": "e2e",
     }
 
-    # Each role creates its own run dir: <run.name>-learner-<agent> and <run.name>-workers.
+    # Each role creates its own run dir: <run.name>-learner-<agent> and <run.name>-workers-<host>.
     learner_run = tmp_path / "runs" / f"e2e-learner-{agent}"
-    workers_run = tmp_path / "runs" / "e2e-workers"
+    workers_run = tmp_path / "runs" / f"e2e-{workers_role()}"
     ckpt_root = learner_run / "checkpoints" / agent
     ws_server = serve_weight_store(port=ws_port)
     learner = mp.Process(

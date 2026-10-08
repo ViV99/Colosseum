@@ -47,16 +47,17 @@ def test_eval_cli_rejects_misordered_policy(tmp_path):
     assert "action space" in str(result.exception)
 
 
-def test_distributed_learner_rejects_misordered_policy_before_serving(tmp_path, monkeypatch):
+def test_distributed_learner_rejects_misordered_policy_before_serving(tmp_path, monkeypatch, restore_root_logging):
     from colosseum import distributed
     from colosseum.transport import grpc_transport
 
     monkeypatch.setattr(grpc_transport, "serve_trajectory_receiver", _fail("serve_trajectory_receiver"))
     with pytest.raises(ConfigError, match="action space"):
         distributed.run_distributed_learner(str(_misordered_config(tmp_path)), "agent_0", 0, "localhost:1")
+    assert not (tmp_path / "runs").exists()  # no run dir for a rejected config (cwd is tmp_path)
 
 
-def test_distributed_workers_reject_misordered_policy_before_spawning(tmp_path, monkeypatch):
+def test_distributed_workers_reject_misordered_policy_before_spawning(tmp_path, monkeypatch, restore_root_logging):
     from colosseum import distributed
 
     monkeypatch.setattr(mp, "set_start_method", _fail("mp.set_start_method"))
@@ -64,3 +65,32 @@ def test_distributed_workers_reject_misordered_policy_before_spawning(tmp_path, 
     with pytest.raises(ConfigError, match="action space"):
         distributed.run_distributed_workers(str(_misordered_config(tmp_path)), "localhost:1",
                                             {"agent_0": "localhost:2"})
+    assert not (tmp_path / "runs").exists()
+
+
+def test_train_rejects_invalid_config_without_creating_a_run_dir(tmp_path, monkeypatch, restore_root_logging,
+                                                                 restore_global_rng):
+    """A rejected config leaves no run dir, so a corrected retry can reuse the same run.name."""
+    import colosseum.launcher as launcher_module
+
+    monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *args, **kwargs: None)
+    launched = []
+
+    class FakeLauncher:
+        def __init__(self, config, run_dir):
+            launched.append(run_dir)
+
+        def launch(self):
+            return 0
+
+    monkeypatch.setattr(launcher_module, "Launcher", FakeLauncher)
+    runs = tmp_path / "runs"
+    overrides = {"run.dir": str(runs), "run.name": "retry"}
+    with pytest.raises(ConfigError, match="action space"):
+        launcher_module.run_training(str(_misordered_config(tmp_path)), overrides)
+    assert not runs.exists() and not launched
+
+    fixed = {**overrides, "networks.policy_class": "helpers.TwelveHeadPolicy"}
+    run_dir = launcher_module.run_training(str(_misordered_config(tmp_path)), fixed)
+    assert run_dir.root == runs / "retry" and launched == [run_dir]
+    assert run_dir.resolved_config_path.is_file()

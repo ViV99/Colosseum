@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import multiprocessing as mp
 import os
 import sys
@@ -103,16 +104,20 @@ def restore_global_rng():
     torch.set_rng_state(states[2])
 
 
-@pytest.fixture
-def restore_root_logging():
-    """Entry points replace the root handlers (setup_process_logging); put pytest's handlers,
-    level and warnings routing back afterwards."""
-    import logging
+def _own_root_handlers() -> list[logging.Handler]:
+    """Root handlers that are not pytest's own (its capture handlers change per test phase)."""
+    return [h for h in logging.getLogger().handlers if not type(h).__module__.startswith("_pytest")]
 
+
+def _root_logging_state() -> tuple[list[logging.Handler], int, bool]:
+    # logging keeps the original showwarning here while captureWarnings(True) is on.
+    return _own_root_handlers(), logging.getLogger().level, logging._warnings_showwarning is not None
+
+
+def _restore_root_logging(state: tuple[list[logging.Handler], int, bool]) -> None:
+    handlers, level, capturing = state
     root = logging.getLogger()
-    handlers, level = list(root.handlers), root.level
-    yield
-    for handler in list(root.handlers):
+    for handler in _own_root_handlers():
         if handler not in handlers:
             root.removeHandler(handler)
             handler.close()
@@ -120,7 +125,37 @@ def restore_root_logging():
         if handler not in root.handlers:
             root.addHandler(handler)
     root.setLevel(level)
-    logging.captureWarnings(False)
+    logging.captureWarnings(capturing)
+
+
+@pytest.fixture
+def restore_root_logging():
+    """Entry points replace the root handlers (setup_process_logging); put the handlers,
+    level and warnings routing back afterwards."""
+    state = _root_logging_state()
+    yield
+    _restore_root_logging(state)
+
+
+@pytest.fixture(autouse=True)
+def _root_logging_unchanged(request: pytest.FixtureRequest):
+    """Fail a test that leaves the root logger changed (handlers, level, captureWarnings).
+
+    Code that calls ``setup_process_logging`` in the test process (an entry point run
+    in-process) must use ``restore_root_logging``. The state is restored before failing,
+    so one leak does not cascade into later tests.
+    """
+    before = _root_logging_state()
+    yield
+    after = _root_logging_state()
+    if after != before:
+        _restore_root_logging(before)
+        pytest.fail(
+            f"{request.node.nodeid} changed the root logger (handlers {before[0]} -> {after[0]}, "
+            f"level {before[1]} -> {after[1]}, captureWarnings {before[2]} -> {after[2]}); "
+            f"use the restore_root_logging fixture",
+            pytrace=False,
+        )
 
 
 @pytest.fixture
