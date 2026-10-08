@@ -38,6 +38,12 @@ def _env_spec(env: Any, index: int) -> GameSpec:
     return spec
 
 
+def _close_env(env: Any) -> None:
+    close = getattr(env, "close", None)
+    if callable(close):
+        close()
+
+
 class VectorEnv:
     """``num_envs`` envs in this process, stepped one after another."""
 
@@ -68,25 +74,30 @@ class VectorEnv:
         return self.envs[index]
 
     def reset(self, requests: Mapping[int, tuple[int | None, str]]) -> dict[int, StepResult]:
-        """Reset the listed envs: ``{env: (seed, layout)}`` -> ``{env: reset result}``."""
-        out: dict[int, StepResult] = {}
-        for index, (seed, layout) in requests.items():
+        """Reset the listed envs: ``{env: (seed, layout)}`` -> ``{env: reset result}``.
+
+        Every index and layout is checked before any env is touched.
+        """
+        for index, (_seed, layout) in requests.items():
+            self._env(index)
             if layout not in self.spec.layouts:
                 raise ValueError(f"env {self._offset + index}: unknown layout {layout!r} "
                                  f"(layouts: {list(self.spec.layouts)})")
-            out[index] = self._env(index).reset(seed, layout)
-        return out
+        return {index: self.envs[index].reset(seed, layout) for index, (seed, layout) in requests.items()}
 
     def step(self, actions: Mapping[int, dict[int, Any]]) -> dict[int, StepResult]:
-        """Step the listed envs only: ``{env: {seat: action}}`` -> ``{env: result}``."""
-        return {index: self._env(index).step(dict(seat_actions)) for index, seat_actions in actions.items()}
+        """Step the listed envs only: ``{env: {seat: action}}`` -> ``{env: result}``.
+
+        Every index is checked before any env is stepped.
+        """
+        for index in actions:
+            self._env(index)
+        return {index: self.envs[index].step(dict(seat_actions)) for index, seat_actions in actions.items()}
 
     def close(self) -> None:
         envs, self.envs = self.envs, []
         for env in envs:
-            close = getattr(env, "close", None)
-            if callable(close):
-                close()
+            _close_env(env)
 
 
 def _split_indices(num_envs: int, num_workers: int) -> list[tuple[int, int]]:
@@ -176,7 +187,7 @@ class SubprocessVectorEnv:
             self.spec: GameSpec = _env_spec(probe, 0)
             self.spec.validate()
         finally:
-            probe.close()
+            _close_env(probe)  # it may not even be a MultiAgentEnv
         self._slices = _split_indices(num_envs, num_workers)
         self.num_workers = len(self._slices)
         self._owner = [w for w, (start, end) in enumerate(self._slices) for _ in range(start, end)]

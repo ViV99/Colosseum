@@ -16,6 +16,18 @@ class _ClosingGame(SoloCounterGame):
         _ClosingGame.closed.append(id(self))
 
 
+class _CountingGame(SoloCounterGame):
+    calls: list[str] = []
+
+    def reset(self, seed, layout):
+        _CountingGame.calls.append("reset")
+        return super().reset(seed, layout)
+
+    def step(self, actions):
+        _CountingGame.calls.append("step")
+        return super().step(actions)
+
+
 class _OtherLengthSpec(SoloCounterGame):
     """Every second instance has a different observation space."""
 
@@ -83,4 +95,19 @@ def test_results_are_numpy():
     vec = VectorEnv(SoloCounterGame, num_envs=1)
     result = vec.reset({0: (None, "solo")})[0]
     assert isinstance(result.obs[0], np.ndarray)
+    vec.close()
+
+
+def test_bad_requests_are_rejected_before_any_env_is_touched():
+    _CountingGame.calls = []
+    vec = VectorEnv(_CountingGame, num_envs=2)
+    with pytest.raises(ValueError, match="env 1: unknown layout"):
+        vec.reset({0: (None, "solo"), 1: (None, "2p")})
+    with pytest.raises(IndexError):
+        vec.reset({0: (None, "solo"), 5: (None, "solo")})
+    assert _CountingGame.calls == []
+    vec.reset({0: (None, "solo")})
+    with pytest.raises(IndexError):
+        vec.step({0: {0: 1}, 5: {0: 1}})
+    assert _CountingGame.calls == ["reset"]
     vec.close()

@@ -26,6 +26,10 @@ class _RaisingGame(SoloCounterGame):
         raise EnvContractError("bad step from the env")
 
 
+def _not_an_env():
+    return object()
+
+
 def _units():
     return UnitsGame(max_units=3)
 
@@ -115,3 +119,8 @@ def test_close_is_bounded_and_idempotent():
 def test_spec_is_checked_in_the_parent_before_spawning():
     with pytest.raises(EnvContractError, match="must be a GameSpec"):
         SubprocessVectorEnv(functools.partial(ScriptedGame, None, []), num_envs=1, num_workers=1)
+
+
+def test_env_fn_must_build_multi_agent_envs_in_the_parent():
+    with pytest.raises(EnvContractError, match="must return a MultiAgentEnv"):
+        SubprocessVectorEnv(_not_an_env, num_envs=1, num_workers=1)
