@@ -7,6 +7,7 @@ top-level classes, so ``functools.partial(Game, ...)`` or the class itself is a 
 
 from __future__ import annotations
 
+import queue
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any
@@ -17,6 +18,7 @@ import torch
 import torch.nn as nn
 from gymnasium.spaces import Box, Dict, Discrete, MultiBinary
 
+from colosseum.core.ipc import assert_no_tensors
 from colosseum.networks.cores import Core, GRUCore, LSTMCore, NoCore, WindowAttentionCore
 from colosseum.sp2.core.specs import ActionSpec, ObsSpec
 from colosseum.sp2.core.tree import Tree, tree_get, tree_leaves, tree_map
@@ -788,3 +790,22 @@ class RecordingObserver:
 
     def kinds(self, env: int | None = None) -> list[str]:
         return [e[0] for e in self.events if env is None or e[1] == env]
+
+
+# ---------------------------------------------------------------------------
+# Part B (T3.4): a queue that rejects tensors
+# ---------------------------------------------------------------------------
+
+
+class NumpyOnlyQueue(queue.Queue):
+    """``queue.Queue`` that raises if an item contains a ``torch.Tensor`` (process-boundary rule)."""
+
+    def put(self, item, block=True, timeout=None):
+        assert_no_tensors(item, "queued item")
+        super().put(item, block, timeout)
+
+    def put_nowait(self, item):
+        self.put(item, block=False)
+
+    def cancel_join_thread(self) -> None:
+        pass
