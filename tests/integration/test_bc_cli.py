@@ -55,3 +55,15 @@ def test_bc_cli_has_no_action_type_option(tmp_path):
     ])
     assert result.exit_code == 2
     assert "No such option" in result.output
+
+
+def test_bc_cli_rejects_non_positive_seq_len(tmp_path):
+    cfg = tmp_path / "cfg.yaml"
+    cfg.write_text(CONFIG)
+    data = tmp_path / "data.pt"
+    _write_data(data)
+    result = CliRunner().invoke(main, [
+        "bc", "-c", str(cfg), "-d", str(data), "-o", str(tmp_path / "x.pt"), "--seq-len", "0",
+    ])
+    assert result.exit_code == 2
+    assert "--seq-len" in result.output

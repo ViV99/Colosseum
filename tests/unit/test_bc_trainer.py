@@ -212,3 +212,119 @@ def test_bc_trains_on_cuda(core):
     assert all(p.device.type == "cuda" for p in model.parameters())
     assert torch.isfinite(torch.tensor(metrics["bc_loss"]))
     assert 0.0 <= metrics["accuracy"] <= 1.0
+
+
+# --- Fix round 1 -----------------------------------------------------------
+
+
+def test_stateful_windows_reset_state_after_dones():
+    model = make_simple_model(obs_dim=4, core="lstm", seed=0)
+    trainer = OfflineBCTrainer(model, seq_len=8)
+    obs = torch.randn(8, 4, generator=torch.Generator().manual_seed(1))
+    index = _window_index(8, 8).t()                                   # [L=8, b=1]
+    dones = torch.zeros(8, dtype=torch.bool)
+    dones[3] = True
+    with torch.no_grad():
+        reset_dist, _ = trainer._sequence_forward(index, obs, None, dones)
+        carried_dist, _ = trainer._sequence_forward(index, obs, None, torch.zeros(8, dtype=torch.bool))
+        fresh = model.step(obs[4:5], model.initial_state(1)).dist
+    # After dones[3] the state is reset: step 4 sees exactly what a fresh episode start sees.
+    assert torch.allclose(reset_dist.logits[4], fresh.logits[0], atol=1e-6)
+    # Sanity: without the reset the carried state changes the output at step 4.
+    assert not torch.allclose(carried_dist.logits[4], fresh.logits[0], atol=1e-4)
+
+
+def test_masks_are_applied_for_stateful_models():
+    n = 64
+    actions = torch.randint(0, 4, (n,))
+    masks = torch.nn.functional.one_hot(actions, 4).bool()
+    trainer = OfflineBCTrainer(make_simple_model(obs_dim=4, core="lstm"), seq_len=8)
+    trainer.add_data(torch.randn(n, 4), actions, action_masks=masks, dones=torch.arange(n) % 5 == 4)
+    metrics = trainer.train(num_epochs=1, batch_size=16)
+    assert metrics["bc_loss_first_epoch"] < 1e-6
+    assert metrics["accuracy"] == 1.0
+
+
+def test_bc_updates_obs_normalizers_once_per_sample():
+    torch.manual_seed(0)
+    n = 5000                                                          # > one 4096-sample update chunk
+    obs = torch.randn(n, 4) * torch.tensor([2.0, 0.5, 1.0, 3.0]) + torch.tensor([5.0, -3.0, 1.0, 0.5])
+    actions = torch.randint(0, 4, (n,))
+    model = make_simple_model(obs_dim=4, normalize=True, seed=0)
+    rms = model.encoder.norm.rms
+    trainer = OfflineBCTrainer(model)
+    trainer.add_data(obs, actions, dones=torch.zeros(n, dtype=torch.bool))
+    trainer.train(num_epochs=1, batch_size=1024)
+    assert rms.count.item() == pytest.approx(n, abs=1e-2)
+    assert torch.allclose(rms.mean, obs.mean(0), atol=1e-4)
+    assert torch.allclose(rms.var, obs.var(0, unbiased=False), rtol=1e-3)
+
+    trainer.train(num_epochs=1, batch_size=1024)                     # no new data: no double count
+    assert rms.count.item() == pytest.approx(n, abs=1e-2)
+
+    more = torch.randn(1000, 4) - 2.0
+    trainer.add_data(more, torch.randint(0, 4, (1000,)), dones=torch.zeros(1000, dtype=torch.bool))
+    trainer.train(num_epochs=1, batch_size=1024)
+    everything = torch.cat([obs, more])
+    assert rms.count.item() == pytest.approx(n + 1000, abs=1e-2)
+    assert torch.allclose(rms.mean, everything.mean(0), atol=1e-4)
+
+
+def test_mask_width_must_match_the_policy():
+    trainer = OfflineBCTrainer(make_simple_model(obs_dim=4))         # Categorical over 4 actions
+    trainer.add_data(torch.randn(8, 4), torch.zeros(8, dtype=torch.long),
+                     action_masks=torch.ones(8, 2, dtype=torch.bool), dones=torch.zeros(8, dtype=torch.bool))
+    with pytest.raises(ValueError, match="action_masks have width 2.*expects 4"):
+        trainer.train(num_epochs=1)
+
+    obs = torch.randn(8, 4)
+    actions = torch.cat([torch.zeros(8, 1), torch.randn(8, 1)], dim=1)
+    trainer = OfflineBCTrainer(_composed(DirSpeedPolicy(16)))       # flat mask width 3
+    trainer.add_data(obs, actions, action_masks=torch.ones(8, 7, dtype=torch.bool),
+                     dones=torch.zeros(8, dtype=torch.bool))
+    with pytest.raises(ValueError, match="action_masks have width 7.*expects 3"):
+        trainer.train(num_epochs=1)
+
+    trainer = OfflineBCTrainer(_composed(GaussPolicy(16, 2)))
+    trainer.add_data(obs, torch.randn(8, 2), action_masks=torch.ones(8, 2, dtype=torch.bool),
+                     dones=torch.zeros(8, dtype=torch.bool))
+    with pytest.raises(ValueError, match="no discrete"):
+        trainer.train(num_epochs=1)
+
+
+def test_missing_dones_warns_only_for_stateful_models(caplog):
+    with caplog.at_level(logging.WARNING, logger="colosseum.bc.offline_bc"):
+        OfflineBCTrainer(make_simple_model(obs_dim=4)).add_data(torch.randn(5, 4), torch.zeros(5, dtype=torch.long))
+    assert "dones" not in caplog.text
+
+
+def test_every_add_data_call_ends_an_episode():
+    trainer = OfflineBCTrainer(make_simple_model(obs_dim=4, core="lstm"))
+    user_dones = torch.zeros(5, dtype=torch.bool)
+    trainer.add_data(torch.randn(5, 4), torch.zeros(5, dtype=torch.long), dones=user_dones)
+    trainer.add_data(torch.randn(3, 4), torch.zeros(3, dtype=torch.long), dones=torch.zeros(3, dtype=torch.bool))
+    assert torch.nonzero(trainer._dataset()[3]).flatten().tolist() == [4, 7]
+    assert not user_dones.any()                                        # caller's tensor is not mutated
+
+
+class _FixedLogProb:
+    def __init__(self, values):
+        self._values = torch.tensor(values)
+
+    def log_prob(self, actions):
+        return self._values
+
+
+def test_non_finite_nll_errors_name_the_right_cause():
+    trainer = OfflineBCTrainer(make_simple_model(obs_dim=4))
+    weights = torch.ones(2)
+    with pytest.raises(RuntimeError, match="NaN.*diverged"):
+        trainer._weighted_nll(_FixedLogProb([float("nan"), 0.0]), None, weights, masked=True)
+    with pytest.raises(ValueError, match="illegal under their action_masks"):
+        trainer._weighted_nll(_FixedLogProb([float("-inf"), 0.0]), None, weights, masked=True)
+    with pytest.raises(ValueError, match="no action_masks") as info:
+        trainer._weighted_nll(_FixedLogProb([float("-inf"), 0.0]), None, weights, masked=False)
+    assert "illegal" not in str(info.value)
+    # Padding rows (weight 0) never raise.
+    loss, count = trainer._weighted_nll(_FixedLogProb([float("-inf"), -1.0]), None, torch.tensor([0.0, 1.0]), False)
+    assert loss.item() == pytest.approx(1.0) and count.item() == 1.0

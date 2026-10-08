@@ -17,8 +17,15 @@ Stateless models train on shuffled transitions. Stateful models
 ``seq_len`` transitions. Each window starts from ``model.initial_state`` and the
 state is reset after every ``done``. A window that starts mid-episode loses the
 context before it (``UnrollOutput`` carries no final state); a random window
-offset per epoch moves those cut points. Without ``dones``, the transitions of
-each file (``add_data`` call) are treated as one episode, with a warning.
+offset per epoch moves those cut points. The last transition of every file
+(``add_data`` call) always ends an episode, so no state is carried across
+unrelated files; without ``dones``, each file is treated as one episode (with a
+warning for stateful models).
+
+Observation normalizers (``NormalizeObs``) are updated once per sample:
+``train`` calls ``model.update_normalizers`` on the data added since the
+previous ``train`` call, before the first epoch, so the saved statistics match
+the data the policy was trained on.
 """
 
 from __future__ import annotations
@@ -100,6 +107,7 @@ class OfflineBCTrainer:
         self._actions: list[torch.Tensor] = []
         self._masks: list[torch.Tensor | None] = []
         self._dones: list[torch.Tensor] = []
+        self._normalized_upto = 0  # samples already fed to model.update_normalizers
 
     @property
     def model(self) -> PolicyModel:
@@ -136,13 +144,18 @@ class OfflineBCTrainer:
         if self._masks and (masks is None) != (self._masks[0] is None):
             raise ValueError("BC data: either every batch/file has 'action_masks' or none does")
         if dones is None:
-            logger.warning("BC data has no 'dones': treating these %d transitions as one episode", n)
+            if self._model.is_stateful:
+                logger.warning(
+                    "BC data has no 'dones': treating these %d transitions as one episode "
+                    "(this matters only for stateful models, which this one is)", n,
+                )
             done_t = torch.zeros(n, dtype=torch.bool)
-            done_t[-1] = True
         else:
-            done_t = torch.as_tensor(dones).bool().reshape(-1)
+            done_t = torch.as_tensor(dones).bool().reshape(-1).clone()
             if done_t.shape[0] != n:
                 raise ValueError(f"BC data: {n} observations but {done_t.shape[0]} dones")
+        # Never carry state across add_data calls (separate files are unrelated episodes).
+        done_t[-1] = True
         self._observations.append(obs)
         self._actions.append(acts)
         self._masks.append(masks)
@@ -191,6 +204,7 @@ class OfflineBCTrainer:
             raise ValueError("num_epochs and batch_size must be >= 1")
         obs, actions, masks, dones = self._dataset()
         actions = self._prepare_actions(obs, actions, masks)
+        self._update_normalizers(obs)
         stateful = self._model.is_stateful
         logger.info(
             "BC training: %d samples, %d epochs, batch_size=%d, %s",
@@ -218,15 +232,23 @@ class OfflineBCTrainer:
             metrics["accuracy"] = accuracy
         return metrics
 
+    def _update_normalizers(self, obs: torch.Tensor) -> None:
+        """Feed every sample added since the last call to ``model.update_normalizers`` once."""
+        new = obs[self._normalized_upto:]
+        for start in range(0, len(new), _EVAL_BATCH):
+            self._model.update_normalizers(new[start:start + _EVAL_BATCH].to(self._device))
+        self._normalized_upto = len(obs)
+
     def _prepare_actions(
         self, obs: torch.Tensor, actions: torch.Tensor, masks: torch.Tensor | None,
     ) -> torch.Tensor:
-        """Check the action dtype/shape against the policy's distribution; return training actions."""
+        """Check actions and masks against the policy's distribution; return training actions."""
         with torch.no_grad():
-            m = None if masks is None else masks[:1].to(self._device)
             dist = self._model.step(
-                obs[:1].to(self._device), self._model.initial_state(1, self._device), m,
+                obs[:1].to(self._device), self._model.initial_state(1, self._device),
             ).dist
+        if masks is not None:
+            self._check_mask_width(dist, masks)
         if isinstance(dist, CategoricalDist):
             if actions.is_floating_point():
                 raise ValueError(
@@ -260,17 +282,47 @@ class OfflineBCTrainer:
         return actions
 
     @staticmethod
+    def _check_mask_width(dist: Distribution, masks: torch.Tensor) -> None:
+        if isinstance(dist, CategoricalDist):
+            expected = dist.logits.shape[-1]
+        elif isinstance(dist, CompositeDist):
+            expected = dist.flat_mask_size
+        else:
+            expected = 0
+        if expected == 0:
+            raise ValueError(
+                f"BC data has action_masks but the policy's {type(dist).__name__} has no discrete "
+                f"component to mask; drop 'action_masks' from the data"
+            )
+        if masks.shape[1] != expected:
+            raise ValueError(
+                f"BC action_masks have width {masks.shape[1]}, but the policy's {type(dist).__name__} "
+                f"expects {expected} (one column per discrete action, in flat-layout order)"
+            )
+
     def _weighted_nll(
-        dist: Distribution, actions: torch.Tensor, weights: torch.Tensor,
+        self, dist: Distribution, actions: torch.Tensor, weights: torch.Tensor, masked: bool,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         nll = -dist.log_prob(actions)
-        bad = ~torch.isfinite(nll) & (weights > 0)
-        if bad.any():
-            raise ValueError(
-                f"{int(bad.sum())} BC expert actions have zero probability under the policy: "
-                f"they are illegal under their action_masks (fix the data)"
+        active = weights > 0
+        nan = torch.isnan(nll) & active
+        if nan.any():
+            raise RuntimeError(
+                f"BC NLL is NaN for {int(nan.sum())} samples: training diverged or the data contains "
+                f"NaN/inf (check observations/actions, lower the learning rate)"
             )
-        nll = torch.where(weights > 0, nll, torch.zeros_like(nll))
+        inf = torch.isinf(nll) & active
+        if inf.any():
+            if masked:
+                raise ValueError(
+                    f"{int(inf.sum())} BC expert actions have zero probability under the policy: "
+                    f"they are illegal under their action_masks (fix the data)"
+                )
+            raise ValueError(
+                f"{int(inf.sum())} BC expert actions have zero probability under the policy "
+                f"(no action_masks are given: an out-of-support action or an underflowing std)"
+            )
+        nll = torch.where(active, nll, torch.zeros_like(nll))
         return (nll * weights).sum(), weights.sum()
 
     def _flat_epoch(
@@ -284,7 +336,7 @@ class OfflineBCTrainer:
             m = None if masks is None else masks[idx].to(self._device)
             dist = self._model.step(o, self._model.initial_state(len(idx), self._device), m).dist
             weights = torch.ones(len(idx), device=self._device)
-            loss_sum, weight = self._weighted_nll(dist, actions[idx].to(self._device), weights)
+            loss_sum, weight = self._weighted_nll(dist, actions[idx].to(self._device), weights, masks is not None)
             self._optimizer.zero_grad()
             (loss_sum / weight).backward()
             self._optimizer.step()
@@ -327,7 +379,7 @@ class OfflineBCTrainer:
             index = windows[order[start:start + per_batch]].t()          # [L, b]
             dist, weights = self._sequence_forward(index, obs, masks, dones)
             a = actions[index.clamp(min=0)].reshape(index.numel(), *actions.shape[1:]).to(self._device)
-            loss_sum, weight = self._weighted_nll(dist, a, weights)
+            loss_sum, weight = self._weighted_nll(dist, a, weights, masks is not None)
             self._optimizer.zero_grad()
             (loss_sum / weight).backward()
             self._optimizer.step()

@@ -52,7 +52,7 @@ def train(config: str, overrides: tuple[str, ...]) -> None:
 @click.option("--epochs", default=10, type=int, show_default=True, help="Number of BC epochs")
 @click.option("--batch-size", default=256, type=int, show_default=True, help="Transitions per gradient step")
 @click.option("--lr", default=1e-3, type=float, show_default=True, help="Adam learning rate")
-@click.option("--seq-len", default=None, type=int,
+@click.option("--seq-len", default=None, type=click.IntRange(min=1),
               help="Window length for stateful models (default: bc.seq_len from the config, 64)")
 def bc(
     config: str,

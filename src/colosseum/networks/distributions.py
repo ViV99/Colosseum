@@ -225,6 +225,11 @@ class CompositeDist(Distribution):
         """``(name, flat_offset, size, is_discrete)`` per component, in flat-layout order."""
         return [(k, *self._layout[k]) for k in self._keys]
 
+    @property
+    def flat_mask_size(self) -> int:
+        """Width of the flat action mask: the summed sizes of the discrete components."""
+        return self._flat_mask_size
+
     def sample(self) -> torch.Tensor:
         """Sample from all sub-distributions and return ``[B, flat_size]``."""
         parts: list[torch.Tensor] = []
