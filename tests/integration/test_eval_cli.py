@@ -165,3 +165,67 @@ def test_load_checkpoint_dir_is_strict(tmp_path):
         load_checkpoint_dir(ckpt_dir)
     with pytest.raises(ConfigError, match="not a directory"):
         load_checkpoint_dir(tmp_path / "nowhere")
+
+
+def test_checkpoint_without_meta_networks_uses_config_networks(tmp_path):
+    _cfg_path, cfg, _pt_path, _ckpt_dir = _setup(tmp_path)
+    torch.manual_seed(1)
+    plain = build_model(cfg)
+    base_dir = tmp_path / "plain_checkpoints"
+    ckpt_id = CheckpointManager(base_dir).save(
+        "agent_c", 1, {k: v.detach().cpu().numpy() for k, v in plain.state_dict().items()},
+    )
+    assert "networks" not in json.loads((base_dir / "agent_c" / ckpt_id / "meta.json").read_text())
+    model = load_eval_model(base_dir / "agent_c" / ckpt_id, cfg)
+    assert not model.is_stateful
+    for key, value in plain.state_dict().items():
+        assert torch.equal(model.state_dict()[key], value)
+
+
+def test_each_distinct_checkpoint_architecture_is_validated_once(tmp_path, monkeypatch):
+    import colosseum.eval as eval_module
+
+    _cfg_path, cfg, _pt_path, gru_dir = _setup(tmp_path)
+    validated_networks = []
+    real_validate = eval_module.validate_config
+    monkeypatch.setattr(eval_module, "validate_config",
+                        lambda c: (validated_networks.append(c.networks), real_validate(c)))
+    same_dir = CheckpointManager(tmp_path / "same").save(
+        "agent_s", 2, {k: v.detach().cpu().numpy() for k, v in build_model(cfg).state_dict().items()},
+        meta_extra={"networks": cfg.networks.model_dump(mode="json", by_alias=True)},
+    )
+    seen = {cfg.networks.model_dump_json()}
+    load_eval_model(tmp_path / "same" / "agent_s" / same_dir, cfg, validated=seen)  # == config.networks
+    assert validated_networks == []
+    load_eval_model(gru_dir, cfg, validated=seen)
+    load_eval_model(gru_dir, cfg, validated=seen)
+    assert validated_networks == [NetworkConfig.model_validate(GRU_NETWORKS)]
+
+
+@pytest.mark.parametrize("content", ["garbage", "list"])
+def test_eval_cli_unusable_pt_is_a_config_error(tmp_path, content):
+    cfg_path, _cfg, _pt_path, _ckpt_dir = _setup(tmp_path)
+    bad = tmp_path / "bad.pt"
+    if content == "garbage":
+        bad.write_bytes(b"not a torch file")
+    else:
+        torch.save([torch.zeros(2)], bad)
+    result = CliRunner().invoke(main, ["eval", "-c", str(cfg_path), "-a", f"a={bad}"])
+    assert result.exit_code == 1, result.output
+    assert result.stderr.startswith("Config error:") and str(bad) in result.stderr
+    assert "Traceback" not in result.output
+
+
+def test_eval_cli_output_dir_must_exist_before_loading(tmp_path, monkeypatch):
+    import colosseum.eval as eval_module
+
+    cfg_path, _cfg, pt_path, _ckpt_dir = _setup(tmp_path)
+
+    def _never(*_args, **_kwargs):
+        raise AssertionError("a model was loaded before --output was checked")
+
+    monkeypatch.setattr(eval_module, "load_eval_model", _never)
+    result = CliRunner().invoke(main, ["eval", "-c", str(cfg_path), "-a", f"a={pt_path}",
+                                       "-o", str(tmp_path / "no_such_dir" / "result.json")])
+    assert result.exit_code == 2, result.output
+    assert "no_such_dir" in result.output

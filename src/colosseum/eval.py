@@ -28,9 +28,11 @@ when equal. Each pair reports:
 
 - W/D/L and the win rate W/n with a 95% Wilson score interval;
 - the score (W + D/2)/n with a 95% Wilson interval computed on the score as if it
-  were a Bernoulli proportion. This is an approximation: a draw counts as half a
-  win, and the per-match score variance (W + D/4)/n - s^2 never exceeds the
-  Bernoulli variance s(1 - s), so the interval is conservative (never too narrow).
+  were a Bernoulli proportion (a draw counts as half a win). Wilson's null variance
+  p(1 - p) is the largest variance any outcome in [0, 1] with mean p can have, so
+  this interval is at least as wide as a Wilson-type interval that uses the true
+  win/draw/loss variance; without draws it is exactly the Bernoulli Wilson
+  interval. Like every Wilson interval it is asymptotic, not exact.
   Paired/rating-based selection (Bradley-Terry with bootstrap) is SP4;
 - a per-seat breakdown keyed by the seats agent a occupied (e.g. "0", or "0,2");
 - mean returns and mean episode length.
@@ -60,13 +62,13 @@ import numpy as np
 import torch
 from pydantic import ValidationError
 
-from colosseum.coordinator.checkpoint_manager import check_model_state, load_checkpoint_dir
+from colosseum.coordinator.checkpoint_manager import check_model_state, load_checkpoint_dir, read_weights_file
 from colosseum.core.config import ColosseumConfig, NetworkConfig
 from colosseum.core.errors import ConfigError
 from colosseum.core.outcomes import player_outcomes
 from colosseum.core.registry import build_model, validate_config
 from colosseum.core.seat_info import acting_flags, check_masks, extract_masks
-from colosseum.core.types import state_dict_from_numpy, state_dict_to_numpy
+from colosseum.core.types import state_dict_from_numpy
 from colosseum.envs.base_env import BaseEnv
 from colosseum.envs.vec_env import VectorEnv
 from colosseum.networks.model import PolicyModel, act
@@ -432,6 +434,11 @@ class SoloStats:
         }
 
 
+def _normal_ci_text(bounds: list[float], n: int) -> str:
+    """Table text of a normal interval; n < 2 has none (the JSON keeps the zero-width one)."""
+    return f"[{bounds[0]:.3f}, {bounds[1]:.3f}]" if n >= 2 else "[n/a]"
+
+
 @dataclass
 class EvalReport:
     """Result of an evaluation; ``to_dict()`` is the JSON schema written by ``--output``."""
@@ -481,8 +488,8 @@ class EvalReport:
                 r = s.to_row()
                 lines.append(
                     f"{r['agent']:<16} {r['n']:>6}  "
-                    f"{r['mean_return']:>9.3f} [{r['return_ci'][0]:.3f}, {r['return_ci'][1]:.3f}]  "
-                    f"{r['mean_outcome']:>6.3f} [{r['outcome_ci'][0]:.3f}, {r['outcome_ci'][1]:.3f}]  "
+                    f"{r['mean_return']:>9.3f} {_normal_ci_text(r['return_ci'], r['n'])}  "
+                    f"{r['mean_outcome']:>6.3f} {_normal_ci_text(r['outcome_ci'], r['n'])}  "
                     f"{r['mean_episode_length']:>8.1f}"
                 )
             return "\n".join(lines)
@@ -561,18 +568,26 @@ def evaluate(
 # ---------------------------------------------------------------------------
 
 
-def load_eval_model(path: str | Path, config: ColosseumConfig) -> PolicyModel:
+def load_eval_model(
+    path: str | Path, config: ColosseumConfig, *, validated: set[str] | None = None,
+) -> PolicyModel:
     """Build a model and load its weights for evaluation.
 
     ``path`` is either
     - a checkpoint directory ``<run>/checkpoints/<agent>/ckpt_v<N>/`` (read with
       ``load_checkpoint_dir``: strictly validated, never modified). If its
       ``meta.json`` has a ``networks`` section (the launcher writes it), the model
-      is built from it, so agents with different architectures can be compared;
-      that architecture is checked with ``validate_config`` against ``config.env``.
+      is built from it, so agents with different architectures can be compared.
       Otherwise the model is built from ``config.networks``;
     - a ``.pt`` file with a plain ``state_dict`` (e.g. ``colosseum bc`` output),
       built from ``config.networks``.
+
+    ``config.networks`` is assumed validated by the caller (the CLI runs
+    ``validate_config(config)`` first). A checkpoint architecture that differs from
+    it is checked with ``validate_config`` against ``config.env``; ``validated``
+    (JSON dumps of architectures already checked against this ``config.env``,
+    updated in place) lets a caller loading several agents check each distinct
+    architecture once.
 
     A malformed checkpoint, invalid ``networks``, an unreadable ``.pt`` or weights
     that do not fit the built model raise ConfigError; a path that is neither a
@@ -588,20 +603,15 @@ def load_eval_model(path: str | Path, config: ColosseumConfig) -> PolicyModel:
                 net_cfg = NetworkConfig.model_validate(networks)
             except ValidationError as e:
                 raise ConfigError(f"Checkpoint {p}: invalid meta.json networks:\n{e}") from e
-            model_config = config.model_copy(update={"networks": net_cfg})
-            try:
-                validate_config(model_config)
-            except ConfigError as e:
-                raise ConfigError(f"Checkpoint {p}: meta.json networks: {e}") from e
+            if net_cfg != config.networks:
+                model_config = config.model_copy(update={"networks": net_cfg})
+                _validate_architecture(model_config, p, validated)
         model_state = loaded["model_state"]
     elif p.is_file() and p.suffix == ".pt":
         try:
-            raw = torch.load(p, map_location="cpu", weights_only=True)
-        except Exception as e:  # noqa: BLE001 - any unpickling failure means unusable weights
-            raise ConfigError(f"{p}: cannot load weights ({type(e).__name__}: {e})") from e
-        if not isinstance(raw, dict) or not all(isinstance(v, torch.Tensor) for v in raw.values()):
-            raise ConfigError(f"{p}: expected a state_dict of tensors")
-        model_state = state_dict_to_numpy(raw)
+            model_state = read_weights_file(p)
+        except ValueError as e:
+            raise ConfigError(f"{p}: {e}") from e
     else:
         raise FileNotFoundError(f"{p}: expected a checkpoint directory or a .pt file")
     model = build_model(model_config)
@@ -609,3 +619,16 @@ def load_eval_model(path: str | Path, config: ColosseumConfig) -> PolicyModel:
     model.load_state_dict(state_dict_from_numpy(model_state))
     model.eval()
     return model
+
+
+def _validate_architecture(model_config: ColosseumConfig, source: Path, validated: set[str] | None) -> None:
+    """``validate_config`` once per distinct ``networks`` (keyed in ``validated``)."""
+    key = model_config.networks.model_dump_json()
+    if validated is not None and key in validated:
+        return
+    try:
+        validate_config(model_config)
+    except ConfigError as e:
+        raise ConfigError(f"Checkpoint {source}: meta.json networks: {e}") from e
+    if validated is not None:
+        validated.add(key)

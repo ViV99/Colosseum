@@ -111,6 +111,7 @@ def test_json_schema_is_pinned(tmp_path):
     path = tmp_path / "result.json"
     report.write_json(path)
     data = json.loads(path.read_text())
+    assert data == report.to_dict()   # JSON round trip loses nothing
     assert set(data) == TOP_KEYS
     assert data["mode"] == "pairwise"
     assert data["agents"] == ["a", "b", "c"]
@@ -135,3 +136,12 @@ def test_json_schema_is_pinned(tmp_path):
     assert set(solo["solo"][0]["per_seat"]) == {"0", "1"}
     for cell in solo["solo"][0]["per_seat"].values():
         assert set(cell) == SOLO_SEAT_KEYS
+
+
+def test_solo_summary_has_no_interval_for_one_episode():
+    report = summarize([_rec(("a",), (1.0,), (3.0,), 4)], ["a"], num_players=1, num_matches=1)
+    row = report.to_dict()["solo"][0]
+    assert row["return_ci"] == [3.0, 3.0] and row["outcome_ci"] == [1.0, 1.0]  # pinned zero-width JSON
+    assert "n/a" in report.summary()
+    two = summarize([_rec(("a",), (1.0,), (r,), 4) for r in (1.0, 3.0)], ["a"], num_players=1, num_matches=2)
+    assert "n/a" not in two.summary()

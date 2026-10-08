@@ -293,14 +293,26 @@ class CheckpointManager:
         return entries[-1] if entries else None
 
 
-def _read_checkpoint(ckpt_dir: Path) -> tuple[dict, dict[str, torch.Tensor]]:
-    """``(meta, model state_dict)`` of one checkpoint dir; any problem raises (no ConfigError
-    wrapping here: callers name their own context)."""
-    meta = _parse_meta(ckpt_dir)
-    state = torch.load(ckpt_dir / MODEL_FILE, map_location="cpu", weights_only=True)
+def read_weights_file(path: str | Path) -> dict[str, np.ndarray]:
+    """Numpy state_dict from a ``torch.save``-d dict of tensors (``model.pt`` or a ``.pt`` file).
+
+    Any failure (missing or unreadable file, unpickling error, not a dict of tensors)
+    raises ValueError; callers wrap it in a ConfigError that names their own context.
+    """
+    path = Path(path)
+    try:
+        state = torch.load(path, map_location="cpu", weights_only=True)
+    except Exception as e:  # noqa: BLE001 - any read/unpickling failure means unusable weights
+        raise ValueError(f"cannot load weights from {path.name} ({type(e).__name__}: {e})") from e
     if not isinstance(state, dict) or not all(isinstance(v, torch.Tensor) for v in state.values()):
-        raise ValueError(f"{MODEL_FILE} is not a state_dict of tensors")
-    return meta, state
+        raise ValueError(f"{path.name} is not a state_dict of tensors")
+    return torch_state_to_numpy(state)
+
+
+def _read_checkpoint(ckpt_dir: Path) -> tuple[dict, dict[str, np.ndarray]]:
+    """``(meta, numpy model state_dict)`` of one checkpoint dir; any problem raises (no
+    ConfigError wrapping here: callers name their own context)."""
+    return _parse_meta(ckpt_dir), read_weights_file(ckpt_dir / MODEL_FILE)
 
 
 def load_checkpoint_dir(ckpt_dir: str | Path) -> dict[str, Any]:
@@ -315,10 +327,10 @@ def load_checkpoint_dir(ckpt_dir: str | Path) -> dict[str, Any]:
     try:
         if not path.is_dir():
             raise ValueError("not a directory")
-        meta, state = _read_checkpoint(path)
-    except Exception as e:  # noqa: BLE001 - any read/parse/unpickling failure means a bad checkpoint
-        raise ConfigError(f"Malformed checkpoint {path}: {type(e).__name__}: {e}") from e
-    return {"model_state": torch_state_to_numpy(state), "meta": meta}
+        meta, model_state = _read_checkpoint(path)
+    except ValueError as e:
+        raise ConfigError(f"Malformed checkpoint {path}: {e}") from e
+    return {"model_state": model_state, "meta": meta}
 
 
 def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
@@ -326,7 +338,7 @@ def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
     ``meta.json``, the only source of the version) raises ConfigError."""
     trainer_path = ckpt_dir / TRAINER_FILE
     try:
-        meta, state = _read_checkpoint(ckpt_dir)
+        meta, model_state = _read_checkpoint(ckpt_dir)
         version = int(meta["policy_version"])
         env_steps = int(meta.get("env_steps") or 0)  # null: unknown (distributed learners)
         trainer_state = trainer_path.read_bytes() if trainer_path.is_file() else None
@@ -336,7 +348,7 @@ def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
             f"({type(e).__name__}: {e})"
         ) from e
     return {
-        "model_state": torch_state_to_numpy(state),
+        "model_state": model_state,
         "trainer_state": trainer_state,
         "policy_version": version,
         "env_steps": env_steps,
@@ -397,12 +409,10 @@ def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
     if kind == RESUME_CHECKPOINT_DIR:
         return _load_checkpoint_dir(path, resume_from)
     try:
-        state = torch.load(path, map_location="cpu", weights_only=True)
-    except Exception as e:  # noqa: BLE001 - any unpickling failure means a bad resume source
-        raise ConfigError(f"training.resume_from={resume_from!r}: cannot load weights ({e})") from e
-    if not isinstance(state, dict) or not all(isinstance(v, torch.Tensor) for v in state.values()):
-        raise ConfigError(f"training.resume_from={resume_from!r}: expected a state_dict of tensors")
-    return {"model_state": torch_state_to_numpy(state), "trainer_state": None,
+        model_state = read_weights_file(path)
+    except ValueError as e:
+        raise ConfigError(f"training.resume_from={resume_from!r}: {e}") from e
+    return {"model_state": model_state, "trainer_state": None,
             "policy_version": 0, "env_steps": 0, "source": str(path)}
 
 

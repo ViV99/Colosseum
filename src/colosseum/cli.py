@@ -161,7 +161,8 @@ def bc(
 
 @main.command("eval")
 @click.option("--config", "-c", required=True, type=click.Path(exists=True),
-              help="Config YAML (env section; networks for .pt agents)")
+              help="Config YAML: its env is used for every match; its networks (always validated) build "
+                   ".pt agents and checkpoint dirs without meta.json 'networks'")
 @click.option("--agent", "-a", "agents", required=True, multiple=True,
               help="name=path. path is a checkpoint dir (model built from its meta.json 'networks', "
                    "else from --config) or a .pt state_dict (model built from --config). Repeatable.")
@@ -185,15 +186,19 @@ def eval_cmd(
     """Evaluate agents/checkpoints against each other (no training).
 
     Exit code: 0 done, 1 config error (also a malformed checkpoint or mismatched weights),
-    2 bad command-line arguments.
+    2 bad command-line arguments, 130 SIGINT (Ctrl+C), 143 SIGTERM.
     """
     import logging
+    from pathlib import Path
 
     from colosseum.core.config import load_config
     from colosseum.core.registry import import_class, validate_config
     from colosseum.eval import evaluate, load_eval_model
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    if output is not None and not Path(output).parent.is_dir():
+        raise click.BadParameter(f"directory {str(Path(output).parent)!r} does not exist", param_hint="'--output'")
 
     with _config_errors():
         cfg = load_config(config)
@@ -204,9 +209,10 @@ def eval_cmd(
         if duplicates:
             raise click.BadParameter(f"duplicate agent names {duplicates}", param_hint="'--agent'")
         models = {}
+        validated = {cfg.networks.model_dump_json()}  # validate_config(cfg) above
         for name, path in specs:
             try:
-                models[name] = load_eval_model(path, cfg)
+                models[name] = load_eval_model(path, cfg, validated=validated)
             except FileNotFoundError as exc:
                 raise click.BadParameter(str(exc), param_hint="'--agent'") from exc
 
