@@ -16,7 +16,7 @@ from colosseum.envs.base_env import BaseEnv
 from colosseum.networks.base import BaseEncoder, BasePolicy, BaseValue
 from colosseum.networks.composed import ComposedModel
 from colosseum.networks.cores import Core, GRUCore, LSTMCore, NoCore, WindowAttentionCore
-from colosseum.networks.distributions import CategoricalDist, DiagGaussianDist
+from colosseum.networks.distributions import CategoricalDist, CompositeDist, DiagGaussianDist
 from colosseum.networks.model import PolicyModel, StepOutput, UnrollOutput
 from colosseum.networks.normalization import NormalizeObs
 
@@ -373,3 +373,86 @@ def rollout_chunks(
     finally:
         loop.close()
     return [TrajectoryChunk.from_payload(c.to_payload()) for c in chunks]
+
+
+TWELVE_NVEC = tuple(range(2, 14))   # unit i has i + 2 actions
+TWELVE_OBS_DIM = 8                  # SimpleEncoder's default obs_dim, so configs need no encoder kwargs
+
+
+class TwelveUnitEnv(BaseEnv):
+    """Solo env with a 12-unit MultiDiscrete action (unit i has i + 2 actions).
+
+    With ``use_mask`` the flat mask (natural unit order) allows only action i for
+    unit i. Every received action vector is appended to ``self.received``.
+    Episodes last 5 steps; rewards are 0.
+    """
+
+    def __init__(self, use_mask: bool = True) -> None:
+        self._use_mask = use_mask
+        self._t = 0
+        self.received: list[np.ndarray] = []
+
+    @property
+    def num_players(self) -> int:
+        return 1
+
+    @property
+    def observation_space(self) -> gymnasium.spaces.Space:
+        return gymnasium.spaces.Box(0.0, 1.0, (TWELVE_OBS_DIM,), np.float32)
+
+    @property
+    def action_space(self) -> gymnasium.spaces.Space:
+        return gymnasium.spaces.MultiDiscrete(np.array(TWELVE_NVEC))
+
+    def _infos(self) -> dict[int, dict]:
+        if not self._use_mask:
+            return {0: {}}
+        mask = np.concatenate([np.arange(n) == i for i, n in enumerate(TWELVE_NVEC)])
+        return {0: {"action_mask": mask}}
+
+    def reset(self, seed=None):
+        self._t = 0
+        return {0: np.zeros(TWELVE_OBS_DIM, np.float32)}, self._infos()
+
+    def step(self, actions):
+        self.received.append(np.asarray(actions[0], dtype=np.int64).copy())
+        self._t += 1
+        done = self._t >= 5
+        return {0: np.zeros(TWELVE_OBS_DIM, np.float32)}, {0: 0.0}, {0: done}, {0: False}, self._infos()
+
+
+class TwelveHeadPolicy(BasePolicy):
+    """One Categorical head per unit, keyed "0".."11" in unit order.
+
+    ``peaked=True``: head i puts (almost) all mass on action i.
+    ``peaked=False``: uniform logits (use it with the env's mask).
+    """
+
+    def __init__(self, in_dim: int = 16, peaked: bool = True) -> None:
+        super().__init__()
+        self.heads = nn.ModuleList(nn.Linear(in_dim, n) for n in TWELVE_NVEC)
+        with torch.no_grad():
+            for i, head in enumerate(self.heads):
+                head.weight.zero_()
+                head.bias.zero_()
+                if peaked:
+                    head.bias[i] = 50.0
+
+    def _named_dists(self, latent: torch.Tensor) -> list[tuple[str, CategoricalDist]]:
+        return [(str(i), CategoricalDist(head(latent))) for i, head in enumerate(self.heads)]
+
+    def forward(self, latent: torch.Tensor) -> CompositeDist:
+        return CompositeDist(dict(self._named_dists(latent)))
+
+
+class MisorderedTwelveHeadPolicy(TwelveHeadPolicy):
+    """Same heads inserted in string-sorted key order ("0", "1", "10", "11", "2", ...)."""
+
+    def forward(self, latent: torch.Tensor) -> CompositeDist:
+        return CompositeDist(dict(sorted(self._named_dists(latent), key=lambda kv: kv[0])))
+
+
+def twelve_unit_model(peaked: bool = True) -> ComposedModel:
+    torch.manual_seed(0)
+    return ComposedModel(SimpleEncoder(TWELVE_OBS_DIM, 16), NoCore(input_dim=16),
+                         TwelveHeadPolicy(16, peaked), SimpleValue(16))

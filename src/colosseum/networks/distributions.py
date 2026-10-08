@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -176,22 +176,27 @@ class DiagGaussianDist(Distribution):
 class CompositeDist(Distribution):
     """Multi-head distribution for composite action spaces (Dict / Tuple / MultiDiscrete).
 
-    Wraps a dict of sub-distributions.  All public methods operate on *flat*
-    ``float32`` tensors of shape ``[B, flat_size]``, where ``flat_size`` is the
-    sum of per-component action dimensions.
+    Wraps an ordered mapping of sub-distributions. All public methods operate on
+    *flat* ``float32`` tensors of shape ``[B, flat_size]``: a discrete component
+    takes one column (the category index as a float), a continuous one takes
+    ``action_dim`` columns.
 
-    Keys are sorted alphabetically so that the flat layout matches
-    :class:`~colosseum.core.action_spec.ActionSpec`.
+    The component order is the insertion order of ``dists`` and defines the flat
+    action and mask layout. It must equal the action space's component order
+    (``ActionSpec.component_names``): Tuple/MultiDiscrete components are named
+    ``"0"``, ``"1"``, ... in index order; Dict components follow
+    ``action_space.spaces`` order (gymnasium sorts plain-dict keys, an
+    ``OrderedDict`` keeps its order). ``ActionSpec.check_distribution`` verifies it.
     """
 
-    def __init__(self, dists: dict[str, Distribution]) -> None:
+    def __init__(self, dists: Mapping[str, Distribution]) -> None:
         if not dists:
             raise ValueError("CompositeDist requires at least one sub-distribution")
 
-        self._keys: list[str] = sorted(dists.keys())
+        self._keys: list[str] = list(dists.keys())
         self._dists: dict[str, Distribution] = {k: dists[k] for k in self._keys}
 
-        # Action layout: offset → (offset, size, is_discrete)
+        # Action layout: key -> (offset, size, is_discrete)
         offset = 0
         self._layout: dict[str, tuple[int, int, bool]] = {}
         for k in self._keys:
@@ -214,11 +219,12 @@ class CompositeDist(Distribution):
             mask_offset += ms
         self._flat_mask_size: int = mask_offset
 
-    # ---- Distribution interface ------------------------------------------
+    # ---- Layout -----------------------------------------------------------
 
     @property
-    def action_dim(self) -> int:
-        return self._flat_size
+    def keys(self) -> list[str]:
+        """Component names in flat-layout order."""
+        return list(self._keys)
 
     @property
     def components(self) -> list[tuple[str, int, int, bool]]:
@@ -229,6 +235,12 @@ class CompositeDist(Distribution):
     def flat_mask_size(self) -> int:
         """Width of the flat action mask: the summed sizes of the discrete components."""
         return self._flat_mask_size
+
+    # ---- Distribution interface ------------------------------------------
+
+    @property
+    def action_dim(self) -> int:
+        return self._flat_size
 
     def sample(self) -> torch.Tensor:
         """Sample from all sub-distributions and return ``[B, flat_size]``."""

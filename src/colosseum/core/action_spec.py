@@ -40,6 +40,9 @@ class ActionSpec:
     flat ``float32`` vectors of length ``flat_size``.  The ``decode``/``encode``
     methods convert between flat and structured representations at the env
     boundary.
+
+    Components are laid out in natural order: Tuple/MultiDiscrete by index
+    (named ``"0"``, ``"1"``, ...), Dict in ``space.spaces`` order.
     """
 
     components: tuple[ActionComponent, ...]
@@ -98,10 +101,8 @@ class ActionSpec:
             )
 
         if isinstance(space, gymnasium.spaces.Dict):
-            return cls._from_named_spaces(
-                {k: space.spaces[k] for k in sorted(space.spaces.keys())},
-                space_type="dict",
-            )
+            # space.spaces order: gymnasium sorts plain-dict keys, OrderedDict keeps its order.
+            return cls._from_named_spaces(dict(space.spaces), space_type="dict")
 
         if isinstance(space, gymnasium.spaces.Tuple):
             named = {str(i): s for i, s in enumerate(space.spaces)}
@@ -120,16 +121,14 @@ class ActionSpec:
         named: dict[str, Any],
         space_type: str,
     ) -> ActionSpec:
-        """Build a composite ActionSpec from an ordered dict of sub-spaces."""
+        """Build a composite ActionSpec from sub-spaces, in the given (natural) order."""
         import gymnasium
 
         components: list[ActionComponent] = []
         offset = 0
         mask_offset = 0
 
-        for name in sorted(named.keys()):
-            sub = named[name]
-
+        for name, sub in named.items():
             # Only allow flat (non-composite) sub-spaces
             if isinstance(sub, (gymnasium.spaces.Dict,
                                 gymnasium.spaces.Tuple,
@@ -178,6 +177,42 @@ class ActionSpec:
             is_composite=True,
             space_type=space_type,
         )
+
+    @property
+    def component_names(self) -> tuple[str, ...]:
+        """Component names in flat-layout order."""
+        return tuple(c.name for c in self.components)
+
+    def check_distribution(self, dist: Any) -> None:
+        """Raise ``ValueError`` unless ``dist`` has this spec's flat action layout.
+
+        Composite spaces need a ``CompositeDist`` whose components are, in order,
+        ``component_names`` with matching sizes and discrete/continuous kinds.
+        """
+        from colosseum.networks.distributions import CompositeDist
+
+        if not self.is_composite:
+            if isinstance(dist, CompositeDist):
+                raise ValueError(
+                    f"action space is {self.space_type} but the policy returned a CompositeDist; "
+                    f"return a single distribution"
+                )
+            return
+        if not isinstance(dist, CompositeDist):
+            raise ValueError(
+                f"action space is {self.space_type} with components {list(self.component_names)}; "
+                f"the policy must return a CompositeDist with these components in this order, "
+                f"got {type(dist).__name__}"
+            )
+        expected = [(c.name, c.size, c.is_discrete) for c in self.components]
+        got = [(name, size, discrete) for name, _offset, size, discrete in dist.components]
+        if got != expected:
+            raise ValueError(
+                "CompositeDist components do not match the action space. Expected "
+                f"(name, size, is_discrete) in this order: {expected}; got {got}. "
+                "Tuple/MultiDiscrete components are named '0', '1', ... in index order; "
+                "Dict components follow action_space.spaces order."
+            )
 
     # ------------------------------------------------------------------
     # Codec

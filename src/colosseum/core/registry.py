@@ -265,6 +265,12 @@ def validate_config(config: ColosseumConfig) -> None:
                     f"value must have shape [B]=({B},), got {tuple(out.value.shape)}. "
                     f"Squeeze the last dim in the value head."
                 )
+            try:
+                spec.check_distribution(out.dist)
+            except ValueError as exc:
+                raise ConfigError(
+                    f"networks: policy distribution does not match the action space: {exc}"
+                ) from exc
             _check_state_batch_dim(out.state, out_alt.state, (B, B_ALT), "step() state")
             try:
                 actions = out.dist.sample()

@@ -47,7 +47,7 @@ def test_action_spec_dict():
     spec = ActionSpec.from_space(space)
     assert spec.is_composite
     assert spec.space_type == "dict"
-    # "direction" (sorted first) → offset=0, size=1; "speed" → offset=1, size=2
+    # gymnasium sorts plain-dict keys: "direction" → offset=0, size=1; "speed" → offset=1, size=2
     assert spec.flat_size == 3
     assert spec.action_shape == (3,)
     assert spec.numpy_dtype == np.float32
@@ -117,7 +117,7 @@ def test_encode_decode_dict():
         "pos": gymnasium.spaces.Box(low=-1, high=1, shape=(2,)),
     })
     spec = ActionSpec.from_space(space)
-    # Sorted keys: "pos" before "type" → flat = [pos[0], pos[1], type]
+    # gymnasium sorts plain-dict keys: "pos" before "type" → flat = [pos[0], pos[1], type]
     structured = {"type": 2, "pos": np.array([0.5, -0.3], dtype=np.float32)}
     flat = spec.encode(structured)
     assert flat.shape == (3,)
@@ -223,12 +223,12 @@ def test_composite_dist_sample_shape():
         "pos": DiagGaussianDist(torch.randn(B, 2), torch.zeros(B, 2)),
     }
     cd = CompositeDist(dists)
-    assert cd.action_dim == 3  # 2 (pos) + 1 (type)
+    assert cd.action_dim == 3  # 1 (type) + 2 (pos)
     s = cd.sample()
     assert s.shape == (B, 3)
     assert s.dtype == torch.float32
-    # Sorted: "pos" at [0:2], "type" at [2] — last column is integer-valued
-    assert (s[:, 2] == s[:, 2].long().float()).all()
+    # Insertion order: "type" at [0] (integer-valued), "pos" at [1:3]
+    assert (s[:, 0] == s[:, 0].long().float()).all()
 
 
 def test_composite_dist_log_prob():
@@ -237,7 +237,7 @@ def test_composite_dist_log_prob():
     mean = torch.tensor([[0.5, -0.5]] * B)
     log_std = torch.zeros(B, 2)
 
-    # Sorted keys: "pos" at [0:2], "type" at [2]
+    # Insertion order: "type" at [0], "pos" at [1:3]
     cd = CompositeDist({
         "type": CategoricalDist(logits),
         "pos": DiagGaussianDist(mean, log_std),
@@ -247,11 +247,9 @@ def test_composite_dist_log_prob():
     assert lp.shape == (B,)
     assert torch.isfinite(lp).all()
 
-    # Verify: sum of per-component log_probs (sorted: pos then type)
-    gauss_lp = DiagGaussianDist(mean, log_std).log_prob(flat[:, 0:2])
-    cat_lp = CategoricalDist(logits).log_prob(flat[:, 2].long())
-    expected = gauss_lp + cat_lp
-    torch.testing.assert_close(lp, expected)
+    cat_lp = CategoricalDist(logits).log_prob(flat[:, 0].long())
+    gauss_lp = DiagGaussianDist(mean, log_std).log_prob(flat[:, 1:3])
+    torch.testing.assert_close(lp, cat_lp + gauss_lp)
 
 
 def test_composite_dist_entropy():
@@ -267,18 +265,16 @@ def test_composite_dist_entropy():
 
 def test_composite_dist_mode():
     B = 3
-    # Sorted: "pos" at [0:2], "type" at [2]
+    # Insertion order: "type" at [0], "pos" at [1:3]
     cd = CompositeDist({
         "type": CategoricalDist(torch.tensor([[10.0, 0.0, 0.0]] * B)),
         "pos": DiagGaussianDist(torch.tensor([[0.5, -0.3]] * B), torch.zeros(B, 2)),
     })
     m = cd.mode()
     assert m.shape == (B, 3)
-    # pos mean at [0:2]
-    torch.testing.assert_close(m[:, 0], torch.tensor([0.5] * B))
-    torch.testing.assert_close(m[:, 1], torch.tensor([-0.3] * B))
-    # type mode at [2] — strong logit at index 0
-    assert (m[:, 2] == 0.0).all()
+    assert (m[:, 0] == 0.0).all()
+    torch.testing.assert_close(m[:, 1], torch.tensor([0.5] * B))
+    torch.testing.assert_close(m[:, 2], torch.tensor([-0.3] * B))
 
 
 def test_composite_dist_apply_mask():
@@ -336,7 +332,7 @@ def test_composite_dist_gradient_flow():
     })
 
     # Use fixed actions (not own sample) so log_prob gradients flow through mean
-    fixed_actions = torch.tensor([[0.1, -0.2, 1.0]] * B)
+    fixed_actions = torch.tensor([[1.0, 0.1, -0.2]] * B)  # type=1 at [0], pos at [1:3]
     lp = cd.log_prob(fixed_actions)
     loss = -lp.mean() - 0.01 * cd.entropy().mean()
     loss.backward()
@@ -486,7 +482,7 @@ def test_appo_composite_train_step():
     appo = APPO(net, config, device="cpu")
 
     # Create chunks with composite actions: [T, flat_size]
-    # Sorted: "direction" (Discrete(4)) at [0], "speed" (Box(2)) at [1:3]
+    # Insertion order: "direction" (Discrete(4)) at [0], "speed" (Box(2)) at [1:3]
     chunks = []
     for _ in range(4):
         T = 8
