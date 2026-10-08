@@ -137,7 +137,7 @@ def run_distributed_learner(
     trains with the configured algorithm, and pushes weights to the WeightStore
     at ``weight_store_address``.
     """
-    from colosseum.core.registry import build_model, import_class
+    from colosseum.core.registry import build_model, import_class, validate_config
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
     from colosseum.learner.learner import learner_process, resolve_device
     from colosseum.transport.grpc_transport import serve_trajectory_receiver
@@ -150,6 +150,7 @@ def run_distributed_learner(
 
     config = _load(config_path, overrides)
     acfg = config.get_agent_config(agent_id)
+    validate_config(acfg)
     max_mb = config.transport.grpc_max_message_mb
 
     device = resolve_device(acfg.learner.device)
@@ -322,7 +323,8 @@ def run_distributed_workers(
         learner_addresses: ``{agent_id: host:port}`` of each agent's
             TrajectoryService.
     """
-    mp.set_start_method("spawn", force=True)
+    from colosseum.core.registry import validate_config
+
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
@@ -331,6 +333,9 @@ def run_distributed_workers(
     config = _load(config_path, overrides)
     agent_ids = list(learner_addresses.keys()) or config.get_trainable_agent_ids()
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_ids}
+    for aid in agent_ids:
+        validate_config(agent_configs[aid])
+    mp.set_start_method("spawn", force=True)
 
     num_players = config.env.num_players
     num_envs = config.rollout.envs_per_worker

@@ -185,8 +185,10 @@ class CompositeDist(Distribution):
     action and mask layout. It must equal the action space's component order
     (``ActionSpec.component_names``): Tuple/MultiDiscrete components are named
     ``"0"``, ``"1"``, ... in index order; Dict components follow
-    ``action_space.spaces`` order (gymnasium sorts plain-dict keys, an
-    ``OrderedDict`` keeps its order). ``ActionSpec.check_distribution`` verifies it.
+    ``action_space.spaces`` order. Gymnasium sorts the keys of a plain dict
+    (falling back to insertion order when the keys are not comparable) and keeps
+    the given order for an ``OrderedDict``, a sequence of ``(key, space)`` pairs or
+    ``Dict(..., sort_keys=False)``. ``ActionSpec.check_distribution`` verifies it.
     """
 
     def __init__(self, dists: Mapping[str, Distribution]) -> None:
@@ -230,6 +232,14 @@ class CompositeDist(Distribution):
     def components(self) -> list[tuple[str, int, int, bool]]:
         """``(name, flat_offset, size, is_discrete)`` per component, in flat-layout order."""
         return [(k, *self._layout[k]) for k in self._keys]
+
+    @property
+    def mask_components(self) -> list[tuple[str, int, int]]:
+        """``(name, mask_offset, mask_size)`` per component, in flat-layout order.
+
+        ``mask_size`` is the number of categories of a discrete head, 0 for a continuous one.
+        """
+        return [(k, *self._mask_layout[k]) for k in self._keys]
 
     @property
     def flat_mask_size(self) -> int:

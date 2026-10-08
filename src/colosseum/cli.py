@@ -70,11 +70,12 @@ def bc(
 
     from colosseum.bc.offline_bc import OfflineBCTrainer
     from colosseum.core.config import load_config
-    from colosseum.core.registry import build_model
+    from colosseum.core.registry import build_model, validate_config
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
 
     cfg = load_config(config)
+    validate_config(cfg)
     model = build_model(cfg)
     device = cfg.learner.device
     if device == "auto":
@@ -110,7 +111,7 @@ def eval_cmd(config: str, agents: tuple[str, ...], num_matches: int, num_envs: i
     import torch
 
     from colosseum.core.config import load_config
-    from colosseum.core.registry import build_model, import_class
+    from colosseum.core.registry import build_model, import_class, validate_config
     from colosseum.eval import evaluate_agents
 
     logging.basicConfig(
@@ -119,6 +120,7 @@ def eval_cmd(config: str, agents: tuple[str, ...], num_matches: int, num_envs: i
     )
 
     cfg = load_config(config)
+    validate_config(cfg)
 
     # Parse agent specs: "name:path.pt"
     agent_configs = {}

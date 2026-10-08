@@ -7,7 +7,7 @@ import torch
 
 from colosseum.algorithms.appo import APPO
 from colosseum.core.config import AlgorithmConfig
-from helpers import TwelveUnitEnv, rollout_chunks, twelve_unit_model
+from helpers import TWELVE_NVEC, TwelveUnitEnv, rollout_chunks, twelve_unit_model
 
 
 @pytest.mark.parametrize("use_mask", [False, True])
@@ -31,6 +31,12 @@ def test_twelve_units_receive_their_own_head_through_rollout_loop(use_mask):
         expected = np.tile(np.arange(12, dtype=np.float32), (chunk.chunk_length, 1))
         np.testing.assert_array_equal(np.asarray(chunk.actions), expected)
         assert torch.isfinite(torch.as_tensor(chunk.action_log_probs)).all()
+        if use_mask:
+            # Natural-order one-hot rows: unit i's segment allows only action i.
+            one_hot = np.concatenate([np.arange(n) == i for i, n in enumerate(TWELVE_NVEC)])
+            masks = np.asarray(chunk.action_masks)
+            assert masks.shape == (chunk.chunk_length, one_hot.size)
+            np.testing.assert_array_equal(masks, np.tile(one_hot, (chunk.chunk_length, 1)))
 
     metrics = APPO(model, AlgorithmConfig(), device="cpu").train_step(chunks)
     assert all(math.isfinite(v) for v in metrics.values())

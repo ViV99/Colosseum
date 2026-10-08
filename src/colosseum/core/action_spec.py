@@ -101,7 +101,8 @@ class ActionSpec:
             )
 
         if isinstance(space, gymnasium.spaces.Dict):
-            # space.spaces order: gymnasium sorts plain-dict keys, OrderedDict keeps its order.
+            # space.spaces order: gymnasium sorts plain-dict keys (insertion order if the keys
+            # are not comparable); OrderedDict, (key, space) pairs and sort_keys=False keep theirs.
             return cls._from_named_spaces(dict(space.spaces), space_type="dict")
 
         if isinstance(space, gymnasium.spaces.Tuple):
@@ -184,35 +185,93 @@ class ActionSpec:
         return tuple(c.name for c in self.components)
 
     def check_distribution(self, dist: Any) -> None:
-        """Raise ``ValueError`` unless ``dist`` has this spec's flat action layout.
+        """Raise ``ValueError`` unless ``dist`` has this spec's flat action and mask layout.
 
-        Composite spaces need a ``CompositeDist`` whose components are, in order,
-        ``component_names`` with matching sizes and discrete/continuous kinds.
+        - ``Discrete(n)`` needs a ``CategoricalDist`` with ``n`` logits.
+        - ``Box`` needs a non-categorical, non-composite distribution whose
+          ``action_dim`` equals the box's last dimension (checked for 1-D boxes).
+        - Composite spaces need a ``CompositeDist`` whose components are, in order,
+          ``component_names``; each discrete head has ``num_categories`` logits
+          (its mask width) and each continuous head has ``size`` columns.
         """
-        from colosseum.networks.distributions import CompositeDist
+        from colosseum.networks.distributions import CategoricalDist, CompositeDist
 
+        got_kind = type(dist).__name__
         if not self.is_composite:
             if isinstance(dist, CompositeDist):
                 raise ValueError(
                     f"action space is {self.space_type} but the policy returned a CompositeDist; "
                     f"return a single distribution"
                 )
+            comp = self.components[0]
+            if self.space_type == "discrete":
+                if not isinstance(dist, CategoricalDist):
+                    raise ValueError(
+                        f"action space is Discrete({comp.num_categories}); the policy must return a "
+                        f"CategoricalDist, got {got_kind}"
+                    )
+                n_logits = int(dist.logits.shape[-1])
+                if n_logits != comp.num_categories:
+                    raise ValueError(
+                        f"action space is Discrete({comp.num_categories}) but the policy's "
+                        f"CategoricalDist has {n_logits} logits"
+                    )
+                return
+            if isinstance(dist, CategoricalDist):
+                raise ValueError(
+                    f"action space is Box{tuple(self.action_shape)}; the policy must return a "
+                    f"continuous distribution (e.g. DiagGaussianDist), got CategoricalDist"
+                )
+            if len(self.action_shape) == 1:
+                try:
+                    action_dim = dist.action_dim
+                except NotImplementedError:
+                    return
+                if action_dim != self.action_shape[0]:
+                    raise ValueError(
+                        f"action space is Box{tuple(self.action_shape)} but the policy's {got_kind} "
+                        f"has action_dim {action_dim}"
+                    )
             return
+
         if not isinstance(dist, CompositeDist):
             raise ValueError(
                 f"action space is {self.space_type} with components {list(self.component_names)}; "
                 f"the policy must return a CompositeDist with these components in this order, "
-                f"got {type(dist).__name__}"
+                f"got {got_kind}"
             )
-        expected = [(c.name, c.size, c.is_discrete) for c in self.components]
-        got = [(name, size, discrete) for name, _offset, size, discrete in dist.components]
-        if got != expected:
+        names = [name for name, _offset, _size, _discrete in dist.components]
+        if names != list(self.component_names):
             raise ValueError(
-                "CompositeDist components do not match the action space. Expected "
-                f"(name, size, is_discrete) in this order: {expected}; got {got}. "
-                "Tuple/MultiDiscrete components are named '0', '1', ... in index order; "
-                "Dict components follow action_space.spaces order."
+                f"CompositeDist components do not match the action space. Expected names in this "
+                f"order: {list(self.component_names)}; got {names}. Tuple/MultiDiscrete components "
+                f"are named '0', '1', ... in index order; Dict components follow "
+                f"action_space.spaces order."
             )
+        mask_sizes = {name: size for name, _offset, size in dist.mask_components}
+        for c, (name, _offset, size, discrete) in zip(self.components, dist.components, strict=True):
+            if c.is_discrete:
+                if not discrete:
+                    raise ValueError(
+                        f"component {name!r} of the action space is Discrete({c.num_categories}) but "
+                        f"the policy's head is continuous (size {size}); use a CategoricalDist"
+                    )
+                if mask_sizes[name] != c.num_categories:
+                    raise ValueError(
+                        f"component {name!r} of the action space is Discrete({c.num_categories}) but "
+                        f"the policy's CategoricalDist head has {mask_sizes[name]} logits"
+                    )
+            else:
+                if discrete:
+                    raise ValueError(
+                        f"component {name!r} of the action space is a Box with {c.size} columns but "
+                        f"the policy's head is a CategoricalDist"
+                    )
+                if size != c.size:
+                    raise ValueError(
+                        f"component {name!r} of the action space is a Box with {c.size} columns but "
+                        f"the policy's head has action_dim {size}"
+                    )
 
     # ------------------------------------------------------------------
     # Codec

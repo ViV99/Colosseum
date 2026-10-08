@@ -116,7 +116,7 @@ def test_validate_config_accepts_window_attention_core():
 def test_validate_config_reports_head_dim_mismatch():
     cfg = _composed(
         core={"class": "colosseum.networks.cores.LSTMCore", "kwargs": {"hidden_size": 32}},
-        policy="helpers.SimplePolicy",  # in_dim is passed -> fine
+        policy=f"{TTT_NETS}.TicTacToePolicy",  # in_dim is passed -> fine
         value="helpers.SimpleValue",
     )
     validate_config(cfg)
