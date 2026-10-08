@@ -271,7 +271,7 @@ class SeatResult:                                        # (T3.4)
     network_id: str             # "latest" | "ckpt_v<N>"
     outcome: float              # in [0,1]; from core.outcomes (env rank/outcome, else reward-based)
     reward: float               # episode return of this seat
-    rank: int | None = None
+    rank: float | None = None   # float: fractional tie ranks are kept (T5.2 ruling)
 
 @dataclass
 class MatchResult:                                       # (T3.4) replaces the dict-keyed version
