@@ -180,3 +180,51 @@ def publish_versions(q, n: int, done) -> None:
     for version in range(1, n + 1):
         assert put_latest(q, WeightPayload("a", version, {"w": np.full(64, version, dtype=np.float32)}))
     done.set()
+
+
+class RecordingAlgorithm:
+    """Minimal duck-typed algorithm for learner-loop tests: records what it was given.
+
+    ``train_step`` stores the batch size, the chunks' behavior versions and the
+    last progress value, then bumps ``policy_version``.
+    """
+
+    def __init__(self, start_version: int = 0) -> None:
+        self._model = TinyModel()
+        self._policy_version = start_version
+        self._progress = 0.0
+        self.batches: list[int] = []
+        self.behavior_versions: list[list[int]] = []
+        self.progress_at_train: list[float] = []
+
+    @property
+    def model(self) -> TinyModel:
+        return self._model
+
+    @property
+    def network(self) -> TinyModel:
+        return self._model
+
+    @property
+    def policy_version(self) -> int:
+        return self._policy_version
+
+    @property
+    def is_off_policy(self) -> bool:
+        return False
+
+    def create_replay_buffer(self, capacity: int):
+        return None
+
+    def set_progress(self, progress: float) -> None:
+        self._progress = float(progress)
+
+    def compute_loss(self, chunks):
+        return {}
+
+    def train_step(self, chunks) -> dict[str, float]:
+        self.batches.append(len(chunks))
+        self.behavior_versions.append([c.behavior_policy_version for c in chunks])
+        self.progress_at_train.append(self._progress)
+        self._policy_version += 1
+        return {"total_loss": 0.0}

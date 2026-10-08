@@ -4,7 +4,7 @@ Each Learner runs in a separate process and owns one trainable agent's
 training loop. It:
 1. Receives chunk payloads (numpy, ``TrajectoryChunk.to_payload()``) from
    workers via a mp.Queue and decodes them
-2. Batches them
+2. Batches them: every train step gets exactly ``batch_chunks`` chunks
 3. Calls algorithm.train_step() to compute loss and update weights
 4. Pushes new weights (numpy ``WeightPayload``) to worker processes via weight queues
 5. Sends metrics and numpy checkpoint snapshots to the main process
@@ -20,6 +20,7 @@ import threading
 import time
 from collections.abc import Callable
 from queue import Empty, Full
+from typing import Any
 
 import torch
 
@@ -97,15 +98,10 @@ def learner_process(
             if total_train_steps > 0 and train_step >= total_train_steps:
                 break
 
-            # Collect a batch of chunks
-            chunks = _collect_chunks(
-                trajectory_queue,
-                batch_size=config.batch_chunks,
-                timeout=1.0,
-            )
-
-            if not chunks:
-                continue
+            # Block until exactly batch_chunks chunks arrived (None: stop requested).
+            chunks = collect_batch(trajectory_queue, config.batch_chunks, stop_event)
+            if chunks is None:
+                break
 
             total_chunks_received += len(chunks)
 
@@ -233,26 +229,30 @@ def resolve_device(device_str: str) -> str:
     return device_str
 
 
-def _collect_chunks(
-    queue: mp.Queue,
+def collect_batch(
+    q: Any,
     batch_size: int,
-    timeout: float = 1.0,
-) -> list[TrajectoryChunk]:
-    """Collect up to batch_size chunk payloads from the queue and decode them.
+    stop_event: Any,
+    poll_interval: float = 0.5,
+) -> list[TrajectoryChunk] | None:
+    """Block until exactly ``batch_size`` chunk payloads arrived; decode them.
 
-    Waits up to `timeout` seconds for the first chunk, then collects
-    remaining chunks non-blocking up to batch_size.
+    Waits in ``poll_interval`` slices and returns None as soon as ``stop_event``
+    is set (a partial batch is dropped: no training on incomplete batches).
     """
     chunks: list[TrajectoryChunk] = []
-    try:
-        chunks.append(TrajectoryChunk.from_payload(queue.get(timeout=timeout)))
-    except Empty:
-        return chunks
     while len(chunks) < batch_size:
+        if stop_event.is_set():
+            return None
         try:
-            chunks.append(TrajectoryChunk.from_payload(queue.get_nowait()))
+            payload = q.get(timeout=poll_interval)
         except Empty:
-            break
+            continue
+        if not isinstance(payload, dict):
+            raise TypeError(
+                f"trajectory queue item must be a chunk payload dict, got {type(payload).__name__}"
+            )
+        chunks.append(TrajectoryChunk.from_payload(payload))
     return chunks
 
 
