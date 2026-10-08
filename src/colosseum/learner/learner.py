@@ -6,7 +6,9 @@ Each learner owns one trainable agent. It:
 2. sets the algorithm's progress (share of the env-step budget) and trains;
 3. publishes new weights (numpy ``WeightPayload``) to every worker's size-1
    mailbox (newest wins);
-4. sends numpy checkpoint snapshots and metrics to the main process.
+4. sends checkpoint payloads (numpy weights + trainer-state bytes, see
+   ``make_checkpoint_payload``) and metrics to the main process, and a final
+   snapshot when it stops.
 
 Nothing this process puts on a queue contains a torch tensor (R6-02).
 
@@ -21,6 +23,7 @@ by itself once ``consumed_samples >= total_timesteps``.
 
 from __future__ import annotations
 
+import io
 import logging
 import multiprocessing as mp
 import threading
@@ -34,10 +37,66 @@ import torch
 
 from colosseum.algorithms.base import BaseAlgorithm
 from colosseum.core.config import LearnerConfig
-from colosseum.core.ipc import SharedCounter, from_numpy_tree, put_latest, to_numpy_tree
+from colosseum.core.ipc import SharedCounter, put_latest
 from colosseum.core.types import TrajectoryChunk, WeightPayload, state_dict_from_numpy, state_dict_to_numpy
 
 logger = logging.getLogger(__name__)
+
+FINAL_CHECKPOINT_TIMEOUT_SEC = 30.0
+
+
+def make_checkpoint_payload(agent_id: str, algorithm: BaseAlgorithm, final: bool = False) -> dict:
+    """Checkpoint snapshot that may cross a process boundary: numpy weights + bytes.
+
+    The trainer state (optimizer, LR progress, scaler, kickstart, policy_version,
+    consumed_samples) is serialized with ``torch.save`` into bytes, because it
+    contains tensors (R6-02).
+    """
+    buf = io.BytesIO()
+    torch.save(algorithm.state_dict(), buf)
+    return {
+        "agent_id": agent_id,
+        "policy_version": int(algorithm.policy_version),
+        "model_state": state_dict_to_numpy(algorithm.model.state_dict()),
+        "trainer_state_bytes": buf.getvalue(),
+        "final": bool(final),
+    }
+
+
+def send_checkpoint(q, payload: dict, block: bool, timeout: float = FINAL_CHECKPOINT_TIMEOUT_SEC) -> bool:
+    """Put a checkpoint payload on ``q``. Returns False (and logs) if the queue stays full."""
+    try:
+        if block:
+            q.put(payload, timeout=timeout)
+        else:
+            q.put_nowait(payload)
+        return True
+    except Full:
+        level = logging.ERROR if block else logging.WARNING
+        logger.log(level, f"Checkpoint queue full; dropped snapshot v{payload.get('policy_version')}")
+        return False
+
+
+def apply_resume_state(algorithm: BaseAlgorithm, resume_state: dict) -> None:
+    """Load weights and trainer state produced by ``resolve_resume`` into ``algorithm``.
+
+    Without a trainer state, only ``policy_version`` is restored (from meta.json), so
+    checkpoint ids keep increasing after a resume.
+    """
+    model = algorithm.model
+    try:
+        device = next(model.parameters()).device
+    except StopIteration:
+        device = torch.device("cpu")
+    model.load_state_dict(state_dict_from_numpy(resume_state["model_state"]))
+    blob = resume_state.get("trainer_state")
+    if blob is not None:
+        algorithm.load_state_dict(torch.load(io.BytesIO(blob), map_location=device, weights_only=True))
+    else:
+        state = algorithm.state_dict()
+        state["policy_version"] = int(resume_state.get("policy_version", 0))
+        algorithm.load_state_dict(state)
+    logger.info(f"Resumed from {resume_state.get('source')} at policy_version {algorithm.policy_version}")
 
 
 def learner_process(
@@ -66,10 +125,11 @@ def learner_process(
         config: learner configuration
         stop_event: set to signal the learner to stop
         metrics_queue: optional queue to send metrics to the main process
-        checkpoint_queue: optional queue to send checkpoint snapshots to main process
-        checkpoint_interval: save checkpoint every N train steps (0 = disabled)
-        resume_state: optional dict with 'state_dict' (numpy), 'optimizer_state'
-            (numpy tree or None) and 'policy_version' to resume training from a checkpoint
+        checkpoint_queue: optional queue for checkpoint payloads (``make_checkpoint_payload``)
+            to the main process; a final snapshot is always sent when the loop ends
+        checkpoint_interval: send a checkpoint every N policy versions (0 = only the final one)
+        resume_state: optional ``checkpoint_manager.resolve_resume`` result (numpy
+            weights, trainer-state bytes or None, policy_version) to resume from
         progress_counter: the global env-step counter (local mode); None in
             distributed mode, where progress is ``consumed_samples / total_timesteps``
         total_timesteps: ``training.total_timesteps`` (0 = no budget: progress stays 0)
@@ -80,12 +140,16 @@ def learner_process(
 
     algorithm = algorithm_factory()
 
-    train_step = 0
+    # On resume both counters continue: train_step from the restored policy_version,
+    # consumed_samples (the distributed budget) from the trainer state.
+    consumed_samples = 0
     if resume_state is not None:
-        train_step = _apply_resume_state(algorithm, resume_state, agent_id)
+        apply_resume_state(algorithm, resume_state)
+        consumed_samples = int(algorithm.state_dict().get("consumed_samples", 0))
+    train_step = int(algorithm.policy_version)
 
     total_chunks_received = 0
-    consumed_samples = 0
+    last_ckpt_version = -1
 
     # Off-policy: create replay buffer if algorithm requires it
     replay_buffer = algorithm.create_replay_buffer(config.queue_size * 4)
@@ -130,10 +194,11 @@ def learner_process(
             if train_step % config.weight_push_interval == 0:
                 _push_weights(algorithm, agent_id, weight_queues)
 
-            pv = algorithm.policy_version
-            if (checkpoint_queue is not None and checkpoint_interval > 0
-                    and pv > 0 and pv % checkpoint_interval == 0):
-                _send_checkpoint(algorithm, agent_id, checkpoint_queue)
+            if checkpoint_queue is not None and checkpoint_interval > 0:
+                pv = algorithm.policy_version
+                if pv > 0 and pv % checkpoint_interval == 0 and pv != last_ckpt_version:
+                    if send_checkpoint(checkpoint_queue, make_checkpoint_payload(agent_id, algorithm), block=False):
+                        last_ckpt_version = pv
 
             if metrics_queue is not None:
                 metrics["agent_id"] = agent_id
@@ -155,6 +220,16 @@ def learner_process(
             weight_queues, trajectory_queue, stop_event, timeout=_weight_flush_timeout(weight_sync_interval),
         )
 
+    if checkpoint_queue is not None:
+        # Final snapshot on every stop. The main process saves it before tearing children down (R3-07).
+        if send_checkpoint(checkpoint_queue, make_checkpoint_payload(agent_id, algorithm, final=True),
+                           block=True, timeout=FINAL_CHECKPOINT_TIMEOUT_SEC):
+            logger.info(f"Learner [{agent_id}]: sent final checkpoint v{algorithm.policy_version}")
+        if hasattr(checkpoint_queue, "join_thread"):
+            # Wait until the snapshot is flushed into the pipe; never cancel_join_thread here.
+            checkpoint_queue.close()
+            checkpoint_queue.join_thread()
+
     logger.info(f"Learner [{agent_id}]: finished. Total train_steps={train_step}")
 
 
@@ -168,36 +243,6 @@ def _progress(
         return 0.0
     done = progress_counter.value if progress_counter is not None else consumed_samples
     return min(1.0, done / total_timesteps)
-
-
-def _apply_resume_state(algorithm: BaseAlgorithm, resume_state: dict, agent_id: str) -> int:
-    """Load weights (and optimizer state, if present) from a numpy ``resume_state``.
-
-    ``resume_state`` is numpy: it crossed the process boundary as a Process argument.
-    """
-    algorithm.model.load_state_dict(state_dict_from_numpy(resume_state["state_dict"]))
-    if resume_state.get("optimizer_state") is not None and hasattr(algorithm, "_optimizer"):
-        algorithm._optimizer.load_state_dict(from_numpy_tree(resume_state["optimizer_state"]))
-    step = int(resume_state.get("policy_version", 0))
-    if hasattr(algorithm, "_policy_version"):
-        algorithm._policy_version = step
-    logger.info(f"Learner [{agent_id}]: resumed from checkpoint at step {step}")
-    return step
-
-
-def _send_checkpoint(algorithm: BaseAlgorithm, agent_id: str, checkpoint_queue: mp.Queue) -> None:
-    """Send a numpy checkpoint snapshot to the main process (skipped if the queue is full)."""
-    pv = algorithm.policy_version
-    optimizer_state = getattr(algorithm, "optimizer_state_dict", None)
-    try:
-        checkpoint_queue.put_nowait({
-            "policy_version": pv,
-            "state_dict": state_dict_to_numpy(algorithm.model.state_dict()),
-            "optimizer_state": None if optimizer_state is None else to_numpy_tree(optimizer_state),
-        })
-        logger.info(f"Learner [{agent_id}]: sent checkpoint at version {pv}")
-    except Full:
-        logger.warning(f"Learner [{agent_id}]: checkpoint queue full, skipping v{pv}")
 
 
 # Shortest exit wait for workers to read pending weight payloads (see

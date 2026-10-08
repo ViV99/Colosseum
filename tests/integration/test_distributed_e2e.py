@@ -72,7 +72,7 @@ def test_distributed_grpc_pipeline(tmp_path):
         run_distributed_workers(cfg_path, ws_addr, {agent: learner_addr}, overrides)
         _wait_for(lambda: client.get_version(agent) > 0, 60, "a trained weight version in the store")
         # The learner's checkpoint drainer turns numpy snapshots back into torch files.
-        _wait_for(lambda: any(ckpt_root.glob("*/meta.json")), 60, "a checkpoint saved by the learner")
+        _wait_for(lambda: any(ckpt_root.glob("ckpt_v*/meta.json")), 60, "a checkpoint saved by the learner")
         version = client.get_version(agent)
         payload = client.get(agent)
     finally:
@@ -85,8 +85,8 @@ def test_distributed_grpc_pipeline(tmp_path):
         ws_server.stop(0)
     assert payload is not None, "no weights were published to the store"
     assert version > 0, f"learner did not train/publish (version={version})"
-    # The newest checkpoint is complete (model.pt is written before meta.json) and
-    # cannot have been evicted; the learner has exited, so nothing writes any more.
-    newest = max((m.parent for m in ckpt_root.glob("*/meta.json")), key=lambda d: int(d.name[len("ckpt_v"):]))
+    # The newest checkpoint is complete (written into a hidden .tmp-* dir and moved into
+    # place atomically) and cannot have been evicted; the learner has exited.
+    newest = max((m.parent for m in ckpt_root.glob("ckpt_v*/meta.json")), key=lambda d: int(d.name[len("ckpt_v"):]))
     state_dict = torch.load(newest / "model.pt", weights_only=True)
     assert state_dict and all(isinstance(v, torch.Tensor) for v in state_dict.values())

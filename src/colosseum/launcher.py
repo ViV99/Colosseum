@@ -27,8 +27,8 @@ import torch
 
 from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
-from colosseum.core.ipc import SharedCounter, from_numpy_tree, to_numpy_tree
-from colosseum.core.types import MatchConfig, state_dict_from_numpy, state_dict_to_numpy
+from colosseum.core.ipc import SharedCounter
+from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig
 from colosseum.metrics.wandb_logger import WandBLogger
 
 logger = logging.getLogger(__name__)
@@ -39,7 +39,9 @@ _WEIGHT_QUEUE_SIZE = 1  # newest-wins mailbox per (agent, worker); see core.ipc.
 _CHECKPOINT_QUEUE_SIZE = 16
 _METRICS_QUEUE_SIZE = 100
 _RESULTS_QUEUE_SIZE = 1000
-_COMMAND_QUEUE_SIZE = 2
+# One slot: a command that was put has been taken by the worker before the next one
+# can be put, so no command (and none of its new_checkpoints) is replaced unseen (D9).
+_COMMAND_QUEUE_SIZE = 1
 
 
 # =====================================================================
@@ -209,112 +211,74 @@ def _derive_worker_configs(
     match_configs: list[MatchConfig],
     coordinator: Coordinator,
     agent_ids: list[str],
+    already_sent: dict[str, set[str]] | None = None,
 ) -> tuple[
-    dict[str, dict[str, dict[str, np.ndarray]]],  # checkpoint_state_dicts_by_agent
+    dict[str, dict[str, dict[str, np.ndarray]]],  # new checkpoints by agent: {agent_id: {ckpt_id: numpy state_dict}}
     list[list[str]],             # slot_network_map
     list[list[bool]],            # collect_mask
     list[list[str]],             # slot_agent_map
 ]:
-    """Derive network pool config from match configs.
+    """Turn match configs into worker slot maps.
 
-    Returns:
-        (checkpoint_state_dicts_by_agent, slot_network_map, collect_mask, slot_agent_map)
-        checkpoint_state_dicts_by_agent: {agent_id: {ckpt_id: numpy state_dict}};
-            these cross the process boundary (worker Process arguments and
-            ``WorkerCommand.new_checkpoints``), so they are numpy, never torch.
-        slot_agent_map[env_idx][player_idx] -> agent_id
+    Checkpoint weights cross the process boundary (worker Process arguments and
+    ``WorkerCommand.new_checkpoints``), so they are numpy, never torch.
+    Checkpoints listed in ``already_sent[agent]`` are referenced but not reloaded.
+    A checkpoint that cannot be loaded (evicted or missing) is replaced by the
+    latest weights with ``collect=True`` and a warning (R4-19).
     """
-    from colosseum.worker.rollout_loop import LATEST_NETWORK_ID
-
+    already_sent = already_sent or {}
+    new_ckpts: dict[str, dict[str, dict[str, np.ndarray]]] = {aid: {} for aid in agent_ids}
+    missing: set[tuple[str, str]] = set()
     collect_mask: list[list[bool]] = []
     slot_network_map: list[list[str]] = []
     slot_agent_map: list[list[str]] = []
-    checkpoint_state_dicts_by_agent: dict[str, dict[str, dict[str, np.ndarray]]] = {
-        aid: {} for aid in agent_ids
-    }
 
     for mc in match_configs:
-        env_collect = []
-        env_nets = []
-        env_agents = []
+        env_collect: list[bool] = []
+        env_nets: list[str] = []
+        env_agents: list[str] = []
         for slot in mc.player_slots:
-            env_collect.append(slot.collect_trajectories)
-            env_agents.append(slot.agent_id)
-
-            if slot.checkpoint_id is not None:
-                ckpt_id = slot.checkpoint_id
-                agent_ckpts = checkpoint_state_dicts_by_agent.get(
-                    slot.agent_id, {},
-                )
-                if ckpt_id not in agent_ckpts:
+            net_id = LATEST_NETWORK_ID
+            collect = slot.collect_trajectories
+            ckpt_id = slot.checkpoint_id
+            if ckpt_id is not None:
+                agent_new = new_ckpts.setdefault(slot.agent_id, {})
+                available = ckpt_id in already_sent.get(slot.agent_id, set()) or ckpt_id in agent_new
+                if not available and (slot.agent_id, ckpt_id) not in missing:
                     try:
-                        sd = coordinator.checkpoint_manager.load(
-                            slot.agent_id, ckpt_id,
-                        )
-                        agent_ckpts[ckpt_id] = state_dict_to_numpy(sd)
+                        agent_new[ckpt_id] = coordinator.checkpoint_manager.load_model(slot.agent_id, ckpt_id)
+                        available = True
                     except FileNotFoundError:
+                        missing.add((slot.agent_id, ckpt_id))
                         logger.warning(
-                            f"Checkpoint {ckpt_id} for {slot.agent_id} "
-                            f"not found, using latest"
+                            f"Checkpoint {ckpt_id} of {slot.agent_id} is missing; that slot plays "
+                            f"the latest weights and collects trajectories"
                         )
-                        ckpt_id = LATEST_NETWORK_ID
-                env_nets.append(ckpt_id)
-            else:
-                env_nets.append(LATEST_NETWORK_ID)
-
+                if available:
+                    net_id = ckpt_id
+                else:
+                    collect = True
+            env_collect.append(collect)
+            env_nets.append(net_id)
+            env_agents.append(slot.agent_id)
         collect_mask.append(env_collect)
         slot_network_map.append(env_nets)
         slot_agent_map.append(env_agents)
 
-    return (
-        checkpoint_state_dicts_by_agent,
-        slot_network_map,
-        collect_mask,
-        slot_agent_map,
-    )
+    return new_ckpts, slot_network_map, collect_mask, slot_agent_map
 
 
-def _resolve_resume_state(
-    config: ColosseumConfig,
-    agent_id: str,
-    coordinator: Coordinator,
-) -> dict | None:
-    """Build a learner resume_state from ``training.resume_from``.
-
-    Accepts either a path to a .pt state_dict (e.g. a BC output) or a checkpoint
-    id resolvable by the checkpoint manager. Returns None if unset/not found.
-    """
-    import os
-
-    rf = config.training.resume_from
-    if not rf:
-        return None
-
-    for path in (rf, rf + ".pt"):
-        if os.path.isfile(path):
-            sd = torch.load(path, weights_only=True)
-            logger.info(f"Resume [{agent_id}]: loaded weights from {path}")
-            return {"state_dict": sd, "policy_version": 0}
-
-    try:
-        sd = coordinator.checkpoint_manager.load(agent_id, rf)
-    except FileNotFoundError:
-        logger.warning(
-            f"Resume target {rf!r} not found for {agent_id}; starting from scratch"
-        )
-        return None
-
-    state = {"state_dict": sd, "policy_version": 0}
-    opt = coordinator.checkpoint_manager.load_optimizer(agent_id, rf)
-    if opt is not None:
-        state["optimizer_state"] = opt
-    if rf.startswith("ckpt_v"):
+def _drain_queue(q) -> list:
+    """Everything currently in ``q``. A broken item (dead producer) ends the drain with a warning."""
+    items = []
+    while True:
         try:
-            state["policy_version"] = int(rf[len("ckpt_v"):])
-        except ValueError:
-            pass
-    logger.info(f"Resume [{agent_id}]: loaded checkpoint {rf}")
-    return state
+            items.append(q.get_nowait())
+        except queue.Empty:
+            return items
+        except (EOFError, OSError) as e:
+            logger.warning(f"Dropped an unreadable queue item: {e!r}")
+            return items
 
 
 # =====================================================================
@@ -335,6 +299,11 @@ class Launcher:
         self._all_queues: list[mp.Queue] = []
         # Env steps taken by all workers together (spec block 2: global budget).
         self._env_step_counter = SharedCounter()
+        # Set by launch(); used by the monitor loop and _shutdown to save checkpoints.
+        self._coordinator: Coordinator | None = None
+        self._agent_ids: list[str] = []
+        self._checkpoint_queues: dict[str, mp.Queue] = {}
+        self._checkpoint_meta: dict[str, dict] = {}
 
     @property
     def env_steps_done(self) -> int:
@@ -367,6 +336,17 @@ class Launcher:
         # Initialize coordinator
         coordinator = Coordinator(cfg)
 
+        # Resume (before any process starts: a bad resume source fails fast).
+        resume_states = self._resolve_resume(agent_configs)
+
+        from colosseum.core.config import config_hash
+        cfg_hash = config_hash(cfg)
+        self._checkpoint_meta = {
+            aid: {"networks": agent_configs[aid].networks.model_dump(mode="json", by_alias=True),
+                  "config_hash": cfg_hash}
+            for aid in trainable_agents
+        }
+
         checkpoint_interval = cfg.self_play.checkpoint_interval
 
         # Per-agent queues
@@ -391,7 +371,7 @@ class Launcher:
         command_queues: list[mp.Queue] = [
             mp.Queue(maxsize=_COMMAND_QUEUE_SIZE) for _ in range(cfg.rollout.num_workers)
         ]
-        worker_broadcast_ckpts: list[dict[str, set]] = [
+        worker_sent_ckpts: list[dict[str, set]] = [
             {aid: set() for aid in trainable_agents} for _ in range(cfg.rollout.num_workers)
         ]
 
@@ -403,11 +383,15 @@ class Launcher:
             self._all_queues.append(checkpoint_queues[aid])
             self._all_queues.extend(weight_queues_per_agent[aid])
 
+        self._coordinator = coordinator
+        self._agent_ids = list(trainable_agents)
+        self._checkpoint_queues = checkpoint_queues
+
         # Start one learner per agent
         for aid in trainable_agents:
             acfg = agent_configs[aid]
-            # numpy only: Process arguments cross the process boundary (R6-02).
-            resume_state = to_numpy_tree(_resolve_resume_state(cfg, aid, coordinator))
+            # numpy + bytes only: Process arguments cross the process boundary (R6-02).
+            resume_state = resume_states[aid]
             learner_proc = mp.Process(
                 target=_learner_target,
                 kwargs=dict(
@@ -442,15 +426,10 @@ class Launcher:
                 slot_network_map,
                 collect_mask,
                 slot_agent_map,
-            ) = _derive_worker_configs(
-                match_configs, coordinator, trainable_agents,
-            )
-
-            # Record which checkpoints this worker already has (sent at launch).
-            for aid in trainable_agents:
-                worker_broadcast_ckpts[worker_id][aid] |= set(
-                    ckpt_dicts_by_agent.get(aid, {}).keys()
-                )
+            ) = _derive_worker_configs(match_configs, coordinator, trainable_agents)
+            # Initial checkpoints travel as process arguments: delivered by construction.
+            for aid, ckpts in ckpt_dicts_by_agent.items():
+                worker_sent_ckpts[worker_id].setdefault(aid, set()).update(ckpts)
 
             worker_weight_queues: dict[str, mp.Queue] = {
                 aid: weight_queues_per_agent[aid][worker_id]
@@ -496,14 +475,13 @@ class Launcher:
         try:
             self._monitor_loop(
                 metrics_queue,
-                checkpoint_queues,
                 results_queue,
                 wandb_logger,
                 cfg.metrics.log_interval,
                 coordinator,
                 trainable_agents,
                 command_queues,
-                worker_broadcast_ckpts,
+                worker_sent_ckpts,
             )
         except KeyboardInterrupt:
             logger.info("Received interrupt, stopping...")
@@ -514,14 +492,13 @@ class Launcher:
     def _monitor_loop(
         self,
         metrics_queue: mp.Queue,
-        checkpoint_queues: dict[str, mp.Queue],
         results_queue: mp.Queue,
         wandb_logger: WandBLogger,
         log_interval: int,
         coordinator: Coordinator,
         agent_ids: list[str],
         command_queues: list[mp.Queue] | None = None,
-        worker_broadcast_ckpts: list[dict[str, set]] | None = None,
+        worker_sent_ckpts: list[dict[str, set]] | None = None,
     ) -> None:
         """Main process monitors metrics, saves checkpoints, checks for completion.
 
@@ -561,21 +538,7 @@ class Launcher:
                 break
 
             # Process per-agent checkpoint saves
-            for aid in agent_ids:
-                cq = checkpoint_queues[aid]
-                while True:
-                    try:
-                        ckpt_data = cq.get_nowait()
-                        ckpt_id = coordinator.maybe_save_checkpoint(
-                            agent_id=aid,
-                            policy_version=ckpt_data["policy_version"],
-                            state_dict=state_dict_from_numpy(ckpt_data["state_dict"]),
-                            optimizer_state=from_numpy_tree(ckpt_data.get("optimizer_state")),
-                        )
-                        if ckpt_id is not None:
-                            logger.info(f"Saved checkpoint {ckpt_id} for {aid}")
-                    except queue.Empty:
-                        break
+            self._drain_all_checkpoints()
 
             # Process episode results from workers
             while True:
@@ -604,7 +567,7 @@ class Launcher:
                     and refresh_interval > 0
                     and time.time() - last_refresh >= refresh_interval):
                 self._refresh_worker_matches(
-                    coordinator, agent_ids, command_queues, worker_broadcast_ckpts,
+                    coordinator, agent_ids, command_queues, worker_sent_ckpts,
                 )
                 last_refresh = time.time()
 
@@ -620,80 +583,104 @@ class Launcher:
 
             time.sleep(0.5)
 
+    def _resolve_resume(self, agent_configs: dict[str, ColosseumConfig]) -> dict[str, dict | None]:
+        """Resolve ``training.resume_from`` for every trainable agent (see ``resolve_resume``).
+
+        Checks each resumed agent's weights against its architecture (ConfigError
+        before any process starts) and continues the global env-step counter from
+        the largest resumed ``env_steps``, so the budget and LR progress continue (D3).
+        """
+        from colosseum.coordinator.checkpoint_manager import check_model_state, resolve_resume
+        from colosseum.core.registry import build_model
+
+        resume_from = self._config.training.resume_from
+        resume_states: dict[str, dict | None] = {aid: None for aid in agent_configs}
+        if not resume_from:
+            return resume_states
+        for aid, acfg in agent_configs.items():
+            state = resolve_resume(resume_from, aid)
+            if state is not None:
+                check_model_state(build_model(acfg), state["model_state"], state["source"])
+                logger.info(f"Resume [{aid}]: {state['source']} (policy_version {state['policy_version']})")
+            resume_states[aid] = state
+        start_env_steps = max((s["env_steps"] for s in resume_states.values() if s), default=0)
+        if start_env_steps > 0:
+            self._env_step_counter.add(start_env_steps)
+            logger.info(f"Resume: env-step counter continues from {start_env_steps}")
+        return resume_states
+
+    def _save_checkpoint(self, payload: dict) -> None:
+        aid = payload["agent_id"]
+        meta = {**self._checkpoint_meta.get(aid, {}), "env_steps": int(self._env_step_counter.value)}
+        self._coordinator.save_checkpoint_payload(payload, meta_extra=meta)
+
+    def _drain_all_checkpoints(self) -> None:
+        for cq in self._checkpoint_queues.values():
+            for payload in _drain_queue(cq):
+                self._save_checkpoint(payload)
+
     def _refresh_worker_matches(
         self,
         coordinator: Coordinator,
         agent_ids: list[str],
         command_queues: list[mp.Queue],
-        worker_broadcast_ckpts: list[dict[str, set]],
+        worker_sent_ckpts: list[dict[str, set]],
     ) -> None:
-        """Re-generate per-worker match assignments and push them to workers.
+        """Advance the owner rotation and send every worker fresh slot maps.
 
-        Advances the coordinator's owner rotation (``next_round``) first, then
-        generates matches for worker ``w`` at global env offset
-        ``w * envs_per_worker``. Each worker gets a fresh set of slot
-        assignments (reflecting current checkpoints / PFSP win rates) plus any
-        checkpoint state_dicts it does not yet have (deltas only, to avoid
-        resending large payloads).
+        Matches for worker ``w`` are generated at global env offset
+        ``w * envs_per_worker``. Each command carries only checkpoints that the
+        worker does not have yet. A checkpoint counts as delivered only after its
+        command was put successfully; a full command queue means the worker skips
+        this round and gets the deltas with the next refresh (D9).
         """
         from colosseum.core.types import WorkerCommand
 
         num_envs = self._config.rollout.envs_per_worker
-
         coordinator.next_round()
         for worker_id, cq in enumerate(command_queues):
+            sent = worker_sent_ckpts[worker_id]
             match_configs = coordinator.generate_match_configs(num_envs, env_offset=worker_id * num_envs)
-            (
-                ckpt_dicts_by_agent,
-                slot_network_map,
-                collect_mask,
-                slot_agent_map,
-            ) = _derive_worker_configs(match_configs, coordinator, agent_ids)
-
-            # Checkpoint deltas not yet sent to this worker.
-            new_ckpts: dict[str, dict[str, dict[str, np.ndarray]]] = {}
-            sent_sets = worker_broadcast_ckpts[worker_id]
-            for aid in agent_ids:
-                for ckpt_id, sd in ckpt_dicts_by_agent.get(aid, {}).items():
-                    if ckpt_id not in sent_sets[aid]:
-                        new_ckpts.setdefault(aid, {})[ckpt_id] = sd
-                        sent_sets[aid].add(ckpt_id)
-
+            new_ckpts, slot_network_map, collect_mask, slot_agent_map = _derive_worker_configs(
+                match_configs, coordinator, agent_ids, already_sent=sent,
+            )
             cmd = WorkerCommand(
                 slot_agent_map=slot_agent_map,
                 slot_network_map=slot_network_map,
                 collect_mask=collect_mask,
-                new_checkpoints=new_ckpts,
+                new_checkpoints={aid: c for aid, c in new_ckpts.items() if c},
             )
             try:
                 cq.put_nowait(cmd)
             except queue.Full:
-                pass  # worker will get the next refresh
+                logger.debug(f"worker-{worker_id} has not consumed its previous command; skipping this refresh")
+                continue
+            for aid, ckpts in new_ckpts.items():
+                sent.setdefault(aid, set()).update(ckpts)
 
     def _shutdown(self) -> None:
-        """Signal all processes to stop and wait for them."""
+        """Stop children; save every learner's final checkpoint before tearing them down."""
         self._stop_event.set()
+        learner_procs = self._processes[: len(self._agent_ids)]
+        deadline = time.monotonic() + 10.0
+        while time.monotonic() < deadline and any(p.is_alive() for p in learner_procs):
+            self._drain_all_checkpoints()
+            time.sleep(0.1)
+        self._drain_all_checkpoints()
 
         # Detach queue feeder threads so a queue still holding undrained data
         # (e.g. trajectory chunks a now-dead learner never consumed, or large
-        # WorkerCommands) cannot block this process — or the workers — from
-        # exiting on join. Without this, a non-daemon worker / the main process
-        # can hang in the queue's join_thread at interpreter shutdown.
+        # WorkerCommands) cannot block this process from exiting on join.
         for q in self._all_queues:
             try:
                 q.cancel_join_thread()
-            except Exception:
+            except (AttributeError, OSError):
                 pass
-
-        # Give processes a moment to notice the stop event
-        time.sleep(1.0)
-
         for proc in self._processes:
             proc.join(timeout=3)
             if proc.is_alive():
                 proc.terminate()
                 proc.join(timeout=2)
-
         logger.info("All processes stopped")
 
 

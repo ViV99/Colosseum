@@ -75,7 +75,8 @@ def test_learner_queues_carry_only_numpy():
     thread.join(timeout=10)
     assert not thread.is_alive()
     ckpt = ckq.get_nowait()
-    assert all(isinstance(v, np.ndarray) for v in ckpt["state_dict"].values())
+    assert all(isinstance(v, np.ndarray) for v in ckpt["model_state"].values())
+    assert isinstance(ckpt["trainer_state_bytes"], bytes)
     assert isinstance(wq.get_nowait(), WeightPayload)
     assert mq.qsize() >= 1
 
@@ -94,7 +95,7 @@ def test_refresh_commands_carry_numpy_checkpoints(tmp_path):
     cfg = ColosseumConfig(**data)
     coord = Coordinator(cfg)
     coord.agent_pool.register_trainable("agent_0")
-    coord.checkpoint_manager.save("agent_0", 50, build_model(cfg).state_dict())
+    coord.checkpoint_manager.save("agent_0", 50, state_dict_to_numpy(build_model(cfg).state_dict()))
     cq = CheckedQueue()
     Launcher(cfg)._refresh_worker_matches(coord, ["agent_0"], [cq], [{"agent_0": set()}])
     cmd = cq.get_nowait()
@@ -102,16 +103,19 @@ def test_refresh_commands_carry_numpy_checkpoints(tmp_path):
     assert all(isinstance(v, np.ndarray) for v in state_dict.values())
 
 
-def test_learner_resumes_from_numpy_state_and_optimizer_tree():
-    """resume_state crosses the process boundary as numpy (weights + optimizer tree)."""
-    from colosseum.core.ipc import to_numpy_tree
+def test_learner_resumes_from_numpy_weights_and_trainer_state_bytes():
+    """resume_state crosses the process boundary as numpy weights + trainer-state bytes."""
+    from colosseum.learner.learner import make_checkpoint_payload
 
     source = APPO(TinyModel(), AlgorithmConfig(), device="cpu")
     source.train_step([TrajectoryChunk.from_payload(chunk_payload(T=4, version=v)) for v in range(2)])
+    payload = make_checkpoint_payload("a", source)
     resume_state = {
-        "state_dict": state_dict_to_numpy(source.model.state_dict()),
-        "optimizer_state": to_numpy_tree(source.optimizer_state_dict),
-        "policy_version": 5,
+        "model_state": payload["model_state"],
+        "trainer_state": payload["trainer_state_bytes"],
+        "policy_version": payload["policy_version"],
+        "env_steps": 0,
+        "source": "test",
     }
     assert_no_tensors(resume_state)
     built: list[APPO] = []
@@ -129,15 +133,15 @@ def test_learner_resumes_from_numpy_state_and_optimizer_tree():
         resume_state=resume_state,
     )
     restored = built[0]
-    assert restored.policy_version == 5
+    assert restored.policy_version == source.policy_version == 1
     for key, value in source.model.state_dict().items():
         assert torch.equal(restored.model.state_dict()[key], value), key
-    src_opt, got_opt = source.optimizer_state_dict, restored.optimizer_state_dict
+    src_opt, got_opt = source.state_dict()["optimizer"], restored.state_dict()["optimizer"]
     assert src_opt["state"].keys() == got_opt["state"].keys()
     for idx, slot in src_opt["state"].items():
         for name, value in slot.items():
             assert torch.equal(got_opt["state"][idx][name], value), (idx, name)
     pushed = wq.get_nowait()
-    assert pushed.policy_version == 5
-    for key, value in resume_state["state_dict"].items():
+    assert pushed.policy_version == 1
+    for key, value in resume_state["model_state"].items():
         assert np.array_equal(pushed.state_dict[key], value), key

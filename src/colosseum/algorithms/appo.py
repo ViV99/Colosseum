@@ -146,10 +146,6 @@ class APPO(BaseAlgorithm):
             return base * 0.5 * (1.0 + math.cos(math.pi * progress))
         return base
 
-    @property
-    def optimizer_state_dict(self) -> dict:
-        return self._optimizer.state_dict()
-
     def _prepare_batch(self, chunks: list[TrajectoryChunk]) -> dict[str, torch.Tensor]:
         """Stack trajectory chunks into batched tensors.
 

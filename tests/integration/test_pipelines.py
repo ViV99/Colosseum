@@ -124,7 +124,7 @@ def test_full_pipeline(tmp_path):
 
 @pytest.mark.timeout(900)
 def test_full_pipeline_with_checkpoint_pool(tmp_path):
-    """Checkpoints are saved every N train steps and the FIFO pool is respected."""
+    """Checkpoints are saved every N train steps, plus a final one, and the FIFO pool is respected."""
     from colosseum.launcher import Launcher
 
     config = _config(
@@ -133,7 +133,8 @@ def test_full_pipeline_with_checkpoint_pool(tmp_path):
         rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
         learner={"batch_chunks": 2, "queue_size": 16},
         # ~300 train steps before the env-step budget stops the run: checkpoints at
-        # 40, 80, ... -> the FIFO pool keeps the last 5 (exact versions depend on timing).
+        # 40, 80, ... and a final one at stop -> the FIFO pool keeps the last 5
+        # (exact versions depend on timing).
         self_play={"checkpoint_interval": 40, "pool_size": 5},
     )
     Launcher(config).launch()
@@ -141,7 +142,9 @@ def test_full_pipeline_with_checkpoint_pool(tmp_path):
     versions = [c.policy_version for c in ckpts]
     assert len(versions) == 5, versions
     assert all(a < b for a, b in zip(versions, versions[1:])), versions
-    assert all(v > 0 and v % 40 == 0 for v in versions), versions
+    assert all(v > 0 and v % 40 == 0 for v in versions[:-1]), versions
+    assert ckpts[-1].meta["final"] is True, "the newest checkpoint is the learner's final snapshot"
+    assert not any(c.meta["final"] for c in ckpts[:-1])
 
 
 @pytest.mark.timeout(900)

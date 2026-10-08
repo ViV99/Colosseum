@@ -44,6 +44,7 @@ from colosseum.core.action_spec import ActionSpec
 from colosseum.core.errors import EnvContractError
 from colosseum.core.outcomes import player_outcomes
 from colosseum.core.types import (
+    LATEST_NETWORK_ID,
     MatchResult,
     SeatResult,
     TrajectoryChunk,
@@ -59,7 +60,7 @@ from colosseum.worker.slots import BufferPool, RolloutBuffer, SlotTrack
 
 logger = logging.getLogger(__name__)
 
-LATEST_NETWORK_ID = "latest"
+__all__ = ["LATEST_NETWORK_ID", "LoopIO", "RolloutLoop"]
 
 
 @dataclass

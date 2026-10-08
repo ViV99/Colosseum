@@ -140,6 +140,11 @@ class TrajectoryChunk:
         )
 
 
+# Network id of an agent's current (latest) weights, as opposed to a checkpoint id
+# ("ckpt_v<N>"); used in slot network maps, SeatResult.network_id and the worker's model pool.
+LATEST_NETWORK_ID = "latest"
+
+
 @dataclass
 class PlayerSlot:
     """Assignment for one player slot in a match.
@@ -150,7 +155,7 @@ class PlayerSlot:
     Attributes:
         agent_id: Which agent occupies this slot.
         checkpoint_id: Specific checkpoint to load.  ``None`` means "use the
-            latest weights from the weight store".
+            latest weights from the weight store" (network id :data:`LATEST_NETWORK_ID`).
         collect_trajectories: Whether to collect trajectories from this slot
             and send them to the agent's learner.  Frozen sparring partners
             typically have this set to ``False``.

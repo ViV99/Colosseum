@@ -8,6 +8,8 @@ them all and can be loaded from a YAML file via :func:`load_config`.
 
 from __future__ import annotations
 
+import hashlib
+import json
 from enum import Enum
 from pathlib import Path
 from typing import Any, Literal
@@ -238,9 +240,11 @@ class TrainingConfig(BaseModel):
     seed: int | None = Field(default=None, description="Global random seed for reproducibility.")
     resume_from: str | None = Field(
         default=None,
-        description="Resume each trainable agent's network (and optimizer, if available) from "
-                    "this checkpoint before training. Either a path to a .pt state_dict (e.g. a "
-                    "BC output) or a checkpoint id in the checkpoint dir (e.g. 'ckpt_v100').",
+        description="Resume each trainable agent before training from: a checkpoint dir (containing "
+                    "model.pt; weights, trainer state and policy_version), a previous run dir "
+                    "(containing checkpoints/; each agent's latest checkpoint there), or a .pt "
+                    "state_dict (e.g. a BC output; weights only, policy_version 0). Policy versions "
+                    "and the global env-step counter continue from the checkpoint.",
     )
     kickstart_teacher: str | None = Field(
         default=None,
@@ -302,7 +306,12 @@ class CheckpointConfig(BaseModel):
     """Checkpoint storage settings."""
 
     dir: str = Field(default="checkpoints", description="Directory for saving checkpoints.")
-    save_optimizer: bool = Field(default=True, description="Whether to include optimizer state in checkpoints.")
+    save_optimizer: bool = Field(
+        default=True,
+        description="Whether checkpoints include the trainer state (optimizer, LR progress, AMP scaler, "
+                    "kickstart, counters) as trainer_state.pt. Without it a resume restores weights and "
+                    "policy_version only.",
+    )
 
 
 class MetricsConfig(BaseModel):
@@ -432,3 +441,9 @@ def load_config(path: str | Path) -> ColosseumConfig:
     with path.open("r") as fh:
         raw: dict[str, Any] = yaml.safe_load(fh) or {}
     return ColosseumConfig.model_validate(raw)
+
+
+def config_hash(config: ColosseumConfig) -> str:
+    """Short stable hash of a resolved config (stored in every checkpoint's meta.json)."""
+    payload = json.dumps(config.model_dump(mode="json", by_alias=True), sort_keys=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:16]

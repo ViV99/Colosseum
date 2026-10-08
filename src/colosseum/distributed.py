@@ -42,9 +42,8 @@ from functools import partial
 
 import torch
 
-from colosseum.core.config import ColosseumConfig, load_config
-from colosseum.core.ipc import from_numpy_tree
-from colosseum.core.types import WeightPayload, state_dict_from_numpy
+from colosseum.core.config import ColosseumConfig, config_hash, load_config
+from colosseum.core.types import WeightPayload
 
 logger = logging.getLogger(__name__)
 
@@ -178,7 +177,6 @@ def run_distributed_learner(
         coordinator_ckpt = CheckpointManager(
             base_dir=config.checkpoint.dir,
             pool_size=config.self_play.pool_size,
-            save_optimizer=config.checkpoint.save_optimizer,
         )
 
     algo_class_path = acfg.algorithm.algorithm_class
@@ -207,20 +205,30 @@ def run_distributed_learner(
     stop_event = threading.Event()
     _install_stop_signal_handlers(stop_event)
 
-    # Drain checkpoint snapshots to disk in the background.
+    # Drain checkpoint payloads (learner.make_checkpoint_payload) to disk in the background.
+    cfg_hash = config_hash(config)
+
+    def _save(data: dict) -> None:
+        if coordinator_ckpt is None:
+            return
+        trainer_state = data.get("trainer_state_bytes") if config.checkpoint.save_optimizer else None
+        coordinator_ckpt.save(
+            agent_id=agent_id,
+            policy_version=int(data["policy_version"]),
+            model_state=data["model_state"],
+            trainer_state=trainer_state,
+            meta_extra={"final": bool(data.get("final", False)),
+                        "networks": acfg.networks.model_dump(mode="json", by_alias=True),
+                        "config_hash": cfg_hash},
+        )
+
     def _drain_checkpoints():
         while not stop_event.is_set():
             try:
                 data = checkpoint_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            if coordinator_ckpt is not None:
-                coordinator_ckpt.save(
-                    agent_id=agent_id,
-                    policy_version=data["policy_version"],
-                    state_dict=state_dict_from_numpy(data["state_dict"]),
-                    optimizer_state=from_numpy_tree(data.get("optimizer_state")),
-                )
+            _save(data)
 
     drainer = threading.Thread(target=_drain_checkpoints, daemon=True)
     drainer.start()
@@ -246,6 +254,12 @@ def run_distributed_learner(
         )
     finally:
         stop_event.set()
+        drainer.join()  # it finishes the save in progress, then sees stop_event
+        while True:  # the final snapshot arrives after stop_event is set
+            try:
+                _save(checkpoint_queue.get_nowait())
+            except queue.Empty:
+                break
         traj_server.stop(0)
         store.close()
         logger.info(f"Distributed learner [{agent_id}] stopped.")

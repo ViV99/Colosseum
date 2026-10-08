@@ -93,14 +93,6 @@ class BaseAlgorithm(ABC):
         raise NotImplementedError(f"{type(self).__name__} does not implement load_state_dict()")
 
     @property
-    def optimizer_state_dict(self) -> dict:
-        """Return the optimizer state dict for checkpointing.
-
-        Subclasses should override if they use a different optimizer setup.
-        """
-        return {}
-
-    @property
     def is_off_policy(self) -> bool:
         """If True, learner adds chunks to a replay buffer instead of training directly."""
         return False

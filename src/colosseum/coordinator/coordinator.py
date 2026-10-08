@@ -3,7 +3,7 @@
 Manages:
 - Agent pool (trainable, frozen, scripted agents)
 - Matchmaking (self-play, PFSP)
-- Checkpoint scheduling
+- Checkpoint storage (learner checkpoint payloads -> CheckpointManager)
 - Match result tracking
 - Pairwise ELO, win-rate matrix and latest-vs-past win rate (from per-seat results)
 """
@@ -20,8 +20,7 @@ from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.coordinator.matchmaker import BaseMatchmaker, PFSPMatchmaker, SelfPlayMatchmaker
 from colosseum.coordinator.ratings import EloRating, PastWinRate, WinRateTracker, pairwise_score
 from colosseum.core.config import ColosseumConfig, TrainingPhase
-from colosseum.core.types import MatchConfig, MatchResult
-from colosseum.worker.rollout_loop import LATEST_NETWORK_ID
+from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig, MatchResult
 
 logger = logging.getLogger(__name__)
 
@@ -37,9 +36,8 @@ class Coordinator:
         for agent_id in config.get_trainable_agent_ids():
             self._agent_pool.register_trainable(agent_id)
         self._checkpoint_manager = CheckpointManager(
-            base_dir=str(checkpoint_dir if checkpoint_dir is not None else config.checkpoint.dir),
+            base_dir=checkpoint_dir if checkpoint_dir is not None else config.checkpoint.dir,
             pool_size=config.self_play.pool_size,
-            save_optimizer=config.checkpoint.save_optimizer,
         )
         self._match_results: deque[MatchResult] = deque(maxlen=10000)
         self._elo = EloRating()
@@ -114,26 +112,22 @@ class Coordinator:
             rng=self._rng,
         )
 
-    def maybe_save_checkpoint(
-        self,
-        agent_id: str,
-        policy_version: int,
-        state_dict: dict,
-        optimizer_state: dict | None = None,
-        metrics: dict | None = None,
-    ) -> str | None:
-        """Save checkpoint if policy_version is at a checkpoint interval."""
-        interval = self._config.self_play.checkpoint_interval
-        if interval > 0 and policy_version > 0 and policy_version % interval == 0:
-            ckpt_id = self._checkpoint_manager.save(
-                agent_id=agent_id,
-                policy_version=policy_version,
-                state_dict=state_dict,
-                optimizer_state=optimizer_state,
-                metrics=metrics,
-            )
-            return ckpt_id
-        return None
+    def save_checkpoint_payload(self, payload: dict, meta_extra: dict | None = None) -> str:
+        """Persist a learner checkpoint payload (see ``learner.make_checkpoint_payload``).
+
+        The trainer state is kept only when ``checkpoint.save_optimizer`` is true.
+        """
+        trainer_state = None
+        if self._config.checkpoint.save_optimizer:
+            trainer_state = payload.get("trainer_state_bytes")
+        meta = {"final": bool(payload.get("final", False)), **(meta_extra or {})}
+        return self._checkpoint_manager.save(
+            agent_id=payload["agent_id"],
+            policy_version=int(payload["policy_version"]),
+            model_state=payload["model_state"],
+            trainer_state=trainer_state,
+            meta_extra=meta,
+        )
 
     def report_match_result(self, result: MatchResult) -> None:
         """Update ratings from one finished match.

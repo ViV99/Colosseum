@@ -1,160 +1,263 @@
-"""Checkpoint manager: save, load, and FIFO-manage model checkpoints."""
+"""Checkpoint storage: atomic per-agent checkpoints, FIFO pool, resume resolution.
+
+Layout (``base_dir`` is ``<run_dir>/checkpoints``)::
+
+    base_dir/<agent_id>/ckpt_v<policy_version>/
+        model.pt            torch.save of the model state_dict (CPU tensors)
+        trainer_state.pt    torch.save of BaseAlgorithm.state_dict() (optional)
+        meta.json           agent_id, checkpoint_id, policy_version, timestamp, + extras
+
+A checkpoint's path is always ``base_dir/agent_id/checkpoint_id``. A ``path`` stored
+in ``meta.json`` (older layouts, copied runs) is never used (R6-06).
+"""
 
 from __future__ import annotations
 
 import json
 import logging
-import random
+import os
+import re
 import shutil
 import time
-from dataclasses import asdict, dataclass, field
+import uuid
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 
+import numpy as np
 import torch
 
+from colosseum.core.errors import ConfigError
+from colosseum.core.types import state_dict_from_numpy, state_dict_to_numpy
+
 logger = logging.getLogger(__name__)
+
+# The single numpy <-> torch state_dict conversion lives in colosseum.core.types.
+numpy_state_to_torch = state_dict_from_numpy
+torch_state_to_numpy = state_dict_to_numpy
+
+MODEL_FILE = "model.pt"
+TRAINER_FILE = "trainer_state.pt"
+META_FILE = "meta.json"
+_CKPT_RE = re.compile(r"ckpt_v(\d+)")
+_TMP_PREFIX = ".tmp-"
 
 
 @dataclass
 class CheckpointInfo:
-    """Metadata for a saved checkpoint."""
+    """One complete checkpoint on disk."""
 
     checkpoint_id: str
     agent_id: str
     policy_version: int
-    path: str
+    path: Path
     timestamp: float
-    metrics: dict = field(default_factory=dict)
+    meta: dict = field(default_factory=dict)
+
+
+def _read_agent_dir(agent_dir: Path) -> list[CheckpointInfo]:
+    """Complete checkpoints of one agent dir (model.pt + meta.json), sorted by version."""
+    infos: list[CheckpointInfo] = []
+    if not agent_dir.is_dir():
+        return infos
+    for d in agent_dir.iterdir():
+        match = _CKPT_RE.fullmatch(d.name)
+        if match is None or not d.is_dir():
+            continue
+        meta_path = d / META_FILE
+        if not (d / MODEL_FILE).is_file() or not meta_path.is_file():
+            continue
+        try:
+            meta = json.loads(meta_path.read_text())
+        except (OSError, json.JSONDecodeError) as e:
+            logger.warning(f"Skipping checkpoint {d}: unreadable {META_FILE} ({e})")
+            continue
+        infos.append(CheckpointInfo(
+            checkpoint_id=d.name,
+            agent_id=agent_dir.name,
+            policy_version=int(match.group(1)),
+            path=d,
+            timestamp=float(meta.get("timestamp", 0.0)),
+            meta=meta,
+        ))
+    infos.sort(key=lambda c: c.policy_version)
+    return infos
 
 
 class CheckpointManager:
-    """Saves checkpoints, manages FIFO pool per agent.
+    """Saves checkpoints atomically and keeps a FIFO pool of ``pool_size`` per agent."""
 
-    Directory structure:
-        base_dir/
-            agent_0/
-                ckpt_v100/
-                    model.pt
-                    meta.json
-                ckpt_v200/
-                    ...
-    """
-
-    def __init__(
-        self,
-        base_dir: str,
-        pool_size: int = 20,
-        save_optimizer: bool = True,
-    ) -> None:
+    def __init__(self, base_dir: str | Path, pool_size: int = 20) -> None:
         self._base_dir = Path(base_dir)
         self._pool_size = pool_size
-        self._save_optimizer = save_optimizer
         self._base_dir.mkdir(parents=True, exist_ok=True)
-
-        # In-memory index: agent_id -> list of CheckpointInfo (sorted by version)
         self._index: dict[str, list[CheckpointInfo]] = {}
-        self._scan_existing()
+        self._scan()
 
-    def _scan_existing(self) -> None:
-        """Scan disk for existing checkpoints on startup."""
-        if not self._base_dir.exists():
-            return
-        for agent_dir in self._base_dir.iterdir():
-            if not agent_dir.is_dir():
+    @property
+    def base_dir(self) -> Path:
+        return self._base_dir
+
+    @property
+    def agents(self) -> list[str]:
+        return list(self._index.keys())
+
+    def _ckpt_dir(self, agent_id: str, checkpoint_id: str) -> Path:
+        return self._base_dir / agent_id / checkpoint_id
+
+    def _scan(self) -> None:
+        for agent_dir in sorted(self._base_dir.iterdir()):
+            if not agent_dir.is_dir() or agent_dir.name.startswith("."):
                 continue
-            agent_id = agent_dir.name
-            self._index[agent_id] = []
-            for ckpt_dir in sorted(agent_dir.iterdir()):
-                meta_path = ckpt_dir / "meta.json"
-                if meta_path.exists():
-                    with open(meta_path) as f:
-                        meta = json.load(f)
-                    info = CheckpointInfo(**meta)
-                    self._index[agent_id].append(info)
-            self._index[agent_id].sort(key=lambda c: c.policy_version)
+            for stale in agent_dir.glob(f"{_TMP_PREFIX}*"):
+                shutil.rmtree(stale, ignore_errors=True)
+            infos = _read_agent_dir(agent_dir)
+            if infos:
+                self._index[agent_dir.name] = infos
 
     def save(
         self,
         agent_id: str,
         policy_version: int,
-        state_dict: dict,
-        optimizer_state: dict | None = None,
-        metrics: dict | None = None,
+        model_state: dict[str, np.ndarray],
+        trainer_state: dict | bytes | None = None,
+        meta_extra: dict | None = None,
     ) -> str:
-        """Save a checkpoint. Returns checkpoint_id. Evicts oldest if pool full."""
-        checkpoint_id = f"ckpt_v{policy_version}"
+        """Write ``ckpt_v<policy_version>`` atomically and evict the oldest beyond ``pool_size``.
+
+        The files are written into ``.tmp-<id>-<rand>/`` and the directory is moved into
+        place with ``os.replace``. An existing checkpoint with the same id is replaced.
+        """
+        checkpoint_id = f"ckpt_v{int(policy_version)}"
         agent_dir = self._base_dir / agent_id
-        ckpt_dir = agent_dir / checkpoint_id
-        ckpt_dir.mkdir(parents=True, exist_ok=True)
+        agent_dir.mkdir(parents=True, exist_ok=True)
+        final_dir = agent_dir / checkpoint_id
+        tmp_dir = agent_dir / f"{_TMP_PREFIX}{checkpoint_id}-{uuid.uuid4().hex[:8]}"
+        tmp_dir.mkdir()
+        timestamp = time.time()
+        meta = {
+            "agent_id": agent_id,
+            "checkpoint_id": checkpoint_id,
+            "policy_version": int(policy_version),
+            "timestamp": timestamp,
+            **(meta_extra or {}),
+        }
+        try:
+            torch.save(numpy_state_to_torch(model_state), tmp_dir / MODEL_FILE)
+            if isinstance(trainer_state, (bytes, bytearray)):
+                (tmp_dir / TRAINER_FILE).write_bytes(bytes(trainer_state))
+            elif trainer_state is not None:
+                torch.save(trainer_state, tmp_dir / TRAINER_FILE)
+            (tmp_dir / META_FILE).write_text(json.dumps(meta, indent=2, sort_keys=True))
+            if final_dir.exists():
+                old_dir = agent_dir / f"{_TMP_PREFIX}old-{checkpoint_id}-{uuid.uuid4().hex[:8]}"
+                os.replace(final_dir, old_dir)
+                os.replace(tmp_dir, final_dir)
+                shutil.rmtree(old_dir, ignore_errors=True)
+            else:
+                os.replace(tmp_dir, final_dir)
+        except BaseException:
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+            raise
 
-        # Save model weights
-        torch.save(state_dict, ckpt_dir / "model.pt")
-
-        # Save optimizer if requested
-        if self._save_optimizer and optimizer_state is not None:
-            torch.save(optimizer_state, ckpt_dir / "optimizer.pt")
-
-        # Save metadata
-        info = CheckpointInfo(
-            checkpoint_id=checkpoint_id,
-            agent_id=agent_id,
-            policy_version=policy_version,
-            path=str(ckpt_dir),
-            timestamp=time.time(),
-            metrics=metrics or {},
-        )
-        with open(ckpt_dir / "meta.json", "w") as f:
-            json.dump(asdict(info), f, indent=2)
-
-        # Update index
-        if agent_id not in self._index:
-            self._index[agent_id] = []
-        self._index[agent_id].append(info)
-
-        # FIFO eviction
-        while len(self._index[agent_id]) > self._pool_size:
-            oldest = self._index[agent_id].pop(0)
-            oldest_path = Path(oldest.path)
-            if oldest_path.exists():
-                shutil.rmtree(oldest_path)
-            logger.debug(f"Evicted checkpoint {oldest.checkpoint_id} for agent {agent_id}")
-
-        logger.info(
-            f"Saved checkpoint {checkpoint_id} for {agent_id} "
-            f"(pool: {len(self._index[agent_id])}/{self._pool_size})"
-        )
+        entries = [c for c in self._index.get(agent_id, []) if c.checkpoint_id != checkpoint_id]
+        entries.append(CheckpointInfo(checkpoint_id, agent_id, int(policy_version), final_dir, timestamp, meta))
+        entries.sort(key=lambda c: c.policy_version)
+        while len(entries) > self._pool_size:
+            victim = next(c for c in entries if c.checkpoint_id != checkpoint_id)
+            entries.remove(victim)
+            shutil.rmtree(self._ckpt_dir(agent_id, victim.checkpoint_id), ignore_errors=True)
+            logger.debug(f"Evicted checkpoint {victim.checkpoint_id} of {agent_id}")
+        self._index[agent_id] = entries
+        logger.info(f"Saved checkpoint {checkpoint_id} of {agent_id} (pool {len(entries)}/{self._pool_size})")
         return checkpoint_id
 
-    def load(self, agent_id: str, checkpoint_id: str) -> dict:
-        """Load state_dict from a checkpoint."""
-        ckpt_dir = self._base_dir / agent_id / checkpoint_id
-        model_path = ckpt_dir / "model.pt"
-        if not model_path.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {model_path}")
-        return torch.load(model_path, weights_only=True)
+    def load_model(self, agent_id: str, checkpoint_id: str) -> dict[str, np.ndarray]:
+        path = self._ckpt_dir(agent_id, checkpoint_id) / MODEL_FILE
+        if not path.is_file():
+            raise FileNotFoundError(f"Checkpoint not found: {path}")
+        return torch_state_to_numpy(torch.load(path, map_location="cpu", weights_only=True))
 
-    def load_optimizer(self, agent_id: str, checkpoint_id: str) -> dict | None:
-        """Load optimizer state from a checkpoint, if it exists."""
-        opt_path = self._base_dir / agent_id / checkpoint_id / "optimizer.pt"
-        if opt_path.exists():
-            return torch.load(opt_path, weights_only=True)
-        return None
+    def load_trainer_state(self, agent_id: str, checkpoint_id: str) -> dict | None:
+        path = self._ckpt_dir(agent_id, checkpoint_id) / TRAINER_FILE
+        if not path.is_file():
+            return None
+        return torch.load(path, map_location="cpu", weights_only=True)
 
     def list_checkpoints(self, agent_id: str) -> list[CheckpointInfo]:
-        """List all checkpoints for an agent, ordered by policy_version."""
         return list(self._index.get(agent_id, []))
 
-    def get_latest(self, agent_id: str) -> CheckpointInfo | None:
-        """Get the most recent checkpoint for an agent."""
-        ckpts = self._index.get(agent_id, [])
-        return ckpts[-1] if ckpts else None
+    def latest(self, agent_id: str) -> CheckpointInfo | None:
+        entries = self._index.get(agent_id, [])
+        return entries[-1] if entries else None
 
-    def get_random(self, agent_id: str) -> CheckpointInfo | None:
-        """Get a random checkpoint from the pool."""
-        ckpts = self._index.get(agent_id, [])
-        return random.choice(ckpts) if ckpts else None
 
-    @property
-    def agents(self) -> list[str]:
-        """List all agents that have checkpoints."""
-        return list(self._index.keys())
+def _load_checkpoint_dir(ckpt_dir: Path) -> dict[str, Any]:
+    meta_path = ckpt_dir / META_FILE
+    meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
+    match = _CKPT_RE.fullmatch(ckpt_dir.name)
+    version = int(meta.get("policy_version", match.group(1) if match else 0))
+    trainer_path = ckpt_dir / TRAINER_FILE
+    return {
+        "model_state": torch_state_to_numpy(
+            torch.load(ckpt_dir / MODEL_FILE, map_location="cpu", weights_only=True)),
+        "trainer_state": trainer_path.read_bytes() if trainer_path.is_file() else None,
+        "policy_version": version,
+        "env_steps": int(meta.get("env_steps", 0)),
+        "source": str(ckpt_dir),
+    }
+
+
+def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
+    """Resolve ``training.resume_from`` for one agent.
+
+    Accepted forms:
+    - a checkpoint dir (contains ``model.pt``): its weights, trainer state and version;
+    - a previous run dir (contains ``checkpoints/``): the agent's latest checkpoint
+      there, or ``None`` (with a warning) if the agent has none;
+    - a ``.pt`` file (e.g. the output of ``colosseum bc``): weights only, version 0.
+
+    The result holds only numpy arrays, bytes and primitives, so it can be passed
+    to a learner process.
+    """
+    path = Path(resume_from)
+    if path.is_dir() and (path / "checkpoints").is_dir():
+        infos = _read_agent_dir(path / "checkpoints" / agent_id)
+        if not infos:
+            logger.warning(f"resume_from={resume_from}: no checkpoints for agent '{agent_id}'; starting fresh")
+            return None
+        return _load_checkpoint_dir(infos[-1].path)
+    if path.is_dir() and (path / MODEL_FILE).is_file():
+        return _load_checkpoint_dir(path)
+    if path.is_file() and path.suffix == ".pt":
+        try:
+            state = torch.load(path, map_location="cpu", weights_only=True)
+        except Exception as e:  # noqa: BLE001 - any unpickling failure means a bad resume source
+            raise ConfigError(f"training.resume_from={resume_from!r}: cannot load weights ({e})") from e
+        if not isinstance(state, dict) or not all(isinstance(v, torch.Tensor) for v in state.values()):
+            raise ConfigError(f"training.resume_from={resume_from!r}: expected a state_dict of tensors")
+        return {"model_state": torch_state_to_numpy(state), "trainer_state": None,
+                "policy_version": 0, "env_steps": 0, "source": str(path)}
+    raise ConfigError(
+        f"training.resume_from={resume_from!r}: expected a checkpoint dir (containing {MODEL_FILE}), "
+        f"a run dir (containing checkpoints/), or a .pt file"
+    )
+
+
+def check_model_state(model: torch.nn.Module, model_state: dict[str, np.ndarray], source: str) -> None:
+    """Raise ConfigError if ``model_state`` cannot be loaded into ``model``."""
+    expected = {k: tuple(v.shape) for k, v in model.state_dict().items()}
+    got = {k: tuple(np.asarray(v).shape) for k, v in model_state.items()}
+    missing = sorted(set(expected) - set(got))
+    unexpected = sorted(set(got) - set(expected))
+    mismatched = sorted(k for k in set(expected) & set(got) if expected[k] != got[k])
+    if not (missing or unexpected or mismatched):
+        return
+    lines = [f"Weights from {source} do not match the agent's architecture:"]
+    if missing:
+        lines.append(f"  missing keys: {missing[:10]}")
+    if unexpected:
+        lines.append(f"  unexpected keys: {unexpected[:10]}")
+    for k in mismatched[:10]:
+        lines.append(f"  shape mismatch {k}: checkpoint {got[k]} vs model {expected[k]}")
+    raise ConfigError("\n".join(lines))

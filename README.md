@@ -227,7 +227,7 @@ Use **kickstarting** during RL to regularize towards a teacher via decaying KL l
 ```yaml
 training:
   phase: "self_play"
-  resume_from: "bc_weights"   # start from BC checkpoint
+  resume_from: "bc_weights.pt"   # start from the BC weights (policy_version 0)
 ```
 
 ### Phase 2: Self-Play
@@ -529,7 +529,7 @@ Worker pods auto-scale via HPA based on CPU utilization. See `deployment/k8s/` f
 | `phase` | `"self_play"` | `"bc"`, `"self_play"`, or `"league"` |
 | `total_timesteps` | `10_000_000` | Total env steps before training ends |
 | `seed` | `null` | Global random seed (null = non-deterministic) |
-| `resume_from` | `null` | Checkpoint ID to resume from |
+| `resume_from` | `null` | Resume from a checkpoint dir (`.../agent_0/ckpt_v100`: weights, trainer state, policy version, env steps), a previous run dir (containing `checkpoints/`: each agent's latest checkpoint), or a `.pt` state_dict (weights only) |
 
 ### `self_play`
 
@@ -546,7 +546,7 @@ Worker pods auto-scale via HPA based on CPU utilization. See `deployment/k8s/` f
 | Key | Default | Description |
 |-----|---------|-------------|
 | `dir` | `"checkpoints"` | Checkpoint directory |
-| `save_optimizer` | `true` | Include optimizer state in checkpoints |
+| `save_optimizer` | `true` | Include the trainer state (optimizer, LR progress, scaler, counters) in checkpoints as `trainer_state.pt` |
 
 ### `metrics`
 

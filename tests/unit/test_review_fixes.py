@@ -130,7 +130,7 @@ def test_refresh_pushes_new_checkpoint_to_worker():
         coord.agent_pool.register_trainable("agent_0")
 
         # Save a checkpoint; the matchmaker lists checkpoints on every match.
-        sd = {k: v.cpu() for k, v in build_model(cfg).state_dict().items()}
+        sd = {k: v.detach().cpu().numpy() for k, v in build_model(cfg).state_dict().items()}
         coord.checkpoint_manager.save("agent_0", 50, sd)
 
         launcher = Launcher(cfg)
@@ -186,36 +186,6 @@ def test_worker_applies_command_loads_checkpoint_and_stages_maps():
     assert loop._slot_network_map == [[LATEST_NETWORK_ID, "ckpt_v50"]]
     assert loop._collect_mask == [[True, False]]
     loop.close()
-
-
-# ---------------------------------------------------------------------------
-# C11: resume_from is honored
-# ---------------------------------------------------------------------------
-
-def test_resume_from_path(tmp_path):
-    from colosseum.coordinator.coordinator import Coordinator
-    from colosseum.core.registry import build_model
-    from colosseum.launcher import _resolve_resume_state
-
-    cfg = _make_cfg(str(tmp_path), phase="self_play")
-    weights_path = str(tmp_path / "bc_weights.pt")
-    sd = build_model(cfg).state_dict()
-    torch.save(sd, weights_path)
-
-    cfg.training.resume_from = weights_path
-    coord = Coordinator(cfg)
-    state = _resolve_resume_state(cfg, "agent_0", coord)
-    assert state is not None
-    assert set(state["state_dict"].keys()) == set(sd.keys())
-
-
-def test_resume_from_none_returns_none(tmp_path):
-    from colosseum.coordinator.coordinator import Coordinator
-    from colosseum.launcher import _resolve_resume_state
-
-    cfg = _make_cfg(str(tmp_path), phase="self_play")
-    coord = Coordinator(cfg)
-    assert _resolve_resume_state(cfg, "agent_0", coord) is None
 
 
 # ---------------------------------------------------------------------------
