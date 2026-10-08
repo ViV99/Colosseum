@@ -1,4 +1,4 @@
-"""Run ``colosseum train`` in a subprocess for integration tests."""
+"""Run ``colosseum train`` in a subprocess for integration and learning tests."""
 from __future__ import annotations
 
 import json
@@ -12,7 +12,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
-REPO_ROOT = Path(__file__).resolve().parents[2]
+REPO_ROOT = Path(__file__).resolve().parents[1]
 TTT_CONFIG = REPO_ROOT / "configs" / "examples" / "tic_tac_toe.yaml"
 TTT_MULTI_CONFIG = REPO_ROOT / "configs" / "examples" / "tic_tac_toe_multi.yaml"
 
