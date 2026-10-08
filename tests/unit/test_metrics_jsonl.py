@@ -47,7 +47,7 @@ def test_writer_one_json_line_per_record_with_numpy_and_nan(tmp_path):
 def test_write_json_atomic(tmp_path):
     write_json_atomic(tmp_path / "ratings.json", {"elo": {"a": 1200.0}})
     assert json.loads((tmp_path / "ratings.json").read_text()) == {"elo": {"a": 1200.0}}
-    assert not list(tmp_path.glob(".*.tmp"))
+    assert sorted(p.name for p in tmp_path.iterdir()) == ["ratings.json"]  # no tmp file left
 
 
 def test_opponent_type():
@@ -166,3 +166,108 @@ def test_report_worker_stats_tags_item_and_never_blocks():
     q.put_nowait("full")
     report_worker_stats(q, 3, {"env_steps": 1})  # full queue: dropped, no exception
     assert q.get_nowait() == "full"
+
+
+def test_system_stats_resume_baselines_have_no_rate_spike():
+    clock = [0.0]
+    stats = SystemStats(clock=lambda: clock[0], initial_env_steps=1_000_000, initial_train_steps={"a": 5000})
+    stats.on_train_step("a", 5000)  # the step the learner resumed from: no progress yet
+    stats.on_train_step("a", 5010)
+    clock[0] = 2.0
+    snap = stats.snapshot(1_000_100, {"a": 0})
+    assert snap["env_steps_per_sec"] == 50.0
+    assert snap["train_steps_per_sec"] == {"a": 5.0}
+
+
+def test_hub_resume_baselines(tmp_path):
+    clock = [0.0]
+    hub = MetricsHub(writer=MetricsWriter(tmp_path / "m.jsonl"), ratings_path=tmp_path / "r.json",
+                     agent_ids=["a"], total_timesteps=10**7, log_interval=1, console_interval_sec=1.0,
+                     clock=lambda: clock[0], initial_env_steps=1_000_000, initial_train_steps={"a": 5000})
+    hub.on_train_metrics({"agent_id": "a", "train_step": 5001})
+    hub.on_train_metrics({"agent_id": "a", "train_step": 5010})
+    clock[0] = 2.0
+    hub.close(env_steps=1_000_100, ratings=RATINGS, queue_depths={"a": 0})
+    system = [json.loads(line) for line in (tmp_path / "m.jsonl").read_text().splitlines()
+              if json.loads(line)["kind"] == "system"]
+    assert system[0]["env_steps_per_sec"] == 50.0 and system[0]["train_steps_per_sec"] == {"a": 5.0}
+
+
+def test_system_stats_forget_silent_workers():
+    clock = [0.0]
+    stats = SystemStats(clock=lambda: clock[0], worker_timeout_sec=6.0)
+    stats.on_worker_stats({"worker_id": 0, "parked_buffers": 4})
+    clock[0] = 5.0
+    stats.on_worker_stats({"worker_id": 1, "parked_buffers": 1})
+    clock[0] = 6.0
+    assert stats.snapshot(0, {})["workers_reporting"] == 2  # worker 0 is exactly at the timeout
+    clock[0] = 7.0
+    snap = stats.snapshot(0, {})
+    assert snap["workers_reporting"] == 1 and snap["parked_buffers"] == 1  # worker 0 went silent
+    clock[0] = 20.0
+    assert stats.snapshot(0, {})["workers_reporting"] == 0
+    stats.on_worker_stats({"worker_id": 0, "parked_buffers": 2})  # a worker that reports again counts again
+    assert stats.snapshot(0, {})["workers_reporting"] == 1
+
+
+def test_default_worker_timeout_is_three_stats_intervals():
+    from colosseum.metrics.aggregator import WORKER_STATS_INTERVAL_SEC
+
+    clock = [0.0]
+    stats = SystemStats(clock=lambda: clock[0])
+    stats.on_worker_stats({"worker_id": 0, "parked_buffers": 0})
+    clock[0] = 3 * WORKER_STATS_INTERVAL_SEC
+    assert stats.snapshot(0, {})["workers_reporting"] == 1
+    clock[0] = 3 * WORKER_STATS_INTERVAL_SEC + 0.1
+    assert stats.snapshot(0, {})["workers_reporting"] == 0
+
+
+def test_hub_keeps_numpy_scalar_metrics(tmp_path):
+    hub = MetricsHub(writer=MetricsWriter(tmp_path / "m.jsonl"), ratings_path=tmp_path / "r.json",
+                     agent_ids=["a"], total_timesteps=10, log_interval=1, console_interval_sec=10.0)
+    hub.on_train_metrics({"agent_id": "a", "train_step": np.int64(1), "loss": np.float32(0.5),
+                          "n": np.int32(3), "kl": np.float64(0.25), "flag": np.bool_(True), "ok": True})
+    hub.close(env_steps=0, ratings=RATINGS, queue_depths={})
+    train = json.loads((tmp_path / "m.jsonl").read_text().splitlines()[0])
+    assert train["kind"] == "train" and train["train_step"] == 1
+    assert train["loss"] == 0.5 and train["n"] == 3.0 and train["kl"] == 0.25
+    assert "flag" not in train and "ok" not in train
+    assert flatten("x", {"a": np.float32(1.5), "b": np.int64(2), "c": np.bool_(False)}) == {"x/a": 1.5, "x/b": 2.0}
+
+
+def test_hub_close_closes_the_file_even_if_the_final_records_fail(tmp_path):
+    writer = MetricsWriter(tmp_path / "m.jsonl")
+    hub = MetricsHub(writer=writer, ratings_path=tmp_path / "missing-dir" / "r.json", agent_ids=["a"],
+                     total_timesteps=10, log_interval=1, console_interval_sec=10.0)
+    with pytest.raises(OSError):
+        hub.close(env_steps=0, ratings=RATINGS, queue_depths={})
+    assert writer.closed
+
+
+def test_launcher_closes_metrics_file_when_final_drain_fails(tmp_path):
+    import queue
+
+    from colosseum.core.config import load_config
+    from colosseum.launcher import Launcher
+    from helpers import example_config, make_test_run_dir
+
+    config = load_config(example_config("tic_tac_toe.yaml"))
+    run = make_test_run_dir(config, tmp_path)
+    launcher = Launcher(config, run)
+    writer = MetricsWriter(run.metrics_path)
+    launcher._metrics_writer = writer
+    launcher._hub = MetricsHub(writer=writer, ratings_path=run.ratings_path, agent_ids=["agent_0"],
+                               total_timesteps=10, log_interval=1, console_interval_sec=10.0)
+
+    class FailingCoordinator:
+        def report_match_result(self, result):
+            raise RuntimeError("boom")
+
+        def ratings_snapshot(self):
+            return RATINGS
+
+    results = queue.Queue()
+    results.put(result(seat(0, "agent_0", 1.0)))
+    with pytest.raises(RuntimeError, match="boom"):
+        launcher._finish_metrics(results, queue.Queue(), FailingCoordinator())
+    assert writer.closed

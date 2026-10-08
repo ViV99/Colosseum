@@ -371,6 +371,7 @@ class Launcher:
         self._checkpoint_meta: dict[str, dict] = {}
         # Set by launch(): the main process's single metrics sink (T6.3) and its queue-depth source.
         self._hub = None
+        self._metrics_writer = None
         self._trajectory_queues: dict[str, mp.Queue] = {}
 
     @property
@@ -448,6 +449,24 @@ class Launcher:
         self._agent_ids = list(trainable_agents)
         self._checkpoint_queues = checkpoint_queues
         self._trajectory_queues = trajectory_queues
+
+        # The metrics hub (and its file) exists before any child starts: an open failure
+        # here cannot orphan children (T6.3). Resumed runs start the rate baselines at the
+        # resumed counters, so the first system record has no resume spike.
+        from colosseum.metrics.hub import MetricsHub
+        from colosseum.metrics.jsonl import MetricsWriter
+
+        self._metrics_writer = MetricsWriter(self._run_dir.metrics_path)
+        self._hub = MetricsHub(
+            writer=self._metrics_writer,
+            ratings_path=self._run_dir.ratings_path,
+            agent_ids=trainable_agents,
+            total_timesteps=cfg.training.total_timesteps,
+            log_interval=cfg.metrics.log_interval,
+            console_interval_sec=cfg.metrics.console_interval_sec,
+            initial_env_steps=int(self._env_step_counter.value),
+            initial_train_steps={aid: int(s["policy_version"]) if s else 0 for aid, s in resume_states.items()},
+        )
 
         # Start one learner per agent
         from colosseum.utils.seeding import learner_seed
@@ -532,18 +551,6 @@ class Launcher:
             worker_proc.start()
             self._processes.append(worker_proc)
 
-        from colosseum.metrics.hub import MetricsHub
-        from colosseum.metrics.jsonl import MetricsWriter
-
-        self._hub = MetricsHub(
-            writer=MetricsWriter(self._run_dir.metrics_path),
-            ratings_path=self._run_dir.ratings_path,
-            agent_ids=trainable_agents,
-            total_timesteps=cfg.training.total_timesteps,
-            log_interval=cfg.metrics.log_interval,
-            console_interval_sec=cfg.metrics.console_interval_sec,
-        )
-
         # Monitor loop
         logger.info("Training started. Press Ctrl+C to stop.")
         try:
@@ -561,11 +568,7 @@ class Launcher:
             try:
                 self._shutdown()
             finally:
-                # What arrived during shutdown (final train metrics, last results) is recorded too.
-                self._drain_results_and_metrics(results_queue, metrics_queue, coordinator)
-                self._hub.close(env_steps=int(self._env_step_counter.value),
-                                ratings=coordinator.ratings_snapshot(),
-                                queue_depths=_queue_depths(self._trajectory_queues))
+                self._finish_metrics(results_queue, metrics_queue, coordinator)
 
     def _monitor_loop(
         self,
@@ -640,6 +643,18 @@ class Launcher:
                 break
 
             time.sleep(0.5)
+
+    def _finish_metrics(self, results_queue: mp.Queue, metrics_queue: mp.Queue,
+                        coordinator: Coordinator) -> None:
+        """Record what arrived during shutdown (final train metrics, last results), write the
+        final records and ratings.json; the metrics file is closed even if any of that fails."""
+        try:
+            self._drain_results_and_metrics(results_queue, metrics_queue, coordinator)
+            self._hub.close(env_steps=int(self._env_step_counter.value),
+                            ratings=coordinator.ratings_snapshot(),
+                            queue_depths=_queue_depths(self._trajectory_queues))
+        finally:
+            self._metrics_writer.close()
 
     def _drain_results_and_metrics(self, results_queue: mp.Queue, metrics_queue: mp.Queue,
                                    coordinator: Coordinator) -> None:

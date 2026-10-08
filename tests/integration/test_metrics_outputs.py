@@ -21,5 +21,5 @@ def test_metrics_jsonl_ratings_json_and_console(tmp_path):
     assert systems[-1]["env_steps"] >= 3000
     assert any(r["workers_reporting"] >= 1 for r in systems)
     ratings = run.ratings()
-    assert set(ratings) >= {"env_steps", "elo", "win_rates", "games", "wr_vs_past"}
+    assert set(ratings) >= {"env_steps", "elo", "win_rates", "games", "wr_vs_past", "past_games"}
     assert "[agent_0] step" in run.stderr  # console progress (main logs INFO to stderr)

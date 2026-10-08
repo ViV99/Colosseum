@@ -12,6 +12,8 @@ import numpy as np
 from colosseum.core.types import LATEST_NETWORK_ID
 
 OPPONENT_TYPES = ("latest", "past", "arena")
+# Default cadence of worker stats (``rollout_worker_process(stats_interval_sec=...)``).
+WORKER_STATS_INTERVAL_SEC = 2.0
 
 
 def opponent_type(result, seat) -> str | None:
@@ -74,25 +76,37 @@ class EpisodeAggregator:
 
 
 class SystemStats:
-    """Throughput and queue health between two snapshots."""
+    """Throughput and queue health between two snapshots.
 
-    def __init__(self, clock: Callable[[], float] = time.monotonic) -> None:
+    Rate baselines start at ``initial_env_steps`` and ``initial_train_steps[agent]`` (0 for
+    agents not listed): the counters a resumed run continues from, so the first snapshot
+    of a resumed run measures only progress made since the start, not the resumed totals.
+    Every train step above the baseline counts, including those reported before the first
+    snapshot. Per-worker stats older than ``worker_timeout_sec`` (a dead or stuck worker)
+    are forgotten, so they stop counting toward ``workers_reporting`` and ``parked_buffers``.
+    """
+
+    def __init__(self, clock: Callable[[], float] = time.monotonic, *, initial_env_steps: int = 0,
+                 initial_train_steps: dict[str, int] | None = None,
+                 worker_timeout_sec: float = 3 * WORKER_STATS_INTERVAL_SEC) -> None:
         self._clock = clock
         self._last_t = clock()
-        self._last_env_steps = 0
-        self._train_steps: dict[str, int] = {}
-        self._last_train_steps: dict[str, int] = {}
-        self._workers: dict[int, dict] = {}
+        self._last_env_steps = int(initial_env_steps)
+        self._last_train_steps: dict[str, int] = {a: int(s) for a, s in (initial_train_steps or {}).items()}
+        self._train_steps: dict[str, int] = dict(self._last_train_steps)
+        self._worker_timeout = float(worker_timeout_sec)
+        self._workers: dict[int, tuple[float, dict]] = {}
 
     def on_train_step(self, agent_id: str, train_step: int) -> None:
         self._train_steps[agent_id] = max(int(train_step), self._train_steps.get(agent_id, 0))
 
     def on_worker_stats(self, stats: dict) -> None:
-        self._workers[int(stats["worker_id"])] = dict(stats)
+        self._workers[int(stats["worker_id"])] = (self._clock(), dict(stats))
 
     def snapshot(self, env_steps: int, queue_depths: dict[str, int]) -> dict[str, Any]:
         now = self._clock()
         dt = now - self._last_t
+        self._workers = {w: v for w, v in self._workers.items() if now - v[0] <= self._worker_timeout}
 
         def rate(delta: float) -> float:
             return delta / dt if dt > 1e-3 else 0.0
@@ -104,7 +118,7 @@ class SystemStats:
                 a: rate(s - self._last_train_steps.get(a, 0)) for a, s in self._train_steps.items()
             },
             "queue_depths": dict(queue_depths),
-            "parked_buffers": int(sum(int(w.get("parked_buffers", 0)) for w in self._workers.values())),
+            "parked_buffers": int(sum(int(w.get("parked_buffers", 0)) for _, w in self._workers.values())),
             "workers_reporting": len(self._workers),
         }
         self._last_t = now

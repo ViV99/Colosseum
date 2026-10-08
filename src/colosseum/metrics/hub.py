@@ -2,18 +2,27 @@
 
 from __future__ import annotations
 
+import numbers
 import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
+
+import numpy as np
 
 from colosseum.metrics.aggregator import EpisodeAggregator, SystemStats
 from colosseum.metrics.console import ConsoleReporter
 from colosseum.metrics.jsonl import MetricsWriter, write_json_atomic
 
 
+def _is_number(value: Any) -> bool:
+    """Real numbers, python or numpy scalars; bools are not numbers here."""
+    return (isinstance(value, (numbers.Real, np.integer, np.floating))
+            and not isinstance(value, (bool, np.bool_)))
+
+
 def _numeric(d: dict) -> dict[str, float]:
-    return {k: float(v) for k, v in d.items() if isinstance(v, (int, float)) and not isinstance(v, bool)}
+    return {k: float(v) for k, v in d.items() if _is_number(v)}
 
 
 def flatten(prefix: str, value: Any) -> dict[str, float]:
@@ -25,7 +34,7 @@ def flatten(prefix: str, value: Any) -> dict[str, float]:
     elif isinstance(value, (list, tuple)):
         for i, v in enumerate(value):
             out.update(flatten(f"{prefix}/{i}", v))
-    elif isinstance(value, (int, float)) and not isinstance(value, bool):
+    elif _is_number(value):
         out[prefix] = float(value)
     return out
 
@@ -35,11 +44,14 @@ class MetricsHub:
 
     Every ``console_interval_sec`` it also writes ``episodes``, ``system`` and ``ratings``
     records, rewrites ``ratings.json`` and prints one console line per agent.
+    ``initial_env_steps`` / ``initial_train_steps`` are the counters a resumed run continues
+    from (rate baselines, see ``SystemStats``).
     """
 
     def __init__(self, *, writer: MetricsWriter, ratings_path: str | Path, agent_ids: list[str],
                  total_timesteps: int, log_interval: int, console_interval_sec: float,
-                 wandb_logger: Any = None, clock: Callable[[], float] = time.monotonic) -> None:
+                 wandb_logger: Any = None, clock: Callable[[], float] = time.monotonic,
+                 initial_env_steps: int = 0, initial_train_steps: dict[str, int] | None = None) -> None:
         self._writer = writer
         self._ratings_path = Path(ratings_path)
         self._agent_ids = list(agent_ids)
@@ -48,7 +60,8 @@ class MetricsHub:
         self._wandb = wandb_logger
         self._clock = clock
         self._episodes = EpisodeAggregator()
-        self._system = SystemStats(clock=clock)
+        self._system = SystemStats(clock=clock, initial_env_steps=initial_env_steps,
+                                   initial_train_steps=initial_train_steps)
         self._console = ConsoleReporter(total_timesteps)
         self._last_tick = clock()
         self._last_train: dict[str, dict[str, float]] = {}
@@ -122,6 +135,8 @@ class MetricsHub:
         self._console.emit(lines)
 
     def close(self, *, env_steps: int, ratings: dict, queue_depths: dict[str, int]) -> None:
-        """Final records and ratings.json, then close the file."""
-        self.maybe_tick(env_steps=env_steps, ratings=ratings, queue_depths=queue_depths, force=True)
-        self._writer.close()
+        """Final records and ratings.json, then close the file (also if writing them fails)."""
+        try:
+            self.maybe_tick(env_steps=env_steps, ratings=ratings, queue_depths=queue_depths, force=True)
+        finally:
+            self._writer.close()

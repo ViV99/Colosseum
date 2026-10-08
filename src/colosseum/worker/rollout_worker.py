@@ -21,6 +21,7 @@ from colosseum.core.ipc import BatchedCounter, SharedCounter, drain_latest
 from colosseum.core.threads import configure_torch_threads
 from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
 from colosseum.envs.base_env import BaseEnv
+from colosseum.metrics.aggregator import WORKER_STATS_INTERVAL_SEC
 from colosseum.networks.model import PolicyModel
 from colosseum.worker.rollout_loop import LATEST_NETWORK_ID, LoopIO, RolloutLoop
 
@@ -85,7 +86,7 @@ def rollout_worker_process(
     vec_env_kind: str = "sync",
     subproc_workers: int | None = None,
     stats_queue: Any = None,
-    stats_interval_sec: float = 2.0,
+    stats_interval_sec: float = WORKER_STATS_INTERVAL_SEC,
 ) -> None:
     """Worker process entry point (see module docstring).
 

@@ -53,6 +53,10 @@ class MetricsWriter:
     def path(self) -> Path:
         return self._path
 
+    @property
+    def closed(self) -> bool:
+        return self._fh.closed
+
     def write(self, kind: str, **fields: Any) -> None:
         if kind not in METRIC_KINDS:
             raise ValueError(f"Unknown metrics kind {kind!r}; expected one of {METRIC_KINDS}")
