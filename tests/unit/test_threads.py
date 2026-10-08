@@ -118,7 +118,7 @@ def _run_learner_target(monkeypatch, config, num_learners, seen=None):
     try:
         _learner_target(
             agent_id="agent_0", config=config, trajectory_queue=None, weight_queues=[],
-            stop_event=None, metrics_queue=None, total_train_steps=0, num_learners=num_learners,
+            stop_event=None, metrics_queue=None, num_learners=num_learners,
         )
     finally:
         torch.set_num_threads(before)

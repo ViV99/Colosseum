@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from dataclasses import dataclass, field
 from functools import partial
 from typing import Any
 
@@ -12,8 +11,10 @@ from torch import Tensor
 
 from colosseum.algorithms.appo import APPO
 from colosseum.core.config import AlgorithmConfig
-from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
-from colosseum.worker.rollout_loop import LoopIO, RolloutLoop
+from colosseum.core.types import TrajectoryChunk, WeightPayload
+from colosseum.worker.rollout_loop import RolloutLoop
+from dataflow_helpers import Collected
+from dataflow_helpers import make_loop as build_loop
 from helpers import CountingEnv, make_simple_model
 
 OBS_DIM = 4
@@ -35,30 +36,6 @@ def weights_payload(agent_id: str, model: Any, version: int) -> WeightPayload:
     return WeightPayload.from_model(agent_id, version, model)
 
 
-@dataclass
-class LoopRecorder:
-    """In-memory endpoints for ``LoopIO``: collects outputs, serves queued inputs."""
-
-    chunks: list[TrajectoryChunk] = field(default_factory=list)
-    results: list[MatchResult] = field(default_factory=list)
-    pending_weights: dict[str, WeightPayload] = field(default_factory=dict)
-    pending_commands: list[WorkerCommand] = field(default_factory=list)
-
-    def poll_weights(self, agent_id: str) -> WeightPayload | None:
-        return self.pending_weights.pop(agent_id, None)
-
-    def poll_command(self) -> WorkerCommand | None:
-        return self.pending_commands.pop(0) if self.pending_commands else None
-
-    def io(self) -> LoopIO:
-        return LoopIO(
-            send_chunk=self.chunks.append,
-            poll_weights=self.poll_weights,
-            report_result=self.results.append,
-            poll_command=self.poll_command,
-        )
-
-
 def make_loop(
     *,
     agent_ids: list[str] | None = None,
@@ -68,27 +45,20 @@ def make_loop(
     chunk_length: int = 4,
     seed: int = 123,
     initial_weights: dict[str, WeightPayload] | None = None,
+    weight_sync_interval: float = 5.0,
     **loop_kwargs: Any,
-) -> tuple[RolloutLoop, LoopRecorder]:
-    """Build a ``RolloutLoop`` wired to a fresh ``LoopRecorder``."""
+) -> tuple[RolloutLoop, Collected]:
+    """``dataflow_helpers.make_loop`` with the contract tests' defaults.
+
+    ``initial_weights`` are served to the initial sync in ``RolloutLoop.__init__``.
+    """
     agent_ids = agent_ids or ["agent_0"]
-    if model_factories is None:
-        model_factories = {aid: simple_factory for aid in agent_ids}
-    rec = LoopRecorder()
-    if initial_weights:
-        rec.pending_weights.update(initial_weights)
-    loop = RolloutLoop(
-        worker_id=0,
-        env_fn=env_fn or counting_env_fn(),
-        num_envs=num_envs,
-        chunk_length=chunk_length,
-        agent_ids=agent_ids,
-        model_factories=model_factories,
-        io=rec.io(),
-        seed=seed,
-        **loop_kwargs,
+    col = Collected(weights={aid: [p] for aid, p in (initial_weights or {}).items()})
+    return build_loop(
+        env_fn or counting_env_fn(), model_factories or simple_factory,
+        agent_ids=agent_ids, num_envs=num_envs, chunk_length=chunk_length, collected=col,
+        seed=seed, weight_sync_interval=weight_sync_interval, **loop_kwargs,
     )
-    return loop, rec
 
 
 def run_steps(loop: RolloutLoop, n: int) -> None:
@@ -96,7 +66,7 @@ def run_steps(loop: RolloutLoop, n: int) -> None:
         loop.step()
 
 
-def run_until_chunks(loop: RolloutLoop, rec: LoopRecorder, n_chunks: int,
+def run_until_chunks(loop: RolloutLoop, rec: Collected, n_chunks: int,
                      max_steps: int = 10_000) -> list[TrajectoryChunk]:
     """Step until at least ``n_chunks`` chunks were sent; return the first ``n_chunks``."""
     for _ in range(max_steps):

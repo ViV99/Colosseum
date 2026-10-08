@@ -1,15 +1,22 @@
 """Learner process: receives trajectory chunks, trains the model, pushes weights.
 
-Each Learner runs in a separate process and owns one trainable agent's
-training loop. It:
-1. Receives chunk payloads (numpy, ``TrajectoryChunk.to_payload()``) from
-   workers via a mp.Queue and decodes them
-2. Batches them: every train step gets exactly ``batch_chunks`` chunks
-3. Calls algorithm.train_step() to compute loss and update weights
-4. Pushes new weights (numpy ``WeightPayload``) to worker processes via weight queues
-5. Sends metrics and numpy checkpoint snapshots to the main process
+Each learner owns one trainable agent. It:
+1. collects exactly ``batch_chunks`` chunk payloads (numpy,
+   ``TrajectoryChunk.to_payload()``) from its queue and decodes them;
+2. sets the algorithm's progress (share of the env-step budget) and trains;
+3. publishes new weights (numpy ``WeightPayload``) to every worker's size-1
+   mailbox (newest wins);
+4. sends numpy checkpoint snapshots and metrics to the main process.
 
 Nothing this process puts on a queue contains a torch tensor (R6-02).
+
+Progress and stopping: in local mode ``progress = min(1, env_step_counter /
+total_timesteps)`` from the shared counter that workers increment; the main
+process is the only budget authority and sets ``stop_event`` at the budget, so
+the learner runs until ``stop_event``. In distributed mode there is no shared
+counter: ``progress = consumed_samples / total_timesteps``, where
+``consumed_samples`` counts this learner's transitions, and the learner stops
+by itself once ``consumed_samples >= total_timesteps``.
 """
 
 from __future__ import annotations
@@ -26,13 +33,14 @@ import torch
 
 from colosseum.algorithms.base import BaseAlgorithm
 from colosseum.core.config import LearnerConfig
-from colosseum.core.ipc import from_numpy_tree, put_latest, to_numpy_tree
+from colosseum.core.ipc import SharedCounter, from_numpy_tree, put_latest, to_numpy_tree
 from colosseum.core.types import TrajectoryChunk, WeightPayload, state_dict_from_numpy, state_dict_to_numpy
 
 logger = logging.getLogger(__name__)
 
 
 def learner_process(
+    *,
     agent_id: str,
     algorithm_factory: Callable[[], BaseAlgorithm],
     trajectory_queue: mp.Queue,
@@ -40,13 +48,14 @@ def learner_process(
     config: LearnerConfig,
     stop_event: mp.Event,
     metrics_queue: mp.Queue | None = None,
-    total_train_steps: int = 0,
     checkpoint_queue: mp.Queue | None = None,
     checkpoint_interval: int = 0,
     resume_state: dict | None = None,
+    progress_counter: SharedCounter | None = None,
+    total_timesteps: int = 0,
     weight_sync_interval: float = 5.0,
 ) -> None:
-    """Main learner process function.
+    """Main learner process function (see module docstring).
 
     Args:
         agent_id: the trainable agent this learner owns
@@ -56,36 +65,26 @@ def learner_process(
         config: learner configuration
         stop_event: set to signal the learner to stop
         metrics_queue: optional queue to send metrics to the main process
-        total_train_steps: stop after this many training steps (0 = run until stop_event)
         checkpoint_queue: optional queue to send checkpoint snapshots to main process
         checkpoint_interval: save checkpoint every N train steps (0 = disabled)
         resume_state: optional dict with 'state_dict' (numpy), 'optimizer_state'
             (numpy tree or None) and 'policy_version' to resume training from a checkpoint
+        progress_counter: the global env-step counter (local mode); None in
+            distributed mode, where progress is ``consumed_samples / total_timesteps``
+        total_timesteps: ``training.total_timesteps`` (0 = no budget: progress stays 0)
         weight_sync_interval: the workers' ``rollout.weight_sync_interval_sec``; sizes
             the exit wait for pending weight payloads (see ``_weight_flush_timeout``)
     """
     logger.info(f"Learner [{agent_id}]: starting on device={resolve_device(config.device)}")
 
-    # Create algorithm and network
     algorithm = algorithm_factory()
 
-    # Resume from checkpoint if provided
     train_step = 0
     if resume_state is not None:
-        # resume_state is numpy (it crossed the process boundary as a Process argument).
-        algorithm.model.load_state_dict(state_dict_from_numpy(resume_state["state_dict"]))
-        if resume_state.get("optimizer_state") is not None and hasattr(algorithm, "_optimizer"):
-            algorithm._optimizer.load_state_dict(from_numpy_tree(resume_state["optimizer_state"]))
-        train_step = resume_state.get("policy_version", 0)
-        if hasattr(algorithm, "_policy_version"):
-            algorithm._policy_version = train_step
-        logger.info(f"Learner [{agent_id}]: resumed from checkpoint at step {train_step}")
-
-    # Set up LR schedule if the algorithm supports it
-    if hasattr(algorithm, "setup_lr_schedule") and total_train_steps > 0:
-        algorithm.setup_lr_schedule(total_train_steps)
+        train_step = _apply_resume_state(algorithm, resume_state, agent_id)
 
     total_chunks_received = 0
+    consumed_samples = 0
 
     # Off-policy: create replay buffer if algorithm requires it
     replay_buffer = algorithm.create_replay_buffer(config.queue_size * 4)
@@ -95,15 +94,20 @@ def learner_process(
         _push_weights(algorithm, agent_id, weight_queues)
 
         while not stop_event.is_set():
-            if total_train_steps > 0 and train_step >= total_train_steps:
+            if (progress_counter is None and total_timesteps > 0
+                    and consumed_samples >= total_timesteps):
+                logger.info(f"Learner [{agent_id}]: consumed {consumed_samples} samples; budget reached")
                 break
 
             # Block until exactly batch_chunks chunks arrived (None: stop requested).
             chunks = collect_batch(trajectory_queue, config.batch_chunks, stop_event)
             if chunks is None:
                 break
-
             total_chunks_received += len(chunks)
+            consumed_samples += sum(c.chunk_length for c in chunks)
+
+            progress = _progress(progress_counter, consumed_samples, total_timesteps)
+            algorithm.set_progress(progress)
 
             # Train step: off-policy adds to buffer, on-policy trains directly
             if replay_buffer is not None:
@@ -111,40 +115,26 @@ def learner_process(
                     replay_buffer.add(chunk)
                 if len(replay_buffer) < config.batch_chunks:
                     continue
-                batch = replay_buffer.sample(config.batch_chunks)
-                metrics = algorithm.train_step(batch)
+                metrics = algorithm.train_step(replay_buffer.sample(config.batch_chunks))
             else:
                 metrics = algorithm.train_step(chunks)
             train_step += 1
+            metrics["progress"] = float(progress)
 
             # Push updated weights to all workers at configured interval
             if train_step % config.weight_push_interval == 0:
                 _push_weights(algorithm, agent_id, weight_queues)
 
-            # Checkpoint: send state_dict to main process at checkpoint intervals
             pv = algorithm.policy_version
-            if (checkpoint_queue is not None
-                    and checkpoint_interval > 0
-                    and pv > 0
-                    and pv % checkpoint_interval == 0):
-                optimizer_state = getattr(algorithm, "optimizer_state_dict", None)
-                try:
-                    checkpoint_queue.put_nowait({
-                        "policy_version": pv,
-                        "state_dict": state_dict_to_numpy(algorithm.model.state_dict()),
-                        "optimizer_state": (
-                            None if optimizer_state is None else to_numpy_tree(optimizer_state)
-                        ),
-                    })
-                    logger.info(f"Learner [{agent_id}]: sent checkpoint at version {pv}")
-                except Full:
-                    logger.warning(f"Learner [{agent_id}]: checkpoint queue full, skipping v{pv}")
+            if (checkpoint_queue is not None and checkpoint_interval > 0
+                    and pv > 0 and pv % checkpoint_interval == 0):
+                _send_checkpoint(algorithm, agent_id, checkpoint_queue)
 
-            # Log metrics
             if metrics_queue is not None:
                 metrics["agent_id"] = agent_id
                 metrics["train_step"] = train_step
                 metrics["chunks_received"] = total_chunks_received
+                metrics["consumed_samples"] = consumed_samples
                 try:
                     metrics_queue.put_nowait(metrics)
                 except Full:
@@ -152,9 +142,8 @@ def learner_process(
 
             if train_step % 10 == 0:
                 logger.info(
-                    f"Learner [{agent_id}]: step={train_step}, "
-                    f"chunks={total_chunks_received}, "
-                    f"loss={metrics.get('total_loss', 0):.4f}"
+                    f"Learner [{agent_id}]: step={train_step}, chunks={total_chunks_received}, "
+                    f"progress={progress:.3f}, loss={metrics.get('total_loss', 0.0):.4f}"
                 )
     finally:
         _release_weight_queues(
@@ -162,6 +151,48 @@ def learner_process(
         )
 
     logger.info(f"Learner [{agent_id}]: finished. Total train_steps={train_step}")
+
+
+def _progress(
+    progress_counter: SharedCounter | None,
+    consumed_samples: int,
+    total_timesteps: int,
+) -> float:
+    """Share of the budget used: the global counter if given, else ``consumed_samples``."""
+    if total_timesteps <= 0:
+        return 0.0
+    done = progress_counter.value if progress_counter is not None else consumed_samples
+    return min(1.0, done / total_timesteps)
+
+
+def _apply_resume_state(algorithm: BaseAlgorithm, resume_state: dict, agent_id: str) -> int:
+    """Load weights (and optimizer state, if present) from a numpy ``resume_state``.
+
+    ``resume_state`` is numpy: it crossed the process boundary as a Process argument.
+    """
+    algorithm.model.load_state_dict(state_dict_from_numpy(resume_state["state_dict"]))
+    if resume_state.get("optimizer_state") is not None and hasattr(algorithm, "_optimizer"):
+        algorithm._optimizer.load_state_dict(from_numpy_tree(resume_state["optimizer_state"]))
+    step = int(resume_state.get("policy_version", 0))
+    if hasattr(algorithm, "_policy_version"):
+        algorithm._policy_version = step
+    logger.info(f"Learner [{agent_id}]: resumed from checkpoint at step {step}")
+    return step
+
+
+def _send_checkpoint(algorithm: BaseAlgorithm, agent_id: str, checkpoint_queue: mp.Queue) -> None:
+    """Send a numpy checkpoint snapshot to the main process (skipped if the queue is full)."""
+    pv = algorithm.policy_version
+    optimizer_state = getattr(algorithm, "optimizer_state_dict", None)
+    try:
+        checkpoint_queue.put_nowait({
+            "policy_version": pv,
+            "state_dict": state_dict_to_numpy(algorithm.model.state_dict()),
+            "optimizer_state": None if optimizer_state is None else to_numpy_tree(optimizer_state),
+        })
+        logger.info(f"Learner [{agent_id}]: sent checkpoint at version {pv}")
+    except Full:
+        logger.warning(f"Learner [{agent_id}]: checkpoint queue full, skipping v{pv}")
 
 
 # Shortest exit wait for workers to read pending weight payloads (see
@@ -181,7 +212,8 @@ def _release_weight_queues(
     weight_queues: list,
     trajectory_queue,
     stop_event,
-    timeout: float = _MIN_WEIGHT_FLUSH_TIMEOUT_SEC,
+    *,
+    timeout: float,
     poll: float = 0.1,
 ) -> None:
     """Let pending weight payloads reach the workers before this process exits.
@@ -190,8 +222,11 @@ def _release_weight_queues(
     buffer keeps an ``mp.Queue`` feeder thread blocked until a worker reads it.
 
     - ``stop_event`` set: workers are stopping and will never read it, so do not
-      wait for the feeders (``cancel_join_thread``).
-    - Otherwise (e.g. budget reached): wait until every feeder has flushed.
+      wait for the feeders (``cancel_join_thread``). This is the normal local
+      exit: the main process sets ``stop_event`` at the global budget.
+    - Otherwise (the learner raised while workers still run, or it stopped by
+      itself at a ``consumed_samples`` budget with ``mp.Queue`` mailboxes; the
+      distributed weight sinks have no feeder): wait until every feeder has flushed.
       Cancelling would kill a feeder mid-message, and a live worker would then
       block forever on the truncated payload. While waiting, keep discarding
       chunks: a worker blocked on this learner's full trajectory queue only

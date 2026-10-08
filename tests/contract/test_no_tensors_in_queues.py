@@ -122,10 +122,12 @@ def test_learner_resumes_from_numpy_state_and_optimizer_tree():
         return built[-1]
 
     wq = CheckedQueue(maxsize=1)
+    stopped = threading.Event()
+    stopped.set()  # already stopped: resume, push the resumed weights, exit
     learner_process(
         agent_id="a", algorithm_factory=factory, trajectory_queue=CheckedQueue(), weight_queues=[wq],
-        config=LearnerConfig(batch_chunks=2, device="cpu"), stop_event=threading.Event(),
-        total_train_steps=5, resume_state=resume_state,  # budget already reached: resume, push, exit
+        config=LearnerConfig(batch_chunks=2, device="cpu"), stop_event=stopped,
+        resume_state=resume_state,
     )
     restored = built[0]
     assert restored.policy_version == 5

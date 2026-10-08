@@ -9,14 +9,18 @@ from __future__ import annotations
 
 import os
 import queue
+from collections.abc import Callable
+from dataclasses import dataclass, field
 
 import gymnasium
 import numpy as np
 import torch
 
 from colosseum.core.ipc import assert_no_tensors, put_latest
-from colosseum.core.types import WeightPayload
+from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
 from colosseum.envs.base_env import BaseEnv
+from colosseum.networks.model import PolicyModel
+from colosseum.worker.rollout_loop import LoopIO, RolloutLoop
 from helpers import TinyMonolithicModel
 
 OBS_DIM = 4
@@ -228,3 +232,59 @@ class RecordingAlgorithm:
         self.progress_at_train.append(self._progress)
         self._policy_version += 1
         return {"total_loss": 0.0}
+
+
+@dataclass
+class Collected:
+    """In-memory LoopIO: everything the loop emits is appended to these lists.
+
+    ``weights[agent_id]`` is a list of WeightPayloads handed out one per
+    ``poll_weights`` call; ``commands`` are handed out one per ``poll_command``.
+    """
+
+    chunks: list[TrajectoryChunk] = field(default_factory=list)
+    results: list[MatchResult] = field(default_factory=list)
+    env_steps: list[int] = field(default_factory=list)
+    weights: dict[str, list[WeightPayload]] = field(default_factory=dict)
+    commands: list[WorkerCommand] = field(default_factory=list)
+
+    def io(self) -> LoopIO:
+        def poll_weights(agent_id: str) -> WeightPayload | None:
+            pending = self.weights.get(agent_id)
+            return pending.pop(0) if pending else None
+
+        def poll_command() -> WorkerCommand | None:
+            return self.commands.pop(0) if self.commands else None
+
+        return LoopIO(send_chunk=self.chunks.append, poll_weights=poll_weights,
+                      report_result=self.results.append, poll_command=poll_command,
+                      add_env_steps=self.env_steps.append)
+
+
+def make_loop(env_factory: Callable[[], BaseEnv],
+              model_factory: Callable[[], PolicyModel] | dict[str, Callable[[], PolicyModel]],
+              *, agent_ids=("a",), num_envs: int = 1, chunk_length: int = 4,
+              collected: Collected | None = None, **kwargs) -> tuple[RolloutLoop, Collected]:
+    """Build a RolloutLoop with in-memory I/O.
+
+    ``model_factory`` is used for every agent, or is a dict ``{agent_id: factory}``.
+    ``collected`` may be pre-filled (e.g. ``weights`` for the initial sync in
+    ``RolloutLoop.__init__``); a fresh one is created otherwise. Other kwargs go
+    to ``RolloutLoop``. Defaults: weight_sync_interval=0.0 (sync every step), seed=0.
+    """
+    col = collected if collected is not None else Collected()
+    factories = (dict(model_factory) if isinstance(model_factory, dict)
+                 else {a: model_factory for a in agent_ids})
+    loop = RolloutLoop(
+        worker_id=0, env_fn=env_factory, num_envs=num_envs, chunk_length=chunk_length,
+        agent_ids=list(agent_ids), model_factories=factories,
+        io=col.io(), weight_sync_interval=kwargs.pop("weight_sync_interval", 0.0),
+        seed=kwargs.pop("seed", 0), **kwargs,
+    )
+    return loop, col
+
+
+def add_to_counter(counter, n: int) -> None:
+    """Spawn target: add 1 to a SharedCounter n times."""
+    for _ in range(n):
+        counter.add(1)

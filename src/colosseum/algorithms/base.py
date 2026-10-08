@@ -50,6 +50,14 @@ class BaseAlgorithm(ABC):
         """Number of training steps completed."""
         ...
 
+    def set_progress(self, progress: float) -> None:
+        """Share (0..1) of the global env-step budget consumed so far.
+
+        The learner calls this before every train step. The default ignores it;
+        algorithms with schedules (APPO's learning rate) override it.
+        """
+        return None
+
     @property
     def optimizer_state_dict(self) -> dict:
         """Return the optimizer state dict for checkpointing.

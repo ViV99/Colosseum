@@ -2,8 +2,9 @@
 
 The wrapper limits torch threads (R2-04), turns queues into :class:`LoopIO`
 callbacks and runs the loop until ``stop_event`` is set (or ``max_env_steps``
-env steps were taken). The loop itself (envs, inference, chunking) lives in
-``colosseum.worker.rollout_loop`` and is testable in-process.
+env steps were taken), adding its env steps to the global budget counter. The
+loop itself (envs, inference, chunking) lives in ``colosseum.worker.rollout_loop``
+and is testable in-process.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from typing import Any
 
 import numpy as np
 
-from colosseum.core.ipc import drain_latest
+from colosseum.core.ipc import BatchedCounter, SharedCounter, drain_latest
 from colosseum.core.threads import configure_torch_threads
 from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
 from colosseum.envs.base_env import BaseEnv
@@ -63,6 +64,7 @@ def rollout_worker_process(
     weight_sync_interval: float = 5.0,
     torch_threads: int = 1,
     max_env_steps: int = 0,
+    env_step_counter: SharedCounter | None = None,
     checkpoint_state_dicts_by_agent: dict[str, dict[str, dict[str, np.ndarray]]] | None = None,
     slot_agent_map: list[list[str]] | None = None,
     slot_network_map: list[list[str]] | None = None,
@@ -81,7 +83,10 @@ def rollout_worker_process(
     drained newest-wins from ``weight_queues[agent_id]``, results are put non-blocking on
     ``results_queue`` and commands are drained with merged checkpoints from
     ``command_queue``. ``max_env_steps`` limits this worker's env steps
-    (0 = until stopped).
+    (0 = until stopped; local workers run until ``stop_event``, distributed
+    workers get a per-worker share of the budget). Env steps are added to
+    ``env_step_counter`` (the global budget counter, if given) about every 0.5 s
+    and once more on exit.
     """
     configure_torch_threads(torch_threads)
 
@@ -107,11 +112,13 @@ def rollout_worker_process(
     def poll_command() -> WorkerCommand | None:
         return _drain_commands(command_queue)
 
+    counter = BatchedCounter(env_step_counter) if env_step_counter is not None else None
     io = LoopIO(
         send_chunk=send_chunk,
         poll_weights=poll_weights,
         report_result=report_result if results_queue is not None else None,
         poll_command=poll_command if command_queue is not None else None,
+        add_env_steps=counter.add if counter is not None else None,
     )
     logger.info(
         f"Worker {worker_id}: starting with {num_envs} envs ({vec_env_kind}), "
@@ -128,6 +135,8 @@ def rollout_worker_process(
     try:
         loop.run(should_stop=stop_event.is_set, max_env_steps=max_env_steps)
     finally:
+        if counter is not None:
+            counter.flush()
         try:
             loop.close()
         finally:

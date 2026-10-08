@@ -122,7 +122,7 @@ def test_initial_and_periodic_weight_sync_set_policy_version():
     run_steps(loop, 4)
     assert [c.behavior_policy_version for c in rec.chunks] == [7, 7]
 
-    rec.pending_weights["agent_0"] = weights_payload("agent_0", src, 9)
+    rec.weights["agent_0"] = [weights_payload("agent_0", src, 9)]
     run_steps(loop, 1)  # the sync at the end of this step picks up version 9
     run_steps(loop, 3)
     loop.close()
@@ -144,7 +144,7 @@ def test_command_reassignment_applies_at_episode_boundary():
     assert (chunks_warm, results_warm) == (8, 4)
 
     # Env 0 seat 1 switches to agent "b"; env 1 seat 1 stops collecting.
-    rec.pending_commands.append(WorkerCommand(
+    rec.commands.append(WorkerCommand(
         slot_agent_map=[["a", "b"], ["a", "a"]],
         slot_network_map=[["latest", "latest"], ["latest", "latest"]],
         collect_mask=[[True, True], [True, False]],

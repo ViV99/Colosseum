@@ -74,7 +74,10 @@ class AlgorithmConfig(BaseModel):
     vtrace_rho_bar: float = Field(default=1.0, gt=0.0, description="V-trace truncation for importance weights (rho).")
     vtrace_c_bar: float = Field(default=1.0, gt=0.0, description="V-trace truncation for trace-cutting (c).")
     learning_rate: float = Field(default=3e-4, gt=0.0, description="Initial learning rate.")
-    lr_schedule: LRSchedule = Field(default=LRSchedule.LINEAR, description="LR schedule type.")
+    lr_schedule: LRSchedule = Field(
+        default=LRSchedule.LINEAR,
+        description="LR schedule over training progress = env steps so far / training.total_timesteps.",
+    )
     use_torch_compile: bool = Field(
         default=False,
         description="Compile V-trace with torch.compile. Adds ~1-3s startup latency.",

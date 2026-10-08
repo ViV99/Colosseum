@@ -125,7 +125,7 @@ class LoopIO:
     poll_weights: Callable[[str], WeightPayload | None]
     report_result: Callable[[MatchResult], None] | None = None
     poll_command: Callable[[], WorkerCommand | None] | None = None
-    add_env_steps: Callable[[int], None] | None = None  # global env-step budget (wired in T2.5)
+    add_env_steps: Callable[[int], None] | None = None  # global env-step budget counter
 
 
 def _run_inference_group(
@@ -593,6 +593,8 @@ class RolloutLoop:
             self.sync_weights()
             self._last_weight_sync = now
 
+        if self._io.add_env_steps is not None:
+            self._io.add_env_steps(num_envs)
         return num_envs
 
     # ------------------------------------------------------------------

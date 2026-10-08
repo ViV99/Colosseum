@@ -6,8 +6,9 @@ feeder thread blocked until a worker reads it:
 
 - workers stopped (``stop_event`` set): nobody will read; the learner must not
   wait for them at exit;
-- learner finished its budget while workers still run: the feeder must flush
-  the whole message, or a live worker blocks forever on a truncated one.
+- learner stopped by itself (``consumed_samples`` budget, no shared counter)
+  while workers still run: the feeder must flush the whole message, or a live
+  worker blocks forever on a truncated one.
 """
 
 import multiprocessing as mp
@@ -21,13 +22,14 @@ from colosseum.learner.learner import learner_process
 from dataflow_helpers import TinyModel, chunk_payload
 
 BIG_NUM_ACTIONS = 8192  # policy head 4 x 8192 floats: ~160 KB per weight payload
+ONE_BATCH = 8  # total_timesteps: one batch of 2 chunks x T=4, then the learner stops itself
 
 
 def _big_appo() -> APPO:
     return APPO(TinyModel(num_actions=BIG_NUM_ACTIONS), AlgorithmConfig(), device="cpu")
 
 
-def _start_learner(ctx, weights, stop, total_train_steps: int):
+def _start_learner(ctx, weights, stop, total_timesteps: int):
     traj = ctx.Queue()
     for version in range(2):
         traj.put(chunk_payload(T=4, version=version))
@@ -35,7 +37,7 @@ def _start_learner(ctx, weights, stop, total_train_steps: int):
         agent_id="a", algorithm_factory=_big_appo, trajectory_queue=traj,
         weight_queues=[weights],
         config=LearnerConfig(batch_chunks=2, weight_push_interval=1, device="cpu"),
-        stop_event=stop, total_train_steps=total_train_steps,
+        stop_event=stop, total_timesteps=total_timesteps,
     ))
     proc.start()
     return proc, traj
@@ -54,7 +56,7 @@ def test_learner_exits_when_workers_stopped_and_weights_are_unread():
     unread_weights = ctx.Queue(maxsize=_WEIGHT_QUEUE_SIZE)
     stop = ctx.Event()
     stop.set()  # workers are stopping: nobody reads the weight queue any more
-    proc, traj = _start_learner(ctx, unread_weights, stop, total_train_steps=1)
+    proc, traj = _start_learner(ctx, unread_weights, stop, total_timesteps=ONE_BATCH)
     try:
         proc.join(timeout=60)
         assert not proc.is_alive(), "learner hung at exit flushing an unread weight payload"
@@ -79,7 +81,7 @@ def test_live_slow_reader_gets_final_weights_after_learner_budget_exit():
                 continue
             time.sleep(1.0)
 
-    proc, traj = _start_learner(ctx, weights, stop, total_train_steps=1)
+    proc, traj = _start_learner(ctx, weights, stop, total_timesteps=ONE_BATCH)
     reader = threading.Thread(target=slow_reader, daemon=True)
     reader.start()
     try:
@@ -107,7 +109,7 @@ def test_learner_budget_exit_does_not_deadlock_with_a_worker_blocked_on_chunks()
         agent_id="a", algorithm_factory=_big_appo, trajectory_queue=traj,
         weight_queues=[weights],
         config=LearnerConfig(batch_chunks=2, weight_push_interval=1, device="cpu"),
-        stop_event=stop, total_train_steps=1,
+        stop_event=stop, total_timesteps=ONE_BATCH,
     ))
     received: list[int] = []
     worker_done = threading.Event()

@@ -11,6 +11,8 @@ to OpenAI Five's approach.
 
 from __future__ import annotations
 
+import math
+
 import torch
 import torch.nn.functional as F
 
@@ -55,21 +57,10 @@ class APPO(BaseAlgorithm):
         else:
             self._compute_vtrace = compute_vtrace
 
-        # LR scheduler (created in setup_lr_schedule when total_steps is known)
-        self._lr_scheduler = None
-
-    def setup_lr_schedule(self, total_steps: int) -> None:
-        """Set up LR schedule over total training steps."""
-        if self._config.lr_schedule == LRSchedule.LINEAR:
-            self._lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self._optimizer,
-                lr_lambda=lambda step: max(0.0, 1.0 - step / max(1, total_steps)),
-            )
-        elif self._config.lr_schedule == LRSchedule.COSINE:
-            self._lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self._optimizer, T_max=max(1, total_steps),
-            )
-        # CONSTANT: no scheduler needed
+        # The LR is a function of training progress (share of the global env-step
+        # budget), set by the learner through set_progress() before every train step.
+        self._progress = 0.0
+        self.set_progress(0.0)
 
     @property
     def model(self) -> PolicyModel:
@@ -78,6 +69,26 @@ class APPO(BaseAlgorithm):
     @property
     def policy_version(self) -> int:
         return self._policy_version
+
+    def set_progress(self, progress: float) -> None:
+        """Set the share (0..1) of the global env-step budget consumed so far.
+
+        The optimizer LR follows ``config.lr_schedule``: constant, linear decay to
+        0 at progress 1, or cosine decay to 0 at progress 1. (Kickstart decay
+        stays in train steps.)
+        """
+        self._progress = min(1.0, max(0.0, float(progress)))
+        lr = self._lr_at(self._progress)
+        for group in self._optimizer.param_groups:
+            group["lr"] = lr
+
+    def _lr_at(self, progress: float) -> float:
+        base = self._config.learning_rate
+        if self._config.lr_schedule == LRSchedule.LINEAR:
+            return base * (1.0 - progress)
+        if self._config.lr_schedule == LRSchedule.COSINE:
+            return base * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return base
 
     @property
     def optimizer_state_dict(self) -> dict:
@@ -283,9 +294,6 @@ class APPO(BaseAlgorithm):
                         metrics_accum[key] = 0.0
                     metrics_accum[key] += value.item()
                 num_updates += 1
-
-        if self._lr_scheduler is not None:
-            self._lr_scheduler.step()
 
         if self._kickstart is not None:
             self._kickstart.step()

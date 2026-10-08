@@ -49,7 +49,7 @@ def test_worker_produces_chunks(tmp_path):
         kwargs=dict(
             worker_id=0, config=config, agent_ids=[agent_id], agent_configs={agent_id: config},
             trajectory_queues=trajectory_queues, weight_queues=weight_queues,
-            stop_event=stop_event, total_timesteps=500,
+            stop_event=stop_event,
         ),
         daemon=True,
     )
@@ -84,7 +84,7 @@ def test_worker_multi_agent_routing(tmp_path):
         kwargs=dict(
             worker_id=0, config=config, agent_ids=agent_ids, agent_configs=agent_configs,
             trajectory_queues=trajectory_queues, weight_queues=weight_queues,
-            stop_event=stop_event, total_timesteps=500,
+            stop_event=stop_event,
             slot_network_map=slot_network_map, collect_mask=collect_mask, slot_agent_map=slot_agent_map,
         ),
         daemon=True,
@@ -132,12 +132,16 @@ def test_full_pipeline_with_checkpoint_pool(tmp_path):
         training={"total_timesteps": 5000},
         rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
         learner={"batch_chunks": 2, "queue_size": 16},
-        # 312 train steps: checkpoints at 40, 80, ..., 280 -> FIFO keeps the last 5.
+        # ~300 train steps before the env-step budget stops the run: checkpoints at
+        # 40, 80, ... -> the FIFO pool keeps the last 5 (exact versions depend on timing).
         self_play={"checkpoint_interval": 40, "pool_size": 5},
     )
     Launcher(config).launch()
     ckpts = CheckpointManager(str(tmp_path / "checkpoints"), pool_size=5).list_checkpoints("agent_0")
-    assert [c.policy_version for c in ckpts] == [120, 160, 200, 240, 280]
+    versions = [c.policy_version for c in ckpts]
+    assert len(versions) == 5, versions
+    assert all(a < b for a, b in zip(versions, versions[1:])), versions
+    assert all(v > 0 and v % 40 == 0 for v in versions), versions
 
 
 @pytest.mark.timeout(900)
@@ -154,7 +158,59 @@ def test_multi_agent_pipeline(tmp_path):
     )
     Launcher(config).launch()
     manager = CheckpointManager(str(tmp_path / "checkpoints"))
-    assert any(manager.list_checkpoints(aid) for aid in config.get_trainable_agent_ids())
+    assert all(manager.list_checkpoints(aid) for aid in config.get_trainable_agent_ids())
+
+
+class _MetricsRecorder:
+    """Stand-in for ``WandBLogger``: records every learner metrics dict the monitor forwards."""
+
+    records: list[tuple[str, int, dict]] = []
+
+    def __init__(self, *args, **kwargs) -> None:
+        pass
+
+    def log_config(self, config: dict) -> None:
+        pass
+
+    def log_train_step(self, agent_id: str, metrics: dict, step: int) -> None:
+        self.records.append((agent_id, step, dict(metrics)))
+
+    def finish(self) -> None:
+        pass
+
+
+@pytest.mark.timeout(900)
+def test_multi_agent_learners_both_train_until_the_budget(tmp_path, monkeypatch):
+    """Two learners share the workers; both keep training until the global budget stops the run.
+
+    Regression (T2.5): with per-learner step budgets, the first learner to finish
+    left the workers blocked on its full chunk queue and the other agent starved.
+    """
+    import colosseum.launcher as launcher_mod
+
+    _MetricsRecorder.records = []
+    monkeypatch.setattr(launcher_mod, "WandBLogger", _MetricsRecorder)
+    config = _config(
+        "tic_tac_toe_multi.yaml", tmp_path,
+        training={"total_timesteps": 3000},
+        rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
+        learner={"batch_chunks": 2, "queue_size": 16, "device": "cpu"},
+        metrics={"log_interval": 1},
+    )
+    launcher = launcher_mod.Launcher(config)
+    launcher.launch()
+
+    assert launcher.env_steps_done >= 3000
+    agent_ids = config.get_trainable_agent_ids()
+    assert len(agent_ids) == 2
+    last_step = {aid: max((s for a, s, _ in _MetricsRecorder.records if a == aid), default=0)
+                 for aid in agent_ids}
+    max_progress = {aid: max((m["progress"] for a, _, m in _MetricsRecorder.records if a == aid),
+                             default=0.0) for aid in agent_ids}
+    # Both learners were still training in the second half of the budget ...
+    assert all(p >= 0.5 for p in max_progress.values()), max_progress
+    # ... and neither starved: they trained comparable numbers of steps.
+    assert min(last_step.values()) >= 0.5 * max(last_step.values()) > 0, last_step
 
 
 @pytest.mark.timeout(900)

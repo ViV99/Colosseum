@@ -27,7 +27,7 @@ import torch
 
 from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
-from colosseum.core.ipc import from_numpy_tree, to_numpy_tree
+from colosseum.core.ipc import SharedCounter, from_numpy_tree, to_numpy_tree
 from colosseum.core.types import MatchConfig, state_dict_from_numpy, state_dict_to_numpy
 from colosseum.metrics.wandb_logger import WandBLogger
 
@@ -68,7 +68,7 @@ def _worker_target(
     trajectory_queues: dict[str, mp.Queue],
     weight_queues: dict[str, mp.Queue],
     stop_event: mp.Event,
-    total_timesteps: int = 0,
+    env_step_counter: SharedCounter | None = None,
     checkpoint_state_dicts_by_agent: dict[str, dict[str, dict]] | None = None,
     slot_network_map: list[list[str]] | None = None,
     collect_mask: list[list[bool]] | None = None,
@@ -106,7 +106,7 @@ def _worker_target(
         gamma=config.algorithm.gamma,
         weight_sync_interval=config.rollout.weight_sync_interval_sec,
         torch_threads=config.rollout.torch_threads,
-        max_env_steps=total_timesteps,
+        env_step_counter=env_step_counter,
         checkpoint_state_dicts_by_agent=checkpoint_state_dicts_by_agent,
         slot_agent_map=slot_agent_map,
         slot_network_map=slot_network_map,
@@ -127,10 +127,11 @@ def _learner_target(
     weight_queues: list[mp.Queue],
     stop_event: mp.Event,
     metrics_queue: mp.Queue,
-    total_train_steps: int,
     checkpoint_queue: mp.Queue | None = None,
     checkpoint_interval: int = 0,
     resume_state: dict | None = None,
+    progress_counter: SharedCounter | None = None,
+    total_timesteps: int = 0,
     num_learners: int = 1,
 ) -> None:
     """Learner process entry point.
@@ -190,10 +191,11 @@ def _learner_target(
         config=config.learner,
         stop_event=stop_event,
         metrics_queue=metrics_queue,
-        total_train_steps=total_train_steps,
         checkpoint_queue=checkpoint_queue,
         checkpoint_interval=checkpoint_interval,
         resume_state=resume_state,
+        progress_counter=progress_counter,
+        total_timesteps=total_timesteps,
         weight_sync_interval=config.rollout.weight_sync_interval_sec,
     )
 
@@ -330,6 +332,13 @@ class Launcher:
         self._processes: list[mp.Process] = []
         self._stop_event = mp.Event()
         self._all_queues: list[mp.Queue] = []
+        # Env steps taken by all workers together (spec block 2: global budget).
+        self._env_step_counter = SharedCounter()
+
+    @property
+    def env_steps_done(self) -> int:
+        """Env steps taken by all workers so far (the global budget counter)."""
+        return self._env_step_counter.value
 
     def launch(self) -> None:
         """Launch the full training pipeline."""
@@ -358,14 +367,6 @@ class Launcher:
         coordinator = Coordinator(cfg)
         for aid in trainable_agents:
             coordinator.agent_pool.register_trainable(aid)
-
-        # Compute total train steps (same for all agents)
-        steps_per_chunk = cfg.rollout.chunk_length
-        chunks_per_step = cfg.learner.batch_chunks
-        env_steps_per_train_step = steps_per_chunk * chunks_per_step
-        total_train_steps = max(
-            1, cfg.training.total_timesteps // env_steps_per_train_step,
-        )
 
         checkpoint_interval = cfg.self_play.checkpoint_interval
 
@@ -417,10 +418,11 @@ class Launcher:
                     weight_queues=weight_queues_per_agent[aid],
                     stop_event=self._stop_event,
                     metrics_queue=metrics_queue,
-                    total_train_steps=total_train_steps,
                     checkpoint_queue=checkpoint_queues[aid],
                     checkpoint_interval=checkpoint_interval,
                     resume_state=resume_state,
+                    progress_counter=self._env_step_counter,
+                    total_timesteps=cfg.training.total_timesteps,
                     num_learners=len(trainable_agents),
                 ),
                 daemon=True,
@@ -469,7 +471,7 @@ class Launcher:
                     trajectory_queues=trajectory_queues,
                     weight_queues=worker_weight_queues,
                     stop_event=self._stop_event,
-                    total_timesteps=cfg.training.total_timesteps // cfg.rollout.num_workers,
+                    env_step_counter=self._env_step_counter,
                     checkpoint_state_dicts_by_agent=ckpt_dicts_by_agent,
                     slot_network_map=slot_network_map,
                     collect_mask=collect_mask,
@@ -527,28 +529,28 @@ class Launcher:
         any newly-saved checkpoints) to workers (C1), so self-play-vs-history
         and PFSP opponent selection evolve during training.
 
-        Stops when ALL learner processes have exited (they are the first
-        N processes in self._processes where N = len(agent_ids)).
+        The main process is the only budget authority: it sets ``stop_event``
+        once all workers together have taken ``training.total_timesteps`` env
+        steps. Learners and workers run until ``stop_event``, so any of them
+        exiting earlier is unexpected. A dead learner stops the run: workers
+        would block on its full trajectory queue and starve the other agents.
+        (Learners are the first ``len(agent_ids)`` entries of ``self._processes``.)
         """
         num_learners = len(agent_ids)
-        learner_procs = self._processes[:num_learners]
+        learner_procs = dict(zip(agent_ids, self._processes[:num_learners], strict=True))
         last_steps: dict[str, int] = {aid: 0 for aid in agent_ids}
 
         refresh_interval = self._config.rollout.match_refresh_interval_sec
         last_refresh = time.time()
 
         while not self._stop_event.is_set():
-            # Stop when ALL learner processes have exited
-            learner_alive = [p.is_alive() for p in learner_procs]
-            if not any(learner_alive):
-                logger.info("All learner processes exited, stopping workers...")
+            dead_learners = [aid for aid, p in learner_procs.items() if not p.is_alive()]
+            if dead_learners and not self._stop_event.is_set():
+                logger.error(
+                    f"Learner process(es) for {dead_learners} exited unexpectedly "
+                    f"(exit codes {[learner_procs[a].exitcode for a in dead_learners]}); stopping."
+                )
                 self._stop_event.set()
-                break
-
-            # Check if all processes are dead (unexpected)
-            alive = [p.is_alive() for p in self._processes]
-            if not any(alive):
-                logger.info("All processes have exited")
                 break
 
             # If every worker has died, learners would starve forever — stop.
@@ -605,6 +607,16 @@ class Launcher:
                     coordinator, agent_ids, command_queues, worker_broadcast_ckpts,
                 )
                 last_refresh = time.time()
+
+            # Global env-step budget (spec block 2): all workers together have
+            # taken training.total_timesteps env steps -> stop everything.
+            if self.env_steps_done >= self._config.training.total_timesteps:
+                logger.info(
+                    f"Env-step budget reached ({self.env_steps_done} >= "
+                    f"{self._config.training.total_timesteps}); stopping."
+                )
+                self._stop_event.set()
+                break
 
             time.sleep(0.5)
 

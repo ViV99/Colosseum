@@ -20,6 +20,14 @@ agent (opponents = latest weights pulled from the store). The dynamic
 coordinator-driven matchmaking (PFSP / historical-checkpoint opponents, C1) is a
 single-machine feature; closing that loop across machines would require running
 the coordinator as its own service and is left as future work.
+
+Budget and progress: there is no shared env-step counter across machines. Each
+distributed learner uses progress = consumed_samples / training.total_timesteps
+(its own transitions, which drives the LR schedule) and stops by itself once
+consumed_samples >= total_timesteps. Each worker stops after
+total_timesteps / num_workers env steps. These numbers differ from the local
+mode budget (env steps summed over workers); a single semantics comes with the
+hub in SP5.
 """
 
 from __future__ import annotations
@@ -194,9 +202,6 @@ def run_distributed_learner(
             kwargs["kickstart"] = kickstart
         return algo_cls(model, acfg.algorithm, **kwargs)
 
-    env_steps_per_train_step = config.rollout.chunk_length * acfg.learner.batch_chunks
-    total_train_steps = max(1, config.training.total_timesteps // env_steps_per_train_step)
-
     stop_event = threading.Event()
     _install_stop_signal_handlers(stop_event)
 
@@ -231,7 +236,8 @@ def run_distributed_learner(
             config=acfg.learner,
             stop_event=stop_event,
             metrics_queue=None,
-            total_train_steps=total_train_steps,
+            progress_counter=None,
+            total_timesteps=config.training.total_timesteps,
             checkpoint_queue=checkpoint_queue if coordinator_ckpt is not None else None,
             checkpoint_interval=config.self_play.checkpoint_interval,
             weight_sync_interval=acfg.rollout.weight_sync_interval_sec,

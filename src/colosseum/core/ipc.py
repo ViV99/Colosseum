@@ -26,6 +26,7 @@ Conversion rules:
 from __future__ import annotations
 
 import dataclasses
+import multiprocessing as mp
 import queue
 import time
 from typing import Any
@@ -71,6 +72,53 @@ def drain_latest(q: Any) -> Any | None:
             latest = q.get_nowait()
         except queue.Empty:
             return latest
+
+
+class SharedCounter:
+    """A process-shared 64-bit counter (``mp.Value("q")``).
+
+    Must be handed to child processes as a ``Process`` argument (not through a
+    queue), like any ``multiprocessing`` synchronized value.
+    """
+
+    def __init__(self, ctx: mp.context.BaseContext | None = None) -> None:
+        ctx = ctx if ctx is not None else mp.get_context()
+        self._val = ctx.Value("q", 0)
+
+    def add(self, n: int) -> None:
+        if n:
+            with self._val.get_lock():
+                self._val.value += int(n)
+
+    @property
+    def value(self) -> int:
+        with self._val.get_lock():
+            return int(self._val.value)
+
+
+class BatchedCounter:
+    """Accumulates increments locally and flushes them into a SharedCounter.
+
+    Workers call :meth:`add` every env step; the shared (locked) counter is
+    touched at most once per ``interval`` seconds. Call :meth:`flush` on exit.
+    """
+
+    def __init__(self, counter: SharedCounter, interval: float = 0.5) -> None:
+        self._counter = counter
+        self._interval = interval
+        self._pending = 0
+        self._last_flush = time.monotonic()
+
+    def add(self, n: int) -> None:
+        self._pending += int(n)
+        if time.monotonic() - self._last_flush >= self._interval:
+            self.flush()
+
+    def flush(self) -> None:
+        if self._pending:
+            self._counter.add(self._pending)
+            self._pending = 0
+        self._last_flush = time.monotonic()
 
 
 # torch float dtypes without a numpy equivalent; upcast to float32 on export.
