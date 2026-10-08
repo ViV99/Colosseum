@@ -73,6 +73,8 @@ class CategoricalDist(Distribution):
     """``logits [B, n]``, optional ``mask [B, n]`` (True = legal). Actions ``int64 [B]``."""
 
     def __init__(self, logits: Tensor, mask: Tensor | None = None) -> None:
+        if not isinstance(logits, Tensor):
+            raise ValueError(f"CategoricalDist: logits must be a tensor, got {type(logits).__name__}")
         if logits.dim() != 2:
             raise ValueError(f"CategoricalDist: logits must be [B, n], got shape {tuple(logits.shape)}")
         self._logits = logits
@@ -140,6 +142,8 @@ class MultiCategoricalDist(Distribution):
     Actions ``int64 [B, C]``."""
 
     def __init__(self, logits: Tensor, nvec: Sequence[int], mask: Tensor | None = None) -> None:
+        if not isinstance(logits, Tensor):
+            raise ValueError(f"MultiCategoricalDist: logits must be a tensor, got {type(logits).__name__}")
         self.nvec = tuple(int(n) for n in nvec)
         if logits.dim() != 2 or logits.shape[-1] != sum(self.nvec):
             raise ValueError(f"MultiCategoricalDist: logits must be [B, {sum(self.nvec)}] for nvec {self.nvec}, "
@@ -216,6 +220,9 @@ class DiagGaussianDist(Distribution):
     """``mean [B, d]``, ``log_std [B, d]`` or ``[d]``. Actions ``float [B, d]``; no mask."""
 
     def __init__(self, mean: Tensor, log_std: Tensor) -> None:
+        for name, value in (("mean", mean), ("log_std", log_std)):
+            if not isinstance(value, Tensor):
+                raise ValueError(f"DiagGaussianDist: {name} must be a tensor, got {type(value).__name__}")
         if mean.dim() != 2:
             raise ValueError(f"DiagGaussianDist: mean must be [B, d], got shape {tuple(mean.shape)}")
         if tuple(log_std.shape) not in (tuple(mean.shape), tuple(mean.shape[-1:])):

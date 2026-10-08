@@ -159,3 +159,25 @@ def test_k1_units_is_one_decider():
     assert dist.num_deciders == 1
     a = {"kind": torch.tensor([[1]]), "target": torch.tensor([[3]])}
     assert torch.allclose(dist.log_prob(a), torch.tensor([-LOG2 - math.log(4)]))
+
+
+def test_empty_rows_sample_and_mode_zero():
+    # unit 0: empty move row (so target, gated by move, is invalid too); unit 1: empty target row only.
+    action = torch.ones(1, 3, 5, dtype=torch.bool)
+    action[0, 0, :3] = False
+    action[0, 1, 3:] = False
+    dist = _dist({"action": action})
+    torch.manual_seed(0)
+    for s in [dist.sample() for _ in range(20)] + [dist.mode()]:
+        assert s["move"][0, 0].item() == 0 and s["target"][0, 1].item() == 0
+
+
+def test_mask_shape_and_key_errors():
+    with pytest.raises(ValueError, match=r"unit mask must be \[B, 3\]"):
+        _dist(batch=2).apply_mask({"unit": torch.ones(1, 3, dtype=torch.bool)})
+    with pytest.raises(ValueError, match=r"action mask must be \[B, 3, 5\]"):
+        _dist(batch=2).apply_mask({"action": torch.ones(1, 3, 5, dtype=torch.bool)})
+    with pytest.raises(ValueError, match=r"unknown mask keys \['units'\]"):
+        _dist({"units": torch.ones(1, 3, dtype=torch.bool)})
+    with pytest.raises(ValueError, match=r"unknown mask keys \['units'\]"):
+        _dist().apply_mask({"units": torch.ones(1, 3, dtype=torch.bool)})

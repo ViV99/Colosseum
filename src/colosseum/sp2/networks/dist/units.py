@@ -45,14 +45,18 @@ class UnitsDist(Distribution):
         self.units = group.units
         self.U = self.units.max_units
         names = [c.name for c in self.units.components]
+        if not isinstance(params, Mapping):
+            raise ValueError(f"UnitsDist: params must be a dict {self._params_form()}, got {type(params).__name__}")
         if set(params) != set(names):
-            raise ValueError(f"UnitsDist: params for components {sorted(params)}, the units have {names}")
+            raise ValueError(f"UnitsDist: params for components {sorted(map(str, params))}, the units have {names}")
         self.params: dict[str, Any] = {}
         first = params[names[0]]
         ref = first.get("mean") if isinstance(first, Mapping) else first
-        if not isinstance(ref, Tensor):
-            raise ValueError(f"UnitsDist: component {names[0]!r} needs a tensor (logits or 'mean'), "
-                             f"got {type(ref).__name__}")
+        if not isinstance(ref, Tensor) or ref.dim() != 3:
+            kind = "mean" if isinstance(first, Mapping) else "logits"
+            got = tuple(ref.shape) if isinstance(ref, Tensor) else type(ref).__name__
+            raise ValueError(f"UnitsDist: component {names[0]!r} needs {kind} [B, {self.U}, "
+                             f"{self.units.components[0].size}], got {got}")
         self.B = int(ref.shape[0])
         device = ref.device
         for c in self.units.components:
@@ -74,17 +78,10 @@ class UnitsDist(Distribution):
                     raise ValueError(f"UnitsDist: component {c.name!r} needs log_std [B, {self.U}, {c.size}] or "
                                      f"[{c.size}], got {got}")
                 self.params[c.name] = {"mean": p["mean"], "log_std": torch.broadcast_to(p["log_std"], p["mean"].shape)}
-        mask = mask or {}
-        unit = mask.get("unit")
-        action = mask.get("action")
+        unit, action = self._check_mask(mask)
         self.unit_mask = (torch.ones(self.B, self.U, dtype=torch.bool, device=device) if unit is None
                           else unit.to(device=device, dtype=torch.bool))
         self.action_mask = None if action is None else action.to(device=device, dtype=torch.bool)
-        if tuple(self.unit_mask.shape) != (self.B, self.U):
-            raise ValueError(f"UnitsDist: unit mask must be [B, {self.U}], got {tuple(self.unit_mask.shape)}")
-        if self.action_mask is not None and tuple(self.action_mask.shape) != (self.B, self.U, group.mask_size):
-            raise ValueError(f"UnitsDist: action mask must be [B, {self.U}, {group.mask_size}], "
-                             f"got {tuple(self.action_mask.shape)}")
         self._row: dict[str, Tensor | None] = {}   # component mask rows [B, U, n]
         self._log_p: dict[str, Tensor] = {}
         offset = 0
@@ -94,6 +91,30 @@ class UnitsDist(Distribution):
                 self._row[c.name] = row
                 self._log_p[c.name] = masked_log_softmax(self.params[c.name], row)
                 offset += c.size
+
+    def _params_form(self) -> str:
+        parts = []
+        for c in self.units.components:
+            if c.kind == "discrete":
+                parts.append(f"{c.name!r}: logits [B, {self.U}, {c.size}]")
+            else:
+                parts.append(f"{c.name!r}: {{'mean': [B, {self.U}, {c.size}], "
+                             f"'log_std': [B, {self.U}, {c.size}] | [{c.size}]}}")
+        return "{" + ", ".join(parts) + "}"
+
+    def _check_mask(self, mask: Mapping[str, Tensor] | None) -> tuple[Tensor | None, Tensor | None]:
+        """``(unit, action)`` of a mask dict after checking its keys and shapes."""
+        mask = mask or {}
+        unknown = sorted(set(mask) - {"unit", "action"})
+        if unknown:
+            raise ValueError(f"UnitsDist: unknown mask keys {unknown} (expected 'unit' and/or 'action')")
+        unit, action = mask.get("unit"), mask.get("action")
+        if unit is not None and tuple(unit.shape) != (self.B, self.U):
+            raise ValueError(f"UnitsDist: unit mask must be [B, {self.U}], got {tuple(unit.shape)}")
+        if action is not None and tuple(action.shape) != (self.B, self.U, self.group.mask_size):
+            raise ValueError(f"UnitsDist: action mask must be [B, {self.U}, {self.group.mask_size}], "
+                             f"got {tuple(action.shape)}")
+        return unit, action
 
     # ---- layout --------------------------------------------------------------------
 
@@ -221,8 +242,7 @@ class UnitsDist(Distribution):
     def apply_mask(self, mask: Mapping[str, Tensor] | None) -> UnitsDist:
         if mask is None:
             return self
-        unit = mask.get("unit")
-        action = mask.get("action")
+        unit, action = self._check_mask(mask)
         new_unit = self.unit_mask if unit is None else self.unit_mask & unit.to(self.unit_mask.device, torch.bool)
         if action is None:
             new_action = self.action_mask
