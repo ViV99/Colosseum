@@ -62,6 +62,12 @@ def test_two_agent_self_play_reaches_budget_and_both_learners_train(tmp_path):
         meta = final_meta(run, agent_id)
         assert meta["final"] is True and meta["agent_id"] == agent_id
         assert meta["networks"]["encoder_class"].endswith("TicTacToeEncoder")
+        # Periodic checkpoints were saved during training, and the final one is the newest.
+        metas = [json.loads((run.root / "checkpoints" / agent_id / f"ckpt_v{v}" / "meta.json").read_text())
+                 for v in checkpoint_versions(run, agent_id)]
+        periodic = [m["policy_version"] for m in metas if m["final"] is False]
+        assert periodic, f"{agent_id}: no periodic checkpoint: {metas}"
+        assert meta["policy_version"] == max(m["policy_version"] for m in metas) > max(periodic)
 
 
 def test_three_agent_league_all_pairs_meet_and_seats_balanced(tmp_path):
@@ -71,9 +77,10 @@ def test_three_agent_league_all_pairs_meet_and_seats_balanced(tmp_path):
         "agents.agent_gamma": "{}",
         "training.total_timesteps": "12000",
         # Seats are shuffled per env and refresh, and kept until the env's next episode boundary,
-        # so episodes are clustered: many envs and a fast refresh give ~10^3 independent draws.
+        # so episodes of one env are clustered. With 256 envs and a 0.2 s refresh an env plays
+        # about one episode per seat draw, so the ~2000 seats per agent are nearly independent.
         "rollout.num_workers": "2",
-        "rollout.envs_per_worker": "64",
+        "rollout.envs_per_worker": "128",
         "rollout.match_refresh_interval_sec": "0.2",
     })
     assert run.returncode == 0, run.stderr[-3000:]
@@ -90,9 +97,9 @@ def test_three_agent_league_all_pairs_meet_and_seats_balanced(tmp_path):
     for agent_id, counts in seats.items():
         total = sum(counts.values())
         assert total >= 200, (agent_id, counts)
-        # ±5% is asserted on 10^4 samples in tests/unit/test_league_matchmaking.py; a short run has
-        # ~10^3 independent seat draws per agent (measured spread ≈ 2.5%), so the end-to-end
-        # check allows ±8% (more than 3 standard deviations).
+        # ±5% is asserted on 10^4 samples in tests/unit/test_league_matchmaking.py. Here, measured
+        # over 20 runs x 3 agents: ~1940 seats per agent, sigma of the seat-0 share 1.28% (the
+        # binomial floor is 1.14%), max deviation 3.2%. ±8% is 6.3 sigma.
         assert abs(counts[0] / total - 0.5) <= 0.08, (agent_id, counts)
 
 
@@ -111,7 +118,8 @@ def test_resume_continues_versions_env_steps_and_lr(tmp_path):
               "training.total_timesteps": str(budget)}
 
     with training_process(TTT_CONFIG, tmp_path, name="first", overrides=common) as (proc, root):
-        assert wait_for(lambda: max_system_env_steps(root) >= interrupt_at or proc.poll() is not None, 180)
+        assert wait_for(lambda: max_system_env_steps(root) >= interrupt_at or proc.poll() is not None, 180), \
+            (tmp_path / "first.stderr").read_text()[-3000:]
         assert proc.poll() is None, (tmp_path / "first.stderr").read_text()[-3000:]
         os.killpg(proc.pid, signal.SIGINT)  # like Ctrl-C: the final checkpoint is still saved
         returncode = proc.wait(60)
