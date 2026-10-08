@@ -38,7 +38,7 @@ import numpy as np
 
 from colosseum.networks.state import State, cat_batch, slice_batch
 from colosseum.sp2.core.specs import ActionSpec, ObsSpec
-from colosseum.sp2.core.tree import Tree, tree_index, tree_map, tree_to_numpy, tree_to_torch
+from colosseum.sp2.core.tree import Tree, tree_map, tree_to_numpy, tree_to_torch
 from colosseum.sp2.core.types import (
     LATEST_NETWORK_ID,
     Lineup,
@@ -171,7 +171,11 @@ class MatchRunner:
         return self._envs[env].lineup
 
     def set_next_lineup(self, env: int, lineup: Lineup) -> None:
-        """Stage ``lineup`` for env ``env``; it is applied at the env's next episode end."""
+        """Stage ``lineup`` for env ``env``; it is applied at the env's next episode end.
+
+        Layout, seat count and every agent's latest model are checked now; the missing-network
+        fallback is applied at the episode end (a checkpoint may be loaded in between).
+        """
         self._check_lineup(lineup, env)
         self._envs[env].next_lineup = lineup
 
@@ -207,6 +211,11 @@ class MatchRunner:
                 f"{self._context}env {env}: lineup for layout {lineup.layout!r} has "
                 f"{len(lineup.seats)} seats, the layout has {size}"
             )
+        for assignment in lineup.seats:
+            if self._models.get(assignment.agent_id, LATEST_NETWORK_ID) is None:
+                raise ValueError(
+                    f"{self._context}env {env}: the model pool has no model for agent {assignment.agent_id!r}"
+                )
 
     def _resolve(self, lineup: Lineup, env: int) -> Lineup:
         """Validate ``lineup`` and replace networks the pool cannot provide by latest + collect."""
@@ -217,8 +226,6 @@ class MatchRunner:
             if self._models.get(aid, net) is not None:
                 seats.append(SeatAssignment(aid, net, assignment.collect))
                 continue
-            if self._models.get(aid, LATEST_NETWORK_ID) is None:
-                raise ValueError(f"{self._context}env {env}: the model pool has no model for agent {aid!r}")
             if (aid, net) not in self._warned_missing:
                 self._warned_missing.add((aid, net))
                 logger.warning(
@@ -261,6 +268,8 @@ class MatchRunner:
                 put_row(obs_batch, j, env_state.result.obs[seat])
                 if mask_batch is not None:
                     put_row(mask_batch, j, env_state.masks[seat])
+            # the records' copies are taken before inference: a model may transform its input in place
+            obs_rows = [tree_map(lambda leaf, j=j: leaf[j].copy(), obs_batch) for j in range(n)]
             state_batch = cat_batch([self._envs[e].states[seat] for e, seat in seats])
             out = act(model, tree_to_torch(obs_batch), state_batch,
                       None if mask_batch is None else tree_to_torch(mask_batch),
@@ -276,7 +285,7 @@ class MatchRunner:
                 records[(e, seat)] = ActRecord(
                     agent_id=aid,
                     network_id=net,
-                    obs=tree_index(obs_batch, j),
+                    obs=obs_rows[j],
                     global_state=gs[seat] if info.has_global_state and gs is not None else None,
                     mask=env_state.masks.get(seat),
                     action=action,

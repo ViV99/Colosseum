@@ -129,6 +129,26 @@ def test_act_records_carry_obs_mask_action_logprob_and_pre_state():
     assert first.log_prob == pytest.approx(float(step.dist.log_prob(torch.tensor([int(first.action)]))), abs=1e-6)
 
 
+class InputMutatingModel(CallCountingModel):
+    """Transforms its observation tensor in place before delegating (allowed for a model)."""
+
+    def step(self, obs, state, action_mask=None):
+        obs.add_(100.0)
+        return super().step(obs, state, action_mask)
+
+
+def test_act_records_keep_the_env_observation_when_the_model_mutates_its_input():
+    model = InputMutatingModel(make_test_model(_role(2)))
+    script = [Tick(acting={0, 1}), Tick(acting={0, 1}), Tick(over=True)]
+    runner, obs, _ = _runner(script, 2, [Lineup("2p", [SeatAssignment("a")] * 2)], {("a", "latest"): model})
+    runner.step()
+    runner.step()
+    recorded = [(e[2], e[3].obs.tolist()) for e in obs.events if e[0] == "act"]
+    assert recorded == [(0, [0.0, 0.0, 0.0, 0.0, 0.0]), (1, [0.0, 0.0, 0.0, 1.0, 0.0]),
+                        (0, [0.0, 0.0, 1.0, 0.0, 0.0]), (1, [0.0, 0.0, 1.0, 1.0, 0.0])]
+    assert model.batch_sizes == [2, 2]
+
+
 def test_units_actions_record_unit_log_probs_and_global_state_reaches_records():
     space = Units(3, gymnasium.spaces.Discrete(2))
     role = _role(1, action_space=space, global_state=True)
@@ -243,6 +263,11 @@ def test_lineups_are_validated():
         _runner(script, 2, [Lineup("2p", [SeatAssignment("a")])], {("a", "latest"): model})
     with pytest.raises(ValueError, match="no model"):
         _runner(script, 2, [Lineup("2p", [SeatAssignment("zzz")] * 2)], {("a", "latest"): model})
+    runner, _, _ = _runner(script, 2, [Lineup("2p", [SeatAssignment("a")] * 2)], {("a", "latest"): model})
+    with pytest.raises(ValueError, match="no model for agent 'zzz'"):
+        runner.set_next_lineup(0, Lineup("2p", [SeatAssignment("a"), SeatAssignment("zzz")]))
+    with pytest.raises(ValueError, match="seats"):
+        runner.set_next_lineup(0, Lineup("2p", [SeatAssignment("a")]))
     with pytest.raises(ValueError, match="one lineup per env"):
         _runner(script, 2, [Lineup("2p", [SeatAssignment("a")] * 2)], {("a", "latest"): model}, num_envs=2)
 
@@ -379,6 +404,25 @@ CONTRACT_CASES = {
     "acting seat without the declared global_state": (
         lambda: [_acts(0, 1, gs=True, global_state={0: np.zeros(2, np.float32)})],
         f"{_W}seat 1, episode step 0, layout 2p: ", r"declares a global_state_space but the acting seat got no"),
+    "observation for an empty seat": (
+        lambda: [_acts(0, 1), StepResult(acting={0}, obs=_seats_obs(0, 2))],
+        f"{_W}seat 2, episode step 1, layout 2p: ", r"an observation for an empty seat"),
+    "terminated for an empty seat": (
+        lambda: [_acts(0, 1), _acts(0, 1, terminated={2})],
+        f"{_W}seat 2, episode step 1, layout 2p: ", r"terminated for an empty seat"),
+    "reset gives rewards": (
+        lambda: [_acts(0, 1, rewards={0: 1.0})],
+        f"{_W}episode step 0, layout 2p: ", r"reset must not give rewards"),
+    "reset terminates seats": (
+        lambda: [_acts(0, 1, terminated={1})],
+        f"{_W}episode step 0, layout 2p: ", r"reset must not terminate seats"),
+    "reset ends the episode": (
+        lambda: [_acts(0, 1, episode_over=True)],
+        f"{_W}episode step 0, layout 2p: ", r"reset must not end the episode"),
+    "truncation without the final global_state the role declares": (
+        lambda: [_acts(0, 1, gs=True),
+                 _over(truncated=True, final_obs=_seats_obs(0, 1), global_state={0: np.zeros(2, np.float32)})],
+        f"{_W}seat 1, episode step 1, layout 2p: ", r"truncated episode without the final global_state"),
     "idle overflow": (
         lambda: [_acts(0, 1), _acts(), _acts(), _acts()],
         f"{_W}episode step 3, layout 2p: ", r"more than env\.max_idle_steps=2 steps in a row"),
