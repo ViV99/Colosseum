@@ -176,6 +176,7 @@ def _learner_target(
                 teacher,
                 initial_lambda=config.training.kickstart_lambda,
                 decay_steps=config.training.kickstart_decay_steps,
+                direction=config.training.kickstart_kl,
             )
             logger.info(f"Kickstart enabled for {agent_id} from {teacher_path}")
         kwargs = {"device": device, "pin_memory": config.learner.pin_memory}

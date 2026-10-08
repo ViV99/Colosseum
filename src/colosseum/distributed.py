@@ -196,6 +196,7 @@ def run_distributed_learner(
                 teacher,
                 initial_lambda=acfg.training.kickstart_lambda,
                 decay_steps=acfg.training.kickstart_decay_steps,
+                direction=acfg.training.kickstart_kl,
             )
         kwargs = {"device": device, "pin_memory": acfg.learner.pin_memory}
         if kickstart is not None:

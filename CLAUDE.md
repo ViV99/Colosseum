@@ -54,7 +54,7 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
 
 **Behavioral Cloning:**
 - Offline BC: supervised learning from recorded trajectories (cross-entropy/MSE loss)
-- Online BC (kickstarting): `loss = RL_loss + λ * KL(policy || BC_policy)`, λ decays over training
+- Online BC (kickstarting): `loss = RL_loss + λ * KL(BC_teacher || policy)` (forward KL by default, `training.kickstart_kl`), λ decays over training
 - Both approaches available; BC phase runs before RL phase
 
 ### Framework: PyTorch
@@ -286,7 +286,7 @@ Working end-to-end IMPALA-style training loop on one machine.
 | Component | File | Description |
 |-----------|------|-------------|
 | Offline BC | `bc/offline_bc.py` | OfflineBCTrainer: load .pt data, supervised CE/MSE loss |
-| Kickstart | `bc/kickstart.py` | KL(student \|\| teacher) with linear lambda decay |
+| Kickstart | `bc/kickstart.py` | KL(teacher \|\| student) by default (configurable), masked, unrolled teacher, linear lambda decay |
 | APPO integration | `algorithms/appo.py` | Optional `kickstart` param adds KL loss to total |
 | CLI | `cli.py` | `colosseum bc --config <path> --data <dir> --output <path>` |
 

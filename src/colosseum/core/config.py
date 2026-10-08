@@ -244,15 +244,20 @@ class TrainingConfig(BaseModel):
     )
     kickstart_teacher: str | None = Field(
         default=None,
-        description="Path to a frozen teacher .pt state_dict (e.g. a BC model). When set, a "
-                    "decaying KL(student || teacher) term is added to the RL loss (online BC / "
-                    "kickstarting). None disables kickstarting.",
+        description="Path to a frozen teacher .pt state_dict (e.g. a BC model), built from this "
+                    "agent's networks config. When set, a decaying KL term between teacher and "
+                    "student is added to the RL loss (direction: kickstart_kl). None disables it.",
     )
     kickstart_lambda: float = Field(
         default=1.0, ge=0.0, description="Initial weight of the kickstart KL term (decays to 0).",
     )
     kickstart_decay_steps: int = Field(
         default=50_000, ge=1, description="Training steps over which the kickstart lambda decays to 0.",
+    )
+    kickstart_kl: Literal["forward", "reverse"] = Field(
+        default="forward",
+        description="Kickstart KL direction: 'forward' = KL(teacher || student) (Kickstarting / "
+                    "AlphaStar / VPT, mode-covering); 'reverse' = KL(student || teacher).",
     )
 
 

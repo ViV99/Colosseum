@@ -50,6 +50,15 @@ def test_update_normalizers_without_normalizer_is_noop():
         assert torch.equal(value, before[key]), key
 
 
+def test_update_normalizers_updates_a_shared_normalizer_once():
+    model = make_simple_model(obs_dim=4, num_actions=4, normalize=True, seed=0)
+    norm = _norm(model)
+    model.shared_norm = norm                    # the same instance under a second attribute
+    start = norm.rms.count.item()
+    model.update_normalizers(torch.randn(8, 4))
+    assert norm.rms.count.item() - start == pytest.approx(8.0, abs=1e-3)
+
+
 @pytest.mark.parametrize("num_epochs,minibatch_chunks", [(1, 0), (3, 1), (2, 2)])
 def test_train_step_counts_each_sample_once(num_epochs, minibatch_chunks):
     model = make_simple_model(obs_dim=4, num_actions=4, normalize=True, seed=0)

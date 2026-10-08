@@ -156,6 +156,17 @@ def test_distribution_cat_categorical_gaussian_composite():
     assert torch.allclose(kc.log_prob(flat), torch.cat([k1.log_prob(flat[:2]), k2.log_prob(flat[2:])]))
 
 
+def test_gaussian_cat_with_broadcast_log_std():
+    torch.manual_seed(0)
+    log_std = torch.tensor([0.1, -0.3])          # a [D] parameter, broadcast over the batch
+    g1 = DiagGaussianDist(torch.randn(2, 2), log_std)
+    g2 = DiagGaussianDist(torch.randn(3, 2), log_std)
+    gc = DiagGaussianDist.cat([g1, g2])
+    x = torch.randn(5, 2)
+    assert torch.allclose(gc.log_prob(x), torch.cat([g1.log_prob(x[:2]), g2.log_prob(x[2:])]))
+    assert torch.allclose(gc.entropy(), torch.cat([g1.entropy(), g2.entropy()]))
+
+
 def test_masked_categorical_cat_keeps_mask():
     logits = torch.zeros(2, A)
     mask = torch.tensor([[True, False, True, False], [False, True, True, True]])

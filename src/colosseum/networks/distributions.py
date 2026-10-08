@@ -60,9 +60,16 @@ class CategoricalDist(Distribution):
     """For discrete action spaces with optional action masking."""
 
     def __init__(self, logits: torch.Tensor, mask: torch.Tensor | None = None):
+        self._mask: torch.Tensor | None = None
         if mask is not None:
-            logits = logits.masked_fill(~mask.bool(), float("-inf"))
+            self._mask = mask.bool()
+            logits = logits.masked_fill(~self._mask, float("-inf"))
         self._dist = torch.distributions.Categorical(logits=logits)
+
+    @property
+    def mask(self) -> torch.Tensor | None:
+        """Bool legal-action mask (True = legal), or None when unmasked."""
+        return self._mask
 
     @property
     def logits(self) -> torch.Tensor:
@@ -85,20 +92,47 @@ class CategoricalDist(Distribution):
         return self._dist.logits.argmax(dim=-1)
 
     def kl_divergence(self, other: Distribution) -> torch.Tensor:
+        """KL(self || other) over legal actions only.
+
+        The legal set is the intersection of both distributions' masks; both sides are
+        renormalized on it. Rows with no common legal action give 0. The result is
+        finite even when only one side is masked; it is computed in float32.
+        """
         if not isinstance(other, CategoricalDist):
             raise TypeError(f"Cannot compute KL between CategoricalDist and {type(other).__name__}")
-        student_log_probs = F.log_softmax(self.logits, dim=-1)
-        teacher_log_probs = F.log_softmax(other.logits, dim=-1)
-        return (student_log_probs.exp() * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+        legal = self._mask
+        if other.mask is not None:
+            legal = other.mask if legal is None else (legal & other.mask)
+        p_logits = self.logits.float()
+        q_logits = other.logits.float()
+        if legal is None:
+            log_p = F.log_softmax(p_logits, dim=-1)
+            log_q = F.log_softmax(q_logits, dim=-1)
+            return (log_p.exp() * (log_p - log_q)).sum(dim=-1)
+        neg = torch.finfo(p_logits.dtype).min
+        log_p = F.log_softmax(p_logits.masked_fill(~legal, neg), dim=-1)
+        log_q = F.log_softmax(q_logits.masked_fill(~legal, neg), dim=-1)
+        terms = torch.where(legal, log_p.exp() * (log_p - log_q), torch.zeros_like(log_p))
+        return terms.sum(dim=-1)
 
     def apply_mask(self, mask: torch.Tensor) -> CategoricalDist:
-        """Return a new CategoricalDist with invalid actions masked out."""
+        """Return a new CategoricalDist with invalid actions masked out (masks combine)."""
+        mask = mask.bool()
+        if self._mask is not None:
+            mask = mask & self._mask
         return CategoricalDist(logits=self.logits, mask=mask)
 
     @classmethod
     def cat(cls, dists: Sequence[CategoricalDist]) -> CategoricalDist:
-        # logits are already normalized and masked (-inf), so no mask is needed.
-        return CategoricalDist(logits=torch.cat([d.logits for d in dists], dim=0))
+        """Concatenate along the batch; masks are concatenated (unmasked parts: all legal)."""
+        logits = torch.cat([d.logits for d in dists], dim=0)
+        if all(d.mask is None for d in dists):
+            return CategoricalDist(logits=logits)
+        mask = torch.cat([
+            d.mask if d.mask is not None else torch.ones_like(d.logits, dtype=torch.bool)
+            for d in dists
+        ], dim=0)
+        return CategoricalDist(logits=logits, mask=mask)
 
 
 class DiagGaussianDist(Distribution):
@@ -132,9 +166,10 @@ class DiagGaussianDist(Distribution):
 
     @classmethod
     def cat(cls, dists: Sequence[DiagGaussianDist]) -> DiagGaussianDist:
+        # log_std may be broadcast (e.g. a [D] parameter): expand it to the mean's shape.
         return DiagGaussianDist(
             torch.cat([d._mean for d in dists], dim=0),
-            torch.cat([d._log_std for d in dists], dim=0),
+            torch.cat([torch.broadcast_to(d._log_std, d._mean.shape) for d in dists], dim=0),
         )
 
 

@@ -112,3 +112,19 @@ def test_chunk_to_and_serialization_keep_initial_state():
     stateless = _chunk(model, None)
     data, compressed = serialize_chunk(stateless)
     assert deserialize_chunk("a", 0, data, compressed).initial_state is None
+
+
+@pytest.mark.parametrize("core", ["none", "lstm"])
+def test_minibatch_slice_of_step_batch_equals_prepared_minibatch(core):
+    """train_step prepares the batch once and slices minibatches; the loss must not change."""
+    from colosseum.algorithms.appo import _select_chunks
+    from helpers import MaskedToyEnv, rollout_chunks
+
+    model = make_simple_model(obs_dim=4, num_actions=4, core=core, seed=0)
+    chunks = rollout_chunks(model, MaskedToyEnv, num_chunks=4, chunk_length=8)
+    algo = APPO(model, AlgorithmConfig(), device="cpu")
+    idx = torch.tensor([2, 0])
+    sliced = algo.compute_loss([chunks[2], chunks[0]], batch=_select_chunks(algo._prepare_batch(chunks), idx))
+    fresh = algo.compute_loss([chunks[2], chunks[0]])
+    for key in fresh:
+        torch.testing.assert_close(sliced[key], fresh[key], msg=key)
