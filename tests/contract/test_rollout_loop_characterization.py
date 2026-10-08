@@ -68,7 +68,7 @@ def test_multi_agent_routing_by_slot():
         agent_ids=["a", "b"], num_envs=2, chunk_length=4,
         slot_agent_map=[["a", "b"], ["a", "b"]],
     )
-    run_steps(loop, 8)
+    run_steps(loop, 9)  # the 2nd chunk of each slot is full after step 8, sealed on step 9 (T3.1)
     loop.close()
 
     by_agent = {"a": 0, "b": 0}
@@ -88,7 +88,7 @@ def test_non_collecting_checkpoint_slot_produces_no_chunks():
         slot_network_map=[["latest", "ckpt_v1"], ["latest", "ckpt_v1"]],
         checkpoint_state_dicts_by_agent={"agent_0": {"ckpt_v1": ckpt}},
     )
-    run_steps(loop, 8)
+    run_steps(loop, 9)  # the 2nd chunk of each slot is full after step 8, sealed on step 9 (T3.1)
     loop.close()
 
     assert len(rec.chunks) == 4
@@ -119,16 +119,18 @@ def test_initial_and_periodic_weight_sync_set_policy_version():
         num_envs=1, chunk_length=4, weight_sync_interval=0.0,
         initial_weights={"agent_0": weights_payload("agent_0", src, 7)},
     )
-    run_steps(loop, 4)
+    # A full chunk is sealed when its slot acts again (T3.1): step 5 seals the
+    # chunk of steps 1..4 and opens the next one, still under version 7.
+    run_steps(loop, 5)
     assert [c.behavior_policy_version for c in rec.chunks] == [7, 7]
 
     rec.weights["agent_0"] = [weights_payload("agent_0", src, 9)]
-    run_steps(loop, 1)  # the sync at the end of this step picks up version 9
-    run_steps(loop, 3)
+    run_steps(loop, 1)  # the sync at the end of this step (6) picks up version 9
+    run_steps(loop, 3)  # step 9 seals the chunk of steps 5..8
     # behavior_policy_version is the version at a chunk's FIRST transition (T2.6):
     # these chunks started on step 5, before the sync loaded version 9.
     assert [c.behavior_policy_version for c in rec.chunks[2:]] == [7, 7]
-    run_steps(loop, 4)  # chunks recorded entirely under version 9
+    run_steps(loop, 4)  # chunks of steps 9..12 (sealed on step 13), entirely under version 9
     loop.close()
     assert [c.behavior_policy_version for c in rec.chunks[4:]] == [9, 9]
     latest = loop._models["agent_0"]["latest"]

@@ -342,3 +342,37 @@ def slot_transitions(chunks: list[TrajectoryChunk]) -> dict[tuple[int, int], lis
                 "value": float(chunk.values[i]), "log_prob": float(chunk.action_log_probs[i]),
             })
     return out
+
+
+def reference_transitions(log: list[dict], num_players: int) -> dict[int, list[dict]]:
+    """Straightforward reference: per player, one transition per acting step.
+
+    A transition gets every reward from its own step until the player's next
+    action (or the episode end); rewards before a player's first action in an
+    episode go to that first transition; the last transition of each episode has
+    ``done=True``. ``log`` is an env's step log (see ``GridStepEnv``).
+    """
+    out: dict[int, list[dict]] = {p: [] for p in range(num_players)}
+    open_tr: dict[int, dict | None] = {p: None for p in range(num_players)}
+    pending = {p: 0.0 for p in range(num_players)}
+    for step in log:
+        for p in range(num_players):
+            if step["active"][p]:
+                tr = {"ep": step["ep"], "t": step["t"], "action": step["actions"][p],
+                      "reward": pending[p], "done": False}
+                out[p].append(tr)
+                open_tr[p] = tr
+                pending[p] = 0.0
+        for p in range(num_players):
+            reward = float(step["rewards"][p])
+            if open_tr[p] is not None:
+                open_tr[p]["reward"] += reward
+            else:
+                pending[p] += reward
+        if step["done"]:
+            for p in range(num_players):
+                if open_tr[p] is not None:
+                    open_tr[p]["done"] = True
+                open_tr[p] = None
+                pending[p] = 0.0
+    return out

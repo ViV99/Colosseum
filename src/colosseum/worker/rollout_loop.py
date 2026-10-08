@@ -14,6 +14,12 @@ Buffers are owned by agents (``worker/slots.py``): each collecting slot holds
 one buffer, and on match re-assignment a slot's partial buffer is parked for
 its agent instead of being discarded (spec block 2). A chunk's
 ``behavior_policy_version`` is the version at its FIRST transition.
+
+A slot's transition stays open (collecting rewards) until the slot acts again
+or its episode ends (spec block 3). A full buffer is sealed when the slot acts
+again, with ``bootstrap_value`` = the value from that action's batched
+inference, or at once with ``bootstrap_value = 0`` when the episode ends; there
+is no separate bootstrap forward pass.
 """
 
 from __future__ import annotations
@@ -183,7 +189,7 @@ class RolloutLoop:
         actions, log_probs, values, pre_states = self._infer(obs, masks)
         self._open_transitions(obs, actions, log_probs, values, masks, acting, pre_states)
         next_obs, rewards, terminated, truncated, infos = self._vec_env.step(actions)
-        self._after_env_step(next_obs, rewards, terminated, truncated, infos)
+        self._after_env_step(rewards, terminated, truncated, infos)
         self._obs, self._infos = next_obs, infos
         n = self._num_envs
         self._env_steps += n
@@ -394,11 +400,13 @@ class RolloutLoop:
         return actions, log_probs, values, pre_states
 
     def _open_transitions(self, obs, actions, log_probs, values, masks, acting, pre_states) -> None:
-        """Record a transition for every acting collecting slot.
+        """For every acting collecting slot: if its buffer is full, seal it with
+        ``bootstrap_value`` = the value from this step's inference; then open a
+        new transition. The previous transition (if any) closes implicitly.
 
-        Slots that report ``info["active"] = False`` are not recorded. A buffer's
-        first transition records the slot's pre-step state and the agent's
-        current policy version.
+        Slots that report ``info["active"] = False`` are not recorded, and their
+        open transition (if any) stays open. A buffer's first transition records
+        the slot's pre-step state and the agent's current policy version.
         """
         E, P = self._num_envs, self._num_players
         masks3 = None if masks is None else masks.reshape(E, P, -1)
@@ -409,6 +417,8 @@ class RolloutLoop:
                 track = self._tracks[e][p]
                 aid = self._slot_agent_map[e][p]
                 buf = track.buffer
+                if buf.is_full:
+                    self._seal(aid, buf, bootstrap_value=float(values[e, p]))
                 if buf.steps == 0:
                     buf.begin_chunk(pre_states[(e, p)], self._policy_versions[aid])
                 buf.open(
@@ -418,37 +428,31 @@ class RolloutLoop:
                 track.has_open = True
                 self._recorded[aid] += 1
 
-    def _after_env_step(self, next_obs, rewards, terminated, truncated, infos) -> None:
-        """Give each transition recorded this step its reward and done flag;
-        seal full buffers (bootstrap = V(next_obs), or 0 after a terminal step)."""
+    def _after_env_step(self, rewards, terminated, truncated, infos) -> None:
+        """Add each collecting slot's reward to its open transition, then end
+        finished episodes. Transitions stay open until the slot acts again."""
         E, P = self._num_envs, self._num_players
         self._ep_rewards += rewards
         self._ep_lengths += 1
         for e in range(E):
-            done = bool(terminated[e] or truncated[e])
             for p in range(P):
                 track = self._tracks[e][p]
-                if not (self._collect_mask[e][p] and track.has_open):
-                    continue
-                buf = track.buffer
-                buf.add_reward(float(rewards[e, p]))
-                if done:
-                    buf.mark_done()
-                track.has_open = False
-                if buf.is_full:
-                    boot = 0.0 if done else self._bootstrap_value_forward(e, p, next_obs[e, p])
-                    self._seal(self._slot_agent_map[e][p], buf, bootstrap_value=boot)
-            if done:
+                if self._collect_mask[e][p] and track.has_open:
+                    track.buffer.add_reward(float(rewards[e, p]))
+            if terminated[e] or truncated[e]:
                 self._end_episode(e, infos[e])
 
     def _end_episode(self, e: int, info_e: dict) -> None:
+        """Mark every open transition done; seal full buffers with bootstrap 0;
+        report the result; apply a staged re-assignment; reset model states."""
         P = self._num_players
         for p in range(P):
-            buf = self._tracks[e][p].buffer
-            # A collecting slot that did not act on the last step still ends its
-            # episode here: its last recorded transition gets done=True.
-            if self._collect_mask[e][p] and buf is not None and buf.steps > 0:
-                buf.mark_done()
+            track = self._tracks[e][p]
+            if self._collect_mask[e][p] and track.has_open:
+                track.buffer.mark_done()
+                track.has_open = False
+                if track.buffer.is_full:
+                    self._seal(self._slot_agent_map[e][p], track.buffer, bootstrap_value=0.0)
         self._report_result(e, info_e)
         self._ep_rewards[e] = 0.0
         self._ep_lengths[e] = 0
@@ -456,14 +460,6 @@ class RolloutLoop:
         self._apply_pending_assignment(e)
         for p in range(P):
             self._tracks[e][p].state = self._initial_state(e, p)
-
-    def _bootstrap_value_forward(self, e: int, p: int, next_obs: np.ndarray) -> float:
-        """V(next_obs) from the slot agent's latest model with the slot's state."""
-        model = self._models[self._slot_agent_map[e][p]][LATEST_NETWORK_ID]
-        obs_b = torch.from_numpy(np.ascontiguousarray(next_obs[None], dtype=np.float32))
-        with torch.no_grad():
-            out = model.step(obs_b, self._tracks[e][p].state)
-        return float(out.value[0])
 
     def _seal(self, aid: str, buf: RolloutBuffer, bootstrap_value: float) -> None:
         chunk = buf.build_chunk(aid, bootstrap_value)

@@ -18,7 +18,7 @@ def test_chunks_carry_initial_state_with_batch_one(core):
     torch.manual_seed(0)
     loop, rec = make_loop(model_factories={"agent_0": lambda: simple_factory(core)},
                           num_envs=2, chunk_length=4)
-    run_steps(loop, 8)
+    run_steps(loop, 9)  # the 2nd chunk of each slot is full after step 8, sealed on step 9 (T3.1)
     loop.close()
     assert len(rec.chunks) == 8
     for c in rec.chunks:
@@ -55,7 +55,7 @@ def test_chunk_initial_state_owns_compact_storage():
     torch.manual_seed(0)
     loop, rec = make_loop(model_factories={"agent_0": lambda: simple_factory("lstm")},
                           num_envs=2, chunk_length=4)
-    run_steps(loop, 8)
+    run_steps(loop, 9)  # the 2nd chunk of each slot is full after step 8, sealed on step 9 (T3.1)
     loop.close()
     mid_episode = rec.chunks[4:]
     assert mid_episode
