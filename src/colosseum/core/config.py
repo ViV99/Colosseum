@@ -403,10 +403,20 @@ class RunConfig(StrictModel):
 
 
 class TransportConfig(StrictModel):
-    """Communication backend settings."""
+    """Communication backend settings.
 
-    mode: TransportMode = Field(default=TransportMode.LOCAL, description="Transport backend to use.")
-    grpc_port: int = Field(default=50051, ge=1, le=65535, description="Port for gRPC services (when mode='grpc').")
+    ``mode`` and ``grpc_port`` are unused in SP1; kept for SP5 (distribution). Distributed
+    roles take their ports as command-line flags.
+    """
+
+    mode: TransportMode = Field(
+        default=TransportMode.LOCAL,
+        description="Transport backend to use. Unused in SP1; kept for SP5 (distribution).",
+    )
+    grpc_port: int = Field(
+        default=50051, ge=1, le=65535,
+        description="Port for gRPC services. Unused in SP1; kept for SP5 (distribution).",
+    )
     grpc_max_message_mb: int = Field(
         default=64,
         ge=1,

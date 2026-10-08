@@ -298,6 +298,7 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
 ### Partial
 - **Distributed mode** (`serve-weight-store`, `run-learner`, `run-workers`) works for latest-weights self-play only: no coordinator, league, ratings, `metrics.jsonl` or WandB; per-worker budgets; `run-learner` ignores `training.resume_from`.
 - **`deployment/`** (Docker, K8s) is not tested.
+- **Unused in SP1, kept for SP5:** `transport/local.py::LocalTransport`, `weight_store/shared_memory.py::SharedMemoryWeightStore` and the config keys `transport.mode` / `transport.grpc_port`. The single-machine launcher wires `mp.Queue` objects directly; distributed roles take ports as command-line flags.
 - **GPU:** never run on CUDA during SP1. All CUDA paths (learner device, AMP fp16/bf16, `pin_memory`, kickstart/BC on CUDA) are covered only by `gpu`-marked tests that have not been executed yet; see `docs/GPU_CHECKS.md`.
 
 ### Not implemented (see Roadmap)

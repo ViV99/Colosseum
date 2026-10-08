@@ -3,6 +3,9 @@
 ``WeightPayload.state_dict`` is a ``dict[str, np.ndarray]`` (spec block 2), so the
 stores keep it as is. Numpy arrays pickle safely across processes, unlike torch
 tensors shared through file descriptors (R6-02).
+
+``InMemoryWeightStore`` backs the gRPC weight store server. ``SharedMemoryWeightStore``
+is unused in SP1; kept for SP5 (distribution).
 """
 
 from __future__ import annotations
@@ -46,7 +49,11 @@ class InMemoryWeightStore(BaseWeightStore):
 
 
 class SharedMemoryWeightStore(BaseWeightStore):
-    """Weight store backed by a ``multiprocessing.Manager`` dict."""
+    """Weight store backed by a ``multiprocessing.Manager`` dict.
+
+    Unused in SP1; kept for SP5 (distribution). Single-machine weights travel through
+    newest-wins ``mp.Queue`` mailboxes (``core.ipc.put_latest``).
+    """
 
     def __init__(self) -> None:
         import multiprocessing as mp

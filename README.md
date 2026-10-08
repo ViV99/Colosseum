@@ -380,7 +380,9 @@ src/colosseum/
   coordinator/  coordinator, matchmaker, ratings, checkpoint_manager, agent_pool
   metrics/      jsonl, aggregator, console, hub, wandb_logger
   envs/         base_env, vec_env, subproc_vec_env
-  bc/ transport/ weight_store/ utils/
+  transport/    gRPC trajectory transport (distributed mode); LocalTransport is unused in SP1, kept for SP5
+  weight_store/ gRPC weight store (distributed mode); SharedMemoryWeightStore is unused in SP1, kept for SP5
+  bc/ utils/
 examples/       tic_tac_toe, composite_action (chase), space_miners (Box2D, from the examples extra)
 configs/examples/
 scripts/        setup-dev.sh, bench_throughput.py
