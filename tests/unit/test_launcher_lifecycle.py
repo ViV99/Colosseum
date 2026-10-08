@@ -202,8 +202,8 @@ def test_failed_start_error_is_not_hidden_by_a_failing_teardown(tmp_path, monkey
 
 
 def test_launch_closes_and_releases_its_queues(tmp_path, monkeypatch):
-    """After launch() every queue it created is released, not left to the cyclic GC (gh-109629):
-    queues the main process only reads are closed; command queues (it writes them) are not."""
+    """After launch() every queue it created is closed and released, not left to the cyclic GC
+    (gh-109629): also the command queues, which the main process writes."""
     created: list = []
     real_queue = mp.Queue
 
@@ -222,10 +222,41 @@ def test_launch_closes_and_releases_its_queues(tmp_path, monkeypatch):
         launcher.launch()
     # 1 agent x (trajectory + checkpoint + 2 weight queues) + metrics + results + 2 command queues
     assert len(created) == 8
-    assert [q._closed for q in created].count(False) == 2  # the two command queues
+    assert all(q._closed for q in created)
     assert launcher._all_queues == [] and launcher._command_queues == []
     assert launcher._trajectory_queues == {} and launcher._checkpoint_queues == {}
     assert launcher._results_queue is None and launcher._metrics_queue is None
+
+
+def _live_feeder_threads() -> set[threading.Thread]:
+    return {t for t in threading.enumerate() if t.name == "QueueFeederThread" and t.is_alive()}
+
+
+def test_launch_leaves_no_queue_feeder_thread_running(tmp_path, monkeypatch):
+    """A worker command still unread when the run ends (the workers stopped first) must not keep
+    the main process's feeder thread alive after launch() returns: at interpreter exit that
+    daemon thread would free the queue's semaphores ("leaked semaphore objects" warning)."""
+    feeders_before = _live_feeder_threads()
+    started: list = []
+    monkeypatch.setattr(launcher_module.mp, "Process", fake_process_class(started, fail_on_worker=False))
+    data = ttt_data(total_timesteps=1000)
+    data["rollout"]["num_workers"] = 2
+    data["rollout"]["match_refresh_interval_sec"] = 0.01
+    cfg = ColosseumConfig.model_validate(data)
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
+    refresh = launcher._refresh_worker_matches
+
+    def refresh_then_reach_budget(*args):
+        refresh(*args)  # one command per worker, never read: the fake workers do not run
+        launcher._env_step_counter.add(cfg.training.total_timesteps)
+
+    launcher._refresh_worker_matches = refresh_then_reach_budget
+    assert launcher.launch() == 0
+    command_queues = [p.kwargs["command_queue"] for p in started if p.target is launcher_module._worker_target]
+    assert len(command_queues) == 2
+    assert all(q._thread is not None for q in command_queues)  # the main process fed each of them
+    assert not _live_feeder_threads() - feeders_before
+    assert all(q._closed for q in command_queues)
 
 
 # ---------------------------------------------------------------------------
@@ -352,9 +383,15 @@ def test_drain_skips_checkpoint_queue_of_a_learner_killed_mid_message(tmp_path, 
     assert ("An incomplete item on the checkpoint-agent_0 queue was never completed "
             "(learner-agent_0 died while sending)") in caplog.text
     assert saved == [{"agent_id": "agent_0", "policy_version": 1}]  # the complete item is kept
-    launcher._release_queues()
-    assert not cq._closed  # its read is stuck on the partial message: the pipe stays open under it
-    assert launcher._all_queues == [] and list(launcher._readers.values())  # only the busy reader is kept
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger="colosseum.launcher"):
+        launcher._release_queues()
+    # Every producer is gone, so closing this process's write end ends the stuck read (EOF): the
+    # reader thread finishes and the queue is closed and released now, not at interpreter exit.
+    assert not [t for t in threading.enumerate() if t.name == "drain-checkpoint-agent_0"]
+    assert cq._closed
+    assert launcher._all_queues == [] and launcher._readers == {}
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], caplog.text
 
 
 def _slow_to_unpickle() -> dict:

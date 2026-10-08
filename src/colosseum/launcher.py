@@ -50,6 +50,9 @@ _RESULTS_QUEUE_SIZE = 1000
 # One slot: a command that was put has been taken by the worker before the next one
 # can be put, so no command (and none of its new_checkpoints) is replaced unseen (D9).
 _COMMAND_QUEUE_SIZE = 1
+# Bound on each step of releasing the queues after the teardown (reading back unread
+# commands, joining feeder threads, ending abandoned reads); see Launcher._release_queues.
+_QUEUE_RELEASE_SEC = 1.0
 
 
 # =====================================================================
@@ -365,12 +368,15 @@ class _QueueReader:
                 except queue.Empty:
                     break
                 except (EOFError, OSError) as e:
-                    logger.warning(f"Dropped an unreadable {self._label} queue item: {e!r}")
+                    if self.abandoned:  # ended by release(): the incomplete item was already reported
+                        logger.debug(f"Abandoned read on the {self._label} queue ended: {e!r}")
+                    else:
+                        logger.warning(f"Dropped an unreadable {self._label} queue item: {e!r}")
                     break
                 self._items.append(item)
         except BaseException as e:  # noqa: BLE001 - re-raised by drain() in the main thread
             self._error = e
-        if self.abandoned:
+        if self.abandoned and self._items:
             logger.warning(f"{len(self._items)} item(s) completed on the abandoned {self._label} queue "
                            f"after shutdown gave up on it; dropped")
 
@@ -415,6 +421,73 @@ class _QueueReader:
         source = f" ({', '.join(dead)} died while sending)" if dead else ""
         logger.error(f"An incomplete item on the {self._label} queue was never completed{source}; "
                      f"it and the rest of that queue are skipped")
+
+    def release(self, timeout: float) -> bool:
+        """End an abandoned read; True once no read thread is left (``timeout`` bounds the wait).
+
+        An abandoned read means every producer is gone, so this process holds the pipe's last
+        write end (it never writes to the queues it reads): closing it makes the stuck
+        ``recv_bytes`` hit end-of-file and the thread exit. The queue can then be closed and
+        freed on the calling thread, rather than its semaphores being finalized with this
+        daemon thread at interpreter exit. Should a producer still hold a write end, the
+        read stays stuck and False is returned.
+        """
+        if self.busy and self.abandoned:
+            try:
+                self._q._writer.close()
+            except (AttributeError, OSError):
+                pass
+            self._thread.join(timeout)
+        return not self.busy
+
+
+def _release_command_queues(queues: list, timeout: float) -> list:
+    """Close the queues this process writes to (worker command queues, maxsize 1) and wait,
+    bounded by ``timeout`` per step, until their feeder threads have exited.
+
+    A feeder thread still running when its queue is freed, or at interpreter exit, drops the
+    last references to the queue's semaphores on that daemon thread, which then unlinks them
+    during interpreter shutdown ("leaked semaphore objects" warning). A command its worker
+    never took would keep the feeder busy (a large one blocks in the pipe write), so it is
+    read back first. A queue still full at the deadline (its reader died holding the read
+    lock) or whose feeder does not exit in time is detached instead (``cancel_join_thread``,
+    the previous behaviour). Returns the queues that were detached.
+    """
+    deadline = time.monotonic() + timeout
+    detached: list = []
+    joiners: list[tuple[Any, threading.Thread]] = []
+    for q in queues:
+        try:
+            while q.full() and time.monotonic() < deadline:
+                try:
+                    q.get(timeout=0.05)
+                except queue.Empty:
+                    pass
+            if q.full():
+                detached.append(q)
+                continue
+            q.close()
+        except Exception as e:  # noqa: BLE001 - best effort: a release never replaces the run's outcome
+            logger.debug(f"Could not drain and close a command queue: {e!r}")
+            detached.append(q)
+            continue
+        joiner = threading.Thread(target=q.join_thread, name="queue-release", daemon=True)
+        joiner.start()
+        joiners.append((q, joiner))
+    join_deadline = time.monotonic() + timeout
+    for q, joiner in joiners:
+        joiner.join(max(0.0, join_deadline - time.monotonic()))
+        if joiner.is_alive():
+            detached.append(q)
+    for q in detached:
+        try:
+            q.cancel_join_thread()
+        except AttributeError:
+            pass
+    if detached:
+        logger.debug(f"{len(detached)} command queue(s) could not be drained and closed in time; "
+                     f"their feeder threads are detached")
+    return detached
 
 
 def _queue_depths(queues: dict[str, Any]) -> dict[str, int]:
@@ -983,10 +1056,14 @@ class Launcher:
                                f"{', '.join(killed)}")
             poll()
             self._finish_reads(max(deadline, time.monotonic() + 1.0), poll)
-            # Detach queue feeder threads so a queue still holding undrained data
-            # (e.g. trajectory chunks a now-dead learner never consumed, or large
-            # WorkerCommands) cannot block this process from exiting.
+            # Detach queue feeder threads so a queue still holding undrained data (e.g.
+            # trajectory chunks a now-dead learner never consumed) cannot block this process
+            # from exiting. The command queues (fed by this process) are drained, closed and
+            # joined with a bound by _release_queues instead.
+            produced_here = {id(q) for q in self._command_queues}
             for q in self._all_queues:
+                if id(q) in produced_here:
+                    continue
                 try:
                     q.cancel_join_thread()
                 except (AttributeError, OSError):
@@ -1002,18 +1079,26 @@ class Launcher:
         Without this, the queues (and their semaphores) outlive ``launch`` until the cyclic
         GC frees them, e.g. along with a traceback; a GC that runs inside the
         multiprocessing resource tracker then warns that they "might leak" (gh-109629).
-        - A queue still being read by a helper thread (a read abandoned on an incomplete
-          message) stays open: closing its pipe under that thread is unsafe.
-        - Command queues (the main process is their producer) are not closed: closing the
-          read end would turn a feeder blocked on an unread command into a BrokenPipeError
-          traceback. Their feeders exit once the queue objects are freed.
+        Every step is bounded by ``_QUEUE_RELEASE_SEC``, so a release never blocks the exit.
+        - Command queues (this process is their producer): unread commands are read back,
+          then the queue is closed and its feeder thread joined, so no feeder outlives
+          ``launch`` to unlink the semaphores during interpreter shutdown
+          (``_release_command_queues``).
+        - A read abandoned on an incomplete message is ended first (``_QueueReader.release``).
+          Should it stay stuck (a producer still holds a write end), its queue stays open:
+          closing the pipe under that thread is unsafe.
         """
+        for reader in self._readers.values():
+            reader.release(_QUEUE_RELEASE_SEC)
         busy = {key: reader for key, reader in self._readers.items() if reader.busy}
         produced_here = {id(q) for q in self._command_queues}
+        _release_command_queues(self._command_queues, _QUEUE_RELEASE_SEC)
         for q in self._all_queues:
+            if id(q) in produced_here:
+                continue
             try:
                 q.cancel_join_thread()  # idempotent; also when _shutdown never got this far
-                if id(q) not in busy and id(q) not in produced_here:
+                if id(q) not in busy:
                     q.close()
             except (AttributeError, OSError):
                 pass
