@@ -95,7 +95,7 @@ def _ttt_config(**sections):
 
 
 def _run_learner_target(monkeypatch, config, num_learners, seen=None):
-    """Call ``_learner_target`` in-process with ``learner_process`` stubbed out.
+    """Call the learner body ``_learner_main`` in-process with ``learner_process`` stubbed out.
 
     Returns the torch thread count and the algorithm seen by the learner loop;
     ``seen`` (if given) also receives the ``learner_process`` kwargs.
@@ -103,7 +103,7 @@ def _run_learner_target(monkeypatch, config, num_learners, seen=None):
     import sys
 
     import colosseum.learner.learner as learner_mod
-    from colosseum.launcher import _learner_target
+    from colosseum.launcher import _learner_main
 
     seen = {} if seen is None else seen
 
@@ -113,10 +113,10 @@ def _run_learner_target(monkeypatch, config, num_learners, seen=None):
         seen["algorithm"] = kwargs["algorithm_factory"]()
 
     monkeypatch.setattr(learner_mod, "learner_process", fake_learner_process)
-    monkeypatch.setattr(sys, "path", list(sys.path))  # _learner_target prepends "."
+    monkeypatch.setattr(sys, "path", list(sys.path))  # _learner_main prepends "."
     before = torch.get_num_threads()
     try:
-        _learner_target(
+        _learner_main(
             agent_id="agent_0", config=config, trajectory_queue=None, weight_queues=[],
             stop_event=None, metrics_queue=None, num_learners=num_learners,
         )

@@ -456,3 +456,12 @@ def twelve_unit_model(peaked: bool = True) -> ComposedModel:
     torch.manual_seed(0)
     return ComposedModel(SimpleEncoder(TWELVE_OBS_DIM, 16), NoCore(input_dim=16),
                          TwelveHeadPolicy(16, peaked), SimpleValue(16))
+
+
+def make_test_run_dir(config, tmp_path, name: str = "test-run"):
+    """Point ``config.run`` at ``tmp_path`` and create the run dir (tests never write to cwd)."""
+    from colosseum.core.run_dir import RunDir
+
+    config.run.dir = str(tmp_path / "runs")
+    config.run.name = name
+    return RunDir.create(config)

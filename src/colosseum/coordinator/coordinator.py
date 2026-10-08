@@ -28,7 +28,7 @@ logger = logging.getLogger(__name__)
 class Coordinator:
     """Central coordinator for training pipeline."""
 
-    def __init__(self, config: ColosseumConfig, checkpoint_dir: str | Path | None = None) -> None:
+    def __init__(self, config: ColosseumConfig, checkpoint_dir: str | Path) -> None:
         self._config = config
         # One RNG for matchmaking and seat shuffling: runs with the same seed get the same schedule.
         self._rng = random.Random(config.training.seed)
@@ -36,7 +36,7 @@ class Coordinator:
         for agent_id in config.get_trainable_agent_ids():
             self._agent_pool.register_trainable(agent_id)
         self._checkpoint_manager = CheckpointManager(
-            base_dir=checkpoint_dir if checkpoint_dir is not None else config.checkpoint.dir,
+            base_dir=checkpoint_dir,
             pool_size=config.self_play.pool_size,
         )
         self._match_results: deque[MatchResult] = deque(maxlen=10000)

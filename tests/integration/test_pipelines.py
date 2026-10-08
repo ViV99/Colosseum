@@ -11,14 +11,13 @@ import pytest
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.types import TrajectoryChunk
-from helpers import example_config
+from helpers import example_config, make_test_run_dir
 
 
 def _config(name: str, tmp_path, **sections: dict) -> ColosseumConfig:
-    """Example config with checkpoints under tmp_path, WandB off and section overrides."""
+    """Example config with WandB off and section overrides (runs go to tmp_path via make_test_run_dir)."""
     data = load_config(example_config(name)).model_dump()
     data["metrics"]["use_wandb"] = False
-    data["checkpoint"]["dir"] = str(tmp_path / "checkpoints")
     for section, values in sections.items():
         data[section].update(values)
     return ColosseumConfig(**data)
@@ -118,8 +117,9 @@ def test_full_pipeline(tmp_path):
         rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
         learner={"batch_chunks": 2, "queue_size": 16},
     )
-    Launcher(config).launch()
-    assert CheckpointManager(str(tmp_path / "checkpoints")).list_checkpoints("agent_0")
+    run = make_test_run_dir(config, tmp_path)
+    Launcher(config, run).launch()
+    assert CheckpointManager(run.checkpoints).list_checkpoints("agent_0")
 
 
 @pytest.mark.timeout(900)
@@ -137,8 +137,9 @@ def test_full_pipeline_with_checkpoint_pool(tmp_path):
         # (exact versions depend on timing).
         self_play={"checkpoint_interval": 40, "pool_size": 5},
     )
-    Launcher(config).launch()
-    ckpts = CheckpointManager(str(tmp_path / "checkpoints"), pool_size=5).list_checkpoints("agent_0")
+    run = make_test_run_dir(config, tmp_path)
+    Launcher(config, run).launch()
+    ckpts = CheckpointManager(run.checkpoints, pool_size=5).list_checkpoints("agent_0")
     versions = [c.policy_version for c in ckpts]
     assert len(versions) == 5, versions
     assert all(a < b for a, b in zip(versions, versions[1:])), versions
@@ -159,8 +160,9 @@ def test_multi_agent_pipeline(tmp_path):
         learner={"batch_chunks": 2, "queue_size": 16},
         self_play={"checkpoint_interval": 50},
     )
-    Launcher(config).launch()
-    manager = CheckpointManager(str(tmp_path / "checkpoints"))
+    run = make_test_run_dir(config, tmp_path)
+    Launcher(config, run).launch()
+    manager = CheckpointManager(run.checkpoints)
     assert all(manager.list_checkpoints(aid) for aid in config.get_trainable_agent_ids())
 
 
@@ -200,7 +202,7 @@ def test_multi_agent_learners_both_train_until_the_budget(tmp_path, monkeypatch)
         learner={"batch_chunks": 2, "queue_size": 16, "device": "cpu"},
         metrics={"log_interval": 1},
     )
-    launcher = launcher_mod.Launcher(config)
+    launcher = launcher_mod.Launcher(config, make_test_run_dir(config, tmp_path))
     launcher.launch()
 
     assert launcher.env_steps_done >= 3000
@@ -230,8 +232,12 @@ def test_subprocess_vec_env_pipeline(tmp_path):
         },
         learner={"batch_chunks": 2, "queue_size": 16},
     )
-    Launcher(config).launch()
-    assert CheckpointManager(str(tmp_path / "checkpoints")).list_checkpoints("agent_0")
+    run = make_test_run_dir(config, tmp_path)
+    Launcher(config, run).launch()
+    assert CheckpointManager(run.checkpoints).list_checkpoints("agent_0")
+    # Env children log to worker-<i>-env<global offset>.log in the run dir (T6.2).
+    assert "worker-0-env0 started (pid" in (run.logs / "worker-0-env0.log").read_text()
+    assert "worker-0-env2 started (pid" in (run.logs / "worker-0-env2.log").read_text()
 
 
 @pytest.mark.timeout(900)
@@ -247,5 +253,7 @@ def test_full_pipeline_lstm_core(tmp_path):
     )
     data = config.model_dump()
     data["networks"]["core"] = {"class": "colosseum.networks.cores.LSTMCore", "kwargs": {"hidden_size": 32}}
-    Launcher(ColosseumConfig(**data)).launch()
-    assert CheckpointManager(str(tmp_path / "checkpoints")).list_checkpoints("agent_0")
+    lstm_config = ColosseumConfig(**data)
+    run = make_test_run_dir(lstm_config, tmp_path)
+    Launcher(lstm_config, run).launch()
+    assert CheckpointManager(run.checkpoints).list_checkpoints("agent_0")

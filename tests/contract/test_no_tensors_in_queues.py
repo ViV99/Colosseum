@@ -24,7 +24,7 @@ from dataflow_helpers import (
     chunk_payload,
     make_tiny_model,
 )
-from helpers import example_config
+from helpers import example_config, make_test_run_dir
 
 
 @pytest.fixture
@@ -87,17 +87,17 @@ def test_refresh_commands_carry_numpy_checkpoints(tmp_path):
     from colosseum.launcher import Launcher
 
     data = load_config(example_config("tic_tac_toe.yaml")).model_dump()
-    data["checkpoint"]["dir"] = str(tmp_path / "ckpt")
     data["training"]["phase"] = "self_play"
     data["self_play"]["latest_prob"] = 0.0
     data["rollout"]["envs_per_worker"] = 4
     data["metrics"]["use_wandb"] = False
     cfg = ColosseumConfig(**data)
-    coord = Coordinator(cfg)
+    coord = Coordinator(cfg, checkpoint_dir=tmp_path / "ckpt")
     coord.agent_pool.register_trainable("agent_0")
     coord.checkpoint_manager.save("agent_0", 50, state_dict_to_numpy(build_model(cfg).state_dict()))
     cq = CheckedQueue()
-    Launcher(cfg)._refresh_worker_matches(coord, ["agent_0"], [cq], [{"agent_0": set()}])
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
+    launcher._refresh_worker_matches(coord, ["agent_0"], [cq], [{"agent_0": set()}])
     cmd = cq.get_nowait()
     state_dict = cmd.new_checkpoints["agent_0"]["ckpt_v50"]
     assert all(isinstance(v, np.ndarray) for v in state_dict.values())

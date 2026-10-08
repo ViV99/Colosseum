@@ -61,7 +61,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["colosseum", "dataflow_helpers", "examples", "harness", "helpers"]
+known-first-party = ["cli_runner", "colosseum", "dataflow_helpers", "examples", "harness", "helpers"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

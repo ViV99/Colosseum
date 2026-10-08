@@ -47,7 +47,6 @@ self_play:
   self_play_ratio: 0.0   # all arena matches for testing
 
 checkpoint:
-  dir: "./checkpoints"
   save_optimizer: false
 
 metrics:

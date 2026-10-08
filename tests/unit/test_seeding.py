@@ -10,6 +10,7 @@ import yaml
 
 from colosseum.core.config import ColosseumConfig
 from colosseum.utils.seeding import derive_seed, learner_seed
+from helpers import make_test_run_dir
 
 TTT = "examples.tic_tac_toe"
 
@@ -64,13 +65,13 @@ def test_learner_seed_streams_are_deterministic_and_distinct():
 
 
 def test_local_learner_weights_follow_training_seed(capture_learner_model, restore_global_rng):
-    from colosseum.launcher import _learner_target
+    from colosseum.launcher import _learner_main
 
     cfg = ColosseumConfig.model_validate(cfg_data(seed=3))
 
     def run(seed):
         torch.manual_seed(12345 + len(capture_learner_model))  # a different global state each time
-        _learner_target(
+        _learner_main(
             agent_id="agent_0", config=cfg, trajectory_queue=None, weight_queues=[],
             stop_event=None, metrics_queue=None, seed=seed,
         )
@@ -82,7 +83,7 @@ def test_local_learner_weights_follow_training_seed(capture_learner_model, resto
     assert not np.array_equal(a, run(learner_seed(3, 1)))
 
 
-def test_launcher_gives_each_learner_its_own_seed_stream(monkeypatch, restore_global_rng):
+def test_launcher_gives_each_learner_its_own_seed_stream(tmp_path, monkeypatch, restore_global_rng):
     """Two agents in one run: each learner process gets learner_seed(seed, agent_index)."""
     import colosseum.launcher as launcher_module
 
@@ -92,7 +93,7 @@ def test_launcher_gives_each_learner_its_own_seed_stream(monkeypatch, restore_gl
         pass
 
     class FakeProcess:
-        def __init__(self, target, kwargs, daemon=None):
+        def __init__(self, target, kwargs, name=None, daemon=None):
             self.target, self.kwargs = target, kwargs
 
         def start(self):
@@ -103,15 +104,17 @@ def test_launcher_gives_each_learner_its_own_seed_stream(monkeypatch, restore_gl
 
     monkeypatch.setattr(launcher_module.mp, "Process", FakeProcess)
     cfg = ColosseumConfig.model_validate(cfg_data(seed=11, agents=["alpha", "beta"]))
+    run = make_test_run_dir(cfg, tmp_path, name="seeded")
     with pytest.raises(_Stop):
-        launcher_module.Launcher(cfg).launch()
+        launcher_module.Launcher(cfg, run).launch()
     assert [k["agent_id"] for k in learner_kwargs] == ["alpha", "beta"]
+    assert [k["log_dir"] for k in learner_kwargs] == [str(run.logs)] * 2
     assert [k["seed"] for k in learner_kwargs] == [learner_seed(11, 0), learner_seed(11, 1)]
 
     learner_kwargs.clear()
     unseeded = ColosseumConfig.model_validate(cfg_data(seed=None, agents=["alpha", "beta"]))
     with pytest.raises(_Stop):
-        launcher_module.Launcher(unseeded).launch()
+        launcher_module.Launcher(unseeded, make_test_run_dir(unseeded, tmp_path, name="unseeded")).launch()
     assert [k["seed"] for k in learner_kwargs] == [None, None]
 
 
@@ -144,7 +147,7 @@ def test_run_learner_seeds_before_building_the_model(
         torch.manual_seed(999 + len(capture_learner_model))
         distributed.run_distributed_learner(
             str(path), agent_id, 0, "localhost:1",
-            overrides={"training.seed": seed, "checkpoint.dir": str(tmp_path / "ckpt")},
+            overrides={"training.seed": seed, "run.dir": str(tmp_path / "runs")},
         )
         return capture_learner_model[-1]
 
@@ -154,10 +157,10 @@ def test_run_learner_seeds_before_building_the_model(
     assert not np.array_equal(a, run("beta", 5))  # distinct per-agent stream
 
     # Same stream as a local-mode learner of the same agent.
-    from colosseum.launcher import _learner_target
+    from colosseum.launcher import _learner_main
 
     cfg = ColosseumConfig.model_validate(cfg_data(seed=5, agents=["alpha", "beta"]))
-    _learner_target(
+    _learner_main(
         agent_id="alpha", config=cfg.get_agent_config("alpha"), trajectory_queue=None,
         weight_queues=[], stop_event=None, metrics_queue=None, seed=learner_seed(5, 0),
     )

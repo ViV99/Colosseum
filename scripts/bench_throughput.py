@@ -85,8 +85,11 @@ class _Recorder:
         pass
 
 
-def _make_config(num_workers: int, checkpoint_dir: str):
-    """The pinned benchmark workload. Every workload-relevant value is explicit."""
+def _make_config(num_workers: int, run_parent: str):
+    """The pinned benchmark workload. Every workload-relevant value is explicit.
+
+    The run (logs, resolved config, checkpoints) goes to ``<run_parent>/bench-w<num_workers>``.
+    """
     from colosseum.core.config import ColosseumConfig
 
     return ColosseumConfig(
@@ -148,7 +151,8 @@ def _make_config(num_workers: int, checkpoint_dir: str):
             "latest_prob": 0.5,
             "shuffle_seats": True,  # one agent, every seat latest+collect: shuffling is a no-op
         },
-        checkpoint={"dir": checkpoint_dir, "save_optimizer": True},
+        checkpoint={"save_optimizer": True},
+        run={"dir": run_parent, "name": f"bench-w{num_workers}"},
         metrics={"use_wandb": False, "log_interval": 1},
         transport={"mode": "local"},
     )
@@ -191,12 +195,13 @@ def compute_rates(samples: list[tuple[float, int, int]], start: float, end: floa
 def run_one(num_workers: int, duration: float, warmup: float) -> dict:
     """Run one configuration; raises RuntimeError if the window is incomplete."""
     import colosseum.launcher as launcher_mod
+    from colosseum.core.run_dir import RunDir
 
     _SAMPLES.clear()
     launcher_mod.WandBLogger = _Recorder
     with tempfile.TemporaryDirectory(prefix="bench-") as tmp:
         config = _make_config(num_workers, tmp)
-        launcher = launcher_mod.Launcher(config)
+        launcher = launcher_mod.Launcher(config, RunDir.create(config))
         started = time.monotonic()
         timer = threading.Timer(warmup + duration, launcher._stop_event.set)
         timer.start()

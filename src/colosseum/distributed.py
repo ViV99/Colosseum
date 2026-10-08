@@ -43,7 +43,10 @@ from functools import partial
 import torch
 
 from colosseum.core.config import ColosseumConfig, config_hash, load_config
+from colosseum.core.run_dir import RunDir
 from colosseum.core.types import WeightPayload
+from colosseum.utils.logging import setup_process_logging
+from colosseum.utils.process import run_child
 from colosseum.utils.seeding import apply_global_seed, learner_seed
 
 logger = logging.getLogger(__name__)
@@ -143,12 +146,12 @@ def run_distributed_learner(
     from colosseum.transport.grpc_transport import serve_trajectory_receiver
     from colosseum.weight_store.grpc_store import GRPCWeightStore
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
+    setup_process_logging(None, f"learner-{agent_id}", console_level=logging.INFO)
     config = load_config(config_path, overrides)
+    run_dir = RunDir.create(config, config_path, role=f"learner-{agent_id}")
+    setup_process_logging(run_dir.logs, f"learner-{agent_id}", console_level=logging.INFO)
+    run_dir.write_resolved_config(config)
+    print(f"Run directory: {run_dir.root}", flush=True)
     acfg = config.get_agent_config(agent_id)
     validate_config(acfg)
     max_mb = config.transport.grpc_max_message_mb
@@ -175,7 +178,7 @@ def run_distributed_learner(
     from colosseum.coordinator.checkpoint_manager import CheckpointManager
     checkpoint_queue: queue.Queue = queue.Queue(maxsize=16)
     coordinator_ckpt = CheckpointManager(
-        base_dir=config.checkpoint.dir,
+        base_dir=run_dir.checkpoints,
         pool_size=config.self_play.pool_size,
     )
 
@@ -282,7 +285,13 @@ def run_distributed_learner(
 # =====================================================================
 
 
-def _dist_worker_target(
+def _dist_worker_target(*, worker_id: int, log_dir: str | None = None, **kwargs) -> None:
+    """Distributed worker process entry point: process logging first."""
+    run_child(f"worker-{worker_id}", log_dir, _dist_worker_main, worker_id=worker_id, **kwargs)
+
+
+def _dist_worker_main(
+    *,
     worker_id: int,
     config: ColosseumConfig,
     agent_ids: list[str],
@@ -293,7 +302,7 @@ def _dist_worker_target(
     total_timesteps: int,
     slot_agent_map: list[list[str]],
 ) -> None:
-    """Worker process: gRPC clients in, rollout_worker_process unchanged."""
+    """Worker process body: gRPC clients in, rollout_worker_process unchanged."""
     import sys
     sys.path.insert(0, ".")
 
@@ -351,12 +360,12 @@ def run_distributed_workers(
     """
     from colosseum.core.registry import validate_config
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
+    setup_process_logging(None, "workers-main", console_level=logging.INFO)
     config = load_config(config_path, overrides)
+    run_dir = RunDir.create(config, config_path, role="workers")
+    setup_process_logging(run_dir.logs, "workers-main", console_level=logging.INFO)
+    run_dir.write_resolved_config(config)
+    print(f"Run directory: {run_dir.root}", flush=True)
     agent_ids = list(learner_addresses.keys()) or config.get_trainable_agent_ids()
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_ids}
     for aid in agent_ids:
@@ -379,10 +388,18 @@ def run_distributed_workers(
     for worker_id in range(config.rollout.num_workers):
         p = mp.Process(
             target=_dist_worker_target,
-            args=(
-                worker_id, config, agent_ids, agent_configs,
-                weight_store_address, learner_addresses, stop_event,
-                per_worker_steps, slot_agent_map,
+            name=f"worker-{worker_id}",
+            kwargs=dict(
+                worker_id=worker_id,
+                log_dir=str(run_dir.logs),
+                config=config,
+                agent_ids=agent_ids,
+                agent_configs=agent_configs,
+                weight_store_address=weight_store_address,
+                learner_addresses=learner_addresses,
+                stop_event=stop_event,
+                total_timesteps=per_worker_steps,
+                slot_agent_map=slot_agent_map,
             ),
             daemon=worker_daemon,
         )

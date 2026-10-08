@@ -67,6 +67,10 @@ def _worker_loop(
             seeding globally consistent: local env ``j`` maps to global env
             ``global_offset + j``).
     """
+    from colosseum.utils.logging import ENV_PROCESS_NAME, inherited_log_dir, setup_process_logging
+
+    setup_process_logging(inherited_log_dir(), f"{os.environ.get(ENV_PROCESS_NAME, 'envproc')}-env{global_offset}")
+
     import torch
 
     # Env children only step envs: one torch thread each (R2-04). OMP_NUM_THREADS=1

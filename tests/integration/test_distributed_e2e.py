@@ -36,7 +36,7 @@ def _port_open(port: int) -> bool:
 
 
 @pytest.mark.timeout(600)
-def test_distributed_grpc_pipeline(tmp_path):
+def test_distributed_grpc_pipeline(tmp_path, restore_root_logging):
     """The learner trains on chunks from gRPC workers and publishes weights (version > 0)."""
     from colosseum.distributed import run_distributed_learner, run_distributed_workers
     from colosseum.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
@@ -55,10 +55,14 @@ def test_distributed_grpc_pipeline(tmp_path):
         "learner.queue_size": 32,
         "self_play.checkpoint_interval": 1,
         "metrics.use_wandb": False,
-        "checkpoint.dir": str(tmp_path / "checkpoints"),
+        "run.dir": str(tmp_path / "runs"),
+        "run.name": "e2e",
     }
 
-    ckpt_root = tmp_path / "checkpoints" / agent
+    # Each role creates its own run dir: <run.name>-learner-<agent> and <run.name>-workers.
+    learner_run = tmp_path / "runs" / f"e2e-learner-{agent}"
+    workers_run = tmp_path / "runs" / "e2e-workers"
+    ckpt_root = learner_run / "checkpoints" / agent
     ws_server = serve_weight_store(port=ws_port)
     learner = mp.Process(
         target=run_distributed_learner,
@@ -90,3 +94,11 @@ def test_distributed_grpc_pipeline(tmp_path):
     newest = max((m.parent for m in ckpt_root.glob("ckpt_v*/meta.json")), key=lambda d: int(d.name[len("ckpt_v"):]))
     state_dict = torch.load(newest / "model.pt", weights_only=True)
     assert state_dict and all(isinstance(v, torch.Tensor) for v in state_dict.values())
+    # Both roles wrote their resolved config and per-process logs.
+    for run in (learner_run, workers_run):
+        assert (run / "config.resolved.yaml").is_file()
+    assert f"learner-{agent} started (pid" in (learner_run / "logs" / f"learner-{agent}.log").read_text()
+    assert "workers-main started (pid" in (workers_run / "logs" / "workers-main.log").read_text()
+    for worker_id in range(2):
+        worker_log = (workers_run / "logs" / f"worker-{worker_id}.log").read_text()
+        assert f"worker-{worker_id} started (pid" in worker_log and f"worker-{worker_id} finished" in worker_log

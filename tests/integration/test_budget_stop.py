@@ -4,6 +4,7 @@ from pathlib import Path
 
 from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.launcher import Launcher
+from helpers import make_test_run_dir
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -18,8 +19,8 @@ def test_launch_stops_at_the_env_step_budget(tmp_path):
     data["learner"]["queue_size"] = 16
     data["learner"]["device"] = "cpu"
     data["metrics"]["use_wandb"] = False
-    data["checkpoint"]["dir"] = str(tmp_path / "ckpt")
-    launcher = Launcher(ColosseumConfig(**data))
+    config = ColosseumConfig(**data)
+    launcher = Launcher(config, make_test_run_dir(config, tmp_path))
     start = time.monotonic()
     launcher.launch()
     assert launcher.env_steps_done >= 400
@@ -38,10 +39,11 @@ def test_a_dead_learner_stops_the_run(tmp_path, caplog):
     data["rollout"]["envs_per_worker"] = 2
     data["learner"]["device"] = "cpu"
     data["metrics"]["use_wandb"] = False
-    data["checkpoint"]["dir"] = str(tmp_path / "ckpt")
     broken = dict(data["algorithm"], algorithm_class="colosseum.algorithms.appo.NoSuchAlgorithm")
     data["agents"]["agent_beta"]["algorithm"] = broken  # agent_beta's learner dies at startup
-    launcher = Launcher(ColosseumConfig(**data))
+    config = ColosseumConfig(**data)
+    run = make_test_run_dir(config, tmp_path)
+    launcher = Launcher(config, run)
     start = time.monotonic()
     with caplog.at_level("ERROR", logger="colosseum.launcher"):
         launcher.launch()
@@ -49,3 +51,6 @@ def test_a_dead_learner_stops_the_run(tmp_path, caplog):
     assert launcher.env_steps_done < 10**9
     assert any("agent_beta" in r.getMessage() and "exited unexpectedly" in r.getMessage()
                for r in caplog.records)
+    # The crash and its traceback are in the dead learner's own log file (T6.2).
+    crash_log = (run.logs / "learner-agent_beta.log").read_text()
+    assert "learner-agent_beta crashed" in crash_log and "NoSuchAlgorithm" in crash_log

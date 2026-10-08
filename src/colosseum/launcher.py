@@ -28,8 +28,11 @@ import torch
 from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.ipc import SharedCounter
+from colosseum.core.run_dir import RunDir
 from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig
 from colosseum.metrics.wandb_logger import WandBLogger
+from colosseum.utils.logging import setup_process_logging
+from colosseum.utils.process import run_child
 
 logger = logging.getLogger(__name__)
 
@@ -81,7 +84,12 @@ def _create_model(config: ColosseumConfig):
     return build_model(config)
 
 
-def _worker_target(
+def _worker_target(*, worker_id: int, log_dir: str | None = None, **kwargs) -> None:
+    """Worker process entry point: process logging first, then the worker body."""
+    run_child(f"worker-{worker_id}", log_dir, _worker_main, worker_id=worker_id, **kwargs)
+
+
+def _worker_main(
     *,
     worker_id: int,
     config: ColosseumConfig,
@@ -98,7 +106,7 @@ def _worker_target(
     results_queue: mp.Queue | None = None,
     command_queue: mp.Queue | None = None,
 ) -> None:
-    """Worker process entry point.
+    """Worker process body (see ``_worker_target``).
 
     Env and model factories are built INSIDE the process (``functools.partial``
     over top-level functions is picklable under spawn, which the subprocess
@@ -141,7 +149,12 @@ def _worker_target(
     )
 
 
-def _learner_target(
+def _learner_target(*, agent_id: str, log_dir: str | None = None, **kwargs) -> None:
+    """Learner process entry point: process logging first, then the learner body."""
+    run_child(f"learner-{agent_id}", log_dir, _learner_main, agent_id=agent_id, **kwargs)
+
+
+def _learner_main(
     *,
     agent_id: str,
     config: ColosseumConfig,
@@ -157,7 +170,7 @@ def _learner_target(
     num_learners: int = 1,
     seed: int | None = None,
 ) -> None:
-    """Learner process entry point.
+    """Learner process body (see ``_learner_target``).
 
     ``num_learners`` (learner processes on this machine) feeds the automatic
     torch thread count when ``learner.torch_threads`` is unset. ``seed`` (from
@@ -317,8 +330,9 @@ class Launcher:
     trajectory chunks to the correct agent's learner.
     """
 
-    def __init__(self, config: ColosseumConfig) -> None:
+    def __init__(self, config: ColosseumConfig, run_dir: RunDir) -> None:
         self._config = config
+        self._run_dir = run_dir
         self._processes: list[mp.Process] = []
         self._stop_event = mp.Event()
         self._all_queues: list[mp.Queue] = []
@@ -360,7 +374,7 @@ class Launcher:
         warn_static_ownership_skew(cfg)
 
         # Initialize coordinator
-        coordinator = Coordinator(cfg)
+        coordinator = Coordinator(cfg, checkpoint_dir=self._run_dir.checkpoints)
 
         # Resume (before any process starts: a bad resume source fails fast).
         resume_states = self._resolve_resume(agent_configs)
@@ -421,8 +435,10 @@ class Launcher:
             resume_state = resume_states[aid]
             learner_proc = mp.Process(
                 target=_learner_target,
+                name=f"learner-{aid}",
                 kwargs=dict(
                     agent_id=aid,
+                    log_dir=str(self._run_dir.logs),
                     config=acfg,
                     trajectory_queue=trajectory_queues[aid],
                     weight_queues=weight_queues_per_agent[aid],
@@ -470,8 +486,10 @@ class Launcher:
             worker_daemon = cfg.rollout.vec_env != "subprocess"
             worker_proc = mp.Process(
                 target=_worker_target,
+                name=f"worker-{worker_id}",
                 kwargs=dict(
                     worker_id=worker_id,
+                    log_dir=str(self._run_dir.logs),
                     config=cfg,
                     agent_ids=trainable_agents,
                     agent_configs=agent_configs,
@@ -743,16 +761,17 @@ class Launcher:
             raise first_error
 
 
-def run_training(config_path: str, overrides: dict | None = None) -> None:
-    """Entry point: load config (overrides applied), seed, launch training."""
+def run_training(config_path: str, overrides: dict | None = None) -> RunDir:
+    """Entry point: load config, create the run dir, log to it, launch training."""
     from colosseum.utils.seeding import apply_global_seed
 
     mp.set_start_method("spawn", force=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    setup_process_logging(None, "main", console_level=logging.INFO)
     config = load_config(config_path, overrides)
     apply_global_seed(config.training.seed)  # after overrides: --set training.seed works (R3-27)
-    launcher = Launcher(config)
-    launcher.launch()
+    run_dir = RunDir.create(config, config_path)
+    setup_process_logging(run_dir.logs, "main", console_level=logging.INFO)
+    run_dir.write_resolved_config(config)
+    print(f"Run directory: {run_dir.root}", flush=True)
+    Launcher(config, run_dir).launch()
+    return run_dir

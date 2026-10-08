@@ -6,10 +6,12 @@ Covers:
   C14 — match outcomes prefer the env's authoritative rank/outcome signal.
 """
 import tempfile
+from pathlib import Path
 
 import torch
 
 from dataflow_helpers import two_seat_result
+from helpers import make_test_run_dir
 
 # ---------------------------------------------------------------------------
 # C14: outcome derivation
@@ -51,9 +53,8 @@ def test_outcomes_fall_back_when_signal_incomplete():
 # C4: PFSP using real win rates
 # ---------------------------------------------------------------------------
 
-def _make_cfg(tmpdir, phase="league", latest_prob=0.5, envs_per_worker=8):
+def _make_cfg(phase="league", latest_prob=0.5, envs_per_worker=8):
     from colosseum.core.config import (
-        CheckpointConfig,
         ColosseumConfig,
         EnvConfig,
         NetworkConfig,
@@ -72,14 +73,13 @@ def _make_cfg(tmpdir, phase="league", latest_prob=0.5, envs_per_worker=8):
         rollout=RolloutConfig(envs_per_worker=envs_per_worker),
         training=TrainingConfig(phase=phase),
         self_play=SelfPlayConfig(latest_prob=latest_prob),
-        checkpoint=CheckpointConfig(dir=tmpdir),
     )
 
 
 def _make_coordinator(tmpdir, phase="league"):
     from colosseum.coordinator.coordinator import Coordinator
 
-    return Coordinator(_make_cfg(tmpdir, phase=phase))
+    return Coordinator(_make_cfg(phase=phase), checkpoint_dir=tmpdir)
 
 
 def test_pfsp_uses_win_rates():
@@ -125,15 +125,15 @@ def test_refresh_pushes_new_checkpoint_to_worker():
     from colosseum.launcher import Launcher
 
     with tempfile.TemporaryDirectory() as tmp:
-        cfg = _make_cfg(tmp, phase="self_play", latest_prob=0.0, envs_per_worker=4)
-        coord = Coordinator(cfg)
+        cfg = _make_cfg(phase="self_play", latest_prob=0.0, envs_per_worker=4)
+        coord = Coordinator(cfg, checkpoint_dir=tmp)
         coord.agent_pool.register_trainable("agent_0")
 
         # Save a checkpoint; the matchmaker lists checkpoints on every match.
         sd = {k: v.detach().cpu().numpy() for k, v in build_model(cfg).state_dict().items()}
         coord.checkpoint_manager.save("agent_0", 50, sd)
 
-        launcher = Launcher(cfg)
+        launcher = Launcher(cfg, make_test_run_dir(cfg, Path(tmp)))
         cq = mp.Queue(maxsize=4)
         broadcast = [{"agent_0": set()}]
 

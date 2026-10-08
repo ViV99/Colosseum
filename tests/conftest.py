@@ -105,7 +105,8 @@ def restore_global_rng():
 
 @pytest.fixture
 def restore_root_logging():
-    """Entry points call logging.basicConfig; put pytest's root handlers and level back afterwards."""
+    """Entry points replace the root handlers (setup_process_logging); put pytest's handlers,
+    level and warnings routing back afterwards."""
     import logging
 
     root = logging.getLogger()
@@ -119,6 +120,7 @@ def restore_root_logging():
         if handler not in root.handlers:
             root.addHandler(handler)
     root.setLevel(level)
+    logging.captureWarnings(False)
 
 
 @pytest.fixture

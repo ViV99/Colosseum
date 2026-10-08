@@ -350,9 +350,8 @@ class SelfPlayConfig(StrictModel):
 
 
 class CheckpointConfig(StrictModel):
-    """Checkpoint storage settings."""
+    """Checkpoint settings. Checkpoints are stored in the run dir (``<run>/checkpoints/``)."""
 
-    dir: str = Field(default="checkpoints", description="Directory for saving checkpoints.")
     save_optimizer: bool = Field(
         default=True,
         description="Whether checkpoints include the trainer state (optimizer, LR progress, AMP scaler, "

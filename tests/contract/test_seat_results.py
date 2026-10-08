@@ -18,9 +18,8 @@ REPO = Path(__file__).resolve().parents[2]
 
 def _coordinator(tmp_path, agents):
     data = load_config(REPO / "configs/examples/tic_tac_toe.yaml").model_dump()
-    data["checkpoint"]["dir"] = str(tmp_path / "ckpt")
     data["metrics"]["use_wandb"] = False
-    coord = Coordinator(ColosseumConfig(**data))
+    coord = Coordinator(ColosseumConfig(**data), checkpoint_dir=tmp_path / "ckpt")
     for aid in agents:
         coord.agent_pool.register_trainable(aid)
     return coord

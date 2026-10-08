@@ -26,6 +26,7 @@ from colosseum.core.config import ColosseumConfig, config_hash
 from colosseum.core.errors import ConfigError
 from colosseum.core.types import MatchConfig, PlayerSlot
 from colosseum.learner.learner import apply_resume_state, make_checkpoint_payload, send_checkpoint
+from helpers import make_test_run_dir
 
 TTT = "examples.tic_tac_toe"
 
@@ -592,11 +593,32 @@ def test_resume_seeds_global_env_step_counter(tmp_path):
 
     run = _old_run_with_checkpoint(tmp_path, make_config(), version=12, env_steps=1200)
     cfg = make_config(resume_from=str(run))
-    launcher = Launcher(cfg)
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
     states = launcher._resolve_resume({"agent_0": cfg.get_agent_config("agent_0")})
     assert states["agent_0"]["policy_version"] == 12
     assert launcher.env_steps_done == 1200
     assert launcher._env_step_counter.value == 1200
+
+
+def test_resume_from_a_run_dir_created_by_run_dir_create(tmp_path):
+    """Checkpoints the launcher saves into ``RunDir.checkpoints`` resume from the run root (T6.2)."""
+    from colosseum.core.registry import build_model
+    from colosseum.launcher import Launcher
+
+    cfg = make_config()
+    first = make_test_run_dir(cfg, tmp_path, name="first")
+    launcher = Launcher(cfg, first)
+    launcher._coordinator = Coordinator(cfg, checkpoint_dir=first.checkpoints)  # as in launch()
+    launcher._env_step_counter.add(321)
+    launcher._save_checkpoint({"agent_id": "agent_0", "policy_version": 7, "final": True,
+                               "model_state": _model_numpy_state(build_model(cfg)), "trainer_state_bytes": None})
+    assert (first.checkpoints / "agent_0" / "ckpt_v7" / "model.pt").is_file()
+
+    resumed_cfg = make_config(resume_from=str(first.root))
+    resumed = Launcher(resumed_cfg, make_test_run_dir(resumed_cfg, tmp_path, name="second"))
+    states = resumed._resolve_resume({"agent_0": resumed_cfg.get_agent_config("agent_0")})
+    assert states["agent_0"]["policy_version"] == 7
+    assert resumed.env_steps_done == 321
 
 
 def test_resume_rejects_architecture_mismatch_before_spawning(tmp_path):
@@ -605,7 +627,7 @@ def test_resume_rejects_architecture_mismatch_before_spawning(tmp_path):
     run = tmp_path / "old_run"
     CheckpointManager(run / "checkpoints").save("agent_0", 3, sd(3))
     cfg = make_config(resume_from=str(run))
-    launcher = Launcher(cfg)
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
     with pytest.raises(ConfigError, match="do not match"):
         launcher._resolve_resume({"agent_0": cfg.get_agent_config("agent_0")})
     assert launcher.env_steps_done == 0
@@ -630,7 +652,7 @@ def test_shutdown_saves_checkpoints_still_queued(tmp_path):
     from colosseum.launcher import Launcher
 
     cfg = make_config()
-    launcher = Launcher(cfg)
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
     launcher._coordinator = Coordinator(cfg, checkpoint_dir=tmp_path / "ckpt")
     launcher._agent_ids = ["agent_0"]
     launcher._checkpoint_meta = {"agent_0": {"config_hash": config_hash(cfg)}}
@@ -668,7 +690,7 @@ def test_drain_saves_remaining_payloads_after_a_failed_save(tmp_path, caplog):
     from colosseum.launcher import Launcher
 
     cfg = make_config()
-    launcher = Launcher(cfg)
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
     launcher._coordinator = Coordinator(cfg, checkpoint_dir=tmp_path / "ckpt")
     q = queue.Queue()
     launcher._checkpoint_queues = {"agent_0": q}
@@ -695,7 +717,7 @@ def test_shutdown_tears_children_down_even_if_a_save_fails(tmp_path):
     from colosseum.launcher import Launcher
 
     cfg = make_config()
-    launcher = Launcher(cfg)
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
     launcher._coordinator = Coordinator(cfg, checkpoint_dir=tmp_path / "ckpt")
     launcher._agent_ids = ["agent_0"]
     cq = mp.get_context("spawn").Queue(maxsize=4)
@@ -734,7 +756,7 @@ def test_shutdown_keeps_draining_after_a_failed_save(tmp_path):
     from colosseum.launcher import Launcher
 
     cfg = ColosseumConfig.model_validate({**make_config().model_dump(mode="json"), "agents": {"a0": {}, "a1": {}}})
-    launcher = Launcher(cfg)
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
     launcher._coordinator = Coordinator(cfg, checkpoint_dir=tmp_path / "ckpt")
     launcher._agent_ids = ["a0", "a1"]
     ctx = mp.get_context("spawn")
