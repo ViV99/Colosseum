@@ -10,14 +10,23 @@ from __future__ import annotations
 from collections.abc import Callable, Mapping, Sequence
 from typing import Any
 
+import gymnasium
 import numpy as np
+import torch
+import torch.nn as nn
 from gymnasium.spaces import Box, Dict, Discrete, MultiBinary
 
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.core.tree import Tree
+from colosseum.networks.cores import Core, GRUCore, LSTMCore, NoCore, WindowAttentionCore
+from colosseum.sp2.core.specs import ActionSpec, ObsSpec
+from colosseum.sp2.core.tree import Tree, tree_get, tree_leaves, tree_map
 from colosseum.sp2.envs.contract import EpisodeTracker
 from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
 from colosseum.sp2.envs.spaces import Units
+from colosseum.sp2.networks.base import BaseCriticEncoder, BaseEncoder, BasePolicy, BaseValue, EncoderOutput
+from colosseum.sp2.networks.composed import ComposedModel
+from colosseum.sp2.networks.dist import Distribution, make_distribution
+from colosseum.sp2.networks.heads import UnitsHead
+from colosseum.sp2.networks.model import PolicyModel, PolicyStep, UnrollOutput
 
 
 def _vec(*values: float) -> np.ndarray:
@@ -457,3 +466,185 @@ def play_episode(env: MultiAgentEnv, layout: str, *, seed: int | None = None,
         masks = tracker.on_step(actions, result)
         results.append(result)
     raise RuntimeError(f"play_episode: no episode_over within {max_steps} steps")
+
+
+# ---------------------------------------------------------------------------
+# Tiny models (T2.3)
+# ---------------------------------------------------------------------------
+
+CORE_KINDS = ("none", "lstm", "gru", "attention")
+
+
+def make_core(kind: str, input_dim: int, hidden: int = 16) -> Core:
+    """A core of ``kind`` (one of ``CORE_KINDS``) sized for tests."""
+    if kind == "none":
+        return NoCore(input_dim)
+    if kind == "lstm":
+        return LSTMCore(input_dim, hidden_size=hidden)
+    if kind == "gru":
+        return GRUCore(input_dim, hidden_size=hidden)
+    if kind == "attention":
+        return WindowAttentionCore(input_dim, d_model=hidden, window=4, num_heads=2)
+    raise ValueError(f"unknown core kind {kind!r}; use one of {CORE_KINDS}")
+
+
+def flatten_tree(spec: ObsSpec, tree: Tree) -> torch.Tensor:
+    """Every leaf ``[B, ...]`` cast to float and flattened, concatenated in leaf order -> ``[B, F]``."""
+    parts = []
+    for leaf in spec.leaves:
+        x = tree_get(tree, leaf.path) if spec.is_dict else tree
+        parts.append(x.reshape(x.shape[0], -1).float())
+    return torch.cat(parts, dim=-1)
+
+
+def params_tree(spec: ActionSpec, per_group: dict[tuple[str, ...], Any]) -> Tree:
+    """Per-group distribution parameters (keyed by group path) as the tree ``make_distribution`` takes."""
+    if not spec.is_dict:
+        return per_group[spec.groups[0].path]
+    tree: dict = {}
+    for path, value in per_group.items():
+        node = tree
+        for key in path[:-1]:
+            node = node.setdefault(key, {})
+        node[path[-1]] = value
+    return tree
+
+
+def _flat_size(spec: ObsSpec) -> int:
+    return sum(int(np.prod(leaf.shape)) if leaf.shape else 1 for leaf in spec.leaves)
+
+
+class GenericEncoder(BaseEncoder):
+    """Any observation space: flatten every leaf (cast to float) -> Linear -> ReLU -> ``[B, hidden]``.
+
+    Records the dtypes of the leaves it was last called with in ``seen_dtypes``.
+    """
+
+    def __init__(self, observation_space: gymnasium.Space, hidden: int = 16) -> None:
+        super().__init__()
+        self.obs_spec = ObsSpec.from_space(observation_space)
+        self.fc = nn.Linear(_flat_size(self.obs_spec), hidden)
+        self._latent_dim = hidden
+        self.seen_dtypes: list[torch.dtype] = []
+
+    @property
+    def latent_dim(self) -> int:
+        return self._latent_dim
+
+    def forward(self, obs: Tree) -> EncoderOutput:
+        self.seen_dtypes = [leaf.dtype for leaf in tree_leaves(obs)]
+        return EncoderOutput(torch.relu(self.fc(flatten_tree(self.obs_spec, obs))), {})
+
+
+class GenericCriticEncoder(BaseCriticEncoder):
+    """Any global-state space: flatten -> Linear -> ReLU -> ``[B, hidden]``."""
+
+    def __init__(self, global_state_space: gymnasium.Space, hidden: int = 16) -> None:
+        super().__init__()
+        self.gs_spec = ObsSpec.from_space(global_state_space)
+        self.fc = nn.Linear(_flat_size(self.gs_spec), hidden)
+        self._out = hidden
+
+    @property
+    def output_dim(self) -> int:
+        return self._out
+
+    def forward(self, global_state: Tree) -> torch.Tensor:
+        return torch.relu(self.fc(flatten_tree(self.gs_spec, global_state)))
+
+
+class TreePolicyHead(BasePolicy):
+    """Any action space: a linear head per group; a units group gets the features concatenated with a
+    learned per-slot embedding of size ``hidden``, fed to a ``UnitsHead``."""
+
+    def __init__(self, in_dim: int, action_spec: ActionSpec, hidden: int = 16) -> None:
+        super().__init__()
+        self.spec = action_spec
+        self.heads = nn.ModuleDict()
+        self.log_std = nn.ParameterDict()
+        self.slots = nn.ParameterDict()
+        for i, group in enumerate(action_spec.groups):
+            key = str(i)
+            if group.kind == "units":
+                self.slots[key] = nn.Parameter(torch.randn(group.units.max_units, hidden) * 0.5)
+                self.heads[key] = UnitsHead(group, in_dim + hidden)
+            elif group.kind == "box":
+                self.heads[key] = nn.Linear(in_dim, group.box_dim)
+                self.log_std[key] = nn.Parameter(torch.zeros(group.box_dim))
+            else:
+                self.heads[key] = nn.Linear(in_dim, group.mask_size)
+
+    def forward(self, features: torch.Tensor, aux: dict[str, torch.Tensor]) -> Distribution:
+        params: dict[tuple[str, ...], Any] = {}
+        for i, group in enumerate(self.spec.groups):
+            key = str(i)
+            if group.kind == "units":
+                slots = self.slots[key].unsqueeze(0).expand(features.shape[0], -1, -1)
+                per_unit = features.unsqueeze(1).expand(-1, slots.shape[1], -1)
+                params[group.path] = self.heads[key](torch.cat([per_unit, slots], dim=-1))
+            elif group.kind == "box":
+                params[group.path] = {"mean": self.heads[key](features), "log_std": self.log_std[key]}
+            else:
+                params[group.path] = self.heads[key](features)
+        return make_distribution(self.spec, params_tree(self.spec, params))
+
+
+class GenericValue(BaseValue):
+    """``[B, in_dim]`` -> Linear -> ReLU -> Linear -> ``[B]``."""
+
+    def __init__(self, in_dim: int, hidden: int = 16) -> None:
+        super().__init__()
+        self.net = nn.Sequential(nn.Linear(in_dim, hidden), nn.ReLU(), nn.Linear(hidden, 1))
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        return self.net(features).squeeze(-1)
+
+
+def make_test_model(role: RoleSpec, core: str = "none", hidden: int = 16) -> ComposedModel:
+    """A small ``ComposedModel`` for any role; a role with a global state gets a critic encoder."""
+    encoder = GenericEncoder(role.observation_space, hidden)
+    trunk = make_core(core, encoder.latent_dim, hidden)
+    critic = GenericCriticEncoder(role.global_state_space, hidden) if role.global_state_space is not None else None
+    value_in = trunk.output_dim + (critic.output_dim if critic is not None else 0)
+    return ComposedModel(encoder, trunk, TreePolicyHead(trunk.output_dim, ActionSpec.from_space(role.action_space),
+                                                        hidden), GenericValue(value_in, hidden), critic)
+
+
+class RandomPolicy(PolicyModel):
+    """Stateless: uniform over legal discrete actions (zero logits + the mask), N(0, 1) for box parts.
+    ``unroll`` returns zero values (or None with ``with_value=False``)."""
+
+    def __init__(self, role: RoleSpec) -> None:
+        super().__init__()
+        self.spec = ActionSpec.from_space(role.action_space)
+
+    def _dist(self, batch: int, device: torch.device) -> Distribution:
+        params: dict[tuple[str, ...], Any] = {}
+        for group in self.spec.groups:
+            if group.kind == "units":
+                U = group.units.max_units
+                params[group.path] = {
+                    c.name: (torch.zeros(batch, U, c.size, device=device) if c.kind == "discrete"
+                             else {"mean": torch.zeros(batch, U, c.size, device=device),
+                                   "log_std": torch.zeros(c.size, device=device)})
+                    for c in group.units.components}
+            elif group.kind == "box":
+                params[group.path] = {"mean": torch.zeros(batch, group.box_dim, device=device),
+                                      "log_std": torch.zeros(group.box_dim, device=device)}
+            else:
+                params[group.path] = torch.zeros(batch, group.mask_size, device=device)
+        return make_distribution(self.spec, params_tree(self.spec, params))
+
+    def step(self, obs: Tree, state: Any, action_mask: Tree | None = None) -> PolicyStep:
+        first = tree_leaves(obs)[0]
+        dist = self._dist(int(first.shape[0]), first.device)
+        return PolicyStep(dist=dist if action_mask is None else dist.apply_mask(action_mask), state=None)
+
+    def unroll(self, obs: Tree, state0: Any, reset_after: torch.Tensor, action_mask: Tree | None = None,
+               global_state: Tree | None = None, with_value: bool = True) -> UnrollOutput:
+        first = tree_leaves(obs)[0]
+        S, B = int(first.shape[0]), int(first.shape[1])
+        dist = self._dist(S * B, first.device)
+        if action_mask is not None:
+            dist = dist.apply_mask(tree_map(lambda m: m.reshape(S * B, *m.shape[2:]), action_mask))
+        return UnrollOutput(dist=dist, value=torch.zeros(S * B, device=first.device) if with_value else None)
