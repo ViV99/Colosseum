@@ -15,11 +15,12 @@ if TYPE_CHECKING:
 def deep_cpu_copy(obj: Any) -> Any:
     """Recursively copy ``obj`` so it shares no storage with live training state.
 
-    Tensors -> ``.detach().cpu().clone()``; numpy arrays -> ``.copy()``; dicts,
-    lists and tuples are rebuilt; anything else is ``copy.deepcopy``'d.
+    Tensors -> ``.detach().to("cpu", copy=True)`` (exactly one copy from any
+    device); numpy arrays -> ``.copy()``; dicts, lists and tuples are rebuilt;
+    anything else is ``copy.deepcopy``'d.
     """
     if isinstance(obj, torch.Tensor):
-        return obj.detach().cpu().clone()
+        return obj.detach().to("cpu", copy=True)
     if isinstance(obj, np.ndarray):
         return obj.copy()
     if isinstance(obj, dict):

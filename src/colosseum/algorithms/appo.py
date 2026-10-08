@@ -11,6 +11,7 @@ to OpenAI Five's approach.
 
 from __future__ import annotations
 
+import logging
 import math
 from typing import Any
 
@@ -24,6 +25,8 @@ from colosseum.core.config import AlgorithmConfig, LRSchedule
 from colosseum.core.types import TrajectoryChunk
 from colosseum.networks.model import PolicyModel, UnrollOutput
 from colosseum.networks.state import cat_batch, slice_batch, state_to, tree_leaves
+
+logger = logging.getLogger(__name__)
 
 
 def _check_teacher_state_layout(student: PolicyModel, teacher: PolicyModel) -> None:
@@ -65,9 +68,8 @@ def _select_chunks(batch: dict, idx: torch.Tensor) -> dict:
 def _explained_variance(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
     """1 - Var(target - predicted) / Var(target); 0 when the target is (near) constant."""
     var_target = target.float().var(unbiased=False)
-    if var_target < 1e-8:
-        return torch.zeros((), device=target.device)
-    return 1.0 - (target.float() - predicted.float()).var(unbiased=False) / var_target
+    ev = 1.0 - (target.float() - predicted.float()).var(unbiased=False) / var_target
+    return torch.where(var_target < 1e-8, torch.zeros_like(ev), ev)   # no host sync
 
 
 class APPO(BaseAlgorithm):
@@ -306,7 +308,7 @@ class APPO(BaseAlgorithm):
         }
         if self._kickstart is not None:
             result["kickstart_loss"] = kickstart_loss.detach()
-            result["kickstart_lambda"] = torch.tensor(self._kickstart.current_lambda)
+            result["kickstart_lambda"] = torch.tensor(self._kickstart.current_lambda, device=total_loss.device)
         return result
 
     def _clip_gradients(self) -> torch.Tensor:
@@ -323,12 +325,19 @@ class APPO(BaseAlgorithm):
         that batch over the chunk dimension B, so each chunk's [T] sequence stays
         intact and stateful models unroll correctly. The LR is set only by
         ``set_progress`` (called by the learner before each step).
+
+        Metrics are minibatch means, accumulated on the device and read back
+        with one host sync. ``grad_norm`` averages the finite pre-clipping norms
+        only (NaN if none was finite); ``skipped_updates`` counts the minibatches
+        whose optimizer step the GradScaler skipped (non-finite gradients).
         """
         cfg = self._config
-        metrics_accum: dict[str, float] = {}
+        sums: dict[str, torch.Tensor] = {}
         num_updates = 0
 
         full_batch = self._prepare_batch(chunks)
+        grad_norm_sum = torch.zeros((), dtype=torch.float64, device=full_batch["rewards"].device)
+        finite_updates = torch.zeros_like(grad_norm_sum)
 
         # Refresh observation-normalization statistics once per train step, from
         # this step's fresh samples only (never once per epoch/minibatch forward).
@@ -348,16 +357,19 @@ class APPO(BaseAlgorithm):
                     self._scaler.scale(total_loss).backward()
                     self._scaler.unscale_(self._optimizer)
                     grad_norm = self._clip_gradients()
-                    self._scaler.step(self._optimizer)
+                    self._scaler.step(self._optimizer)      # skipped if the gradients are not finite
                     self._scaler.update()
                 else:
                     total_loss.backward()
                     grad_norm = self._clip_gradients()
                     self._optimizer.step()
-                losses["grad_norm"] = grad_norm
 
+                finite = torch.isfinite(grad_norm)
+                grad_norm_sum += torch.where(finite, grad_norm.detach().double(), 0.0)
+                finite_updates += finite
                 for key, value in losses.items():
-                    metrics_accum[key] = metrics_accum.get(key, 0.0) + value.item()
+                    value = value.detach().double()
+                    sums[key] = sums[key] + value if key in sums else value
                 num_updates += 1
 
         if self._kickstart is not None:
@@ -365,7 +377,13 @@ class APPO(BaseAlgorithm):
         self._policy_version += 1
         self._consumed_samples += sum(c.chunk_length for c in chunks)
 
-        metrics = {k: v / max(1, num_updates) for k, v in metrics_accum.items()}
+        keys = list(sums)
+        *totals, grad_norm_total, num_finite = torch.stack(
+            [sums[k] for k in keys] + [grad_norm_sum, finite_updates]
+        ).tolist()
+        metrics = {k: v / max(1, num_updates) for k, v in zip(keys, totals)}
+        metrics["grad_norm"] = grad_norm_total / num_finite if num_finite > 0 else float("nan")
+        metrics["skipped_updates"] = float(num_updates - num_finite) if self._scaler is not None else 0.0
         metrics["policy_version"] = float(self._policy_version)
         metrics["lr"] = float(self._optimizer.param_groups[0]["lr"])
         return metrics
@@ -390,15 +408,25 @@ class APPO(BaseAlgorithm):
         """Restore :meth:`state_dict` output; the input is copied, never aliased.
 
         The optimizer moves its state to the parameters' device. A saved scaler
-        or kickstart state is ignored when this run has no AMP / no kickstart.
-        The LR is re-derived from the restored progress.
+        or kickstart state is ignored (with a warning) when this run has no AMP /
+        no kickstart, and a run with AMP / kickstart but no saved state starts
+        them fresh (also with a warning). The LR is re-derived from the
+        restored progress.
         """
         state = deep_cpu_copy(state)
         self._optimizer.load_state_dict(state["optimizer"])
-        if self._scaler is not None and state["scaler"] is not None:
-            self._scaler.load_state_dict(state["scaler"])
-        if self._kickstart is not None and state["kickstart"] is not None:
-            self._kickstart.load_state_dict(state["kickstart"])
+        self._load_optional_state("GradScaler", self._scaler, state["scaler"])
+        self._load_optional_state("kickstart", self._kickstart, state["kickstart"])
         self._policy_version = int(state["policy_version"])
         self._consumed_samples = int(state["consumed_samples"])
         self.set_progress(float(state["progress"]))
+
+    @staticmethod
+    def _load_optional_state(name: str, component: Any, saved: dict | None) -> None:
+        """Restore an optional component (GradScaler, kickstart) and warn on a mismatch."""
+        if component is not None and saved is not None:
+            component.load_state_dict(saved)
+        elif saved is not None:
+            logger.warning("Resume: the saved %s state is ignored because this run has no %s.", name, name)
+        elif component is not None:
+            logger.warning("Resume: no %s state was saved; this run's %s starts fresh.", name, name)

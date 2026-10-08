@@ -50,6 +50,30 @@ def test_grad_norm_is_measured_before_clipping():
     assert metrics["grad_norm"] > 1e-3
 
 
+def test_no_skipped_updates_without_overflow():
+    model = tiny_model()
+    chunks = rollout_chunks(model, MaskedToyEnv, num_chunks=4, chunk_length=8)
+    metrics = APPO(model, AlgorithmConfig(num_epochs=2, minibatch_chunks=2), device="cpu").train_step(chunks)
+    assert metrics["skipped_updates"] == 0.0
+    assert math.isfinite(metrics["grad_norm"]) and metrics["grad_norm"] > 0.0
+
+
+def test_scaler_skipped_updates_are_counted_and_excluded_from_grad_norm():
+    """An infinite loss scale makes every scaled gradient non-finite: GradScaler skips each
+    optimizer step, and grad_norm (finite norms only) has nothing to average."""
+    model = tiny_model()
+    chunks = rollout_chunks(model, MaskedToyEnv, num_chunks=4, chunk_length=8)
+    algo = APPO(model, AlgorithmConfig(num_epochs=1, minibatch_chunks=2), device="cpu")
+    algo._scaler = torch.amp.GradScaler("cpu", init_scale=float("inf"))
+    before = {k: v.detach().clone() for k, v in algo.model.state_dict().items()}
+    metrics = algo.train_step(chunks)
+    assert metrics["skipped_updates"] == 2.0
+    assert math.isnan(metrics["grad_norm"])
+    assert math.isfinite(metrics["total_loss"])
+    for key, value in algo.model.state_dict().items():
+        assert torch.equal(value, before[key]), key
+
+
 def test_compute_loss_reports_the_new_per_minibatch_metrics():
     model = tiny_model()
     chunks = rollout_chunks(model, MaskedToyEnv, num_chunks=2, chunk_length=8)
@@ -72,8 +96,8 @@ def test_amp_train_step_on_cuda(amp_dtype, core):
     algo = APPO(model, AlgorithmConfig(num_epochs=2, minibatch_chunks=2, use_amp=True, amp_dtype=amp_dtype),
                 device="cuda")
     assert algo._use_amp
-    # The GradScaler is created for every AMP dtype (float16 needs it; bfloat16 runs through it harmlessly).
-    assert algo._scaler is not None
+    if amp_dtype == "float16":
+        assert algo._scaler is not None
     before = {k: v.detach().clone() for k, v in algo.model.state_dict().items()}
     metrics = None
     for _ in range(3):
@@ -81,6 +105,10 @@ def test_amp_train_step_on_cuda(amp_dtype, core):
     for key in ("total_loss", "policy_loss", "value_loss", "entropy", "rho_mean", "explained_variance", "lr"):
         assert math.isfinite(metrics[key]), key
     assert metrics["policy_version"] == 3.0
+    assert 0.0 <= metrics["skipped_updates"] <= 4.0          # 2 epochs x 2 minibatches per step
+    if amp_dtype == "float16":
+        scale = algo._scaler.get_scale()
+        assert math.isfinite(scale) and scale > 0.0
     changed = any(not torch.equal(before[k], v) for k, v in algo.model.state_dict().items())
     assert changed, "three AMP train steps never updated the weights"
     for p in algo.model.parameters():

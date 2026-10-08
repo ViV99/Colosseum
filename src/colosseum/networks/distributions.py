@@ -86,7 +86,13 @@ class CategoricalDist(Distribution):
         return self._dist.log_prob(actions)
 
     def entropy(self) -> torch.Tensor:
-        return self._dist.entropy()
+        if self._mask is None:
+            return self._dist.entropy()
+        # Illegal actions contribute exactly 0 to the value and to the gradient.
+        # (torch's entropy multiplies probs by logits clamped to finfo.min, whose
+        # backward overflows to inf -> NaN under AMP loss scaling.)
+        log_p = self._dist.logits                          # normalized, -inf where illegal
+        return -(log_p.exp() * log_p.masked_fill(~self._mask, 0.0)).sum(dim=-1)
 
     def mode(self) -> torch.Tensor:
         return self._dist.logits.argmax(dim=-1)

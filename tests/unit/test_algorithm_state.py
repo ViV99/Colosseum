@@ -131,6 +131,38 @@ def test_resume_reproduces_the_next_update_exactly():
     _assert_tree_equal(algo_state, algo_state_frozen)
 
 
+def test_load_state_dict_warns_about_mismatched_scaler_and_kickstart_state(caplog):
+    model = tiny_model()
+    chunks = rollout_chunks(model, MaskedToyEnv, num_chunks=2, chunk_length=8)
+    plain = APPO(model, AlgorithmConfig(), device="cpu")
+    plain.train_step(chunks)
+    plain_state = plain.state_dict()
+
+    rich = APPO(tiny_model(seed=3), AlgorithmConfig(), device="cpu",
+                kickstart=KickstartLoss(tiny_model(seed=4), initial_lambda=1.0, decay_steps=10))
+    rich._scaler = torch.amp.GradScaler("cpu")
+    rich.train_step(chunks)
+    rich_state = rich.state_dict()
+
+    caplog.set_level("WARNING", logger="colosseum.algorithms.appo")
+    APPO(tiny_model(), AlgorithmConfig(), device="cpu").load_state_dict(rich_state)
+    text = caplog.text
+    assert "GradScaler state" in text and "ignored" in text
+    assert "kickstart state" in text
+
+    caplog.clear()
+    fresh_rich = APPO(tiny_model(), AlgorithmConfig(), device="cpu",
+                      kickstart=KickstartLoss(tiny_model(seed=4), initial_lambda=1.0, decay_steps=10))
+    fresh_rich._scaler = torch.amp.GradScaler("cpu")
+    fresh_rich.load_state_dict(plain_state)
+    text = caplog.text
+    assert "no GradScaler state" in text and "no kickstart state" in text
+
+    caplog.clear()
+    APPO(tiny_model(), AlgorithmConfig(), device="cpu").load_state_dict(plain_state)
+    assert caplog.text == ""
+
+
 def test_base_algorithm_state_methods_raise_not_implemented():
     from colosseum.algorithms.base import BaseAlgorithm
 
@@ -155,18 +187,45 @@ def test_base_algorithm_state_methods_raise_not_implemented():
         Minimal().load_state_dict({})
 
 
+def _assert_scaler_round_trip(algo: APPO, other: APPO) -> None:
+    """Give ``algo``'s scaler a non-default state, save it, restore it into ``other``'s fresh scaler."""
+    algo._scaler.update(new_scale=1234.0)            # distinctive scale (default init_scale is 65536)
+    state = algo.state_dict()
+    saved = state["scaler"]
+    assert saved is not None and saved["scale"] == 1234.0
+    assert saved["_growth_tracker"] > 0              # successful unskipped steps since the last growth
+    fresh = other._scaler.state_dict()
+    assert fresh["scale"] != saved["scale"] and fresh["_growth_tracker"] != saved["_growth_tracker"]
+    other.load_state_dict(state)
+    assert other._scaler.state_dict() == saved
+    assert other._scaler.get_scale() == 1234.0
+
+
+def test_grad_scaler_state_round_trips_with_a_cpu_scaler():
+    """CPU coverage of the scaler save/restore path: APPO creates a GradScaler only for
+    AMP on CUDA, so this test installs a CPU GradScaler (torch.amp supports it) by hand."""
+    model = tiny_model()
+    chunks = rollout_chunks(model, MaskedToyEnv, num_chunks=4, chunk_length=8)
+    cfg = AlgorithmConfig(num_epochs=1, minibatch_chunks=2)
+    algo = APPO(model, cfg, device="cpu")
+    algo._scaler = torch.amp.GradScaler("cpu")
+    algo.train_step(chunks)
+    algo.train_step(chunks)
+    other = APPO(tiny_model(seed=5), cfg, device="cpu")
+    other._scaler = torch.amp.GradScaler("cpu")
+    _assert_scaler_round_trip(algo, other)
+
+
 @pytest.mark.gpu
 def test_grad_scaler_state_round_trips_on_cuda():
     model = tiny_model()
-    chunks = rollout_chunks(model, MaskedToyEnv, num_chunks=2, chunk_length=8)
-    cfg = AlgorithmConfig(use_amp=True, amp_dtype="float16")
+    chunks = rollout_chunks(model, MaskedToyEnv, num_chunks=4, chunk_length=8)
+    cfg = AlgorithmConfig(num_epochs=2, minibatch_chunks=2, use_amp=True, amp_dtype="float16")
     algo = APPO(model, cfg, device="cuda")
-    algo.train_step(chunks)
-    state = algo.state_dict()
-    assert state["scaler"] is not None and "scale" in state["scaler"]
+    for _ in range(3):
+        algo.train_step(chunks)
     other = APPO(tiny_model(seed=5), cfg, device="cuda")
-    other.load_state_dict(state)
-    assert other._scaler.get_scale() == algo._scaler.get_scale()
+    _assert_scaler_round_trip(algo, other)
 
 
 @pytest.mark.gpu

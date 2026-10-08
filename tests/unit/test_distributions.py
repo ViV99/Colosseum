@@ -75,3 +75,21 @@ def test_gaussian_kl_type_mismatch():
 
     with pytest.raises(TypeError):
         gaussian.kl_divergence(categorical)
+
+
+def test_masked_categorical_entropy_gradient_survives_loss_scaling():
+    """Illegal actions contribute exactly 0 to the entropy AND to its gradient.
+
+    torch's Categorical.entropy clamps -inf logits to finfo.min, so a GradScaler-sized
+    upstream gradient times finfo.min overflows to inf and then inf * p(=0) gives NaN:
+    every AMP float16 update with action masks would be skipped.
+    """
+    logits = torch.randn(6, 4, requires_grad=True)
+    mask = torch.tensor([[True, True, False, False]] * 3 + [[True, False, True, True]] * 3)
+    dist = CategoricalDist(logits, mask=mask)
+    entropy = dist.entropy()
+    ref = torch.distributions.Categorical(logits=logits.detach().masked_fill(~mask, float("-inf"))).entropy()
+    torch.testing.assert_close(entropy.detach(), ref)
+    (entropy.sum() * 65536.0 * 1e3).backward()
+    assert torch.isfinite(logits.grad).all()
+    assert (logits.grad[~mask] == 0).all()
