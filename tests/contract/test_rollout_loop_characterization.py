@@ -119,16 +119,16 @@ def test_initial_and_periodic_weight_sync_set_policy_version():
         num_envs=1, chunk_length=4, weight_sync_interval=0.0,
         initial_weights={"agent_0": weights_payload("agent_0", src, 7)},
     )
-    # A full chunk is sealed when its slot acts again (T3.1): step 5 seals the
-    # chunk of steps 1..4 and opens the next one, still under version 7.
-    run_steps(loop, 5)
-    assert [c.behavior_policy_version for c in rec.chunks] == [7, 7]
-
+    run_steps(loop, 4)
+    # Version 9 is offered before step 5. Step 5 acts under version 7: it seals the
+    # chunk of steps 1..4 (T3.1: sealed when the slot acts again) and opens the
+    # chunk of steps 5..8 under version 7; the sync at the END of step 5 loads v9.
     rec.weights["agent_0"] = [weights_payload("agent_0", src, 9)]
-    run_steps(loop, 1)  # the sync at the end of this step (6) picks up version 9
-    run_steps(loop, 3)  # step 9 seals the chunk of steps 5..8
+    run_steps(loop, 1)
+    assert [c.behavior_policy_version for c in rec.chunks] == [7, 7]
+    run_steps(loop, 4)  # step 9 seals the chunk of steps 5..8
     # behavior_policy_version is the version at a chunk's FIRST transition (T2.6):
-    # these chunks started on step 5, before the sync loaded version 9.
+    # these chunks started on step 5, before the sync at its end loaded version 9.
     assert [c.behavior_policy_version for c in rec.chunks[2:]] == [7, 7]
     run_steps(loop, 4)  # chunks of steps 9..12 (sealed on step 13), entirely under version 9
     loop.close()

@@ -248,9 +248,9 @@ class SubprocessVectorEnv:
             terminated: np.ndarray [num_envs]  (bool) -- True if ANY player terminated
             truncated:  np.ndarray [num_envs]  (bool) -- True if ANY player truncated
             infos:      list of num_envs info dicts (player_index -> info).
-                        For auto-reset envs the info for each player includes
-                        ``"terminal_observation"`` and ``"terminal_info"``,
-                        identical to :meth:`VectorEnv.step`.
+                        For an env that auto-reset, each player's info is the
+                        RESET info plus ``"terminal_observation"`` and
+                        ``"terminal_info"``, identical to :meth:`VectorEnv.step`.
         """
         actions = np.asarray(actions)
 

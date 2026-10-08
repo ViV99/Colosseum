@@ -376,3 +376,93 @@ def reference_transitions(log: list[dict], num_players: int) -> dict[int, list[d
                 open_tr[p] = None
                 pending[p] = 0.0
     return out
+
+
+class AlternatingWinEnv(_Base):
+    """Turn-based 2-player env: player ``t % 2`` acts at step ``t``.
+
+    - Episode ``ep`` lasts 3 steps if ``ep`` is even, else 4. The player who makes
+      the last move wins: +1 to the mover, -1 to the other.
+    - In 4-step episodes player 1 gets +0.5 at step 0, before its first move.
+    - After a step, the acting slot's mask is [True, True, False] and the
+      non-acting slot's mask is all False. The reset info has only "active"
+      (no mask: every action is legal at t=0). ``use_masks=False`` omits every
+      mask (and the illegal-action check), so only "active" drives the worker.
+    - The info returned on the terminal step is deliberately bogus (nobody
+      active, all-false masks): the first decision of the next episode must use
+      the reset info, otherwise the acting slot sees an empty mask (R2-14).
+    - Raises if the mover plays action 2 when it is illegal (t > 0).
+    """
+
+    def __init__(self, env_id: int = 0, use_masks: bool = True) -> None:
+        super().__init__(env_id)
+        self.use_masks = use_masks
+
+    def reset(self, seed=None):
+        self.ep += 1
+        self.t = 0
+        return self._obs(), {p: {"active": p == 0} for p in range(2)}
+
+    def _length(self) -> int:
+        return 3 if self.ep % 2 == 0 else 4
+
+    def _info(self) -> dict[int, dict]:
+        mover = self.t % 2
+        if not self.use_masks:
+            return {p: {"active": p == mover} for p in range(2)}
+        return {p: {"active": p == mover,
+                    "action_mask": (np.array([True, True, False]) if p == mover
+                                    else np.zeros(NUM_ACTIONS, dtype=bool))}
+                for p in range(2)}
+
+    def step(self, actions):
+        mover = self.t % 2
+        if self.use_masks and self.t > 0 and int(actions[mover]) == 2:
+            raise AssertionError(f"illegal action from mover {mover} at t={self.t}")
+        pre_obs = self._obs()
+        rew = {0: 0.0, 1: 0.0}
+        if self.t == 0 and self._length() == 4:
+            rew[1] = 0.5
+        self.t += 1
+        done = self.t >= self._length()
+        if done:
+            rew = {mover: 1.0, 1 - mover: -1.0}
+        self.log.append({"ep": self.ep, "t": self.t - 1, "obs": pre_obs,
+                         "actions": {p: int(actions[p]) for p in range(2)},
+                         "active": {p: p == mover for p in range(2)},
+                         "rewards": rew, "done": done, "truncated": False})
+        if done:
+            info = {p: {"active": False, "action_mask": np.zeros(NUM_ACTIONS, dtype=bool),
+                        "rank": 1 if p == mover else 2} for p in range(2)}
+        else:
+            info = self._info()
+        return self._obs(), rew, {p: done for p in range(2)}, {p: False for p in range(2)}, info
+
+
+class BadMaskEnv(AlternatingWinEnv):
+    """Like AlternatingWinEnv, but at step 1 the ACTING slot gets an all-false mask."""
+
+    def _info(self) -> dict[int, dict]:
+        info = super()._info()
+        if self.t == 1:
+            info[1]["action_mask"] = np.zeros(NUM_ACTIONS, dtype=bool)
+        return info
+
+
+class InfoLeakEnv(_Base):
+    """1-player env whose terminal step info carries stale keys the reset info lacks."""
+
+    NUM_PLAYERS = 1
+
+    def reset(self, seed=None):
+        self.ep += 1
+        self.t = 0
+        return self._obs(), {0: {"active": True, "phase": "reset"}}
+
+    def step(self, actions):
+        self.t += 1
+        done = self.t >= 2
+        info = {0: {"active": False, "phase": "step",
+                    "action_mask": np.array([False, True, False]),
+                    "rank": 1, "outcome": 0.123}}
+        return self._obs(), {0: 1.0}, {0: done}, {0: False}, info

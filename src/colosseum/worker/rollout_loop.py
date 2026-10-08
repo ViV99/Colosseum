@@ -20,6 +20,12 @@ or its episode ends (spec block 3). A full buffer is sealed when the slot acts
 again, with ``bootstrap_value`` = the value from that action's batched
 inference, or at once with ``bootstrap_value = 0`` when the episode ends; there
 is no separate bootstrap forward pass.
+
+Turn-based envs (``BaseEnv`` convention): only slots whose ``info["active"]`` is
+true (or missing) run inference and advance their model state; the others send
+the zero action. Rewards that reach a slot before its first action in an
+episode accumulate in ``SlotTrack.pending_reward`` and go to that first
+transition, so final rewards and ``done`` reach every collecting slot.
 """
 
 from __future__ import annotations
@@ -35,6 +41,7 @@ import numpy as np
 import torch
 
 from colosseum.core.action_spec import ActionSpec
+from colosseum.core.errors import EnvContractError
 from colosseum.core.outcomes import player_outcomes
 from colosseum.core.types import (
     MatchResult,
@@ -186,7 +193,9 @@ class RolloutLoop:
         obs = self._obs
         acting = self._acting_flags(self._infos)
         masks = self._extract_masks(self._infos)
-        actions, log_probs, values, pre_states = self._infer(obs, masks)
+        if masks is not None:
+            self._check_masks(masks, acting)
+        actions, log_probs, values, pre_states = self._infer(obs, masks, acting)
         self._open_transitions(obs, actions, log_probs, values, masks, acting, pre_states)
         next_obs, rewards, terminated, truncated, infos = self._vec_env.step(actions)
         self._after_env_step(rewards, terminated, truncated, infos)
@@ -362,11 +371,31 @@ class RolloutLoop:
                     out[e * P + p] = np.asarray(raw, dtype=bool).reshape(M)
         return out
 
-    def _infer(self, obs: np.ndarray, masks: np.ndarray | None):
-        """Batched inference for every slot, grouped by (agent, network).
+    def _check_masks(self, masks: np.ndarray, acting: np.ndarray) -> None:
+        """Mask rules (R1-13, ET-08): an empty mask row (per discrete component)
+        on a non-acting slot becomes all-true; on an acting slot it is an error."""
+        P = self._num_players
+        for comp in self._action_spec.components:
+            if comp.mask_size == 0:
+                continue
+            lo, hi = comp.mask_offset, comp.mask_offset + comp.mask_size
+            empty = ~masks[:, lo:hi].any(axis=1)
+            for flat in np.flatnonzero(empty):
+                e, p = divmod(int(flat), P)
+                if acting[e, p]:
+                    raise EnvContractError(
+                        f"worker {self.worker_id}, env {e}, slot {p}, episode step "
+                        f"{int(self._ep_lengths[e])}: action_mask has no legal action "
+                        f"(component {comp.name!r}) for an acting slot"
+                    )
+                masks[flat, lo:hi] = True
 
+    def _infer(self, obs: np.ndarray, masks: np.ndarray | None, acting: np.ndarray):
+        """Batched inference for acting slots, grouped by (agent, network).
+
+        Non-acting slots keep the default action (zeros) and their model state.
         Returns (actions [E,P,*A], log_probs [E,P], values [E,P], pre_states)
-        where ``pre_states[(e, p)]`` is the slot's model state BEFORE this step.
+        where ``pre_states[(e, p)]`` is the acting slot's state BEFORE this step.
         """
         E, P = self._num_envs, self._num_players
         spec = self._action_spec
@@ -379,7 +408,8 @@ class RolloutLoop:
         groups: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
         for e in range(E):
             for p in range(P):
-                groups[(self._slot_agent_map[e][p], self._slot_network_map[e][p])].append((e, p))
+                if acting[e, p]:
+                    groups[(self._slot_agent_map[e][p], self._slot_network_map[e][p])].append((e, p))
 
         for (aid, net_id), slots in groups.items():
             model = self._resolve_model(aid, net_id)
@@ -402,7 +432,8 @@ class RolloutLoop:
     def _open_transitions(self, obs, actions, log_probs, values, masks, acting, pre_states) -> None:
         """For every acting collecting slot: if its buffer is full, seal it with
         ``bootstrap_value`` = the value from this step's inference; then open a
-        new transition. The previous transition (if any) closes implicitly.
+        new transition carrying the slot's ``pending_reward``. The previous
+        transition (if any) closes implicitly.
 
         Slots that report ``info["active"] = False`` are not recorded, and their
         open transition (if any) stays open. A buffer's first transition records
@@ -424,27 +455,36 @@ class RolloutLoop:
                 buf.open(
                     obs[e, p], actions[e, p], float(log_probs[e, p]), float(values[e, p]),
                     None if masks3 is None else masks3[e, p],
+                    reward=track.pending_reward,
                 )
+                track.pending_reward = 0.0
                 track.has_open = True
                 self._recorded[aid] += 1
 
     def _after_env_step(self, rewards, terminated, truncated, infos) -> None:
-        """Add each collecting slot's reward to its open transition, then end
+        """Add each collecting slot's reward to its open transition, or to its
+        ``pending_reward`` before its first action in the episode; then end
         finished episodes. Transitions stay open until the slot acts again."""
         E, P = self._num_envs, self._num_players
         self._ep_rewards += rewards
         self._ep_lengths += 1
         for e in range(E):
             for p in range(P):
+                if not self._collect_mask[e][p]:
+                    continue
                 track = self._tracks[e][p]
-                if self._collect_mask[e][p] and track.has_open:
-                    track.buffer.add_reward(float(rewards[e, p]))
+                r = float(rewards[e, p])
+                if track.has_open:
+                    track.buffer.add_reward(r)
+                else:
+                    track.pending_reward += r
             if terminated[e] or truncated[e]:
                 self._end_episode(e, infos[e])
 
     def _end_episode(self, e: int, info_e: dict) -> None:
         """Mark every open transition done; seal full buffers with bootstrap 0;
-        report the result; apply a staged re-assignment; reset model states."""
+        drop rewards of slots that never acted; report the result; apply a staged
+        re-assignment; reset model states."""
         P = self._num_players
         for p in range(P):
             track = self._tracks[e][p]
@@ -453,6 +493,7 @@ class RolloutLoop:
                 track.has_open = False
                 if track.buffer.is_full:
                     self._seal(self._slot_agent_map[e][p], track.buffer, bootstrap_value=0.0)
+            track.pending_reward = 0.0
         self._report_result(e, info_e)
         self._ep_rewards[e] = 0.0
         self._ep_lengths[e] = 0

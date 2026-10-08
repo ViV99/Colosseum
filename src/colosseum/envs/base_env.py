@@ -16,8 +16,14 @@ class BaseEnv(ABC):
     Players are identified by integer indices 0..N-1.
     All return values are dicts keyed by player index.
 
-    For turn-based games: only the active player's action matters;
-    other players can pass any valid action (ignored by env).
+    Turn-based convention (used by the rollout worker):
+    - ``info[p]["active"]`` (bool) marks the players who act on the next step;
+      players without the key act. A non-acting player runs no inference, sends
+      a zero action (ignored by the env) and its model state does not advance.
+    - ``info[p]["action_mask"]`` may be all-false for a non-acting player; an
+      acting player must have at least one legal action (else EnvContractError).
+    - A player's rewards are credited to its last action until it acts again; at
+      episode end the last transition of every collecting player gets done=True.
     """
 
     @property

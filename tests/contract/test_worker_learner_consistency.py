@@ -11,6 +11,7 @@ import torch
 
 from colosseum.core.types import WorkerCommand, state_dict_to_numpy
 from colosseum.networks.state import tree_leaves
+from dataflow_helpers import AlternatingWinEnv, EnvFactory
 from harness import (
     learner_eval,
     make_loop,
@@ -165,3 +166,32 @@ def test_heterogeneous_agents_and_checkpoint_opponents():
         lp, v, worker_lp, worker_v = learner_eval(model, chunks)
         assert _max_diff(lp, worker_lp) < TOL, agent_id
         assert _max_diff(v, worker_v) < TOL, agent_id
+
+
+@pytest.mark.parametrize("use_masks", [True, False], ids=["masks", "no_masks"])
+@pytest.mark.parametrize("core", [k for k in CORE_KINDS if k != "none"])
+def test_turn_based_stateful_core_reproduces(core, use_masks):
+    """Turn-based env: only ``info["active"]`` slots act, so a stateful core's
+    state must advance only on the slot's own moves. The learner unrolls each
+    chunk (the slot's own moves only) and must reproduce the worker's log-probs
+    and values; any state advance on the opponent's moves breaks this (T3.2)."""
+    torch.manual_seed(0)
+    learner_model = simple_factory(core)
+    loop, rec = make_loop(
+        model_factories={"agent_0": lambda: simple_factory(core)},
+        env_fn=EnvFactory(AlternatingWinEnv, use_masks=use_masks),
+        num_envs=2, chunk_length=3,  # episodes give a slot 1-2 moves -> chunks start mid-episode
+        initial_weights={"agent_0": weights_payload("agent_0", learner_model, 0)},
+    )
+    chunks = run_until_chunks(loop, rec, 8)
+    loop.close()
+
+    assert any(bool(c.dones[:-1].any()) for c in chunks), "no chunk spans an episode boundary"
+    assert any(not _is_zero_state(c.initial_state) for c in chunks), \
+        "no chunk starts mid-episode with a non-zero state"
+    if use_masks:
+        assert any(c.action_masks is not None and not bool(c.action_masks.all()) for c in chunks)
+
+    lp, v, worker_lp, worker_v = learner_eval(learner_model, chunks)
+    assert _max_diff(lp, worker_lp) < TOL
+    assert _max_diff(v, worker_v) < TOL

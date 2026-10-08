@@ -67,6 +67,10 @@ def test_simultaneous_chunks_match_the_reference_construction():
     assert set(by_slot) == {(0, 0), (0, 1), (1, 0), (1, 1)}
     for (env_id, p), chunks in by_slot.items():
         ref = reference_transitions(envs.created[env_id].log, 2)[p]
+        # A full group of 4 reference rows is sealed iff its last row is done
+        # (sealed at the episode end) or a following row exists (the slot acted again).
+        expected = sum(1 for k in range(len(ref) // 4) if ref[4 * k + 3]["done"] or len(ref) > 4 * k + 4)
+        assert len(chunks) == expected, (env_id, p, len(chunks), expected)
         for k, chunk in enumerate(chunks):
             rows = ref[4 * k: 4 * k + 4]
             assert [r["ep"] for r in rows] == chunk.observations[:, 1].int().tolist()
