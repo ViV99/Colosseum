@@ -70,6 +70,10 @@ In this overview, contract paths are written as `colosseum.sp2.X`; after T7.3 th
 - **Spec block 0 item 3** (move `_QueueReader` and queue helpers to `core/ipc.py`) is done in T0.1 on the old code, so the `sp2` launcher copy starts from the cleaned version. The `registry._reset_mask_row` duplication disappears with the old registry in T7.3.
 - **Rating entities (spec block 7, "Сущность рейтинга — (агент, сеть), как в SP1"):** the plan follows SP1's actual code: ELO and the win-rate matrix are keyed by the base `agent_id` (a checkpoint of X playing Y counts as X vs Y); "latest of X vs a checkpoint of X" updates `wr_vs_past`; two `latest` seats of the same agent carry no signal and are skipped. The team-pair weighting of the spec is applied on top (see `member_pairs`).
 - **`tic_tac_toe`, `chase`, `space_miners`** are rewritten as new files in their example directories (`game.py`, `models.py`) because the old `env.py`/`networks.py` are used by old tests until T7.3, which deletes the old files.
+- **`ratings.json` and `ratings` records** are `{"env_steps": N, "layouts": {<layout>: {...}}}`, not the flat `{<layout>: ...}` sketched in spec block 7: a layout may legally be named `env_steps`, so layouts are nested (amendment R1).
+- **Vector-env API shape:** spec block 1 sketches `step -> list[StepResult]` and `reset(env_index, seed, layout)`; the contract uses mapping in, dict out (`reset(requests)`, `step(actions)`), which batches resets into one IPC round. Same semantics.
+- **Tree utilities:** spec block 2 says the `networks/state.py` utilities are generalized. The plan keeps `networks/state.py` for model `State` pytrees and adds `core/tree.py` for data trees (observations, actions, masks); merging them is not needed (YAGNI).
+- **Distributed mode** (spec block 10): each worker env draws its layout from `matchmaking.layouts` once and keeps it for the worker's lifetime (no coordinator in distributed mode until SP5). Recorded as ruling PR-3.
 
 ---
 
@@ -930,6 +934,49 @@ def make_test_config(game: str, **overrides) -> ColosseumConfig: ...   # T5.4; t
 
 ---
 
+## Contract amendments (reconciled after all plan parts were written)
+
+The four parts were written in parallel. Each ends with its own `## Contract notes`; those additions are accepted unless an item below overrides them. **The items below are binding** over the parts and over the contract above. Prefixes: A = `01-…`, B = `02-…`, C = `03-…`, D = `04-…`. Line numbers refer to the committed part files.
+
+**Formats and names**
+- **R1 — `ratings.json` shape (C wins).** `{"env_steps": N, "layouts": {<layout>: {"outcome_kind", "elo", "win_rates", "games", "wr_vs_past", "past_games", "scores", "cross_play", "role_win_rates"}}}`; the `ratings` records in `metrics.jsonl` carry the same `layouts` object. Part D changes: `"1v2" in run.ratings()` → `"1v2" in run.ratings()["layouts"]` (D:1683); `run.ratings()["coop2"]["cross_play"]` → `run.ratings()["layouts"]["coop2"]["cross_play"]` (D:1690, D:3237); D:1387, D contract note 7 and T8.6's README rows describe the nested shape.
+- **R2 — episode metric keys (C wins).** Episode breakdowns are `episodes/<agent>/by_layout/<layout>/<role>/...` (record field `by_layout`), not `episodes/<layout>/...` as written in the T5.3 contract paragraph above.
+- **R3 — `make_test_config` (C wins).** `tests/game_helpers.py::make_test_config(game: str, **sections) -> ColosseumConfig` is created in **T5.3** (not T5.4); `game` is a `TOY_GAMES` name; `sections` are top-level config dicts deep-merged onto the tiny defaults, except `agents`, which replaces.
+- **R4 — `put_row` stays.** Part A's `tree_assign` keeps rejecting a bare-array destination; Part B's `colosseum.sp2.worker.buffers.put_row(dst, idx, src)` is a contract name for row writes into buffer trees. Both were executed as written; unifying them is not worth touching verified code.
+- **R5 — `MatchRunner(context=...)`** must end with `", "` (B contract note); Part D's `demo_checks.random_matches` passes `context="demo, "`.
+- **R6 — queue helpers** are public in `colosseum.core.ipc` after T0.1 (`QueueReader`, `release_command_queues`, `queue_depths`); the `sp2` launcher imports them.
+- **R7 — `metrics/jsonl.py` gets an `sp2` copy** (C): its required-key tables describe record shapes that change. The "Reused unchanged" list above is amended accordingly.
+- **R8 — `__main__` docstring.** `src/colosseum/sp2/__main__.py` keeps the SP1 docstring line "(used by the Docker/K8s entrypoints)", so the overlay does not drop it.
+
+**Algorithm**
+- **R9 — mode resolution at K == 1** (amends B's `resolve_modes` ruling). With one decider:
+  - `auto` values resolve to `ratio_mode=joint`, `unit_trace=joint`, `entropy_reduction=sum`;
+  - an explicit `ratio_mode: per_unit` collapses to `joint` with a one-time INFO log ("one decider: per_unit equals joint except for the rho factor; using joint");
+  - explicit `unit_trace: geo_mean` and `entropy_reduction: mean_valid` collapse silently to `joint`/`sum` (identical at K = 1);
+  - an explicit `unit_trace: none` is honoured (ρ = c = 1 is defined independently of K).
+  T4.2 updates `test_modes_resolve_auto_and_collapse_for_one_decider` accordingly.
+- **R10 — diagnostics (T4.2).** Add `log_rho_joint_abs_p95` to the train metrics and `DIAGNOSTICS`, plus a zero-lag test pinning `ess == 1`, `clip_fraction == clip_fraction_joint == 0`, `rho_clip_frac == c_clip_frac == 0`.
+- **R11 — `unit_trace` default change in T8.4.** If the ruling changes the default, T8.4 also modifies `tests/unit/test_appo_v2.py` (the auto-resolution assertion; add it to T8.4's **Files**). T8.4's detection check becomes `grep -n "geo_mean" tests/unit/test_appo_v2.py`; T4.2's test is the pin, so no separate `test_unit_trace_default.py` is created.
+
+**Coverage additions (gaps found by the cross-check)**
+- **R12 — GPU successors.** T7.3 deletes SP1's `gpu` tests in `test_algorithm_state.py`, `test_appo_metrics.py`, `test_bc_trainer.py`, `test_kickstart_kl.py`. Add `gpu`-marked successors: in **T4.2** (`test_appo_v2.py`: GradScaler round trip, `state_dict` round trip on CUDA, an AMP step with a Dict + `uint8` observation and `global_state`, `pin_memory`; `test_kickstart_v2.py`: kickstart on CUDA with masks and an LSTM core) and in **T6.3** (`test_sp2_bc_trainer.py`: BC with tree data on CUDA). T7.3's coverage gate gets a "GPU successor" column. T8.6 rebuilds the `docs/GPU_CHECKS.md` table from `.venv/bin/python -m pytest -m gpu --collect-only -q` instead of editing rows.
+- **R13 — episode metrics per layout (T5.3).** `by_layout[layout][role]` also carries `length_mean` and W/D/L by opponent type (`latest`/`past`/`arena`), with assertions.
+- **R14 — env contract errors through `MatchRunner` (T3.3).** One parametrized test per `EpisodeTracker` error of spec block 1, driven through `MatchRunner` with `ScriptedGame`/`TickGame`, including idle overflow via `MatchRunner(max_idle_steps=...)`. **T5.4** asserts that `env.max_idle_steps` reaches `rollout_worker_process`.
+- **R15 — elimination and truncation in the same step (T3.4).** `test_chunk_v2_rules.py` adds a case where a seat is terminated in the truncation step: its open ACT becomes terminal and no BOOT is written for it, while the other live seats get BOOT(final_obs).
+- **R16 — `global_state` reaches only the value path, end to end (T4.3).** With `GlobalStateGame`: perturb the chunks' `global_state`; learner log-probs are unchanged and values change.
+
+**Overlay (T7.3)**
+- **R17 — deferred gate rows.** The coverage-gate rows for `learning/test_ttt_slow.py` + `ttt_eval.py` (successor T8.3) and `unit/test_examples.py` (successor T8.5) are "deferred to T8.3 / T8.5 (accepted gap)"; T7.3 still deletes those files and the old `space_miners` / `composite_action` `env.py`, `networks.py` and configs.
+- **R18 — benchmark workload.** T7.3 replaces `NUM_PLAYERS` / `"num_players"` in `scripts/bench_throughput.py`'s `workload` dict with `"layout": "2p"` (and updates its unit test), so T8.4's "after" JSON has no SP1-only field.
+
+**Rulings taken at the plan stage** (move them into the SP2 acceptance report's rulings ledger in T8.7)
+- **PR-1 — K == 1 mode collapse** (R9). Why: keeps spec block 6's "при K = 1 все режимы дают один результат" exact and SP1 behaviour for every game without units. Cost if wrong: a `Units(1, …)` agent configured with `per_unit` trains with the joint loss (logged once).
+- **PR-2 — a team's core always takes one seat; only the other seats follow `teammates`** (C's reading of spec block 7 item 4, "Остальные места команды"). The core's seat is drawn uniformly among the team's seats of a role the core plays; `shuffle_seats` is applied afterwards. Why: the owner always collects in its own team, which ownership rotation and the `coop_buttons` criterion need. Cost if wrong: `mixed` never fills the core's own seat with another agent.
+- **PR-3 — distributed layouts are fixed per worker env** (see Deviations). Why: no coordinator in distributed mode until SP5. Cost if wrong: distributed runs of multi-layout games see a fixed layout mix decided at worker start.
+- **PR-4 — `put_row` kept next to `tree_assign`** (R4). Cost if wrong: a small duplicate helper.
+
+---
+
 ## Cross-part execution notes
 
 - **Plan code vs. current code.** Every part was written against the code its author expected. When a task's "before" block does not match the repository, keep the intent, the contract and the task's tests, adapt the edit, and say so in the commit body. Never weaken a test to make it pass.
@@ -941,45 +988,47 @@ def make_test_config(game: str, **overrides) -> ColosseumConfig: ...   # T5.4; t
 
 ## Task index and execution order
 
-| ID | Task | Depends on |
-|---|---|---|
-| T0.1 | SP1 residuals: second Ctrl+C, `bc` unreadable data, queue helpers to `core/ipc.py` | — |
-| T1.1 | Tree utilities | T0.1 |
-| T1.2 | `Units` space | T1.1 |
-| T1.3 | `ObsSpec`, `ActionSpec`, mask rules | T1.2 |
-| T1.4 | `GameSpec`, `MultiAgentEnv`, `StepResult`, `Outcome`, `resolve_outcome`, toy games | T1.3 |
-| T1.5 | `EpisodeTracker`: seat lifecycle and contract checks | T1.4 |
-| T1.6 | `VectorEnv`, `SubprocessVectorEnv` (no auto-reset) | T1.4 |
-| T1.7 | Config v2 | T0.1 |
-| T2.1 | Leaf distributions, `TreeDist`, `make_distribution` | T1.3 |
-| T2.2 | `UnitsDist` (masks, `only_if`, deciders) | T2.1 |
-| T2.3 | Model protocol, base classes, `ComposedModel` + critic, heads, `NormalizeObs`, test models | T2.2 |
-| T2.4 | Roles resolution, `build_model`, `make_env`, `env_spec` | T2.3, T1.7, T1.4 |
-| T3.1 | `sp2` types: chunk v2 + payloads, lineups, results, commands | T1.1 |
-| T3.2 | Buffers with `act`/`boot`/`pad` slots and parking | T3.1, T1.3 |
-| T3.3 | `MatchRunner` | T1.5, T1.6, T2.3, T3.1 |
-| T3.4 | `RolloutLoop` + worker process; chunk-structure and lifecycle contract tests | T3.2, T3.3, T2.4 |
-| T4.1 | V-trace over slots | T0.1 |
-| T4.2 | APPO v2 (unit modes, reductions, diagnostics) + kickstart v2 | T4.1, T3.1, T2.3, T1.7 |
-| T4.3 | Contract: learner reproduces worker log-probs (4 cores, boot/pad/truncation/elimination), bootstrap by learner | T3.4, T4.2 |
-| T4.4 | Learner process on chunk v2 | T4.2 |
-| T5.1 | `LineupMatchmaker`, `validate_matchmaking`, `permute_seats` | T1.4, T1.7, T3.1 |
-| T5.2 | Ratings per layout: team-pair ELO, win rates, past, scores, cross-play | T3.1, T1.4 |
-| T5.3 | Coordinator, checkpoint manager (roles in meta), metrics aggregator/hub | T5.1, T5.2 |
-| T5.4 | Launcher, run dir, CLI `train`; integration runs on toy games | T3.4, T4.4, T5.3, T2.4 |
-| T6.1 | Eval engine, reports, CLI `eval` | T3.3, T5.4 |
-| T6.2 | `validate_config`, CLI `validate` | T5.4, T5.1, T1.5 |
-| T6.3 | Offline BC on trees, CLI `bc --agent` | T2.4, T5.4 |
-| T6.4 | Distributed mode on chunk v2, CLI distributed commands | T4.4, T3.4, T5.4 |
-| T7.1 | Port SP1 integration coverage to the `sp2` CLI | T6.1–T6.4 |
-| T7.2 | New tic-tac-toe on the contract; SP1 fast learning tests on the new pipeline | T5.4 |
-| T7.3 | Overlay: delete legacy, move `sp2` into place, rename, bench switch | T7.1, T7.2 |
-| T8.1 | Demo envs: `coin_grid`, `unit_harvest`, `tron` (+ models, configs, smoke) | T7.3 |
-| T8.2 | Demo envs: `team_tag`, `predator_prey`, `coop_buttons` (+ models, configs, smoke) | T7.3 |
-| T8.3 | Learning tests: fast (units bandit, coop bandit) and slow (criterion 3) | T8.1, T8.2 |
-| T8.4 | Units experiment, throughput "after", `global_state` size | T8.3 |
-| T8.5 | Reference examples: `space_miners`, `chase` on the new contract | T7.3 |
-| T8.6 | Docs: `ENV_GUIDE.md`, README, CLAUDE.md, `GPU_CHECKS.md` | T8.4, T8.5 |
-| T8.7 | Acceptance run against spec section 3 | T8.6 |
+Execute **strictly in the order of this table** (amended after the cross-check; the order differs from the numbering at T6.2/T6.1, T7.2/T7.1 and T8.5/T8.3). Every task also lists its dependencies in its **Interfaces** block.
 
-Parallelism: T1.7 and T4.1 can run any time after T0.1; T3.1 after T1.1; T5.1/T5.2 after their deps; T6.1–T6.4 are independent of each other after T5.4 (they all touch `sp2/cli.py` — rebase in index order); T8.1, T8.2 and T8.5 are independent.
+| Order | ID | Task | Depends on |
+|---|---|---|---|
+| 1 | T0.1 | SP1 residuals: second Ctrl+C, `bc` unreadable data, queue helpers to `core/ipc.py` | — |
+| 2 | T1.1 | Tree utilities | T0.1 |
+| 3 | T1.2 | `Units` space | T1.1 |
+| 4 | T1.3 | `ObsSpec`, `ActionSpec`, mask rules | T1.2 |
+| 5 | T1.4 | `GameSpec`, `MultiAgentEnv`, `StepResult`, `Outcome`, `resolve_outcome`, toy games | T1.3 |
+| 6 | T1.5 | `EpisodeTracker`: seat lifecycle and contract checks | T1.4 |
+| 7 | T1.6 | `VectorEnv`, `SubprocessVectorEnv` (no auto-reset) | T1.4 |
+| 8 | T1.7 | Config v2 | T0.1 |
+| 9 | T2.1 | Leaf distributions, `TreeDist`, `make_distribution` | T1.3 |
+| 10 | T2.2 | `UnitsDist` (masks, `only_if`, deciders) | T2.1 |
+| 11 | T2.3 | Model protocol, base classes, `ComposedModel` + critic, heads, `NormalizeObs`, test models | T2.2, T1.4, T1.5 |
+| 12 | T2.4 | Roles resolution, `build_model`, `make_env`, `env_spec` | T2.3, T1.7, T1.4 |
+| 13 | T3.1 | `sp2` types: chunk v2 + payloads, lineups, results, commands | T1.1 |
+| 14 | T3.2 | Buffers with `act`/`boot`/`pad` slots and parking | T3.1, T1.3 |
+| 15 | T3.3 | `MatchRunner` (+ R14) | T1.5, T1.6, T2.3, T3.1, T3.2 |
+| 16 | T3.4 | `RolloutLoop` + worker process; chunk-structure and lifecycle contract tests (+ R15) | T3.2, T3.3, T2.4 |
+| 17 | T4.1 | V-trace over slots | T3.1 |
+| 18 | T4.2 | APPO v2 (unit modes, reductions, diagnostics) + kickstart v2 (+ R9, R10, R12) | T4.1, T3.1, T3.2, T2.3, T1.7 |
+| 19 | T4.3 | Contract: learner reproduces worker log-probs (4 cores), bootstrap by learner (+ R16) | T3.4, T4.2 |
+| 20 | T4.4 | Learner process on chunk v2 | T4.2, T3.4 |
+| 21 | T5.1 | `LineupMatchmaker`, `validate_matchmaking`, `permute_seats` | T1.4, T1.7, T3.1 |
+| 22 | T5.2 | Ratings per layout: team-pair ELO, win rates, past, scores, cross-play | T3.1, T1.4 |
+| 23 | T5.3 | Coordinator, checkpoint manager (roles in meta), metrics aggregator/hub, `make_test_config` (+ R2, R3, R13) | T5.1, T5.2, T4.4, T2.4 |
+| 24 | T5.4 | Launcher, run dir, CLI `train`; integration runs on toy games (+ R14) | T3.4, T4.4, T5.3, T2.4 |
+| 25 | T6.2 | `validate_config`, CLI `validate` | T5.4, T5.1, T1.5 |
+| 26 | T6.1 | Eval engine, reports, CLI `eval` | T3.3, T5.4, T6.2 |
+| 27 | T6.3 | Offline BC on trees, CLI `bc --agent` (+ R12) | T2.4, T5.4, T6.2 |
+| 28 | T6.4 | Distributed mode on chunk v2, CLI distributed commands | T4.4, T3.4, T5.4, T6.2 |
+| 29 | T7.2 | New tic-tac-toe on the contract; SP1 fast learning tests on the new pipeline | T5.4, T6.2, T6.3 |
+| 30 | T7.1 | Port SP1 integration coverage to the `sp2` CLI | T6.1–T6.4, T7.2 |
+| 31 | T7.3 | Overlay: delete legacy, move `sp2` into place, rename, bench switch (+ R12, R17, R18) | T7.1, T7.2 |
+| 32 | T8.1 | Demo envs: `coin_grid`, `unit_harvest`, `tron` (+ models, configs, smoke) | T7.3 |
+| 33 | T8.2 | Demo envs: `team_tag`, `predator_prey`, `coop_buttons` (+ models, configs, smoke; R1) | T8.1 |
+| 34 | T8.5 | Reference examples: `space_miners`, `chase` on the new contract | T8.1 |
+| 35 | T8.3 | Learning tests: fast (units bandit, coop bandit) and slow (criterion 3; R1) | T8.1, T8.2 |
+| 36 | T8.4 | Units experiment, throughput "after", `global_state` size (+ R11) | T8.3 |
+| 37 | T8.6 | Docs: `ENV_GUIDE.md`, README, CLAUDE.md, `GPU_CHECKS.md` (+ R1, R12) | T8.4, T8.5 |
+| 38 | T8.7 | Acceptance run against spec section 3; rulings PR-1..PR-4 go into the report | T8.6 |
+
+Parallelism (optional): T1.6 ∥ T1.7; T5.1 ∥ T5.2; T8.2 ∥ T8.5. Tasks that touch `src/colosseum/sp2/cli.py` (T5.4, T6.1–T6.4) run in table order.
