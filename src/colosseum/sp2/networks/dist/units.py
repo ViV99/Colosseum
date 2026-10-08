@@ -49,7 +49,10 @@ class UnitsDist(Distribution):
             raise ValueError(f"UnitsDist: params for components {sorted(params)}, the units have {names}")
         self.params: dict[str, Any] = {}
         first = params[names[0]]
-        ref = first if isinstance(first, Tensor) else first["mean"]
+        ref = first.get("mean") if isinstance(first, Mapping) else first
+        if not isinstance(ref, Tensor):
+            raise ValueError(f"UnitsDist: component {names[0]!r} needs a tensor (logits or 'mean'), "
+                             f"got {type(ref).__name__}")
         self.B = int(ref.shape[0])
         device = ref.device
         for c in self.units.components:
@@ -62,9 +65,14 @@ class UnitsDist(Distribution):
             else:
                 if not isinstance(p, Mapping) or set(p) != {"mean", "log_std"}:
                     raise ValueError(f"UnitsDist: box component {c.name!r} needs {{'mean', 'log_std'}}")
-                if tuple(p["mean"].shape) != (self.B, self.U, c.size):
-                    raise ValueError(f"UnitsDist: component {c.name!r} needs mean [B, {self.U}, {c.size}], "
-                                     f"got {tuple(p['mean'].shape)}")
+                if not isinstance(p["mean"], Tensor) or tuple(p["mean"].shape) != (self.B, self.U, c.size):
+                    got = tuple(p["mean"].shape) if isinstance(p["mean"], Tensor) else type(p["mean"]).__name__
+                    raise ValueError(f"UnitsDist: component {c.name!r} needs mean [B, {self.U}, {c.size}], got {got}")
+                if not isinstance(p["log_std"], Tensor) or tuple(p["log_std"].shape) not in (
+                        (self.B, self.U, c.size), (c.size,)):
+                    got = tuple(p["log_std"].shape) if isinstance(p["log_std"], Tensor) else type(p["log_std"]).__name__
+                    raise ValueError(f"UnitsDist: component {c.name!r} needs log_std [B, {self.U}, {c.size}] or "
+                                     f"[{c.size}], got {got}")
                 self.params[c.name] = {"mean": p["mean"], "log_std": torch.broadcast_to(p["log_std"], p["mean"].shape)}
         mask = mask or {}
         unit = mask.get("unit")

@@ -218,6 +218,9 @@ class DiagGaussianDist(Distribution):
     def __init__(self, mean: Tensor, log_std: Tensor) -> None:
         if mean.dim() != 2:
             raise ValueError(f"DiagGaussianDist: mean must be [B, d], got shape {tuple(mean.shape)}")
+        if tuple(log_std.shape) not in (tuple(mean.shape), tuple(mean.shape[-1:])):
+            raise ValueError(f"DiagGaussianDist: log_std must be [B, d] or [d] for mean {tuple(mean.shape)}, "
+                             f"got shape {tuple(log_std.shape)}")
         self._mean = mean
         self._log_std = torch.broadcast_to(log_std, mean.shape)
 

@@ -156,16 +156,26 @@ def make_distribution(spec: ActionSpec, params: Tree) -> TreeDist:
     discrete -> logits ``[B, n]``; multi_discrete -> logits ``[B, sum(nvec)]``; box ->
     ``{"mean": [B, d], "log_std": [B, d] | [d]}``; units -> ``UnitsDist`` parameters
     (one entry per component: logits ``[B, U, n]`` or ``{"mean", "log_std"}``).
+    A parameter or shape mismatch raises ``ValueError`` naming the action group.
     """
     parts: dict[tuple[str, ...], Distribution] = {}
     for group in spec.groups:
         p = _group_params(params, spec, group)
-        if group.kind == "discrete":
-            parts[group.path] = CategoricalDist(p)
-        elif group.kind == "multi_discrete":
-            parts[group.path] = MultiCategoricalDist(p, group.nvec)
-        elif group.kind == "box":
-            parts[group.path] = DiagGaussianDist(p["mean"], p["log_std"])
-        else:
-            parts[group.path] = UnitsDist(group, p)
+        try:
+            parts[group.path] = _make_part(group, p)
+        except (ValueError, TypeError) as e:
+            raise ValueError(f"action group {_fmt(group.path)}: {e}") from e
     return TreeDist(spec, parts)
+
+
+def _make_part(group: ActionGroup, p: Any) -> Distribution:
+    if group.kind == "discrete":
+        return CategoricalDist(p)
+    if group.kind == "multi_discrete":
+        return MultiCategoricalDist(p, group.nvec)
+    if group.kind == "box":
+        if not isinstance(p, Mapping) or set(p) != {"mean", "log_std"}:
+            got = sorted(p) if isinstance(p, Mapping) else type(p).__name__
+            raise ValueError(f"a box group needs params {{'mean': [B, d], 'log_std': [B, d] | [d]}}, got {got}")
+        return DiagGaussianDist(p["mean"], p["log_std"])
+    return UnitsDist(group, p)
