@@ -19,7 +19,7 @@ _LATENT = 32
 
 
 class ChaseEncoder(BaseEncoder):
-    def __init__(self):
+    def __init__(self, **kwargs):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(_OBS_DIM, _LATENT),
@@ -37,7 +37,7 @@ class ChaseEncoder(BaseEncoder):
 class ChasePolicy(BasePolicy):
     """Composite policy: direction (Discrete(4)) + speed (Box(1))."""
 
-    def __init__(self, in_dim: int = _LATENT):
+    def __init__(self, in_dim: int = _LATENT, **kwargs):
         super().__init__()
         self.dir_head = nn.Linear(in_dim, 4)
         self.speed_mean = nn.Linear(in_dim, 1)
@@ -54,7 +54,7 @@ class ChasePolicy(BasePolicy):
 
 
 class ChaseValue(BaseValue):
-    def __init__(self, in_dim: int = _LATENT):
+    def __init__(self, in_dim: int = _LATENT, **kwargs):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(in_dim, 16),

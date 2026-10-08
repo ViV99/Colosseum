@@ -1,3 +1,8 @@
+# Composite Dict action space (direction: Discrete(4), speed: Box(1)).
+run:
+  name: null
+  dir: "runs"
+
 env:
   env_class: "examples.composite_action.env.ChaseEnv"
   num_players: 2
@@ -5,31 +10,24 @@ env:
 
 networks:
   encoder_class: "examples.composite_action.networks.ChaseEncoder"
-  core: null              # e.g. {class: colosseum.networks.cores.LSTMCore, kwargs: {hidden_size: 128}}
+  core: null
   policy_class: "examples.composite_action.networks.ChasePolicy"
   value_class: "examples.composite_action.networks.ChaseValue"
   kwargs: {}
 
 algorithm:
-  name: "appo"
   gamma: 0.99
   vtrace_lambda: 1.0
-  eps_clip: 0.2
-  value_loss_coeff: 0.5
   entropy_coeff: 0.01
-  max_grad_norm: 0.5
-  num_epochs: 1
-  minibatch_chunks: 0
-  vtrace_rho_bar: 1.0
-  vtrace_c_bar: 1.0
   learning_rate: 3.0e-4
   lr_schedule: "constant"
 
 rollout:
-  chunk_length: 20       # matches episode length
+  chunk_length: 20
   num_workers: 2
   envs_per_worker: 4
   weight_sync_interval_sec: 2.0
+  torch_threads: 1
 
 learner:
   device: "auto"
@@ -38,19 +36,13 @@ learner:
 
 training:
   phase: "self_play"
-  total_timesteps: 5000
+  total_timesteps: 50000
 
 self_play:
-  checkpoint_interval: 10    # train steps; ~31 train steps in this run
+  checkpoint_interval: 10
   pool_size: 5
   latest_prob: 0.5
-
-checkpoint:
-  save_optimizer: true
 
 metrics:
   use_wandb: false
   log_interval: 10
-
-transport:
-  mode: "local"

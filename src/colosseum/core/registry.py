@@ -279,9 +279,11 @@ def validate_config(config: ColosseumConfig) -> None:
                 raise ConfigError(f"model.initial_state(B) failed: {type(e).__name__}: {e}") from e
             _check_state_batch_dim(state0, state0_alt, (B, B_ALT), "initial_state")
             _check_state_payload(state0)
+            # Structure first, without the env's mask: a head of the wrong kind or size
+            # must be reported as such, not as a failure to apply the mask to it.
             try:
-                out = model.step(obs, state0, mask)
-                out_alt = model.step(obs_alt, state0_alt, mask_alt)
+                out = model.step(obs, state0)
+                out_alt = model.step(obs_alt, state0_alt)
             except Exception as e:
                 raise ConfigError(
                     f"model.step failed on a dummy batch with obs shape {tuple(obs.shape)}: "
@@ -318,6 +320,15 @@ def validate_config(config: ColosseumConfig) -> None:
                 raise ConfigError(
                     f"networks: policy distribution does not match the action space: {exc}"
                 ) from exc
+            if mask is not None:
+                try:
+                    model.step(obs, state0, mask)
+                    model.step(obs_alt, state0_alt, mask_alt)
+                except Exception as e:
+                    raise ConfigError(
+                        f"model.step failed with the env's action_mask (shape {tuple(mask.shape)}): "
+                        f"{type(e).__name__}: {e}"
+                    ) from e
 
             dones = torch.zeros(T, B, dtype=torch.bool)
             dones[1, 0] = True

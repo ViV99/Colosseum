@@ -75,7 +75,9 @@ def test_three_agent_league_all_pairs_meet_and_seats_balanced(tmp_path):
         "training.phase": "league",
         "self_play.self_play_ratio": "0.0",
         "agents.agent_gamma": "{}",
-        "training.total_timesteps": "12000",
+        # Masked tic-tac-toe has no illegal-move forfeits, so episodes run ~7.6 moves (T8.1);
+        # 20000 steps keep the ~2000 seats per agent that the bound below was measured on.
+        "training.total_timesteps": "20000",
         # Seats are shuffled per env and refresh, and kept until the env's next episode boundary,
         # so episodes of one env are clustered. With 256 envs and a 0.2 s refresh an env plays
         # about one episode per seat draw, so the ~2000 seats per agent are nearly independent.

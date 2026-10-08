@@ -4,9 +4,15 @@ from __future__ import annotations
 from cli_runner import TTT_CONFIG, run_train
 from colosseum.metrics.jsonl import REQUIRED_KEYS
 
+# Workers report stats every WORKER_STATS_INTERVAL_SEC (2 s). With masked, turn-based
+# tic-tac-toe (T8.1) TINY's 3000 steps can finish before the first report, so the budget
+# is raised to keep the run longer than one stats interval.
+BUDGET = 12000
+
 
 def test_metrics_jsonl_ratings_json_and_console(tmp_path):
-    run = run_train(TTT_CONFIG, tmp_path, name="metrics-run")
+    run = run_train(TTT_CONFIG, tmp_path, name="metrics-run",
+                    overrides={"training.total_timesteps": str(BUDGET)})
     assert run.returncode == 0, run.stderr[-3000:]
     records = run.records()
     kinds = {r["kind"] for r in records}
@@ -18,7 +24,7 @@ def test_metrics_jsonl_ratings_json_and_console(tmp_path):
     assert sum(r["episodes"] for r in episodes) > 0
     assert set(episodes[0]["wdl"]) == {"latest", "past", "arena"}
     systems = run.records("system")
-    assert systems[-1]["env_steps"] >= 3000
+    assert systems[-1]["env_steps"] >= BUDGET
     assert any(r["workers_reporting"] >= 1 for r in systems)
     ratings = run.ratings()
     assert set(ratings) >= {"env_steps", "elo", "win_rates", "games", "wr_vs_past", "past_games"}

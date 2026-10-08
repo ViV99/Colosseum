@@ -67,8 +67,10 @@ class ChaseEnv(BaseEnv):
 
         for p in range(2):
             a = actions[p]
-            d = int(a["direction"])
-            s = float(np.clip(a["speed"], 0.0, 1.0))
+            d = int(np.asarray(a["direction"]).reshape(-1)[0])
+            # speed may be a scalar (ActionSpec.decode) or a shape-(1,) array (action_space.sample());
+            # float() of a 1-element array is an error on numpy 2.x (R6-12).
+            s = float(np.clip(np.asarray(a["speed"], dtype=np.float32).reshape(-1)[0], 0.0, 1.0))
             self._positions[p] += _DIRS[d] * s
             self._positions[p] = np.clip(self._positions[p], 0.0, _GRID)
 
