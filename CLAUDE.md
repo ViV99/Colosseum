@@ -245,7 +245,7 @@ User writes env + encoder + networks → selects algorithm + matchmaking via con
 
 ## Implementation Status
 
-State after SP1 (foundation and stabilization, branch `sp1-stabilization`). Test suite: **873** fast tests, **3** slow, **16** GPU-only (`pytest -m "not gpu and not slow"` is the CI suite). The full review that motivated SP1 is `review/README.md` (a frozen snapshot of the pre-SP1 code; never edit it); the SP1 spec is `docs/superpowers/specs/2026-10-08-sp1-stabilization-design.md`.
+State after SP1 (foundation and stabilization; developed on branch `sp1-stabilization`, accepted by the owner and merged into `main` on 2026-10-08). Test suite: **873** fast tests, **3** slow, **16** GPU-only (`pytest -m "not gpu and not slow"` is the CI suite). The full review that motivated SP1 is `review/README.md` (a frozen snapshot of the pre-SP1 code; never edit it); the SP1 spec is `docs/superpowers/specs/2026-10-08-sp1-stabilization-design.md`.
 
 Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on `sys.path`, also for spawned children):
 - `colosseum validate -c cfg.yaml [--set k=v ...]`: schema, env `num_players`, a dummy step/unroll of every agent's model.
@@ -345,6 +345,28 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
   - SharedMemory zero-copy weight store (raw `shared_memory` instead of queue payloads);
   - dynamic add/remove of agents and machines during a run;
   - config inheritance / profiles (`extends: base.yaml`).
+- **Residuals from the SP1 final review** (small; do them as the first commits of SP2):
+  - a second Ctrl+C while `Launcher._release_command_queues` runs (signal handlers already restored) can skip its `cancel_join_thread()` fallback; if a dead worker left an unread command larger than 64 KiB, interpreter exit waits for another Ctrl+C. Fix: `except BaseException` → `cancel_join_thread()` on every queue not yet closed → `raise`;
+  - `colosseum bc` with an unreadable data file (`PermissionError` / `OSError` from `torch.load` in `bc/offline_bc.py`) still prints a traceback instead of one `Config error:` line;
+  - `launcher.py` (~1100 lines) could move `_QueueReader` and the queue helpers to `core/ipc.py`; `registry._reset_mask_row` duplicates the mask flattening of `core/seat_info.extract_masks` to give better errors;
+  - distributed (SP5): the learner's final checkpoint can be lost when the checkpoint drainer stops first and the 16-slot queue is full.
+
+### Next step
+SP2 (game model). Like SP1, it starts with a brainstorm and a written spec before any plan or code (see Development Workflow). The owner still has to run `docs/GPU_CHECKS.md` on a CUDA machine.
+
+## Development Workflow
+
+- **One sub-project at a time**, in roadmap order (SP4 and SP5 may run in parallel). Each one goes: brainstorm → spec in `docs/superpowers/specs/` → implementation plan in `docs/superpowers/plans/<date>-<name>/` (overview with global constraints, interface contract and contract amendments, then parts with tasks) → implementation on a branch `spN-<name>` → acceptance report in `docs/superpowers/reports/` → merge.
+- **`main` stays stable.** A sub-project branch is merged with `git merge --no-ff` only after the owner explicitly accepts the acceptance report, so one `git revert -m 1 <merge>` undoes it. Push the branch to `origin` regularly while working.
+- **Implementation process (SP1):** one subagent per plan task (TDD, commit), a spec + quality review after every task, fix rounds with scoped re-reviews, then one whole-branch review with a single fix wave, then acceptance against the spec's §3 criteria.
+- **Decisions taken on the owner's behalf** are recorded as rulings ("what — why — cost if wrong"). The SP1 list (58 rulings) is at the end of `docs/superpowers/reports/2026-10-08-sp1-acceptance.md`. Check it before changing an area SP1 touched, and revise a ruling explicitly (with the owner) rather than silently undoing it.
+- **Frozen material:** `review/` is the pre-SP1 review snapshot and SP specs/plans are history; never edit them to match new code.
+- **Dev machine and tests:**
+  - setup: `scripts/setup-dev.sh` (CPU-only torch from the PyTorch CPU index; `--gpu` for CUDA);
+  - CI suite: `.venv/bin/python -m pytest -m "not gpu and not slow" -q -rw` (must pass with zero warnings), plus `-m slow` for the learning test and `.venv/bin/ruff check .`;
+  - test conventions: no `__init__.py` under `tests/`; import support modules by bare name (`from helpers import ...`, `from cli_runner import ...`); test basenames and support-class names are unique; every file goes under `tmp_path`; integration runs start processes through `tests/cli_runner.py` (process-group cleanup);
+  - at most 2 worker processes in tests (the benchmark may use 4); `OMP_NUM_THREADS=1`;
+  - any config-schema change also updates `scripts/bench_throughput.py::_make_config` (pinned benchmark workload; guarded by `tests/unit/test_bench_throughput.py`).
 
 ## Tech Stack
 
