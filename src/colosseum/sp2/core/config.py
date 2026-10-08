@@ -587,14 +587,18 @@ class ColosseumConfig(StrictModel):
                 raise ValueError(f"agents.{agent_id}: invalid override:\n{e}") from None
         return self
 
-    def get_agent_config(self, agent_id: str) -> ColosseumConfig:
-        """Effective config of one agent: global sections deep-merged with its override."""
+    def _require_known_agent(self, agent_id: str) -> None:
+        """Raise ConfigError unless ``agent_id`` is a configured agent (or ``agent_0`` without ``agents``)."""
         if self.agents and agent_id not in self.agents:
             raise ConfigError(f"Unknown agent '{agent_id}'. Known agents: {sorted(self.agents)}")
         if not self.agents and agent_id != "agent_0":
             raise ConfigError(
                 f"Unknown agent '{agent_id}': without an 'agents' section the only agent is 'agent_0'"
             )
+
+    def get_agent_config(self, agent_id: str) -> ColosseumConfig:
+        """Effective config of one agent: global sections deep-merged with its override."""
+        self._require_known_agent(agent_id)
         data = self.model_dump(by_alias=True)
         override = self.agents.get(agent_id)
         if override is not None:
@@ -606,13 +610,11 @@ class ColosseumConfig(StrictModel):
         return ColosseumConfig.model_validate(data)
 
     def agent_roles(self, agent_id: str) -> list[str] | None:
-        """``agents.<id>.roles`` (None when omitted: the agent plays every role)."""
-        if self.agents and agent_id not in self.agents:
-            raise ConfigError(f"Unknown agent '{agent_id}'. Known agents: {sorted(self.agents)}")
-        if not self.agents and agent_id != "agent_0":
-            raise ConfigError(
-                f"Unknown agent '{agent_id}': without an 'agents' section the only agent is 'agent_0'"
-            )
+        """``agents.<id>.roles`` (None when omitted: the agent plays every role).
+
+        Call it on the top-level config, not on a ``get_agent_config()`` result (which has ``agents == {}``).
+        """
+        self._require_known_agent(agent_id)
         override = self.agents.get(agent_id)
         return None if override is None or override.roles is None else list(override.roles)
 

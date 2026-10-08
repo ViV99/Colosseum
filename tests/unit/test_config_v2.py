@@ -65,6 +65,7 @@ def test_chunk_length_needs_two_slots():
 @pytest.mark.parametrize("kwargs", [
     {"mode": "arena"}, {"layouts": {"2p": 0.0}}, {"layouts": {"2p": -1.0}}, {"self_play_ratio": 1.5},
     {"latest_prob": -0.1}, {"teammates": "random"}, {"teammate_self_prob": 2.0}, {"pfsp_exponent": -1.0},
+    {"layouts": {"2p": float("nan")}},
 ])
 def test_matchmaking_bounds(kwargs):
     with pytest.raises(ValidationError):
