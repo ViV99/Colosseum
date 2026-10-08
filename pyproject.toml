@@ -4,25 +4,32 @@ version = "0.1.0"
 description = "Distributed RL training framework for competitive bot programming"
 requires-python = ">=3.11"
 dependencies = [
-    "torch>=2.2.0",
+    "torch>=2.6",
     "numpy>=1.26.0",
     "gymnasium>=1.0.0",
     "pyyaml>=6.0",
     "pydantic>=2.5.0",
     "lz4>=4.3.0",
-    "wandb>=0.16.0",
     "click>=8.1.0",
 ]
 
 [project.optional-dependencies]
+# The generated code in colosseum/transport/colosseum_pb2*.py requires these versions.
 grpc = [
-    "grpcio>=1.60.0",
-    "grpcio-tools>=1.60.0",
-    "protobuf>=4.25.0",
+    "grpcio>=1.78",
+    "grpcio-tools>=1.78",
+    "protobuf>=6.31",
+]
+wandb = [
+    "wandb>=0.16.0",
+]
+examples = [
+    "Box2D>=2.3.10",  # examples/space_miners (import Box2D); has cp312 manylinux wheels
 ]
 dev = [
-    "pytest>=7.4.0",
-    "ruff>=0.1.0",
+    "pytest>=8.0",
+    "pytest-timeout>=2.3",
+    "ruff>=0.6",
 ]
 
 [project.scripts]
@@ -38,6 +45,29 @@ packages = ["src/colosseum"]
 [tool.ruff]
 line-length = 120
 target-version = "py311"
+extend-exclude = [
+    "src/colosseum/transport/colosseum_pb2.py",
+    "src/colosseum/transport/colosseum_pb2_grpc.py",
+    "review",
+    "research",
+]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "B", "UP"]
+ignore = [
+    "B027",   # empty non-abstract methods in ABCs are intentional optional hooks
+    "B905",   # zip() without strict= : lengths are checked explicitly where it matters
+    "UP042",  # keep `class X(str, Enum)`; StrEnum changes str() formatting
+]
+
+[tool.ruff.lint.isort]
+known-first-party = ["cli_runner", "colosseum", "dataflow_helpers", "examples", "harness", "helpers", "learning_envs", "ttt_eval"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+addopts = "-ra --strict-markers"
+timeout = 300
+markers = [
+    "gpu: needs a CUDA device (auto-skipped without CUDA)",
+    "slow: longer than ~20 s; excluded from the fast suite (-m 'not gpu and not slow')",
+]

@@ -1,12 +1,17 @@
-"""Observation normalization utilities (running mean/std).
+"""Observation normalization (running mean/std).
 
 ``NormalizeObs`` keeps its running statistics in registered *buffers*, so they
-are part of the network ``state_dict`` and therefore ride along with the normal
-weight-sync path (learner -> workers) at zero extra plumbing cost — which is
-exactly what an async actor-learner setup needs to keep worker inference and
-learner training using the same normalization.
+are part of the model ``state_dict`` and ride along with the normal weight sync
+(learner -> workers) and checkpoints.
 
-Usage — prepend it inside your encoder::
+The statistics change only through :meth:`NormalizeObs.update`; ``forward`` is
+a pure function of the current statistics, in train and eval mode alike. The
+algorithm calls ``PolicyModel.update_normalizers(obs)`` exactly once per train
+step with the batch's fresh observations, before any loss forward. So every
+sample is counted once, whatever the number of epochs and minibatches, and the
+learner's forward uses the same statistics for every minibatch of a step.
+
+Usage: put it inside your encoder::
 
     class MyEncoder(BaseEncoder):
         def __init__(self, obs_dim=...):
@@ -17,8 +22,9 @@ Usage — prepend it inside your encoder::
         def forward(self, obs):
             return self.net(self.norm(obs))
 
-Statistics update only in ``train()`` mode (i.e. on the learner). Workers run
-in ``eval()`` mode and just apply the latest synced stats.
+The default ``PolicyModel.update_normalizers`` feeds the raw observations to
+every ``NormalizeObs`` submodule. If a normalizer sees something else (a slice
+or a transform of the observation), override ``update_normalizers``.
 """
 
 from __future__ import annotations
@@ -55,25 +61,38 @@ class RunningMeanStd(nn.Module):
 
 
 class NormalizeObs(nn.Module):
-    """Normalize observations by running mean/std; updates stats only in training.
+    """Normalize observations by running mean/std; statistics change only in ``update``.
 
     Args:
         shape: per-observation feature shape (e.g. ``(obs_dim,)`` or ``(C, H, W)``).
         clip: clip normalized values to ``[-clip, clip]`` (0 disables).
-        epsilon: numerical floor for the std.
+        epsilon: numerical floor for the variance.
     """
 
     def __init__(self, shape: tuple[int, ...], clip: float = 10.0, epsilon: float = 1e-8) -> None:
         super().__init__()
-        self.rms = RunningMeanStd(shape)
+        self.shape: tuple[int, ...] = tuple(int(s) for s in shape)
+        self.rms = RunningMeanStd(self.shape)
         self._clip = clip
         self._eps = epsilon
 
+    @torch.no_grad()
+    def update(self, obs: torch.Tensor) -> None:
+        """Add a batch of observations ``[..., *shape]`` (any leading dims) to the statistics."""
+        n = len(self.shape)
+        if obs.dim() < n or tuple(obs.shape[obs.dim() - n:]) != self.shape:
+            raise ValueError(
+                f"NormalizeObs(shape={self.shape}) cannot update from observations of shape "
+                f"{tuple(obs.shape)}: the trailing dims must equal {self.shape}. If this "
+                f"normalizer sees a transformed observation, override "
+                f"PolicyModel.update_normalizers for your model."
+            )
+        flat = obs.reshape(-1, *self.shape).to(self.rms.mean.dtype)
+        if flat.shape[0] == 0:
+            return
+        self.rms.update(flat)
+
     def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        if self.training:
-            # Flatten leading dims to [N, *shape] for the stats update.
-            flat = obs.reshape(-1, *self.rms.mean.shape)
-            self.rms.update(flat)
         normed = (obs - self.rms.mean) / torch.sqrt(self.rms.var + self._eps)
         if self._clip > 0:
             normed = torch.clamp(normed, -self._clip, self._clip)

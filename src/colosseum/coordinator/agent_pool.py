@@ -5,7 +5,6 @@ from __future__ import annotations
 import logging
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -24,14 +23,14 @@ class AgentHandle:
     agent_type: AgentType
 
     # For trainable agents
-    network_config: Optional[dict] = None
+    network_config: dict | None = None
 
     # For frozen agents
-    checkpoint_path: Optional[str] = None
-    checkpoint_id: Optional[str] = None
+    checkpoint_path: str | None = None
+    checkpoint_id: str | None = None
 
     # For scripted agents
-    scripted_class: Optional[str] = None
+    scripted_class: str | None = None
 
     # Ratings (populated later in Milestone 4)
     elo: float = 1200.0
@@ -48,7 +47,7 @@ class AgentPool:
     def register_trainable(
         self,
         agent_id: str,
-        network_config: Optional[dict] = None,
+        network_config: dict | None = None,
     ) -> AgentHandle:
         """Register a trainable agent with its own learner."""
         handle = AgentHandle(
@@ -64,7 +63,7 @@ class AgentPool:
         self,
         agent_id: str,
         checkpoint_path: str,
-        checkpoint_id: Optional[str] = None,
+        checkpoint_id: str | None = None,
     ) -> AgentHandle:
         """Register a frozen checkpoint agent (no training)."""
         handle = AgentHandle(

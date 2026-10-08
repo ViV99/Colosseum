@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any
 
 import gymnasium
 import numpy as np
@@ -16,8 +16,22 @@ class BaseEnv(ABC):
     Players are identified by integer indices 0..N-1.
     All return values are dicts keyed by player index.
 
-    For turn-based games: only the active player's action matters;
-    other players can pass any valid action (ignored by env).
+    Turn-based convention (used by the rollout worker):
+    - ``info[p]["active"]`` (bool) marks the players who act on the next step;
+      players without the key act. A non-acting player runs no inference, sends
+      a zero action (ignored by the env) and its model state does not advance.
+    - ``info[p]["action_mask"]`` may be all-false for a non-acting player; an
+      acting player must have at least one legal action (else EnvContractError).
+    - A player's rewards are credited to its last action until it acts again;
+      rewards before its first action in an episode go to that first action. At
+      episode end the last transition of every collecting player *that acted in
+      the episode* gets the final reward and done=True; the rewards of a player
+      that never acted in the episode are dropped.
+
+    Time limits: end an episode that is cut off (not finished) with
+    ``truncated=True`` and ``terminated=False``. The rollout worker then adds
+    ``gamma * V(final_obs)`` to each collecting player's last reward, using the
+    final observation the vector env keeps in ``info[p]["terminal_observation"]``.
     """
 
     @property
@@ -40,7 +54,7 @@ class BaseEnv(ABC):
 
     @abstractmethod
     def reset(
-        self, seed: Optional[int] = None
+        self, seed: int | None = None
     ) -> tuple[dict[int, np.ndarray], dict[int, dict]]:
         """Reset environment.
 
@@ -87,6 +101,6 @@ class BaseEnv(ABC):
         """Clean up resources."""
         pass
 
-    def render(self) -> Optional[Any]:
+    def render(self) -> Any | None:
         """Optional rendering."""
         return None

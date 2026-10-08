@@ -18,6 +18,7 @@ htmlcov/
 # Training artifacts
 checkpoints/
 runs/
+/eval.json
 wandb/
 *.pt
 *.pth

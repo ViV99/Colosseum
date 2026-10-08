@@ -1,6 +1,7 @@
 from __future__ import annotations
 
-from typing import Any, Callable, Optional
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
@@ -69,7 +70,7 @@ class VectorEnv:
     # ------------------------------------------------------------------
 
     def reset_all(
-        self, seed: Optional[int] = None
+        self, seed: int | None = None
     ) -> tuple[np.ndarray, list[dict[int, dict]]]:
         """Reset all envs.
 
@@ -107,9 +108,9 @@ class VectorEnv:
             terminated: np.ndarray [num_envs]  (bool) -- True if ANY player terminated
             truncated:  np.ndarray [num_envs]  (bool) -- True if ANY player truncated
             infos:      list of num_envs info dicts (player_index -> info).
-                        For auto-reset envs the info for each player includes
-                        ``"terminal_observation"`` with the final observation and
-                        ``"terminal_info"`` with the final info dict.
+                        For an env that auto-reset, each player's info is the
+                        RESET info plus ``"terminal_observation"`` (the final
+                        observation) and ``"terminal_info"`` (the final step's info).
         """
         action_dicts = self._unstack_actions(actions)
 
@@ -131,20 +132,20 @@ class VectorEnv:
             for p in range(self.num_players):
                 rewards[k, p] = rew_k[p]
 
-            # Auto-reset if the episode ended.
+            # Auto-reset if the episode ended. The returned info is the RESET
+            # info: it describes the observation the agents act on next (masks,
+            # "active", ...). The final step's obs/info are kept only under
+            # "terminal_observation" / "terminal_info" (R2-14).
             if env_terminated or env_truncated:
-                # Preserve terminal data in infos before resetting.
-                for p in range(self.num_players):
-                    original_info = {k: v for k, v in info_k[p].items()}
-                    info_k[p]["terminal_observation"] = obs_k[p]
-                    info_k[p]["terminal_info"] = original_info
-
                 new_obs, new_info = env.reset()
                 obs_dicts.append(new_obs)
-                # Merge reset info into the returned infos (terminal data already stored).
+                merged: dict[int, dict] = {}
                 for p in range(self.num_players):
-                    info_k[p].update(new_info[p])
-                all_infos.append(info_k)
+                    out = dict(new_info.get(p, {}))
+                    out["terminal_observation"] = obs_k[p]
+                    out["terminal_info"] = dict(info_k[p])
+                    merged[p] = out
+                all_infos.append(merged)
             else:
                 obs_dicts.append(obs_k)
                 all_infos.append(info_k)

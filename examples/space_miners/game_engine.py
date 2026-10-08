@@ -4,20 +4,20 @@ Adapted from the competition local runner. Uses Box2D for physics simulation.
 Requires: pip install Box2D
 """
 
-import math
 import logging
+import math
 import random
 from typing import Any
 
 import Box2D
 from Box2D import (
-    b2World,
-    b2Vec2,
+    b2_dynamicBody,
     b2BodyDef,
+    b2CircleShape,
     b2FixtureDef,
     b2PolygonShape,
-    b2_dynamicBody,
-    b2CircleShape,
+    b2Vec2,
+    b2World,
 )
 
 # Game world constants

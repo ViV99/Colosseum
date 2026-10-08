@@ -271,7 +271,7 @@ class SeatResult:                                        # (T3.4)
     network_id: str             # "latest" | "ckpt_v<N>"
     outcome: float              # in [0,1]; from core.outcomes (env rank/outcome, else reward-based)
     reward: float               # episode return of this seat
-    rank: int | None = None
+    rank: float | None = None   # float: fractional tie ranks are kept (T5.2 ruling)
 
 @dataclass
 class MatchResult:                                       # (T3.4) replaces the dict-keyed version
@@ -289,9 +289,18 @@ class WorkerCommand:            # new_checkpoints become numpy state dicts (T2.2
 
 `PlayerSlot` and `MatchConfig` are unchanged.
 
-### `colosseum.core.ipc` (T2.3, T2.5)
+### `colosseum.core.ipc` (T2.2, T2.3, T2.5)
 
 ```python
+# T2.2: the single numpy <-> torch conversion point (torch->numpy copies, bf16->float32;
+# numpy->torch shares writable C-contiguous arrays, copies the rest)
+def tensor_to_numpy(t: Tensor) -> np.ndarray: ...
+def numpy_to_tensor(a: np.ndarray) -> Tensor: ...
+def is_namedtuple(x: Any) -> bool: ...
+def to_numpy_tree(obj: Any) -> Any: ...                  # dict/list/tuple/namedtuple, tensor leaves -> numpy
+def from_numpy_tree(obj: Any) -> Any: ...
+def find_tensor(obj: Any, path: str = "item") -> str | None: ...
+def assert_no_tensors(obj: Any, what: str = "item") -> None: ...   # TypeError naming the path
 def put_latest(q: mp.Queue, item: Any, timeout: float = 1.0) -> bool: ...   # maxsize=1 queue; evicts a stale/in-flight item (see amendment B1)
 def drain_latest(q: mp.Queue) -> Any | None: ...         # returns the newest available item or None
 class SharedCounter:                                     # wraps mp.Value("q")
@@ -384,7 +393,10 @@ def learner_process(*, agent_id: str, algorithm_factory: Callable[[], BaseAlgori
                     trajectory_queue, weight_queues: list, config: LearnerConfig, stop_event,
                     metrics_queue=None, checkpoint_queue=None, checkpoint_interval: int = 0,
                     resume_state: dict | None = None, progress_counter: SharedCounter | None = None,
-                    total_timesteps: int = 0, run_dir: str | None = None) -> None: ...
+                    total_timesteps: int = 0, run_dir: str | None = None,
+                    weight_sync_interval: float = 5.0) -> None: ...
+    # weight_sync_interval (T2.2): rollout.weight_sync_interval_sec; sizes the exit wait for
+    # unread weight payloads (max(60 s, 3 x interval))
 ```
 
 ### `colosseum.coordinator` (T5.1–T5.3)

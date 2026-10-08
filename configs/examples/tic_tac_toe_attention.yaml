@@ -1,0 +1,50 @@
+# Tic-tac-toe with a stateful core: causal attention over the last 8 latents of the episode.
+run:
+  name: null
+  dir: "runs"
+
+env:
+  env_class: "examples.tic_tac_toe.env.TicTacToeEnv"
+  num_players: 2
+  kwargs: {}
+
+networks:
+  encoder_class: "examples.tic_tac_toe.networks.TicTacToeEncoder"
+  core:
+    class: "colosseum.networks.cores.WindowAttentionCore"
+    kwargs: {d_model: 64, window: 8, num_heads: 4, num_layers: 1}
+  policy_class: "examples.tic_tac_toe.networks.TicTacToePolicy"   # gets in_dim = core.output_dim
+  value_class: "examples.tic_tac_toe.networks.TicTacToeValue"
+  kwargs: {}
+
+algorithm:
+  gamma: 0.99
+  vtrace_lambda: 1.0
+  entropy_coeff: 0.01
+  learning_rate: 3.0e-4
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 32
+  num_workers: 2
+  envs_per_worker: 16
+  weight_sync_interval_sec: 2.0
+  torch_threads: 1
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  phase: "self_play"
+  total_timesteps: 600000
+
+self_play:
+  checkpoint_interval: 100
+  pool_size: 10
+  latest_prob: 0.8
+
+metrics:
+  use_wandb: false
+  log_interval: 10

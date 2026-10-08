@@ -1,3 +1,8 @@
+# Two trainable agents in a league: every match is an arena match (self_play_ratio 0.0).
+run:
+  name: null
+  dir: "runs"
+
 env:
   env_class: "examples.tic_tac_toe.env.TicTacToeEnv"
   num_players: 2
@@ -5,64 +10,54 @@ env:
 
 networks:
   encoder_class: "examples.tic_tac_toe.networks.TicTacToeEncoder"
+  core: null
   policy_class: "examples.tic_tac_toe.networks.TicTacToePolicy"
   value_class: "examples.tic_tac_toe.networks.TicTacToeValue"
   kwargs: {}
 
 algorithm:
-  name: "appo"
   gamma: 0.99
-  gae_lambda: 0.95
-  eps_clip: 0.2
-  value_loss_coeff: 0.5
+  vtrace_lambda: 1.0
   entropy_coeff: 0.01
-  max_grad_norm: 0.5
-  num_epochs: 1
-  minibatch_chunks: 0
-  vtrace_rho_bar: 1.0
-  vtrace_c_bar: 1.0
   learning_rate: 3.0e-4
   lr_schedule: "constant"
 
 rollout:
-  chunk_length: 8
-  num_workers: 1
-  envs_per_worker: 4
+  chunk_length: 32
+  num_workers: 2
+  envs_per_worker: 8
   weight_sync_interval_sec: 2.0
+  torch_threads: 1
+  match_refresh_interval_sec: 10.0
 
 learner:
   device: "auto"
-  queue_size: 16
-  batch_chunks: 2
+  queue_size: 32
+  batch_chunks: 8
 
 training:
   phase: "league"
-  total_timesteps: 3000
+  total_timesteps: 300000
 
 self_play:
-  checkpoint_interval: 30    # train steps; small so the league pool fills during the short run
+  checkpoint_interval: 100
   pool_size: 5
-  latest_prob: 0.5
-  self_play_ratio: 0.0   # all arena matches for testing
+  latest_prob: 0.8
+  self_play_ratio: 0.0
+  pfsp_exponent: 1.0
+  shuffle_seats: true
 
 checkpoint:
-  dir: "./checkpoints"
   save_optimizer: false
 
 metrics:
   use_wandb: false
-  log_interval: 5
+  log_interval: 10
+  console_interval_sec: 10.0
 
-transport:
-  mode: "local"
-
-# Two trainable agents with same architecture
+# Agent overrides are partial and deep-merged onto the sections above.
 agents:
-  agent_alpha:
-    networks: null
-    algorithm: null
-    learner: null
+  agent_alpha: {}
   agent_beta:
-    networks: null
-    algorithm: null
-    learner: null
+    algorithm:
+      learning_rate: 1.0e-4

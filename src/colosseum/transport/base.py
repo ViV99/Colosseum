@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
 
 from colosseum.core.types import TrajectoryChunk
 
@@ -19,7 +18,7 @@ class BaseTransport(ABC):
         ...
 
     @abstractmethod
-    def recv_chunk(self, agent_id: str, timeout: Optional[float] = None) -> Optional[TrajectoryChunk]:
+    def recv_chunk(self, agent_id: str, timeout: float | None = None) -> TrajectoryChunk | None:
         """Receive a trajectory chunk for the given agent's learner.
 
         Args:

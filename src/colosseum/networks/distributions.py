@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
+from collections.abc import Mapping, Sequence
 
 import torch
 import torch.nn.functional as F
@@ -46,14 +46,30 @@ class Distribution(ABC):
         """
         return self
 
+    @classmethod
+    def cat(cls, dists: Sequence[Distribution]) -> Distribution:
+        """Concatenate same-type distributions along the batch dimension.
+
+        Used by the default ``PolicyModel.unroll`` (a per-step loop). Custom
+        distributions must override it to be used with that default.
+        """
+        raise NotImplementedError(f"{cls.__name__}.cat is not implemented")
+
 
 class CategoricalDist(Distribution):
     """For discrete action spaces with optional action masking."""
 
-    def __init__(self, logits: torch.Tensor, mask: Optional[torch.Tensor] = None):
+    def __init__(self, logits: torch.Tensor, mask: torch.Tensor | None = None):
+        self._mask: torch.Tensor | None = None
         if mask is not None:
-            logits = logits.masked_fill(~mask.bool(), float("-inf"))
+            self._mask = mask.bool()
+            logits = logits.masked_fill(~self._mask, float("-inf"))
         self._dist = torch.distributions.Categorical(logits=logits)
+
+    @property
+    def mask(self) -> torch.Tensor | None:
+        """Bool legal-action mask (True = legal), or None when unmasked."""
+        return self._mask
 
     @property
     def logits(self) -> torch.Tensor:
@@ -70,27 +86,67 @@ class CategoricalDist(Distribution):
         return self._dist.log_prob(actions)
 
     def entropy(self) -> torch.Tensor:
-        return self._dist.entropy()
+        if self._mask is None:
+            return self._dist.entropy()
+        # Illegal actions contribute exactly 0 to the value and to the gradient.
+        # (torch's entropy multiplies probs by logits clamped to finfo.min, whose
+        # backward overflows to inf -> NaN under AMP loss scaling.)
+        log_p = self._dist.logits                          # normalized, -inf where illegal
+        return -(log_p.exp() * log_p.masked_fill(~self._mask, 0.0)).sum(dim=-1)
 
     def mode(self) -> torch.Tensor:
         return self._dist.logits.argmax(dim=-1)
 
     def kl_divergence(self, other: Distribution) -> torch.Tensor:
+        """KL(self || other) over legal actions only.
+
+        The legal set is the intersection of both distributions' masks; both sides are
+        renormalized on it. Rows with no common legal action give 0. The result is
+        finite even when only one side is masked; it is computed in float32.
+        """
         if not isinstance(other, CategoricalDist):
             raise TypeError(f"Cannot compute KL between CategoricalDist and {type(other).__name__}")
-        student_log_probs = F.log_softmax(self.logits, dim=-1)
-        teacher_log_probs = F.log_softmax(other.logits, dim=-1)
-        return (student_log_probs.exp() * (student_log_probs - teacher_log_probs)).sum(dim=-1)
+        legal = self._mask
+        if other.mask is not None:
+            legal = other.mask if legal is None else (legal & other.mask)
+        p_logits = self.logits.float()
+        q_logits = other.logits.float()
+        if legal is None:
+            log_p = F.log_softmax(p_logits, dim=-1)
+            log_q = F.log_softmax(q_logits, dim=-1)
+            return (log_p.exp() * (log_p - log_q)).sum(dim=-1)
+        neg = torch.finfo(p_logits.dtype).min
+        log_p = F.log_softmax(p_logits.masked_fill(~legal, neg), dim=-1)
+        log_q = F.log_softmax(q_logits.masked_fill(~legal, neg), dim=-1)
+        terms = torch.where(legal, log_p.exp() * (log_p - log_q), torch.zeros_like(log_p))
+        return terms.sum(dim=-1)
 
     def apply_mask(self, mask: torch.Tensor) -> CategoricalDist:
-        """Return a new CategoricalDist with invalid actions masked out."""
+        """Return a new CategoricalDist with invalid actions masked out (masks combine)."""
+        mask = mask.bool()
+        if self._mask is not None:
+            mask = mask & self._mask
         return CategoricalDist(logits=self.logits, mask=mask)
+
+    @classmethod
+    def cat(cls, dists: Sequence[CategoricalDist]) -> CategoricalDist:
+        """Concatenate along the batch; masks are concatenated (unmasked parts: all legal)."""
+        logits = torch.cat([d.logits for d in dists], dim=0)
+        if all(d.mask is None for d in dists):
+            return CategoricalDist(logits=logits)
+        mask = torch.cat([
+            d.mask if d.mask is not None else torch.ones_like(d.logits, dtype=torch.bool)
+            for d in dists
+        ], dim=0)
+        return CategoricalDist(logits=logits, mask=mask)
 
 
 class DiagGaussianDist(Distribution):
     """For continuous action spaces with diagonal covariance."""
 
     def __init__(self, mean: torch.Tensor, log_std: torch.Tensor):
+        self._mean = mean
+        self._log_std = log_std
         self._dist = torch.distributions.Normal(mean, log_std.exp())
 
     @property
@@ -114,26 +170,41 @@ class DiagGaussianDist(Distribution):
             raise TypeError(f"Cannot compute KL between DiagGaussianDist and {type(other).__name__}")
         return torch.distributions.kl_divergence(self._dist, other._dist).sum(dim=-1)
 
+    @classmethod
+    def cat(cls, dists: Sequence[DiagGaussianDist]) -> DiagGaussianDist:
+        # log_std may be broadcast (e.g. a [D] parameter): expand it to the mean's shape.
+        return DiagGaussianDist(
+            torch.cat([d._mean for d in dists], dim=0),
+            torch.cat([torch.broadcast_to(d._log_std, d._mean.shape) for d in dists], dim=0),
+        )
+
 
 class CompositeDist(Distribution):
     """Multi-head distribution for composite action spaces (Dict / Tuple / MultiDiscrete).
 
-    Wraps a dict of sub-distributions.  All public methods operate on *flat*
-    ``float32`` tensors of shape ``[B, flat_size]``, where ``flat_size`` is the
-    sum of per-component action dimensions.
+    Wraps an ordered mapping of sub-distributions. All public methods operate on
+    *flat* ``float32`` tensors of shape ``[B, flat_size]``: a discrete component
+    takes one column (the category index as a float), a continuous one takes
+    ``action_dim`` columns.
 
-    Keys are sorted alphabetically so that the flat layout matches
-    :class:`~colosseum.core.action_spec.ActionSpec`.
+    The component order is the insertion order of ``dists`` and defines the flat
+    action and mask layout. It must equal the action space's component order
+    (``ActionSpec.component_names``): Tuple/MultiDiscrete components are named
+    ``"0"``, ``"1"``, ... in index order; Dict components follow
+    ``action_space.spaces`` order. Gymnasium sorts the keys of a plain dict
+    (falling back to insertion order when the keys are not comparable) and keeps
+    the given order for an ``OrderedDict``, a sequence of ``(key, space)`` pairs or
+    ``Dict(..., sort_keys=False)``. ``ActionSpec.check_distribution`` verifies it.
     """
 
-    def __init__(self, dists: dict[str, Distribution]) -> None:
+    def __init__(self, dists: Mapping[str, Distribution]) -> None:
         if not dists:
             raise ValueError("CompositeDist requires at least one sub-distribution")
 
-        self._keys: list[str] = sorted(dists.keys())
+        self._keys: list[str] = list(dists.keys())
         self._dists: dict[str, Distribution] = {k: dists[k] for k in self._keys}
 
-        # Action layout: offset → (offset, size, is_discrete)
+        # Action layout: key -> (offset, size, is_discrete)
         offset = 0
         self._layout: dict[str, tuple[int, int, bool]] = {}
         for k in self._keys:
@@ -155,6 +226,31 @@ class CompositeDist(Distribution):
             self._mask_layout[k] = (mask_offset, ms)
             mask_offset += ms
         self._flat_mask_size: int = mask_offset
+
+    # ---- Layout -----------------------------------------------------------
+
+    @property
+    def keys(self) -> list[str]:
+        """Component names in flat-layout order."""
+        return list(self._keys)
+
+    @property
+    def components(self) -> list[tuple[str, int, int, bool]]:
+        """``(name, flat_offset, size, is_discrete)`` per component, in flat-layout order."""
+        return [(k, *self._layout[k]) for k in self._keys]
+
+    @property
+    def mask_components(self) -> list[tuple[str, int, int]]:
+        """``(name, mask_offset, mask_size)`` per component, in flat-layout order.
+
+        ``mask_size`` is the number of categories of a discrete head, 0 for a continuous one.
+        """
+        return [(k, *self._mask_layout[k]) for k in self._keys]
+
+    @property
+    def flat_mask_size(self) -> int:
+        """Width of the flat action mask: the summed sizes of the discrete components."""
+        return self._flat_mask_size
 
     # ---- Distribution interface ------------------------------------------
 
@@ -178,7 +274,7 @@ class CompositeDist(Distribution):
 
     def log_prob(self, flat_actions: torch.Tensor) -> torch.Tensor:
         """Compute log-probability of a flat action tensor ``[B, flat_size]``."""
-        total: Optional[torch.Tensor] = None
+        total: torch.Tensor | None = None
         for k in self._keys:
             off, sz, is_disc = self._layout[k]
             d = self._dists[k]
@@ -191,7 +287,7 @@ class CompositeDist(Distribution):
         return total
 
     def entropy(self) -> torch.Tensor:
-        total: Optional[torch.Tensor] = None
+        total: torch.Tensor | None = None
         for k in self._keys:
             e = self._dists[k].entropy()
             total = e if total is None else total + e
@@ -232,8 +328,16 @@ class CompositeDist(Distribution):
             raise ValueError(
                 f"Key mismatch: {self._keys} vs {other._keys}"
             )
-        total: Optional[torch.Tensor] = None
+        total: torch.Tensor | None = None
         for k in self._keys:
             kl = self._dists[k].kl_divergence(other._dists[k])
             total = kl if total is None else total + kl
         return total
+
+    @classmethod
+    def cat(cls, dists: Sequence[CompositeDist]) -> CompositeDist:
+        keys = dists[0]._keys
+        for d in dists:
+            if d._keys != keys:
+                raise ValueError(f"Key mismatch: {d._keys} vs {keys}")
+        return CompositeDist({k: type(dists[0]._dists[k]).cat([d._dists[k] for d in dists]) for k in keys})

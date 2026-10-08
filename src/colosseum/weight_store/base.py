@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import Optional
 
 from colosseum.core.types import WeightPayload
 
@@ -15,7 +14,7 @@ class BaseWeightStore(ABC):
         ...
 
     @abstractmethod
-    def get(self, agent_id: str) -> Optional[WeightPayload]:
+    def get(self, agent_id: str) -> WeightPayload | None:
         """Get latest weights for an agent. Returns None if no weights published yet."""
         ...
 

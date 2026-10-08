@@ -18,6 +18,15 @@ _GRID = 10.0
 _MAX_STEPS = 20
 
 
+def _single(value, name: str, player: int):
+    """The one element of a scalar or size-1 array action component."""
+    arr = np.asarray(value)
+    if arr.size != 1:
+        raise ValueError(f"player {player}: action component {name!r} must have exactly one element, "
+                         f"got shape {arr.shape}")
+    return arr.reshape(-1)[0]
+
+
 class ChaseEnv(BaseEnv):
     """Two players chase fixed targets on a grid with composite actions."""
 
@@ -67,8 +76,10 @@ class ChaseEnv(BaseEnv):
 
         for p in range(2):
             a = actions[p]
-            d = int(a["direction"])
-            s = float(np.clip(a["speed"], 0.0, 1.0)) if not isinstance(a["speed"], (int, float)) else float(np.clip(a["speed"], 0.0, 1.0))
+            # Components may be scalars (ActionSpec.decode) or shape-(1,) arrays (action_space.sample());
+            # float() of a 1-element array is an error on numpy 2.x (R6-12).
+            d = int(_single(a["direction"], "direction", p))
+            s = float(np.clip(_single(a["speed"], "speed", p), 0.0, 1.0))
             self._positions[p] += _DIRS[d] * s
             self._positions[p] = np.clip(self._positions[p], 0.0, _GRID)
 

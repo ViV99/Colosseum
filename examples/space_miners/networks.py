@@ -44,16 +44,16 @@ class SpaceMinersEncoder(BaseEncoder):
 class SpaceMinersPolicy(BasePolicy):
     """Composite policy: 6D continuous acceleration + 3 binary push heads."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, in_dim: int = _LATENT, **kwargs) -> None:
         super().__init__()
         # Acceleration: 3 ships × 2D = 6
-        self.accel_mean = nn.Linear(_LATENT, 6)
+        self.accel_mean = nn.Linear(in_dim, 6)
         self.accel_logstd = nn.Parameter(torch.zeros(6))
 
         # Push: binary per ship
-        self.push_head_0 = nn.Linear(_LATENT, 2)
-        self.push_head_1 = nn.Linear(_LATENT, 2)
-        self.push_head_2 = nn.Linear(_LATENT, 2)
+        self.push_head_0 = nn.Linear(in_dim, 2)
+        self.push_head_1 = nn.Linear(in_dim, 2)
+        self.push_head_2 = nn.Linear(in_dim, 2)
 
     def forward(self, latent: torch.Tensor) -> CompositeDist:
         batch_size = latent.shape[0]
@@ -73,10 +73,10 @@ class SpaceMinersPolicy(BasePolicy):
 class SpaceMinersValue(BaseValue):
     """MLP value head: latent → scalar."""
 
-    def __init__(self, **kwargs) -> None:
+    def __init__(self, in_dim: int = _LATENT, **kwargs) -> None:
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(_LATENT, 64),
+            nn.Linear(in_dim, 64),
             nn.ReLU(),
             nn.Linear(64, 1),
         )

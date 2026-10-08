@@ -20,6 +20,14 @@ agent (opponents = latest weights pulled from the store). The dynamic
 coordinator-driven matchmaking (PFSP / historical-checkpoint opponents, C1) is a
 single-machine feature; closing that loop across machines would require running
 the coordinator as its own service and is left as future work.
+
+Budget and progress: there is no shared env-step counter across machines. Each
+distributed learner uses progress = consumed_samples / training.total_timesteps
+(its own transitions, which drives the LR schedule) and stops by itself once
+consumed_samples >= total_timesteps. Each worker stops after
+total_timesteps / num_workers env steps. These numbers differ from the local
+mode budget (env steps summed over workers); a single semantics comes with the
+hub in SP5.
 """
 
 from __future__ import annotations
@@ -28,15 +36,19 @@ import logging
 import multiprocessing as mp
 import queue
 import signal
+import socket
 import threading
 import time
 from functools import partial
-from typing import Optional
 
 import torch
 
-from colosseum.core.config import ColosseumConfig, load_config
+from colosseum.core.config import ColosseumConfig, config_hash, load_config
+from colosseum.core.run_dir import RunDir, safe_path_component
 from colosseum.core.types import WeightPayload
+from colosseum.utils.logging import setup_process_logging
+from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
+from colosseum.utils.seeding import apply_global_seed, learner_seed
 
 logger = logging.getLogger(__name__)
 
@@ -48,7 +60,7 @@ logger = logging.getLogger(__name__)
 
 
 class GRPCTrajectorySink:
-    """``.put``-compatible sink that ships chunks to a learner over gRPC.
+    """``.put``-compatible sink that ships chunk payloads to a learner over gRPC.
 
     Transient RPC failures (e.g. the learner restarting or shutting down) drop
     the chunk rather than crashing the worker — trajectory data is replaceable,
@@ -66,7 +78,7 @@ class GRPCTrajectorySink:
         except grpc.RpcError as e:
             logger.debug(f"Dropping chunk for {self._agent_id}: {e.code()}")
 
-    def put(self, chunk, timeout: Optional[float] = None) -> None:  # noqa: ARG002
+    def put(self, chunk, timeout: float | None = None) -> None:  # noqa: ARG002
         self._send(chunk)
 
     def put_nowait(self, chunk) -> None:
@@ -121,31 +133,39 @@ def run_distributed_learner(
     agent_id: str,
     traj_port: int,
     weight_store_address: str,
-    overrides: Optional[dict] = None,
-) -> None:
-    """Run one trainable agent's learner as a standalone gRPC service.
+    overrides: dict | None = None,
+) -> int:
+    """Run one trainable agent's learner as a standalone gRPC service; returns the exit code
+    (0 when it stopped at its budget, 128 + signum after SIGINT / SIGTERM).
 
     Starts a TrajectoryService on ``traj_port`` (workers send chunks here),
     trains with the configured algorithm, and pushes weights to the WeightStore
     at ``weight_store_address``.
     """
-    from colosseum.core.registry import build_network, import_class
-    from colosseum.learner.learner import learner_process
+    from colosseum.core.registry import build_model, import_class, validate_config
+    from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
+    from colosseum.learner.learner import learner_process, resolve_device
     from colosseum.transport.grpc_transport import serve_trajectory_receiver
     from colosseum.weight_store.grpc_store import GRPCWeightStore
 
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
-
-    config = _load(config_path, overrides)
+    setup_process_logging(None, f"learner-{agent_id}", console_level=logging.INFO)
+    config = load_config(config_path, overrides)
     acfg = config.get_agent_config(agent_id)
+    validate_config(acfg)  # before the run dir exists: a bad config leaves nothing behind
+    run_dir = RunDir.create(config, config_path, role=f"learner-{agent_id}")
+    config = run_dir.with_run_name(config)
+    setup_process_logging(run_dir.logs, f"learner-{agent_id}", console_level=logging.INFO)
+    run_dir.write_resolved_config(config)
+    print(f"Run directory: {run_dir.root}", flush=True)
     max_mb = config.transport.grpc_max_message_mb
 
-    device = acfg.learner.device
-    if device == "auto":
-        device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = resolve_device(acfg.learner.device)
+    # The learner role does not know which workers share its machine, so with
+    # learner.torch_threads unset it assumes none (num_workers=0).
+    configure_torch_threads(resolve_learner_threads(
+        acfg.learner.torch_threads, device, num_workers=0,
+        worker_threads=acfg.rollout.torch_threads, num_learners=1,
+    ))
 
     # Trajectory inbox filled by the gRPC server, drained by learner_process.
     chunk_queue: queue.Queue = queue.Queue(maxsize=acfg.learner.queue_size)
@@ -156,60 +176,77 @@ def run_distributed_learner(
     store = GRPCWeightStore(weight_store_address, max_message_mb=max_mb)
     weight_sink = [GRPCWeightSink(store, agent_id)]
 
-    # Optional checkpoint persistence (drained off-thread so training never blocks).
+    # Checkpoint persistence (drained off-thread so training never blocks). Always on:
+    # the learner's final snapshot is saved even without periodic checkpoints.
+    from colosseum.coordinator.checkpoint_manager import CheckpointManager
     checkpoint_queue: queue.Queue = queue.Queue(maxsize=16)
-    coordinator_ckpt = None
-    if config.self_play.checkpoint_interval > 0:
-        from colosseum.coordinator.checkpoint_manager import CheckpointManager
-        coordinator_ckpt = CheckpointManager(
-            base_dir=config.checkpoint.dir,
-            pool_size=config.self_play.pool_size,
-            save_optimizer=config.checkpoint.save_optimizer,
-        )
+    coordinator_ckpt = CheckpointManager(
+        base_dir=run_dir.checkpoints,
+        pool_size=config.self_play.pool_size,
+    )
 
     algo_class_path = acfg.algorithm.algorithm_class
     algo_cls = import_class(algo_class_path)
     teacher_path = acfg.training.kickstart_teacher
 
     def algorithm_factory():
-        net = build_network(acfg)
+        model = build_model(acfg)
         kickstart = None
         if teacher_path:
             from colosseum.bc.kickstart import KickstartLoss
-            teacher = build_network(acfg)
+            teacher = build_model(acfg)
             teacher.load_state_dict(torch.load(teacher_path, weights_only=True, map_location=device))
             teacher.to(device)
             kickstart = KickstartLoss(
                 teacher,
                 initial_lambda=acfg.training.kickstart_lambda,
                 decay_steps=acfg.training.kickstart_decay_steps,
+                direction=acfg.training.kickstart_kl,
             )
         kwargs = {"device": device, "pin_memory": acfg.learner.pin_memory}
         if kickstart is not None:
             kwargs["kickstart"] = kickstart
-        return algo_cls(net, acfg.algorithm, **kwargs)
-
-    env_steps_per_train_step = config.rollout.chunk_length * acfg.learner.batch_chunks
-    total_train_steps = max(1, config.training.total_timesteps // env_steps_per_train_step)
+        return algo_cls(model, acfg.algorithm, **kwargs)
 
     stop_event = threading.Event()
-    signal.signal(signal.SIGINT, lambda *_: stop_event.set())
-    signal.signal(signal.SIGTERM, lambda *_: stop_event.set())
+    supervisor = ProcessSupervisor(stop_event)
 
-    # Drain checkpoint snapshots to disk in the background.
+    # Seed right before learner_process builds the model (validate_config above also draws
+    # from the RNGs). Same per-agent stream as a local-mode learner.
+    agent_index = config.get_trainable_agent_ids().index(agent_id)
+    apply_global_seed(learner_seed(config.training.seed, agent_index))
+
+    # Drain checkpoint payloads (learner.make_checkpoint_payload) to disk in the background.
+    cfg_hash = config_hash(config)
+
+    def _save(data: dict) -> None:
+        """Persist one payload; a failure is logged and never kills the caller."""
+        trainer_state = data.get("trainer_state_bytes") if config.checkpoint.save_optimizer else None
+        try:
+            coordinator_ckpt.save(
+                agent_id=agent_id,
+                policy_version=int(data["policy_version"]),
+                model_state=data["model_state"],
+                trainer_state=trainer_state,
+                # env_steps is null: a distributed learner has no global env-step count
+                # (its consumed_samples counts transitions of its own seats, a different
+                # quantity), so a resume from it does not seed the env-step budget.
+                meta_extra={"final": bool(data.get("final", False)),
+                            "networks": acfg.networks.model_dump(mode="json", by_alias=True),
+                            "config_hash": cfg_hash,
+                            "env_steps": None},
+            )
+        except Exception:  # noqa: BLE001 - one failed save must not stop checkpointing
+            logger.exception(f"Distributed learner [{agent_id}]: failed to save checkpoint "
+                             f"v{data.get('policy_version')}")
+
     def _drain_checkpoints():
         while not stop_event.is_set():
             try:
                 data = checkpoint_queue.get(timeout=0.5)
             except queue.Empty:
                 continue
-            if coordinator_ckpt is not None:
-                coordinator_ckpt.save(
-                    agent_id=agent_id,
-                    policy_version=data["policy_version"],
-                    state_dict=data["state_dict"],
-                    optimizer_state=data.get("optimizer_state"),
-                )
+            _save(data)
 
     drainer = threading.Thread(target=_drain_checkpoints, daemon=True)
     drainer.start()
@@ -219,6 +256,9 @@ def run_distributed_learner(
         f"weights -> {weight_store_address}"
     )
     try:
+        # SIGINT / SIGTERM set stop_event (and are remembered for the exit code); installed
+        # inside the try so the finally always restores them.
+        supervisor.install_signal_handlers()
         learner_process(
             agent_id=agent_id,
             algorithm_factory=algorithm_factory,
@@ -227,15 +267,29 @@ def run_distributed_learner(
             config=acfg.learner,
             stop_event=stop_event,
             metrics_queue=None,
-            total_train_steps=total_train_steps,
-            checkpoint_queue=checkpoint_queue if coordinator_ckpt is not None else None,
+            progress_counter=None,
+            total_timesteps=config.training.total_timesteps,
+            checkpoint_queue=checkpoint_queue,
             checkpoint_interval=config.self_play.checkpoint_interval,
+            weight_sync_interval=acfg.rollout.weight_sync_interval_sec,
         )
     finally:
         stop_event.set()
+        drainer.join()  # it finishes the save in progress, then sees stop_event
+        while True:  # the final snapshot arrives after stop_event is set
+            try:
+                _save(checkpoint_queue.get_nowait())
+            except queue.Empty:
+                break
         traj_server.stop(0)
         store.close()
+        supervisor.restore_signal_handlers()
         logger.info(f"Distributed learner [{agent_id}] stopped.")
+    if supervisor.received_signal is not None:
+        signum = int(supervisor.received_signal)
+        logger.warning(f"Distributed learner [{agent_id}] stopped by {signal.Signals(signum).name}")
+        return 128 + signum
+    return 0
 
 
 # =====================================================================
@@ -243,7 +297,13 @@ def run_distributed_learner(
 # =====================================================================
 
 
-def _dist_worker_target(
+def _dist_worker_target(*, worker_id: int, log_dir: str | None = None, **kwargs) -> None:
+    """Distributed worker process entry point: process logging first."""
+    run_child(f"worker-{worker_id}", log_dir, _dist_worker_main, worker_id=worker_id, **kwargs)
+
+
+def _dist_worker_main(
+    *,
     worker_id: int,
     config: ColosseumConfig,
     agent_ids: list[str],
@@ -254,51 +314,40 @@ def _dist_worker_target(
     total_timesteps: int,
     slot_agent_map: list[list[str]],
 ) -> None:
-    """Worker process: gRPC clients in, rollout_worker_process unchanged."""
-    import sys
-    sys.path.insert(0, ".")
-
-    from colosseum.core.registry import build_network
+    """Worker process body: gRPC clients in, rollout_worker_process unchanged."""
+    from colosseum.core.registry import build_model
+    from colosseum.launcher import _create_env
     from colosseum.transport.grpc_transport import GRPCTransport
     from colosseum.weight_store.grpc_store import GRPCWeightStore
     from colosseum.worker.rollout_worker import rollout_worker_process
 
     max_mb = config.transport.grpc_max_message_mb
     store = GRPCWeightStore(weight_store_address, max_message_mb=max_mb)
-
     transports = {
         aid: GRPCTransport(learner_addresses[aid], max_message_mb=max_mb)
         for aid in agent_ids
     }
-    trajectory_queues = {aid: GRPCTrajectorySink(transports[aid], aid) for aid in agent_ids}
-    weight_queues = {aid: GRPCWeightSource(store, aid) for aid in agent_ids}
-    network_factories = {
-        aid: partial(build_network, agent_configs[aid]) for aid in agent_ids
-    }
-
-    env_class_path = config.env.env_class
-    env_kwargs = config.env.kwargs
 
     worker_seed = None
     if config.training.seed is not None:
         worker_seed = config.training.seed + worker_id * 1000
 
-    from colosseum.launcher import _create_env
-
     rollout_worker_process(
         worker_id=worker_id,
-        env_fn=partial(_create_env, env_class_path, env_kwargs),
+        env_fn=partial(_create_env, config.env.env_class, config.env.kwargs),
         num_envs=config.rollout.envs_per_worker,
         chunk_length=config.rollout.chunk_length,
-        weight_sync_interval=config.rollout.weight_sync_interval_sec,
-        stop_event=stop_event,
-        total_timesteps=total_timesteps,
-        seed=worker_seed,
         agent_ids=agent_ids,
-        network_factories=network_factories,
-        trajectory_queues=trajectory_queues,
-        weight_queues=weight_queues,
+        model_factories={aid: partial(build_model, agent_configs[aid]) for aid in agent_ids},
+        trajectory_queues={aid: GRPCTrajectorySink(transports[aid], aid) for aid in agent_ids},
+        weight_queues={aid: GRPCWeightSource(store, aid) for aid in agent_ids},
+        stop_event=stop_event,
+        gamma={aid: agent_configs[aid].algorithm.gamma for aid in agent_ids},
+        weight_sync_interval=config.rollout.weight_sync_interval_sec,
+        torch_threads=config.rollout.torch_threads,
+        max_env_steps=total_timesteps,
         slot_agent_map=slot_agent_map,
+        seed=worker_seed,
         vec_env_kind=config.rollout.vec_env,
         subproc_workers=config.rollout.subproc_workers,
     )
@@ -308,9 +357,12 @@ def run_distributed_workers(
     config_path: str,
     weight_store_address: str,
     learner_addresses: dict[str, str],
-    overrides: Optional[dict] = None,
-) -> None:
-    """Launch rollout workers that feed remote learners over gRPC.
+    overrides: dict | None = None,
+) -> int:
+    """Launch rollout workers that feed remote learners over gRPC; returns the exit code.
+
+    Workers stop by themselves after their share of the budget (exit 0). A worker exiting
+    non-zero stops the others (exit code 1); SIGINT / SIGTERM stop all of them (128 + signum).
 
     Args:
         config_path: path to the YAML config.
@@ -318,15 +370,21 @@ def run_distributed_workers(
         learner_addresses: ``{agent_id: host:port}`` of each agent's
             TrajectoryService.
     """
-    mp.set_start_method("spawn", force=True)
-    logging.basicConfig(
-        level=logging.INFO,
-        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
-    )
+    from colosseum.core.registry import validate_config
 
-    config = _load(config_path, overrides)
+    setup_process_logging(None, "workers-main", console_level=logging.INFO)
+    config = load_config(config_path, overrides)
     agent_ids = list(learner_addresses.keys()) or config.get_trainable_agent_ids()
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_ids}
+    for aid in agent_ids:
+        validate_config(agent_configs[aid])  # before the run dir exists
+    # One dir per machine: worker hosts sharing a run.name on a shared filesystem never collide.
+    run_dir = RunDir.create(config, config_path, role=workers_role())
+    config = run_dir.with_run_name(config)
+    setup_process_logging(run_dir.logs, "workers-main", console_level=logging.INFO)
+    run_dir.write_resolved_config(config)
+    print(f"Run directory: {run_dir.root}", flush=True)
+    mp.set_start_method("spawn", force=True)
 
     num_players = config.env.num_players
     num_envs = config.rollout.envs_per_worker
@@ -337,41 +395,60 @@ def run_distributed_workers(
     ]
 
     stop_event = mp.Event()
-    procs: list[mp.Process] = []
+    supervisor = ProcessSupervisor(stop_event, log_dir=run_dir.logs)
+    supervisor.install_signal_handlers()
     worker_daemon = config.rollout.vec_env != "subprocess"
     per_worker_steps = config.training.total_timesteps // config.rollout.num_workers
 
-    for worker_id in range(config.rollout.num_workers):
-        p = mp.Process(
-            target=_dist_worker_target,
-            args=(
-                worker_id, config, agent_ids, agent_configs,
-                weight_store_address, learner_addresses, stop_event,
-                per_worker_steps, slot_agent_map,
-            ),
-            daemon=worker_daemon,
-        )
-        p.start()
-        procs.append(p)
-
-    logger.info(
-        f"Started {len(procs)} distributed workers -> learners {learner_addresses}, "
-        f"weights <- {weight_store_address}"
-    )
+    code = 0
     try:
-        while any(p.is_alive() for p in procs):
+        for worker_id in range(config.rollout.num_workers):
+            proc = mp.Process(
+                target=_dist_worker_target,
+                name=f"worker-{worker_id}",
+                kwargs=dict(
+                    worker_id=worker_id,
+                    log_dir=str(run_dir.logs),
+                    config=config,
+                    agent_ids=agent_ids,
+                    agent_configs=agent_configs,
+                    weight_store_address=weight_store_address,
+                    learner_addresses=learner_addresses,
+                    stop_event=stop_event,
+                    total_timesteps=per_worker_steps,
+                    slot_agent_map=slot_agent_map,
+                ),
+                daemon=worker_daemon,
+            )
+            start_process(proc)
+            supervisor.add(f"worker-{worker_id}", proc)
+
+        logger.info(f"Started {config.rollout.num_workers} distributed workers -> learners "
+                    f"{learner_addresses}, weights <- {weight_store_address}")
+        while not stop_event.is_set() and supervisor.alive():
+            failure = supervisor.first_failure(nonzero_only=True)
+            if failure is not None:
+                logger.error(failure.message())
+                code = 1
+                break
             time.sleep(0.5)
-    except KeyboardInterrupt:
-        logger.info("Interrupt — stopping workers")
     finally:
         stop_event.set()
-        time.sleep(1.0)
-        for p in procs:
-            p.join(timeout=3)
-            if p.is_alive():
-                p.terminate()
-                p.join(timeout=2)
+        supervisor.wait_all(SHUTDOWN_GRACE_SEC)
+        killed = supervisor.kill_remaining()
+        supervisor.restore_signal_handlers()
         logger.info("Distributed workers stopped.")
+    if supervisor.received_signal is not None:
+        signum = int(supervisor.received_signal)
+        logger.warning(f"Received {signal.Signals(signum).name}; distributed workers stopped")
+        return 128 + signum
+    if code == 0:
+        # Exits after the loop ended (e.g. one worker finished, another crashed meanwhile).
+        failures = supervisor.failures(exclude=set(killed))
+        for failure in failures:
+            logger.error(failure.message())
+        code = 1 if failures else 0
+    return code
 
 
 # =====================================================================
@@ -379,15 +456,6 @@ def run_distributed_workers(
 # =====================================================================
 
 
-def _load(config_path: str, overrides: Optional[dict]) -> ColosseumConfig:
-    config = load_config(config_path)
-    if overrides:
-        data = config.model_dump()
-        for key, value in overrides.items():
-            parts = key.split(".")
-            d = data
-            for part in parts[:-1]:
-                d = d[part]
-            d[parts[-1]] = value
-        config = ColosseumConfig(**data)
-    return config
+def workers_role() -> str:
+    """Run-dir role of ``run-workers`` on this machine: ``workers-<host>``."""
+    return f"workers-{safe_path_component(socket.gethostname(), 'host')}"

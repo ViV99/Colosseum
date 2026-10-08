@@ -1,3 +1,10 @@
+# Tic-tac-toe self-play. README quickstart: about 70 s on 8 CPU cores (2 workers), then the latest
+# checkpoint, played greedily with the mask, beats a random legal-move player in >= 80% of games
+# (measured 86-93% over 4 runs, <= 1.25% losses; tests/learning/test_ttt_slow.py).
+run:
+  name: null              # default: tic_tac_toe-<YYYYmmdd-HHMMSS>
+  dir: "runs"
+
 env:
   env_class: "examples.tic_tac_toe.env.TicTacToeEnv"
   num_players: 2
@@ -5,30 +12,32 @@ env:
 
 networks:
   encoder_class: "examples.tic_tac_toe.networks.TicTacToeEncoder"
+  core: null              # stateless (MLP); see tic_tac_toe_attention.yaml for a core
   policy_class: "examples.tic_tac_toe.networks.TicTacToePolicy"
   value_class: "examples.tic_tac_toe.networks.TicTacToeValue"
   kwargs: {}
 
 algorithm:
-  name: "appo"
   gamma: 0.99
-  gae_lambda: 0.95
+  vtrace_lambda: 1.0
   eps_clip: 0.2
   value_loss_coeff: 0.5
   entropy_coeff: 0.01
   max_grad_norm: 0.5
   num_epochs: 1
-  minibatch_chunks: 0    # 0 = use all chunks as one batch
+  minibatch_chunks: 0
   vtrace_rho_bar: 1.0
   vtrace_c_bar: 1.0
-  learning_rate: 3.0e-4
+  learning_rate: 1.0e-3
   lr_schedule: "constant"
 
 rollout:
-  chunk_length: 32        # short for TicTacToe (games are ~5-9 steps)
+  chunk_length: 32
   num_workers: 2
-  envs_per_worker: 8
+  envs_per_worker: 16
   weight_sync_interval_sec: 2.0
+  torch_threads: 1
+  match_refresh_interval_sec: 30.0
 
 learner:
   device: "auto"
@@ -37,22 +46,20 @@ learner:
 
 training:
   phase: "self_play"
-  total_timesteps: 100000
+  total_timesteps: 600000   # global env steps across all workers
+  seed: null
 
 self_play:
-  checkpoint_interval: 50    # train steps; ~390 train steps in this run → ~7 checkpoints
+  checkpoint_interval: 100  # train steps
   pool_size: 10
-  latest_prob: 0.5
+  latest_prob: 0.8
+  shuffle_seats: true
 
 checkpoint:
-  dir: "./checkpoints"
   save_optimizer: true
 
 metrics:
-  use_wandb: false        # set to true if you want WandB logging
+  use_wandb: false
   wandb_project: "colosseum"
-  wandb_entity: null
   log_interval: 10
-
-transport:
-  mode: "local"
+  console_interval_sec: 10.0

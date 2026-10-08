@@ -1,15 +1,14 @@
 from __future__ import annotations
 
-import os
-from typing import Any, Callable, Optional
-
 import multiprocessing as mp
+import os
+from collections.abc import Callable
+from typing import Any
 
 import numpy as np
 
 from colosseum.envs.base_env import BaseEnv
 from colosseum.envs.vec_env import VectorEnv
-
 
 # ----------------------------------------------------------------------
 # Worker-side commands (sent parent -> subprocess over the Pipe).
@@ -68,6 +67,21 @@ def _worker_loop(
             seeding globally consistent: local env ``j`` maps to global env
             ``global_offset + j``).
     """
+    from colosseum.utils.logging import ENV_PROCESS_NAME, inherited_log_dir, setup_process_logging
+
+    setup_process_logging(inherited_log_dir(), f"{os.environ.get(ENV_PROCESS_NAME, 'envproc')}-env{global_offset}")
+
+    from colosseum.utils.process import init_child_process
+
+    # Same policy as the worker: Ctrl-C is coordinated by the main process, and the
+    # env process dies with its worker.
+    init_child_process()
+
+    import torch
+
+    # Env children only step envs: one torch thread each (R2-04). OMP_NUM_THREADS=1
+    # is already in this process's environment (set by the parent before spawn).
+    torch.set_num_threads(1)
     vec_env = VectorEnv(env_fn, slice_size)
     try:
         while True:
@@ -136,7 +150,7 @@ class SubprocessVectorEnv:
         self,
         env_fn: Callable[[], BaseEnv],
         num_envs: int,
-        num_workers: Optional[int] = None,
+        num_workers: int | None = None,
     ) -> None:
         if num_envs < 1:
             raise ValueError(f"num_envs must be >= 1, got {num_envs}")
@@ -175,25 +189,35 @@ class SubprocessVectorEnv:
         self._procs: list[Any] = []
         self._closed = False
 
-        for (start, end) in self._slices:
-            parent_conn, child_conn = self._ctx.Pipe()
-            proc = self._ctx.Process(
-                target=_worker_loop,
-                args=(child_conn, env_fn, end - start, start),
-                daemon=True,
-            )
-            proc.start()
-            # Close the child end in the parent so EOF propagates correctly.
-            child_conn.close()
-            self._parent_conns.append(parent_conn)
-            self._procs.append(proc)
+        # Children must start with OMP_NUM_THREADS=1: they import torch while
+        # unpickling env_fn, before _worker_loop runs (R2-04).
+        prev_omp = os.environ.get("OMP_NUM_THREADS")
+        os.environ["OMP_NUM_THREADS"] = "1"
+        try:
+            for (start, end) in self._slices:
+                parent_conn, child_conn = self._ctx.Pipe()
+                proc = self._ctx.Process(
+                    target=_worker_loop,
+                    args=(child_conn, env_fn, end - start, start),
+                    daemon=True,
+                )
+                proc.start()
+                # Close the child end in the parent so EOF propagates correctly.
+                child_conn.close()
+                self._parent_conns.append(parent_conn)
+                self._procs.append(proc)
+        finally:
+            if prev_omp is None:
+                os.environ.pop("OMP_NUM_THREADS", None)
+            else:
+                os.environ["OMP_NUM_THREADS"] = prev_omp
 
     # ------------------------------------------------------------------
     # Public API (mirrors VectorEnv exactly)
     # ------------------------------------------------------------------
 
     def reset_all(
-        self, seed: Optional[int] = None
+        self, seed: int | None = None
     ) -> tuple[np.ndarray, list[dict[int, dict]]]:
         """Reset all envs.
 
@@ -234,9 +258,9 @@ class SubprocessVectorEnv:
             terminated: np.ndarray [num_envs]  (bool) -- True if ANY player terminated
             truncated:  np.ndarray [num_envs]  (bool) -- True if ANY player truncated
             infos:      list of num_envs info dicts (player_index -> info).
-                        For auto-reset envs the info for each player includes
-                        ``"terminal_observation"`` and ``"terminal_info"``,
-                        identical to :meth:`VectorEnv.step`.
+                        For an env that auto-reset, each player's info is the
+                        RESET info plus ``"terminal_observation"`` and
+                        ``"terminal_info"``, identical to :meth:`VectorEnv.step`.
         """
         actions = np.asarray(actions)
 

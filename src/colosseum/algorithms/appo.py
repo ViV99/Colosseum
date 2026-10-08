@@ -11,17 +11,65 @@ to OpenAI Five's approach.
 
 from __future__ import annotations
 
-from typing import Optional
+import logging
+import math
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-from colosseum.algorithms.base import BaseAlgorithm
+from colosseum.algorithms.base import BaseAlgorithm, deep_cpu_copy
 from colosseum.algorithms.vtrace import compute_vtrace
 from colosseum.bc.kickstart import KickstartLoss
 from colosseum.core.config import AlgorithmConfig, LRSchedule
 from colosseum.core.types import TrajectoryChunk
-from colosseum.networks.actor_critic import ActorCriticNetwork
+from colosseum.networks.model import PolicyModel, UnrollOutput
+from colosseum.networks.state import cat_batch, slice_batch, state_to, tree_leaves
+
+logger = logging.getLogger(__name__)
+
+
+def _check_teacher_state_layout(student: PolicyModel, teacher: PolicyModel) -> None:
+    """SP1 teachers reuse the student's chunk initial states, so the layouts must match."""
+    student_shapes = [tuple(t.shape) for t in tree_leaves(student.initial_state(1))]
+    teacher_shapes = [tuple(t.shape) for t in tree_leaves(teacher.initial_state(1))]
+    if student_shapes != teacher_shapes:
+        raise ValueError(
+            "kickstart teacher must share the student's state layout in SP1 "
+            f"(student state leaves {student_shapes}, teacher {teacher_shapes}); "
+            "build the teacher from the student's networks config"
+        )
+
+
+# Layout of every key ``APPO._prepare_batch`` produces (``_select_chunks`` rejects others).
+_TIME_MAJOR_KEYS = frozenset({
+    "observations", "actions", "behavior_log_probs", "rewards", "dones", "old_values", "action_masks",
+})                                                   # [T, B, ...]
+_CHUNK_MAJOR_KEYS = frozenset({"bootstrap_values"})  # [B, ...]
+_STATE_KEY = "initial_state"                         # State pytree, leaves [B, ...]
+
+
+def _select_chunks(batch: dict, idx: torch.Tensor) -> dict:
+    """Rows ``idx`` of the chunk dimension of a prepared batch (``[T, B, ...]`` -> ``[T, b, ...]``)."""
+    idx = idx.to(batch["rewards"].device)
+    out = {}
+    for key, value in batch.items():
+        if key == _STATE_KEY:
+            out[key] = slice_batch(value, idx)
+        elif key in _CHUNK_MAJOR_KEYS:
+            out[key] = value[idx]
+        elif key in _TIME_MAJOR_KEYS:
+            out[key] = value[:, idx]
+        else:
+            raise KeyError(f"_select_chunks: batch key {key!r} has no declared layout")
+    return out
+
+
+def _explained_variance(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """1 - Var(target - predicted) / Var(target); 0 when the target is (near) constant."""
+    var_target = target.float().var(unbiased=False)
+    ev = 1.0 - (target.float() - predicted.float()).var(unbiased=False) / var_target
+    return torch.where(var_target < 1e-8, torch.zeros_like(ev), ev)   # no host sync
 
 
 class APPO(BaseAlgorithm):
@@ -29,16 +77,20 @@ class APPO(BaseAlgorithm):
 
     def __init__(
         self,
-        network: ActorCriticNetwork,
+        model: PolicyModel,
         config: AlgorithmConfig,
         device: str | torch.device = "cpu",
-        kickstart: Optional[KickstartLoss] = None,
         pin_memory: bool = False,
+        kickstart: KickstartLoss | None = None,
     ):
-        self._network = network.to(device)
+        self._model = model.to(device)
+        if kickstart is not None:
+            _check_teacher_state_layout(self._model, kickstart.teacher)
+            kickstart.to(device)
         self._config = config
         self._device = device
         self._policy_version = 0
+        self._consumed_samples = 0
         self._kickstart = kickstart
         self._pin_memory = pin_memory
 
@@ -47,7 +99,7 @@ class APPO(BaseAlgorithm):
         self._amp_dtype = getattr(torch, config.amp_dtype, torch.float16)
         self._scaler = torch.amp.GradScaler("cuda") if self._use_amp else None
 
-        self._optimizer = torch.optim.Adam(network.parameters(), lr=config.learning_rate)
+        self._optimizer = torch.optim.Adam(self._model.parameters(), lr=config.learning_rate)
         self._zero_loss = torch.tensor(0.0, device=device)
 
         # Optionally compile V-trace for faster execution
@@ -56,33 +108,43 @@ class APPO(BaseAlgorithm):
         else:
             self._compute_vtrace = compute_vtrace
 
-        # LR scheduler (created in setup_lr_schedule when total_steps is known)
-        self._lr_scheduler = None
-
-    def setup_lr_schedule(self, total_steps: int) -> None:
-        """Set up LR schedule over total training steps."""
-        if self._config.lr_schedule == LRSchedule.LINEAR:
-            self._lr_scheduler = torch.optim.lr_scheduler.LambdaLR(
-                self._optimizer,
-                lr_lambda=lambda step: max(0.0, 1.0 - step / max(1, total_steps)),
-            )
-        elif self._config.lr_schedule == LRSchedule.COSINE:
-            self._lr_scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-                self._optimizer, T_max=max(1, total_steps),
-            )
-        # CONSTANT: no scheduler needed
+        # The LR is a function of training progress (share of the global env-step
+        # budget), set by the learner through set_progress() before every train step.
+        self._progress = 0.0
+        self.set_progress(0.0)
 
     @property
-    def network(self) -> ActorCriticNetwork:
-        return self._network
+    def model(self) -> PolicyModel:
+        return self._model
 
     @property
     def policy_version(self) -> int:
         return self._policy_version
 
     @property
-    def optimizer_state_dict(self) -> dict:
-        return self._optimizer.state_dict()
+    def consumed_samples(self) -> int:
+        """Total transitions passed to train_step (sum of chunk lengths)."""
+        return self._consumed_samples
+
+    def set_progress(self, progress: float) -> None:
+        """Set the share (0..1) of the global env-step budget consumed so far.
+
+        The optimizer LR follows ``config.lr_schedule``: constant, linear decay to
+        0 at progress 1, or cosine decay to 0 at progress 1. (Kickstart decay
+        stays in train steps.)
+        """
+        self._progress = min(1.0, max(0.0, float(progress)))
+        lr = self._lr_at(self._progress)
+        for group in self._optimizer.param_groups:
+            group["lr"] = lr
+
+    def _lr_at(self, progress: float) -> float:
+        base = self._config.learning_rate
+        if self._config.lr_schedule == LRSchedule.LINEAR:
+            return base * (1.0 - progress)
+        if self._config.lr_schedule == LRSchedule.COSINE:
+            return base * 0.5 * (1.0 + math.cos(math.pi * progress))
+        return base
 
     def _prepare_batch(self, chunks: list[TrajectoryChunk]) -> dict[str, torch.Tensor]:
         """Stack trajectory chunks into batched tensors.
@@ -115,80 +177,70 @@ class APPO(BaseAlgorithm):
             }
         else:
             batch = {k: v.to(device) for k, v in batch_cpu.items()}
+        # Model state before each chunk's first transition: leaves [1, ...] -> [B, ...].
+        batch["initial_state"] = state_to(cat_batch([c.initial_state for c in chunks]), device)
         return batch
 
-    def compute_loss(self, chunks: list[TrajectoryChunk]) -> dict[str, torch.Tensor]:
-        """Compute APPO loss from a batch of trajectory chunks.
+    def _autocast(self) -> torch.autocast:
+        """AMP autocast context (a no-op unless AMP is enabled on CUDA)."""
+        return torch.autocast(device_type="cuda", dtype=self._amp_dtype, enabled=self._use_amp)
 
-        Steps:
-        1. Stack chunks into [T, B, ...] tensors
-        2. Forward pass: get current log_probs, values, entropy
-           (recurrent path uses evaluate_actions_recurrent for sequence processing)
-        3. Compute V-trace targets + advantages
-        4. PPO clipped surrogate with V-trace advantages
-        5. Value loss: MSE(values, vtrace_targets)
-        6. Entropy bonus
+    def _evaluate(self, batch: dict) -> tuple[UnrollOutput, torch.Tensor, torch.Tensor, torch.Tensor]:
+        """The one evaluation path (training and ``evaluate_chunks``): unroll the model
+        over the batch under AMP autocast, from the chunks' initial states with the
+        chunks' dones and action masks.
+
+        Returns ``(out, log_probs, values, entropy)``: the ``UnrollOutput`` (``[T*B]``
+        time-major) and three float32 ``[T, B]`` tensors.
+        """
+        T, B = batch["rewards"].shape
+        flat_actions = batch["actions"].reshape(T * B, *batch["actions"].shape[2:])
+        with self._autocast():
+            out = self._model.unroll(
+                batch["observations"],
+                batch["initial_state"],
+                batch["dones"].bool(),
+                batch.get("action_masks"),
+            )
+            log_probs = out.dist.log_prob(flat_actions).float().reshape(T, B)
+            values = out.value.float().reshape(T, B)
+            entropy = out.dist.entropy().float().reshape(T, B)
+        return out, log_probs, values, entropy
+
+    @torch.no_grad()
+    def evaluate_chunks(self, chunks: list[TrajectoryChunk]) -> tuple[torch.Tensor, torch.Tensor]:
+        """Current model's log-probs of the recorded actions and its values.
+
+        Returns two ``[T*B]`` tensors in time-major order (index ``t*B + b`` is
+        step ``t`` of ``chunks[b]``), computed exactly as in training (same
+        ``_evaluate``: ``model.unroll`` from ``cat_batch(chunk.initial_state ...)``
+        under the same autocast).
+        """
+        _, log_probs, values, _ = self._evaluate(self._prepare_batch(chunks))
+        return log_probs.reshape(-1), values.reshape(-1)
+
+    def compute_loss(self, chunks: list[TrajectoryChunk]) -> dict[str, torch.Tensor]:
+        """APPO loss and diagnostics for one minibatch of chunks (see ``_loss_from_batch``)."""
+        return self._loss_from_batch(self._prepare_batch(chunks))
+
+    def _loss_from_batch(self, batch: dict) -> dict[str, torch.Tensor]:
+        """APPO loss for one prepared minibatch (``_prepare_batch`` output or a
+        ``_select_chunks`` slice of it; the batch is the only input, so chunks and
+        tensors cannot disagree).
+
+        1. Unroll the model over the [T, B, ...] batch from the chunks' initial
+           states with the chunks' dones and action masks (``_evaluate``).
+        2. V-trace(lambda) targets and advantages from the recomputed log-probs/values.
+        3. PPO clipped surrogate on the V-trace advantages, value MSE, entropy bonus.
+        4. Optional kickstart KL on the same (masked) student distribution.
+        5. Diagnostics: approx_kl, clip_fraction, rho_mean, rho_clip_frac,
+           explained_variance (of the V-trace targets by the new values).
         """
         cfg = self._config
-        batch = self._prepare_batch(chunks)
-
-        T, B = batch["rewards"].shape
-        obs_shape = batch["observations"].shape[2:]
-        act_shape = batch["actions"].shape[2:]
-
-        # Flattened observations [T*B, *obs_shape] — used by the stateless path
-        # and by the kickstart KL term (defined here so both the recurrent and
-        # stateless branches can reference it).
-        flat_obs = batch["observations"].reshape(T * B, *obs_shape)
-
-        # Determine if we should use the recurrent training path
-        has_recurrent = (
-            self._network.is_recurrent
-            and chunks[0].lstm_hidden is not None
-        )
-
-        # Forward pass through current network (optionally with AMP)
-        amp_ctx = torch.autocast(
-            device_type="cuda", dtype=self._amp_dtype, enabled=self._use_amp,
-        )
-
-        if has_recurrent:
-            # Recurrent path: process [T, B, ...] sequences through RNN
-            # Stack hidden inits: each chunk.lstm_hidden is (h, c) with shape
-            # [num_layers, hidden_size].  Need [num_layers, B, hidden_size].
-            h_init = torch.stack(
-                [c.lstm_hidden[0] for c in chunks], dim=1,
-            ).to(self._device)
-            c_init = torch.stack(
-                [c.lstm_hidden[1] for c in chunks], dim=1,
-            ).to(self._device)
-            action_mask_seq = batch.get("action_masks")
-
-            with amp_ctx:
-                target_log_probs, new_values, entropy = (
-                    self._network.evaluate_actions_recurrent(
-                        batch["observations"], batch["actions"],
-                        (h_init, c_init),
-                        action_mask_seq=action_mask_seq,
-                        dones_seq=batch["dones"],
-                    )
-                )
-        else:
-            # Stateless path: flatten T*B for feedforward evaluation
-            flat_actions = batch["actions"].reshape(T * B, *act_shape)
-
-            flat_masks = None
-            if "action_masks" in batch:
-                mask_shape = batch["action_masks"].shape[2:]
-                flat_masks = batch["action_masks"].reshape(T * B, *mask_shape)
-
-            with amp_ctx:
-                target_log_probs, new_values, entropy = self._network.evaluate_actions(
-                    flat_obs, flat_actions, action_mask=flat_masks,
-                )
-            target_log_probs = target_log_probs.reshape(T, B)
-            new_values = new_values.reshape(T, B)
-            entropy = entropy.reshape(T, B)
+        masks = batch.get("action_masks")          # [T, B, A] | None
+        dones = batch["dones"].bool()              # [T, B]
+        state0 = batch["initial_state"]            # leaves [B, ...]
+        out, target_log_probs, new_values, entropy = self._evaluate(batch)
 
         # V-trace targets and advantages
         with torch.no_grad():
@@ -198,44 +250,46 @@ class APPO(BaseAlgorithm):
                 rewards=batch["rewards"],
                 values=new_values.detach(),
                 bootstrap_value=batch["bootstrap_values"],
-                dones=batch["dones"],
+                dones=dones,
                 gamma=cfg.gamma,
                 rho_bar=cfg.vtrace_rho_bar,
                 c_bar=cfg.vtrace_c_bar,
+                lam=cfg.vtrace_lambda,
             )
 
         # PPO clipped surrogate loss
-        log_ratio = torch.clamp(
-            target_log_probs - batch["behavior_log_probs"], -20.0, 20.0
-        )
+        log_ratio = torch.clamp(target_log_probs - batch["behavior_log_probs"], -20.0, 20.0)
         ratio = torch.exp(log_ratio)
         adv = vtrace_advantages.detach()
         if cfg.normalize_advantages and adv.numel() > 1:
             adv = (adv - adv.mean()) / (adv.std() + 1e-8)
-
         surr1 = ratio * adv
         surr2 = torch.clamp(ratio, 1.0 - cfg.eps_clip, 1.0 + cfg.eps_clip) * adv
         policy_loss = -torch.min(surr1, surr2).mean()
 
-        # Value loss
         value_loss = F.mse_loss(new_values, vtrace_targets.detach())
-
-        # Entropy loss (negative because we want to maximize entropy)
         entropy_loss = -entropy.mean()
-
-        # Total loss
         total_loss = policy_loss + cfg.value_loss_coeff * value_loss + cfg.entropy_coeff * entropy_loss
 
-        # Kickstart loss (KL to teacher policy)
+        # Kickstart: KL between the frozen teacher and THIS forward's student distribution.
         kickstart_loss = self._zero_loss
         if self._kickstart is not None and self._kickstart.current_lambda > 0:
-            kickstart_loss = self._kickstart.compute(self._network, flat_obs)
+            with self._autocast():
+                kickstart_loss = self._kickstart.compute(
+                    student_dist=out.dist,
+                    observations=batch["observations"],
+                    dones=dones,
+                    state0=state0,
+                    action_mask=masks,
+                )
             total_loss = total_loss + kickstart_loss
 
-        # Metrics for logging
         with torch.no_grad():
             approx_kl = ((ratio - 1) - log_ratio).mean()
             clip_fraction = ((ratio - 1.0).abs() > cfg.eps_clip).float().mean()
+            rho_mean = ratio.mean()
+            rho_clip_frac = (ratio > cfg.vtrace_rho_bar).float().mean()
+            explained_variance = _explained_variance(new_values, vtrace_targets)
 
         result = {
             "total_loss": total_loss,
@@ -244,76 +298,131 @@ class APPO(BaseAlgorithm):
             "entropy": -entropy_loss,
             "approx_kl": approx_kl,
             "clip_fraction": clip_fraction,
+            "rho_mean": rho_mean,
+            "rho_clip_frac": rho_clip_frac,
+            "explained_variance": explained_variance,
         }
         if self._kickstart is not None:
             result["kickstart_loss"] = kickstart_loss.detach()
-            result["kickstart_lambda"] = torch.tensor(self._kickstart.current_lambda)
+            result["kickstart_lambda"] = torch.tensor(self._kickstart.current_lambda, device=total_loss.device)
         return result
 
-    def train_step(self, chunks: list[TrajectoryChunk]) -> dict[str, float]:
-        """Full training step with minibatch iterations.
+    def _clip_gradients(self) -> torch.Tensor:
+        """Clip to ``max_grad_norm``; return the total gradient norm BEFORE clipping.
 
-        Performs num_epochs passes over the data, splitting into minibatches.
+        Under AMP the caller must have unscaled the gradients first.
+        """
+        return torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._config.max_grad_norm)
+
+    def train_step(self, chunks: list[TrajectoryChunk]) -> dict[str, float]:
+        """One training step: normalizer update, then num_epochs x minibatches of updates.
+
+        The step's chunks are stacked and moved once; minibatches are slices of
+        that batch over the chunk dimension B, so each chunk's [T] sequence stays
+        intact and stateful models unroll correctly. The LR is set only by
+        ``set_progress`` (called by the learner before each step).
+
+        Metrics are minibatch means, accumulated on the device and read back
+        with one host sync. ``grad_norm`` averages the finite pre-clipping norms
+        only (NaN if none was finite); ``skipped_updates`` counts the minibatches
+        whose optimizer step the GradScaler skipped (non-finite gradients).
         """
         cfg = self._config
-        metrics_accum: dict[str, float] = {}
+        sums: dict[str, torch.Tensor] = {}
         num_updates = 0
 
+        full_batch = self._prepare_batch(chunks)
+        grad_norm_sum = torch.zeros((), dtype=torch.float64, device=full_batch["rewards"].device)
+        finite_updates = torch.zeros_like(grad_norm_sum)
+
+        # Refresh observation-normalization statistics once per train step, from
+        # this step's fresh samples only (never once per epoch/minibatch forward).
+        self._model.update_normalizers(full_batch["observations"].flatten(0, 1))
+
+        mb_size = cfg.minibatch_chunks if cfg.minibatch_chunks > 0 else len(chunks)
         for _epoch in range(cfg.num_epochs):
-            # For APPO, we typically do a single pass (num_epochs=1)
-            # because the data is already off-policy. Multiple epochs
-            # further increase the off-policyness.
-            # However, we support multiple epochs for flexibility.
-
-            # Shuffle chunks and create minibatches (minibatching is over the
-            # batch dimension B = number of chunks; each chunk's [T] sequence
-            # stays intact so recurrent training is unaffected).
+            # APPO data is already off-policy, so num_epochs is typically 1;
+            # more epochs increase the off-policyness further.
             indices = torch.randperm(len(chunks))
-            mb_size = cfg.minibatch_chunks if cfg.minibatch_chunks > 0 else len(chunks)
-
             for start in range(0, len(chunks), mb_size):
-                end = min(start + mb_size, len(chunks))
-                mb_indices = indices[start:end]
-                mb_chunks = [chunks[i] for i in mb_indices]
-
-                if not mb_chunks:
-                    continue
-
-                losses = self.compute_loss(mb_chunks)
+                losses = self._loss_from_batch(_select_chunks(full_batch, indices[start:start + mb_size]))
                 total_loss = losses["total_loss"]
 
                 self._optimizer.zero_grad()
-
                 if self._scaler is not None:
                     self._scaler.scale(total_loss).backward()
-                    if cfg.max_grad_norm > 0:
-                        self._scaler.unscale_(self._optimizer)
-                        torch.nn.utils.clip_grad_norm_(self._network.parameters(), cfg.max_grad_norm)
-                    self._scaler.step(self._optimizer)
+                    self._scaler.unscale_(self._optimizer)
+                    grad_norm = self._clip_gradients()
+                    self._scaler.step(self._optimizer)      # skipped if the gradients are not finite
                     self._scaler.update()
                 else:
                     total_loss.backward()
-                    if cfg.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self._network.parameters(), cfg.max_grad_norm)
+                    grad_norm = self._clip_gradients()
                     self._optimizer.step()
 
-                # Accumulate metrics
+                finite = torch.isfinite(grad_norm)
+                grad_norm_sum += torch.where(finite, grad_norm.detach().double(), 0.0)
+                finite_updates += finite
                 for key, value in losses.items():
-                    if key not in metrics_accum:
-                        metrics_accum[key] = 0.0
-                    metrics_accum[key] += value.item()
+                    value = value.detach().double()
+                    sums[key] = sums[key] + value if key in sums else value
                 num_updates += 1
-
-        if self._lr_scheduler is not None:
-            self._lr_scheduler.step()
 
         if self._kickstart is not None:
             self._kickstart.step()
-
         self._policy_version += 1
+        self._consumed_samples += sum(c.chunk_length for c in chunks)
 
-        # Average metrics
-        metrics = {k: v / max(1, num_updates) for k, v in metrics_accum.items()}
+        keys = list(sums)
+        *totals, grad_norm_total, num_finite = torch.stack(
+            [sums[k] for k in keys] + [grad_norm_sum, finite_updates]
+        ).tolist()
+        metrics = {k: v / max(1, num_updates) for k, v in zip(keys, totals)}
+        metrics["grad_norm"] = grad_norm_total / num_finite if num_finite > 0 else float("nan")
+        metrics["skipped_updates"] = float(num_updates - num_finite) if self._scaler is not None else 0.0
         metrics["policy_version"] = float(self._policy_version)
-        metrics["learning_rate"] = self._optimizer.param_groups[0]["lr"]
+        metrics["lr"] = float(self._optimizer.param_groups[0]["lr"])
         return metrics
+
+    def state_dict(self) -> dict[str, Any]:
+        """Deep CPU copy of the training state (model weights excluded).
+
+        Keys: ``optimizer``, ``progress`` (the LR is a function of it),
+        ``scaler`` (None without AMP), ``kickstart`` (None without kickstart),
+        ``policy_version``, ``consumed_samples``.
+        """
+        return deep_cpu_copy({
+            "optimizer": self._optimizer.state_dict(),
+            "progress": float(self._progress),
+            "scaler": self._scaler.state_dict() if self._scaler is not None else None,
+            "kickstart": self._kickstart.state_dict() if self._kickstart is not None else None,
+            "policy_version": int(self._policy_version),
+            "consumed_samples": int(self._consumed_samples),
+        })
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore :meth:`state_dict` output; the input is copied, never aliased.
+
+        The optimizer moves its state to the parameters' device. A saved scaler
+        or kickstart state is ignored (with a warning) when this run has no AMP /
+        no kickstart, and a run with AMP / kickstart but no saved state starts
+        them fresh (also with a warning). The LR is re-derived from the
+        restored progress.
+        """
+        state = deep_cpu_copy(state)
+        self._optimizer.load_state_dict(state["optimizer"])
+        self._load_optional_state("GradScaler", self._scaler, state["scaler"])
+        self._load_optional_state("kickstart", self._kickstart, state["kickstart"])
+        self._policy_version = int(state["policy_version"])
+        self._consumed_samples = int(state["consumed_samples"])
+        self.set_progress(float(state["progress"]))
+
+    @staticmethod
+    def _load_optional_state(name: str, component: Any, saved: dict | None) -> None:
+        """Restore an optional component (GradScaler, kickstart) and warn on a mismatch."""
+        if component is not None and saved is not None:
+            component.load_state_dict(saved)
+        elif saved is not None:
+            logger.warning("Resume: the saved %s state is ignored because this run has no %s.", name, name)
+        elif component is not None:
+            logger.warning("Resume: no %s state was saved; this run's %s starts fresh.", name, name)

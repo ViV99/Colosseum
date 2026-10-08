@@ -1,0 +1,104 @@
+"""End-to-end distributed (gRPC) run on localhost: weight store + learner + workers."""
+
+from __future__ import annotations
+
+import multiprocessing as mp
+import socket
+import time
+
+import pytest
+import torch
+
+from helpers import example_config
+
+pytest.importorskip("grpc")
+
+
+def _free_port() -> int:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.bind(("", 0))
+        return s.getsockname()[1]
+
+
+def _wait_for(condition, timeout: float, what: str) -> None:
+    """Poll ``condition()`` every 0.1 s until it is true; fail after ``timeout`` seconds."""
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            pytest.fail(f"timed out after {timeout:.0f} s waiting for {what}")
+        time.sleep(0.1)
+
+
+def _port_open(port: int) -> bool:
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+        s.settimeout(0.2)
+        return s.connect_ex(("localhost", port)) == 0
+
+
+@pytest.mark.timeout(600)
+def test_distributed_grpc_pipeline(tmp_path, restore_root_logging):
+    """The learner trains on chunks from gRPC workers and publishes weights (version > 0)."""
+    from colosseum.distributed import run_distributed_learner, run_distributed_workers, workers_role
+    from colosseum.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
+
+    ws_port, traj_port = _free_port(), _free_port()
+    ws_addr, learner_addr = f"localhost:{ws_port}", f"localhost:{traj_port}"
+    agent = "agent_0"
+    cfg_path = str(example_config("tic_tac_toe.yaml"))
+    overrides = {
+        "training.total_timesteps": 1200,
+        "rollout.num_workers": 2,
+        "rollout.envs_per_worker": 4,
+        "rollout.chunk_length": 8,
+        "rollout.weight_sync_interval_sec": 0.5,
+        "learner.batch_chunks": 2,
+        "learner.queue_size": 32,
+        "self_play.checkpoint_interval": 1,
+        "metrics.use_wandb": False,
+        "run.dir": str(tmp_path / "runs"),
+        "run.name": "e2e",
+    }
+
+    # Each role creates its own run dir: <run.name>-learner-<agent> and <run.name>-workers-<host>.
+    learner_run = tmp_path / "runs" / f"e2e-learner-{agent}"
+    workers_run = tmp_path / "runs" / f"e2e-{workers_role()}"
+    ckpt_root = learner_run / "checkpoints" / agent
+    ws_server = serve_weight_store(port=ws_port)
+    learner = mp.Process(
+        target=run_distributed_learner,
+        args=(cfg_path, agent, traj_port, ws_addr, overrides),
+        daemon=False,
+    )
+    learner.start()
+    client = GRPCWeightStore(ws_addr)
+    try:
+        _wait_for(lambda: _port_open(traj_port), 60, "the learner's TrajectoryService to bind")
+        run_distributed_workers(cfg_path, ws_addr, {agent: learner_addr}, overrides)
+        _wait_for(lambda: client.get_version(agent) > 0, 60, "a trained weight version in the store")
+        # The learner's checkpoint drainer turns numpy snapshots back into torch files.
+        _wait_for(lambda: any(ckpt_root.glob("ckpt_v*/meta.json")), 60, "a checkpoint saved by the learner")
+        version = client.get_version(agent)
+        payload = client.get(agent)
+    finally:
+        learner.terminate()
+        learner.join(timeout=10)
+        if learner.is_alive():  # never leave a non-daemon child behind (it would hang pytest)
+            learner.kill()
+            learner.join()
+        client.close()
+        ws_server.stop(0)
+    assert payload is not None, "no weights were published to the store"
+    assert version > 0, f"learner did not train/publish (version={version})"
+    # The newest checkpoint is complete (written into a hidden .tmp-* dir and moved into
+    # place atomically) and cannot have been evicted; the learner has exited.
+    newest = max((m.parent for m in ckpt_root.glob("ckpt_v*/meta.json")), key=lambda d: int(d.name[len("ckpt_v"):]))
+    state_dict = torch.load(newest / "model.pt", weights_only=True)
+    assert state_dict and all(isinstance(v, torch.Tensor) for v in state_dict.values())
+    # Both roles wrote their resolved config and per-process logs.
+    for run in (learner_run, workers_run):
+        assert (run / "config.resolved.yaml").is_file()
+    assert f"learner-{agent} started (pid" in (learner_run / "logs" / f"learner-{agent}.log").read_text()
+    assert "workers-main started (pid" in (workers_run / "logs" / "workers-main.log").read_text()
+    for worker_id in range(2):
+        worker_log = (workers_run / "logs" / f"worker-{worker_id}.log").read_text()
+        assert f"worker-{worker_id} started (pid" in worker_log and f"worker-{worker_id} finished" in worker_log

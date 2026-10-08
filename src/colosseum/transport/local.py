@@ -1,21 +1,27 @@
 """Local transport using multiprocessing queues.
 
+Unused in SP1; kept for SP5 (distribution). The single-machine launcher wires its
+``mp.Queue`` objects directly.
+
 For single-machine mode. Trajectory chunks flow from worker processes
-to learner processes via mp.Queue.
+to learner processes via mp.Queue as numpy payload dicts
+(``TrajectoryChunk.to_payload()``), never as torch tensors.
 """
 
 from __future__ import annotations
 
 import multiprocessing as mp
 from queue import Empty
-from typing import Optional
 
 from colosseum.core.types import TrajectoryChunk
 from colosseum.transport.base import BaseTransport
 
 
 class LocalTransport(BaseTransport):
-    """Single-machine transport using multiprocessing.Queue."""
+    """Single-machine transport using multiprocessing.Queue.
+
+    Unused in SP1; kept for SP5 (distribution).
+    """
 
     def __init__(self, queue_size: int = 64) -> None:
         self._queue_size = queue_size
@@ -27,22 +33,23 @@ class LocalTransport(BaseTransport):
             self._queues[agent_id] = mp.Queue(maxsize=self._queue_size)
 
     def send_chunk(self, agent_id: str, chunk: TrajectoryChunk) -> None:
-        """Send chunk to the agent's queue. Blocks if queue is full."""
+        """Send the chunk's numpy payload to the agent's queue. Blocks if the queue is full."""
         if agent_id not in self._queues:
             raise KeyError(f"No channel for agent '{agent_id}'. Call create_channel() first.")
-        self._queues[agent_id].put(chunk)
+        self._queues[agent_id].put(chunk.to_payload())
 
-    def recv_chunk(self, agent_id: str, timeout: Optional[float] = None) -> Optional[TrajectoryChunk]:
-        """Receive chunk from the agent's queue."""
+    def recv_chunk(self, agent_id: str, timeout: float | None = None) -> TrajectoryChunk | None:
+        """Receive and decode a chunk from the agent's queue (None on timeout)."""
         if agent_id not in self._queues:
             raise KeyError(f"No channel for agent '{agent_id}'. Call create_channel() first.")
         try:
             if timeout == 0:
-                return self._queues[agent_id].get_nowait()
+                payload = self._queues[agent_id].get_nowait()
             else:
-                return self._queues[agent_id].get(timeout=timeout)
+                payload = self._queues[agent_id].get(timeout=timeout)
         except Empty:
             return None
+        return TrajectoryChunk.from_payload(payload)
 
     def get_queue(self, agent_id: str) -> mp.Queue:
         """Get the underlying queue for direct use by worker/learner processes."""

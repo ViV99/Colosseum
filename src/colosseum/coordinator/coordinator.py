@@ -3,28 +3,24 @@
 Manages:
 - Agent pool (trainable, frozen, scripted agents)
 - Matchmaking (self-play, PFSP)
-- Checkpoint scheduling
+- Checkpoint storage (learner checkpoint payloads -> CheckpointManager)
 - Match result tracking
-- ELO ratings and win rate tracking
+- Pairwise ELO, win-rate matrix and latest-vs-past win rate (from per-seat results)
 """
 
 from __future__ import annotations
 
 import logging
+import random
 from collections import deque
-from typing import Optional
+from pathlib import Path
 
 from colosseum.coordinator.agent_pool import AgentPool
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
-from colosseum.coordinator.matchmaker import (
-    BaseMatchmaker,
-    PFSPMatchmaker,
-    SelfPlayMatchmaker,
-    SimpleSelfPlayMatchmaker,
-)
-from colosseum.coordinator.ratings import EloRating, WinRateTracker
+from colosseum.coordinator.matchmaker import BaseMatchmaker, PFSPMatchmaker, SelfPlayMatchmaker
+from colosseum.coordinator.ratings import EloRating, PastWinRate, WinRateTracker, pairwise_score
 from colosseum.core.config import ColosseumConfig, TrainingPhase
-from colosseum.core.types import MatchConfig, MatchResult
+from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig, MatchResult
 
 logger = logging.getLogger(__name__)
 
@@ -32,18 +28,23 @@ logger = logging.getLogger(__name__)
 class Coordinator:
     """Central coordinator for training pipeline."""
 
-    def __init__(self, config: ColosseumConfig) -> None:
+    def __init__(self, config: ColosseumConfig, checkpoint_dir: str | Path) -> None:
         self._config = config
+        # One RNG for matchmaking and seat shuffling: runs with the same seed get the same schedule.
+        self._rng = random.Random(config.training.seed)
         self._agent_pool = AgentPool()
+        for agent_id in config.get_trainable_agent_ids():
+            self._agent_pool.register_trainable(agent_id)
         self._checkpoint_manager = CheckpointManager(
-            base_dir=config.checkpoint.dir,
+            base_dir=checkpoint_dir,
             pool_size=config.self_play.pool_size,
-            save_optimizer=config.checkpoint.save_optimizer,
         )
-        self._matchmaker: Optional[BaseMatchmaker] = None
         self._match_results: deque[MatchResult] = deque(maxlen=10000)
         self._elo = EloRating()
         self._win_rates = WinRateTracker()
+        self._past = PastWinRate()
+        self._refresh_round = 0
+        self._matchmaker: BaseMatchmaker = self._build_matchmaker()
 
     @property
     def agent_pool(self) -> AgentPool:
@@ -61,127 +62,115 @@ class Coordinator:
     def win_rates(self) -> WinRateTracker:
         return self._win_rates
 
-    def setup_matchmaker(self, agent_id: str) -> None:
-        """Set up the matchmaker based on training phase and available resources."""
-        phase = self._config.training.phase
+    @property
+    def past_win_rate(self) -> PastWinRate:
+        return self._past
 
-        if phase == TrainingPhase.LEAGUE:
-            self._matchmaker = PFSPMatchmaker(
+    @property
+    def refresh_round(self) -> int:
+        return self._refresh_round
+
+    def next_round(self) -> None:
+        """Advance the owner rotation. The launcher calls this once per match refresh."""
+        self._refresh_round += 1
+
+    def generate_match_configs(self, num_envs: int, env_offset: int) -> list[MatchConfig]:
+        """One match per env. Env ``e`` of this batch has global index ``g = env_offset + e``.
+
+        Its owner is ``agents[(g + refresh_round) % n_trainable]``, so every trainable
+        agent owns envs in every phase, and ownership rotates between refreshes.
+        """
+        agents = [a.agent_id for a in self._agent_pool.list_trainable()]
+        if not agents:
+            raise ValueError("Coordinator has no trainable agents")
+        num_players = self._config.env.num_players
+        shuffle = self._config.self_play.shuffle_seats
+        configs: list[MatchConfig] = []
+        for e in range(num_envs):
+            owner = agents[(env_offset + e + self._refresh_round) % len(agents)]
+            match = self._matchmaker.match_for(owner, num_players)
+            if shuffle:
+                self._rng.shuffle(match.player_slots)
+            configs.append(match)
+        return configs
+
+    def _build_matchmaker(self) -> BaseMatchmaker:
+        sp = self._config.self_play
+        if self._config.training.phase == TrainingPhase.LEAGUE:
+            return PFSPMatchmaker(
                 agent_pool=self._agent_pool,
                 checkpoint_manager=self._checkpoint_manager,
                 win_rate_tracker=self._win_rates,
-                self_play_ratio=self._config.self_play.self_play_ratio,
-                pfsp_exponent=self._config.self_play.pfsp_exponent,
-                latest_prob=self._config.self_play.latest_prob,
+                self_play_ratio=sp.self_play_ratio,
+                pfsp_exponent=sp.pfsp_exponent,
+                latest_prob=sp.latest_prob,
+                rng=self._rng,
             )
-            trainable = self._agent_pool.list_trainable()
-            logger.info(
-                f"Using PFSPMatchmaker with {len(trainable)} trainable agents"
-            )
-        else:
-            # Self-play phase
-            checkpoints = self._checkpoint_manager.list_checkpoints(agent_id)
-            if checkpoints:
-                self._matchmaker = SelfPlayMatchmaker(
-                    checkpoint_manager=self._checkpoint_manager,
-                    latest_prob=self._config.self_play.latest_prob,
-                )
-                logger.info(f"Using SelfPlayMatchmaker with {len(checkpoints)} checkpoints")
-            else:
-                self._matchmaker = SimpleSelfPlayMatchmaker()
-                logger.info("Using SimpleSelfPlayMatchmaker (no checkpoints yet)")
+        return SelfPlayMatchmaker(
+            checkpoint_manager=self._checkpoint_manager,
+            latest_prob=sp.latest_prob,
+            rng=self._rng,
+        )
 
-    def generate_match_configs(
-        self,
-        agent_id: str,
-        num_envs: int,
-    ) -> list[MatchConfig]:
-        """Generate match configs using the current matchmaker."""
-        num_players = self._config.env.num_players
-        if self._matchmaker is None:
-            self.setup_matchmaker(agent_id)
-        return self._matchmaker.generate_matches(agent_id, num_envs, num_players)
+    def save_checkpoint_payload(self, payload: dict, meta_extra: dict | None = None) -> str:
+        """Persist a learner checkpoint payload (see ``learner.make_checkpoint_payload``).
 
-    def maybe_save_checkpoint(
-        self,
-        agent_id: str,
-        policy_version: int,
-        state_dict: dict,
-        optimizer_state: Optional[dict] = None,
-        metrics: Optional[dict] = None,
-    ) -> Optional[str]:
-        """Save checkpoint if policy_version is at a checkpoint interval."""
-        interval = self._config.self_play.checkpoint_interval
-        if interval > 0 and policy_version > 0 and policy_version % interval == 0:
-            ckpt_id = self._checkpoint_manager.save(
-                agent_id=agent_id,
-                policy_version=policy_version,
-                state_dict=state_dict,
-                optimizer_state=optimizer_state,
-                metrics=metrics,
-            )
-            # Update matchmaker to use new checkpoints
-            self.setup_matchmaker(agent_id)
-            return ckpt_id
-        return None
-
-    @staticmethod
-    def _base_agent(player_key: str) -> str:
-        """Strip the ``:network_id`` suffix from a player key.
-
-        Workers report outcomes keyed by ``"agent_id:network_id"`` (e.g.
-        ``"agent_0:latest"`` or ``"agent_0:ckpt_v100"``).  ELO / win-rate
-        tracking and PFSP opponent selection operate at the *agent* level,
-        so we aggregate to the base ``agent_id``.
+        The trainer state is kept only when ``checkpoint.save_optimizer`` is true.
         """
-        return player_key.split(":", 1)[0]
+        trainer_state = None
+        if self._config.checkpoint.save_optimizer:
+            trainer_state = payload.get("trainer_state_bytes")
+        meta = {"final": bool(payload.get("final", False)), **(meta_extra or {})}
+        return self._checkpoint_manager.save(
+            agent_id=payload["agent_id"],
+            policy_version=int(payload["policy_version"]),
+            model_state=payload["model_state"],
+            trainer_state=trainer_state,
+            meta_extra=meta,
+        )
 
     def report_match_result(self, result: MatchResult) -> None:
-        """Record outcome and update ratings.
+        """Update ratings from one finished match.
 
-        Outcomes are aggregated to the base ``agent_id`` level (the unit PFSP
-        selects over).  Pairs that resolve to the *same* base agent (e.g. a
-        solo self-play match of latest vs. a historical checkpoint of the same
-        agent) are skipped — they carry no cross-agent signal and would
-        otherwise pollute the win-rate matrix that PFSP reads.
+        Every pair of seats is compared by ``outcome`` (higher 1, equal 0.5, lower 0).
+        - Different base agents: update the win-rate matrix and ELO. ELO deltas are
+          computed from the pre-match ratings with K scaled by 1/(N-1).
+        - Same agent, one seat ``latest`` and the other a checkpoint: update
+          ``wr_vs_past`` from the latest seat's point of view.
+        - Two ``latest`` seats of one agent carry no signal and are skipped.
         """
         self._match_results.append(result)
-
-        # Aggregate per-slot outcomes to the base agent level. If the same base
-        # agent occupies multiple slots, average its outcome across them.
-        agent_outcomes: dict[str, list[float]] = {}
-        for player_key, outcome in result.player_outcomes.items():
-            base = self._base_agent(player_key)
-            agent_outcomes.setdefault(base, []).append(outcome)
-        agg = {a: sum(v) / len(v) for a, v in agent_outcomes.items()}
-
-        # Update ELO and win rates from pairwise (base-agent) outcomes.
-        agents = list(agg.keys())
-        for i, a in enumerate(agents):
-            for j, b in enumerate(agents):
-                if i >= j:
-                    continue  # each unordered pair once; skips same-agent
-                outcome_a = agg[a]
-                outcome_b = agg[b]
-
-                self._win_rates.record(a, b, outcome_a)
-
-                if outcome_a > outcome_b:
-                    self._elo.update(a, b, draw=False)
-                elif outcome_b > outcome_a:
-                    self._elo.update(b, a, draw=False)
-                else:
-                    self._elo.update(a, b, draw=True)
+        seats = result.seats
+        n = len(seats)
+        if n < 2:
+            return
+        cross: list[tuple[str, str, float]] = []
+        for i in range(n):
+            for j in range(i + 1, n):
+                a, b = seats[i], seats[j]
+                score = pairwise_score(a.outcome, b.outcome)
+                if a.agent_id != b.agent_id:
+                    cross.append((a.agent_id, b.agent_id, score))
+                elif a.network_id == LATEST_NETWORK_ID and b.network_id != LATEST_NETWORK_ID:
+                    self._past.record(a.agent_id, score)
+                elif b.network_id == LATEST_NETWORK_ID and a.network_id != LATEST_NETWORK_ID:
+                    self._past.record(b.agent_id, 1.0 - score)
+        for a_id, b_id, score in cross:
+            self._win_rates.record_pair(a_id, b_id, score)
+        if cross:
+            self._elo.update_pairs(cross, k_scale=1.0 / (n - 1))
 
     @property
     def match_results(self) -> list[MatchResult]:
         return self._match_results
 
-    def get_ratings_summary(self) -> dict:
-        """Get a summary of all agent ratings."""
-        trainable = self._agent_pool.list_trainable()
-        agent_ids = [a.agent_id for a in trainable]
+    def ratings_snapshot(self) -> dict:
+        """JSON-serializable ratings of all trainable agents (persisted by the metrics hub)."""
+        ids = [a.agent_id for a in self._agent_pool.list_trainable()]
         return {
-            "elo": {aid: self._elo.get(aid) for aid in agent_ids},
-            "win_rates": self._win_rates.get_win_rate_matrix(agent_ids),
+            "elo": {a: self._elo.get(a) for a in ids},
+            "win_rates": self._win_rates.get_win_rate_matrix(ids),
+            "games": self._win_rates.get_games_matrix(ids),
+            "wr_vs_past": {a: self._past.get(a) for a in ids},
+            "past_games": {a: self._past.games(a) for a in ids},
         }
