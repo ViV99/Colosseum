@@ -50,7 +50,6 @@ services:
     command: [
       "python", "-m", "colosseum", "run-workers",
       "--config", "configs/examples/tic_tac_toe.yaml",
-      "--set", "run.dir=/app/checkpoints",
       "--weight-store", "weight-store:50051",
       "--learner", "agent_0=learner:50052",
     ]

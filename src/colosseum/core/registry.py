@@ -205,20 +205,85 @@ def check_env_num_players(config: ColosseumConfig, env: Any = None) -> None:
         )
 
 
+def _reset_mask_row(config: ColosseumConfig, spec: Any, info_dict: Any, num_players: int) -> Any:
+    """The flat bool mask row validate_config's dummy masked step uses, or None if no seat has a mask.
+
+    Reset infos go through the worker's seat rules (``core/seat_info.py``): ``active``
+    defaults to True, composite masks are flattened, an empty row of a non-acting seat
+    becomes all-true and an empty row of an acting seat is an :class:`EnvContractError`.
+    The row is the first acting seat's; if no seat acts at reset, it is all-true.
+    """
+    import numpy as np
+
+    from colosseum.core.seat_info import acting_flags, check_masks, extract_masks
+
+    infos = [info_dict if isinstance(info_dict, dict) else {}]
+    size = spec.flat_mask_size
+    for p in range(num_players):
+        info = infos[0].get(p)
+        raw = info.get("action_mask") if isinstance(info, dict) else None
+        if raw is None:
+            continue
+        try:
+            flat = spec.flatten_mask(raw) if isinstance(raw, dict) else np.asarray(raw, dtype=bool)
+        except (TypeError, ValueError) as e:
+            raise ConfigError(
+                f"env action_mask of seat {p} at reset cannot be flattened for the action space: "
+                f"{type(e).__name__}: {e}"
+            ) from e
+        if flat.shape != (size,):
+            raise ConfigError(
+                f"env action_mask has shape {flat.shape} (seat {p} at reset), but the action space "
+                f"needs ({size},)"
+            )
+    masks = extract_masks(infos, 1, num_players, spec)
+    if masks is None:
+        return None
+    acting = acting_flags(infos, 1, num_players)
+    check_masks(masks, acting, spec, lambda e, p: f"env.reset(seed=0) of {config.env.env_class!r}, seat {p}")
+    seats = np.flatnonzero(acting[0])
+    return masks[seats[0]] if seats.size else np.ones(size, dtype=bool)
+
+
+def _check_step_output(out: Any, batch: int, context: str = "") -> None:
+    from colosseum.networks.distributions import Distribution
+
+    if not isinstance(out.dist, Distribution):
+        raise ConfigError(
+            f"the policy head must return a colosseum Distribution "
+            f"(colosseum.networks.distributions), got {type(out.dist).__name__}{context}"
+        )
+    if tuple(out.value.shape) != (batch,):
+        raise ConfigError(
+            f"value must have shape [B]=({batch},), got {tuple(out.value.shape)}{context}. "
+            f"Squeeze the last dim in the value head."
+        )
+
+
+def _sample(dist: Any) -> Any:
+    try:
+        return dist.sample()
+    except Exception as e:
+        raise ConfigError(
+            f"sampling from the policy distribution {type(dist).__name__} failed: "
+            f"{type(e).__name__}: {e}"
+        ) from e
+
+
 def validate_config(config: ColosseumConfig) -> None:
     """Build the env and the model and exercise ``step``/``unroll`` on dummy data.
 
     Raises :class:`ConfigError` with a precise message on any structural problem
     (bad class, head/core dimension mismatch, wrong value shape, state without a
     batch dim or that cannot be sent between processes, action/mask size
-    mismatch) before any process is spawned.
+    mismatch) before any process is spawned. An acting seat whose reset action mask has
+    no legal action raises :class:`EnvContractError`, as it would in the worker.
     """
     import numpy as np
     import torch
 
     from colosseum.core.action_spec import ActionSpec
     from colosseum.networks.composed import ComposedModel
-    from colosseum.networks.distributions import Distribution
 
     env = _make_env(config)
     try:
@@ -256,18 +321,9 @@ def validate_config(config: ColosseumConfig) -> None:
         obs = sample.unsqueeze(0).repeat(B, *([1] * sample.dim()))
         obs_alt = sample.unsqueeze(0).repeat(B_ALT, *([1] * sample.dim()))
         mask = None
-        raw_mask = info_dict.get(0, {}).get("action_mask") if isinstance(info_dict, dict) else None
-        if raw_mask is not None:
-            if isinstance(raw_mask, dict):
-                flat_mask = spec.flatten_mask(raw_mask)
-            else:
-                flat_mask = np.asarray(raw_mask, dtype=bool)
-            if flat_mask.shape != (spec.flat_mask_size,):
-                raise ConfigError(
-                    f"env action_mask has shape {flat_mask.shape}, but the action space needs "
-                    f"({spec.flat_mask_size},)"
-                )
-            mask = torch.as_tensor(flat_mask).unsqueeze(0).repeat(B, 1)
+        mask_row = _reset_mask_row(config, spec, info_dict, env.num_players)
+        if mask_row is not None:
+            mask = torch.as_tensor(mask_row).unsqueeze(0).repeat(B, 1)
         mask_alt = None if mask is None else mask[:1].repeat(B_ALT, 1)
 
         model.eval()
@@ -289,24 +345,9 @@ def validate_config(config: ColosseumConfig) -> None:
                     f"model.step failed on a dummy batch with obs shape {tuple(obs.shape)}: "
                     f"{type(e).__name__}: {e}.{hint}"
                 ) from e
-            if not isinstance(out.dist, Distribution):
-                raise ConfigError(
-                    f"the policy head must return a colosseum Distribution "
-                    f"(colosseum.networks.distributions), got {type(out.dist).__name__}"
-                )
-            if tuple(out.value.shape) != (B,):
-                raise ConfigError(
-                    f"value must have shape [B]=({B},), got {tuple(out.value.shape)}. "
-                    f"Squeeze the last dim in the value head."
-                )
+            _check_step_output(out, B)
             _check_state_batch_dim(out.state, out_alt.state, (B, B_ALT), "step() state")
-            try:
-                actions = out.dist.sample()
-            except Exception as e:
-                raise ConfigError(
-                    f"sampling from the policy distribution {type(out.dist).__name__} failed: "
-                    f"{type(e).__name__}: {e}"
-                ) from e
+            actions = _sample(out.dist)
             expected = (B, *spec.action_shape)
             if tuple(actions.shape) != expected:
                 raise ConfigError(
@@ -322,13 +363,15 @@ def validate_config(config: ColosseumConfig) -> None:
                 ) from exc
             if mask is not None:
                 try:
-                    model.step(obs, state0, mask)
+                    out_m = model.step(obs, state0, mask)
                     model.step(obs_alt, state0_alt, mask_alt)
                 except Exception as e:
                     raise ConfigError(
                         f"model.step failed with the env's action_mask (shape {tuple(mask.shape)}): "
                         f"{type(e).__name__}: {e}"
                     ) from e
+                _check_step_output(out_m, B, " (with the env's action_mask)")
+                actions = _sample(out_m.dist)  # legal actions, so the masked unroll can score them
 
             dones = torch.zeros(T, B, dtype=torch.bool)
             dones[1, 0] = True
@@ -345,6 +388,11 @@ def validate_config(config: ColosseumConfig) -> None:
                 raise ConfigError(
                     f"unroll must return time-major [T*B]=({T * B},) values/log-probs, got "
                     f"{tuple(unrolled.value.shape)} / {tuple(log_probs.shape)}"
+                )
+            if not torch.isfinite(log_probs).all():
+                raise ConfigError(
+                    "model.unroll gives non-finite log-probs for actions sampled from model.step "
+                    "(with the same action mask); step and unroll must agree on the policy and its mask"
                 )
     finally:
         _close_env(env)

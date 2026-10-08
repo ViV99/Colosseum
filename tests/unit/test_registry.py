@@ -7,7 +7,7 @@ import torch
 from pydantic import ValidationError
 
 from colosseum.core.config import ColosseumConfig, CoreConfig, EnvConfig, NetworkConfig, load_config
-from colosseum.core.errors import ColosseumError, ConfigError
+from colosseum.core.errors import ColosseumError, ConfigError, EnvContractError
 from colosseum.core.registry import build_model, validate_config
 from colosseum.networks.composed import ComposedModel
 from colosseum.networks.cores import LSTMCore, NoCore, WindowAttentionCore
@@ -208,3 +208,23 @@ def test_wrong_classes_are_rejected_before_construction():
         build_model(_cfg(model_class="torch.nn.Linear"))
     with pytest.raises(ConfigError, match="must subclass colosseum.networks.cores.Core"):
         build_model(_composed(core={"class": "torch.nn.Linear"}))
+
+
+# ---------------------------------------------------------------------------
+# T8.1 fix round 1: reset masks follow the worker's seat rules
+# ---------------------------------------------------------------------------
+
+
+def test_validate_config_accepts_inactive_seat_zero_with_empty_mask():
+    validate_config(_monolithic("helpers.TinyMonolithicModel", env_class="helpers.InactiveSeatZeroEnv"))
+
+
+def test_validate_config_rejects_acting_seat_with_empty_mask():
+    with pytest.raises(EnvContractError, match=r"EmptyMaskActingSeatEnv.*seat 1: action_mask has no legal action"):
+        validate_config(_monolithic("helpers.TinyMonolithicModel", env_class="helpers.EmptyMaskActingSeatEnv"))
+
+
+def test_validate_config_unroll_scores_legal_actions_under_a_partial_mask():
+    # Unmasked, the model picks action 0 (illegal: only the last action is legal), whose masked
+    # log-prob is -inf. The unroll must be fed actions sampled from the masked step.
+    validate_config(_monolithic("helpers.PrefersActionZeroModel", env_class="helpers.OneLegalActionEnv"))

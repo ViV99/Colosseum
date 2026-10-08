@@ -11,7 +11,7 @@ from click.testing import CliRunner
 from colosseum.cli import main
 from colosseum.core.config import load_config
 from colosseum.core.registry import build_model
-from examples.composite_action.env import ChaseEnv
+from examples.composite_action.env import _DIRS, _GRID, ChaseEnv
 from examples.tic_tac_toe.env import TicTacToeEnv
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -49,7 +49,21 @@ def test_chase_accepts_its_own_sampled_actions_and_scalars():
     env.action_space.seed(0)
     for _ in range(3):
         env.step({0: env.action_space.sample(), 1: env.action_space.sample()})  # speed: shape (1,) array
+    before = env._positions.copy()
     env.step({0: {"direction": 1, "speed": 0.5}, 1: {"direction": np.int64(2), "speed": np.float32(1.0)}})
+    expected = np.clip(before + np.stack([_DIRS[1] * 0.5, _DIRS[2] * 1.0]), 0.0, _GRID)
+    np.testing.assert_allclose(env._positions, expected, rtol=0, atol=1e-6)
+    sampled = {"direction": np.array([3]), "speed": np.array([0.25], dtype=np.float32)}
+    before = env._positions.copy()
+    env.step({0: sampled, 1: sampled})
+    np.testing.assert_allclose(env._positions, np.clip(before + _DIRS[3] * 0.25, 0.0, _GRID), rtol=0, atol=1e-6)
+
+
+def test_chase_rejects_multi_element_action_components():
+    env = ChaseEnv()
+    env.reset(seed=0)
+    with pytest.raises(ValueError, match=r"player 0: action component 'speed'.*shape \(2,\)"):
+        env.step({0: {"direction": 0, "speed": np.array([0.1, 0.2])}, 1: {"direction": 0, "speed": 0.1}})
 
 
 @pytest.mark.parametrize("path", CONFIGS, ids=[p.name for p in CONFIGS])

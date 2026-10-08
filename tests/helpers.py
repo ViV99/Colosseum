@@ -289,6 +289,45 @@ class ResetFailsEnv(CountingEnv):
         raise RuntimeError("reset exploded")
 
 
+class InactiveSeatZeroEnv(CountingEnv):
+    """Turn-based reset: seat 0 waits with an all-false mask, seat 1 acts with action 1 legal."""
+
+    def reset(self, seed=None):
+        obs, _ = super().reset(seed)
+        legal = np.zeros(self.num_actions, dtype=bool)
+        legal[1] = True
+        return obs, {0: {"active": False, "action_mask": np.zeros(self.num_actions, dtype=bool)},
+                     1: {"active": True, "action_mask": legal}}
+
+
+class EmptyMaskActingSeatEnv(CountingEnv):
+    """Seat 1 acts at reset (no ``active`` key) but its action mask has no legal action."""
+
+    def reset(self, seed=None):
+        obs, _ = super().reset(seed)
+        return obs, {p: {"action_mask": np.full(self.num_actions, p != 1)} for p in obs}
+
+
+class OneLegalActionEnv(CountingEnv):
+    """Every seat's action mask allows only the last action."""
+
+    def reset(self, seed=None):
+        obs, _ = super().reset(seed)
+        legal = np.arange(self.num_actions) == self.num_actions - 1
+        return obs, {p: {"action_mask": legal.copy()} for p in obs}
+
+
+class PrefersActionZeroModel(TinyMonolithicModel):
+    """TinyMonolithicModel whose unmasked policy picks action 0 with probability ~1."""
+
+    def __init__(self, obs_dim: int = 27, num_actions: int = 9) -> None:
+        super().__init__(obs_dim, num_actions)
+        with torch.no_grad():
+            self.pi.weight.zero_()
+            self.pi.bias.zero_()
+            self.pi.bias[0] = 50.0
+
+
 # ---------------------------------------------------------------------------
 # Algorithm / eval test kit (SP1 blocks 4 and 7)
 # ---------------------------------------------------------------------------
