@@ -296,7 +296,7 @@ def _dist_worker_target(
         trajectory_queues={aid: GRPCTrajectorySink(transports[aid], aid) for aid in agent_ids},
         weight_queues={aid: GRPCWeightSource(store, aid) for aid in agent_ids},
         stop_event=stop_event,
-        gamma=config.algorithm.gamma,
+        gamma={aid: agent_configs[aid].algorithm.gamma for aid in agent_ids},
         weight_sync_interval=config.rollout.weight_sync_interval_sec,
         torch_threads=config.rollout.torch_threads,
         max_env_steps=total_timesteps,

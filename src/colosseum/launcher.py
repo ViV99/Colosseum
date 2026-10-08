@@ -103,7 +103,7 @@ def _worker_target(
         trajectory_queues=trajectory_queues,
         weight_queues=weight_queues,
         stop_event=stop_event,
-        gamma=config.algorithm.gamma,
+        gamma={aid: agent_configs[aid].algorithm.gamma for aid in agent_ids},
         weight_sync_interval=config.rollout.weight_sync_interval_sec,
         torch_threads=config.rollout.torch_threads,
         env_step_counter=env_step_counter,

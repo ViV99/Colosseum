@@ -381,8 +381,9 @@ def reference_transitions(log: list[dict], num_players: int) -> dict[int, list[d
 class AlternatingWinEnv(_Base):
     """Turn-based 2-player env: player ``t % 2`` acts at step ``t``.
 
-    - Episode ``ep`` lasts 3 steps if ``ep`` is even, else 4. The player who makes
-      the last move wins: +1 to the mover, -1 to the other.
+    - Episode ``ep`` lasts ``lengths[ep % len(lengths)]`` steps (default: 3 if
+      ``ep`` is even, else 4). The player who makes the last move wins: +1 to the
+      mover, -1 to the other.
     - In 4-step episodes player 1 gets +0.5 at step 0, before its first move.
     - After a step, the acting slot's mask is [True, True, False] and the
       non-acting slot's mask is all False. The reset info has only "active"
@@ -394,9 +395,10 @@ class AlternatingWinEnv(_Base):
     - Raises if the mover plays action 2 when it is illegal (t > 0).
     """
 
-    def __init__(self, env_id: int = 0, use_masks: bool = True) -> None:
+    def __init__(self, env_id: int = 0, use_masks: bool = True, lengths=(3, 4)) -> None:
         super().__init__(env_id)
         self.use_masks = use_masks
+        self.lengths = tuple(lengths)
 
     def reset(self, seed=None):
         self.ep += 1
@@ -404,7 +406,7 @@ class AlternatingWinEnv(_Base):
         return self._obs(), {p: {"active": p == 0} for p in range(2)}
 
     def _length(self) -> int:
-        return 3 if self.ep % 2 == 0 else 4
+        return self.lengths[self.ep % len(self.lengths)]
 
     def _info(self) -> dict[int, dict]:
         mover = self.t % 2

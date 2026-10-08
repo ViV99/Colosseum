@@ -60,7 +60,7 @@ def rollout_worker_process(
     trajectory_queues: dict[str, Any],
     weight_queues: dict[str, Any],
     stop_event: Any,
-    gamma: float = 0.99,
+    gamma: float | dict[str, float] = 0.99,
     weight_sync_interval: float = 5.0,
     torch_threads: int = 1,
     max_env_steps: int = 0,

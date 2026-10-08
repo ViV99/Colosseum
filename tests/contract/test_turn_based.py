@@ -96,3 +96,32 @@ def test_empty_mask_on_an_acting_slot_raises():
     loop.step()
     with pytest.raises(EnvContractError, match=r"env 0, slot 1, episode step 1"):
         loop.step()
+
+
+def test_non_acting_slots_send_the_zero_action():
+    _, envs, _ = _run()
+    acting_actions = []
+    for env in envs.created:
+        for step in env.log:
+            for p in range(2):
+                if step["active"][p]:
+                    acting_actions.append(step["actions"][p])
+                else:
+                    assert step["actions"][p] == 0, step
+    assert any(a != 0 for a in acting_actions)   # sampling would expose a non-zero leak
+
+
+def test_pending_reward_of_a_never_acting_slot_is_dropped_at_episode_end():
+    # Episode 0 lasts 1 step: only p0 moves and wins, so p1 gets -1 without acting.
+    # Episode 1 (4 steps) gives p1 +0.5 before its first move: that transition must
+    # carry +0.5 only, not the -1 left over from episode 0.
+    envs = EnvFactory(AlternatingWinEnv, lengths=(1, 4))
+    loop, col = make_loop(envs, ProbeModel, num_envs=1, chunk_length=2)
+    for _ in range(6):        # episodes 0 (1 step), 1 (4 steps), 2 (1 step)
+        loop.step()
+    got = slot_transitions(col.chunks)
+    assert [(t["ep"], t["t"], t["reward"], t["done"]) for t in got[(0, 1)]] == \
+           [(1, 1, 0.5, False), (1, 3, 1.0, True)]
+    assert [(t["ep"], t["t"], t["reward"], t["done"]) for t in got[(0, 0)]] == \
+           [(0, 0, 1.0, True), (1, 0, 0.0, False), (1, 2, -1.0, True), (2, 0, 1.0, True)]
+    assert loop.stats["dropped_reward_episodes"] == 2

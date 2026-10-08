@@ -22,8 +22,16 @@ class BaseEnv(ABC):
       a zero action (ignored by the env) and its model state does not advance.
     - ``info[p]["action_mask"]`` may be all-false for a non-acting player; an
       acting player must have at least one legal action (else EnvContractError).
-    - A player's rewards are credited to its last action until it acts again; at
-      episode end the last transition of every collecting player gets done=True.
+    - A player's rewards are credited to its last action until it acts again;
+      rewards before its first action in an episode go to that first action. At
+      episode end the last transition of every collecting player *that acted in
+      the episode* gets the final reward and done=True; the rewards of a player
+      that never acted in the episode are dropped.
+
+    Time limits: end an episode that is cut off (not finished) with
+    ``truncated=True`` and ``terminated=False``. The rollout worker then adds
+    ``gamma * V(final_obs)`` to each collecting player's last reward, using the
+    final observation the vector env keeps in ``info[p]["terminal_observation"]``.
     """
 
     @property

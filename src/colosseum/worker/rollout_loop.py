@@ -1,31 +1,31 @@
 """In-process rollout loop: vectorized envs, batched inference, per-slot transitions.
 
-``RolloutLoop`` owns the environments and the per-agent model pools of one
-worker. All I/O (sending chunks, pulling weights, reporting match results,
-receiving match re-assignments) goes through :class:`LoopIO` callbacks, so the
-loop runs unchanged in a worker process (``rollout_worker_process``) and
-in-process in tests.
+All I/O goes through :class:`LoopIO` callbacks, so the loop runs unchanged in a
+worker process (``rollout_worker_process``) and in-process in tests.
 
 Multi-agent: several agents can occupy different player slots of the same
 environments. Inference is grouped by (agent_id, network_id) for batching, and
 each chunk is routed to the agent that produced it.
 
-Buffers are owned by agents (``worker/slots.py``): each collecting slot holds
-one buffer, and on match re-assignment a slot's partial buffer is parked for
-its agent instead of being discarded (spec block 2). A chunk's
-``behavior_policy_version`` is the version at its FIRST transition.
-
-A slot's transition stays open (collecting rewards) until the slot acts again
-or its episode ends (spec block 3). A full buffer is sealed when the slot acts
-again, with ``bootstrap_value`` = the value from that action's batched
-inference, or at once with ``bootstrap_value = 0`` when the episode ends; there
-is no separate bootstrap forward pass.
-
-Turn-based envs (``BaseEnv`` convention): only slots whose ``info["active"]`` is
-true (or missing) run inference and advance their model state; the others send
-the zero action. Rewards that reach a slot before its first action in an
-episode accumulate in ``SlotTrack.pending_reward`` and go to that first
-transition, so final rewards and ``done`` reach every collecting slot.
+Transition model (spec block 3):
+- Only *acting* slots (``info["active"]``; absent = all act) run inference; the
+  others send the default action (zeros) and their model state is unchanged.
+- A collecting slot's transition stays *open* until that slot acts again, so
+  rewards produced on other players' turns land on it. Rewards that arrive
+  before the slot's first action in an episode accumulate in ``pending_reward``
+  and are added to that first transition.
+- A full buffer is sealed when the slot acts again: ``bootstrap_value`` is the
+  value from that inference. At episode end every open transition is marked
+  ``done`` (truncation adds ``gamma * V(final_obs)`` to its reward, with the
+  slot agent's gamma) and a full buffer is sealed with ``bootstrap_value = 0``.
+  No separate bootstrap forward.
+- Final rewards and ``done`` therefore reach every collecting slot *that acted
+  in the episode*. A slot that never acted in an episode has no transition to
+  carry them: its ``pending_reward`` is dropped at the episode end (counted in
+  ``stats["dropped_reward_episodes"]``).
+- Buffers are owned by agents (``worker/slots.py``) and parked on match
+  re-assignment instead of being discarded (block 2). A chunk's
+  ``behavior_policy_version`` is the version at its FIRST transition.
 """
 
 from __future__ import annotations
@@ -85,7 +85,7 @@ class RolloutLoop:
         agent_ids: list[str],
         model_factories: dict[str, Callable[[], PolicyModel]],
         io: LoopIO,
-        gamma: float = 0.99,
+        gamma: float | dict[str, float] = 0.99,
         weight_sync_interval: float = 5.0,
         slot_agent_map: list[list[str]] | None = None,
         slot_network_map: list[list[str]] | None = None,
@@ -101,7 +101,11 @@ class RolloutLoop:
         self._model_factories = model_factories
         self._chunk_length = chunk_length
         self._weight_sync_interval = weight_sync_interval
-        self._gamma = float(gamma)  # used for truncation bootstrapping (T3.3)
+        # Per-agent discount, used for truncation bootstrapping (B2).
+        if isinstance(gamma, dict):
+            self._gammas = {aid: float(gamma[aid]) for aid in self._agent_ids}
+        else:
+            self._gammas = {aid: float(gamma) for aid in self._agent_ids}
 
         if seed is not None:
             torch.manual_seed(seed)
@@ -181,6 +185,7 @@ class RolloutLoop:
         self._ep_counter = np.zeros(E, dtype=np.int64)
         self._env_steps = 0
         self._chunks_sent = 0
+        self._dropped_reward_episodes = 0
         self._recorded: dict[str, int] = defaultdict(int)
 
     # ------------------------------------------------------------------
@@ -234,6 +239,7 @@ class RolloutLoop:
             "env_steps": self._env_steps,
             "episodes": int(self._ep_counter.sum()),
             "parked_buffers": self._pool.parked_count(),
+            "dropped_reward_episodes": self._dropped_reward_episodes,
             "recorded_transitions": sum(self._recorded.values()),
         }
         for aid in self._agent_ids:
@@ -374,21 +380,21 @@ class RolloutLoop:
     def _check_masks(self, masks: np.ndarray, acting: np.ndarray) -> None:
         """Mask rules (R1-13, ET-08): an empty mask row (per discrete component)
         on a non-acting slot becomes all-true; on an acting slot it is an error."""
-        P = self._num_players
+        acting_flat = acting.reshape(-1)
         for comp in self._action_spec.components:
             if comp.mask_size == 0:
                 continue
             lo, hi = comp.mask_offset, comp.mask_offset + comp.mask_size
             empty = ~masks[:, lo:hi].any(axis=1)
-            for flat in np.flatnonzero(empty):
-                e, p = divmod(int(flat), P)
-                if acting[e, p]:
-                    raise EnvContractError(
-                        f"worker {self.worker_id}, env {e}, slot {p}, episode step "
-                        f"{int(self._ep_lengths[e])}: action_mask has no legal action "
-                        f"(component {comp.name!r}) for an acting slot"
-                    )
-                masks[flat, lo:hi] = True
+            bad = np.flatnonzero(empty & acting_flat)
+            if bad.size:
+                e, p = divmod(int(bad[0]), self._num_players)
+                raise EnvContractError(
+                    f"worker {self.worker_id}, env {e}, slot {p}, episode step "
+                    f"{int(self._ep_lengths[e])}: action_mask has no legal action "
+                    f"(component {comp.name!r}) for an acting slot"
+                )
+            masks[empty, lo:hi] = True
 
     def _infer(self, obs: np.ndarray, masks: np.ndarray | None, acting: np.ndarray):
         """Batched inference for acting slots, grouped by (agent, network).
@@ -479,13 +485,16 @@ class RolloutLoop:
                 else:
                     track.pending_reward += r
             if terminated[e] or truncated[e]:
-                self._end_episode(e, infos[e])
+                self._end_episode(e, bool(terminated[e]), bool(truncated[e]), infos[e])
 
-    def _end_episode(self, e: int, info_e: dict) -> None:
-        """Mark every open transition done; seal full buffers with bootstrap 0;
-        drop rewards of slots that never acted; report the result; apply a staged
+    def _end_episode(self, e: int, terminated: bool, truncated: bool, info_e: dict) -> None:
+        """Close env ``e``'s episode: truncation bootstrap; ``done`` on every open
+        transition (full buffers sealed with bootstrap 0); drop the pending
+        reward of slots that never acted; report the result; apply a staged
         re-assignment; reset model states."""
         P = self._num_players
+        if truncated and not terminated:
+            self._bootstrap_truncation(e, info_e)
         for p in range(P):
             track = self._tracks[e][p]
             if self._collect_mask[e][p] and track.has_open:
@@ -493,6 +502,12 @@ class RolloutLoop:
                 track.has_open = False
                 if track.buffer.is_full:
                     self._seal(self._slot_agent_map[e][p], track.buffer, bootstrap_value=0.0)
+            if track.pending_reward != 0.0:
+                self._dropped_reward_episodes += 1
+                logger.debug(
+                    f"Worker {self.worker_id}: env {e}, slot {p}: dropping reward "
+                    f"{track.pending_reward} of an episode the slot never acted in"
+                )
             track.pending_reward = 0.0
         self._report_result(e, info_e)
         self._ep_rewards[e] = 0.0
@@ -501,6 +516,34 @@ class RolloutLoop:
         self._apply_pending_assignment(e)
         for p in range(P):
             self._tracks[e][p].state = self._initial_state(e, p)
+
+    def _bootstrap_truncation(self, e: int, info_e: dict) -> None:
+        """Add ``gamma * V(final_obs)`` to every open transition of env ``e``.
+
+        One batched forward per (agent, network) group, with each slot's current
+        model state, on ``info[p]["terminal_observation"]``; ``gamma`` is the
+        slot agent's (R1-03, R2-09).
+        """
+        groups: dict[tuple[str, str], list[int]] = defaultdict(list)
+        for p in range(self._num_players):
+            if self._collect_mask[e][p] and self._tracks[e][p].has_open:
+                groups[(self._slot_agent_map[e][p], self._slot_network_map[e][p])].append(p)
+        for (aid, net_id), players in groups.items():
+            try:
+                final = np.stack([np.asarray(info_e[p]["terminal_observation"]) for p in players])
+            except (KeyError, TypeError) as exc:
+                raise EnvContractError(
+                    f"worker {self.worker_id}, env {e}: truncated episode without "
+                    f"info['terminal_observation']"
+                ) from exc
+            model = self._resolve_model(aid, net_id)
+            obs_b = torch.from_numpy(np.ascontiguousarray(final, dtype=np.float32))
+            state_b = cat_batch([self._tracks[e][p].state for p in players])
+            with torch.no_grad():
+                out = model.step(obs_b, state_b)
+            v = out.value.float().cpu().numpy()
+            for j, p in enumerate(players):
+                self._tracks[e][p].buffer.add_reward(self._gammas[aid] * float(v[j]))
 
     def _seal(self, aid: str, buf: RolloutBuffer, bootstrap_value: float) -> None:
         chunk = buf.build_chunk(aid, bootstrap_value)
