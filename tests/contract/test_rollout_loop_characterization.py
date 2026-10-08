@@ -93,9 +93,10 @@ def test_non_collecting_checkpoint_slot_produces_no_chunks():
 
     assert len(rec.chunks) == 4
     assert all(player_index(c) == {0} for c in rec.chunks)
-    # The checkpoint network really occupies seat 1 (results key it separately).
+    # The checkpoint network really occupies seat 1 (its own SeatResult).
     assert len(rec.results) == 2
-    assert all(set(r.player_outcomes) == {"agent_0:latest", "agent_0:ckpt_v1"} for r in rec.results)
+    assert all([(s.seat, s.agent_id, s.network_id) for s in r.seats]
+               == [(0, "agent_0", "latest"), (1, "agent_0", "ckpt_v1")] for r in rec.results)
 
 
 def test_episode_results_are_reported_per_env():
@@ -107,8 +108,9 @@ def test_episode_results_are_reported_per_env():
     assert len(rec.results) == 8  # 2 envs x 4 episodes of 5 steps
     for r in rec.results:
         assert r.episode_length == EPISODE
-        assert set(r.player_outcomes) == {"agent_0:latest"}  # both seats share one key
-        assert set(r.total_rewards) == {"agent_0:latest"}
+        # Both seats of the same agent/network are reported, none overwritten (T3.4).
+        assert [(s.seat, s.agent_id, s.network_id) for s in r.seats] == [
+            (0, "agent_0", "latest"), (1, "agent_0", "latest")]
     assert loop.stats["episodes"] == 8
 
 
@@ -166,9 +168,11 @@ def test_command_reassignment_applies_at_episode_boundary():
     assert sorted((c.agent_id, *player_index(c)) for c in before) == [("a", 0), ("a", 0), ("a", 1), ("a", 1)]
     boundary_results = rec.results[results_warm:results_boundary]
     assert len(boundary_results) == 2
-    assert all(set(r.player_outcomes) == {"a:latest"} for r in boundary_results)
+    assert all([(s.agent_id, s.network_id) for s in r.seats] == [("a", "latest"), ("a", "latest")]
+               for r in boundary_results)
     # Env 0's next episode is played under the new assignment.
-    assert set(rec.results[results_boundary].player_outcomes) == {"a:latest", "b:latest"}
+    assert [(s.agent_id, s.network_id) for s in rec.results[results_boundary].seats] == [
+        ("a", "latest"), ("b", "latest")]
 
     after = rec.chunks[chunks_boundary:]
     a_after = [c for c in after if c.agent_id == "a"]

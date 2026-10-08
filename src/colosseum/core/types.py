@@ -183,22 +183,34 @@ class MatchConfig:
 
 
 @dataclass
-class MatchResult:
-    """Outcome of a completed match, reported back to the coordinator.
+class SeatResult:
+    """Outcome of one seat of a finished match.
 
     Attributes:
-        match_id: Matches the ``match_id`` from the originating
-            :class:`MatchConfig`.
-        player_outcomes: Mapping from ``agent_id`` to outcome value:
-            ``1.0`` for win, ``0.0`` for loss, ``0.5`` for draw.
-        total_rewards: Mapping from ``agent_id`` to the cumulative undiscounted
-            reward earned during the match.
-        episode_length: Total number of environment steps in the match.
+        seat: Seat (player slot) index in the env.
+        agent_id: Base agent that played the seat.
+        network_id: ``"latest"`` or a checkpoint id (``"ckpt_v<N>"``).
+        outcome: In [0, 1] (1 = best), from :mod:`colosseum.core.outcomes`: the
+            env's terminal ``outcome``/``rank`` if every seat has one, else
+            derived from episode rewards.
+        reward: Undiscounted episode return of the seat.
+        rank: The env's terminal ``rank`` for the seat (1 = best), if provided.
     """
 
+    seat: int
+    agent_id: str
+    network_id: str
+    outcome: float
+    reward: float
+    rank: int | None = None
+
+
+@dataclass
+class MatchResult:
+    """A finished match, one :class:`SeatResult` per seat (no key collisions)."""
+
     match_id: str
-    player_outcomes: dict[str, float] = field(default_factory=dict)
-    total_rewards: dict[str, float] = field(default_factory=dict)
+    seats: list[SeatResult] = field(default_factory=list)
     episode_length: int = 0
 
 

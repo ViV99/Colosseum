@@ -125,36 +125,31 @@ class Coordinator:
         return None
 
     @staticmethod
-    def _base_agent(player_key: str) -> str:
-        """Strip the ``:network_id`` suffix from a player key.
+    def _seat_outcomes_by_agent(result: MatchResult) -> dict[str, list[float]]:
+        """Every seat's outcome, grouped by base agent id (no seat is dropped).
 
-        Workers report outcomes keyed by ``"agent_id:network_id"`` (e.g.
-        ``"agent_0:latest"`` or ``"agent_0:ckpt_v100"``).  ELO / win-rate
-        tracking and PFSP opponent selection operate at the *agent* level,
-        so we aggregate to the base ``agent_id``.
+        One agent may hold several seats (self-play latest vs latest, an N-player
+        arena that repeats agents); each seat contributes its own outcome.
         """
-        return player_key.split(":", 1)[0]
+        by_agent: dict[str, list[float]] = {}
+        for seat in result.seats:
+            by_agent.setdefault(seat.agent_id, []).append(float(seat.outcome))
+        return by_agent
 
     def report_match_result(self, result: MatchResult) -> None:
-        """Record outcome and update ratings.
+        """Record a per-seat result and update ratings.
 
-        Outcomes are aggregated to the base ``agent_id`` level (the unit PFSP
-        selects over).  Pairs that resolve to the *same* base agent (e.g. a
-        solo self-play match of latest vs. a historical checkpoint of the same
-        agent) are skipped — they carry no cross-agent signal and would
-        otherwise pollute the win-rate matrix that PFSP reads.
+        Seat outcomes are averaged per base agent (the unit PFSP selects over),
+        then every pair of DIFFERENT agents updates the win-rate matrix and ELO.
+        Same-agent pairs (latest vs its own checkpoint, or two seats of one
+        agent) carry no cross-agent signal and are skipped. Pairwise seat
+        ratings replace this in T5.2.
         """
         self._match_results.append(result)
 
-        # Aggregate per-slot outcomes to the base agent level. If the same base
-        # agent occupies multiple slots, average its outcome across them.
-        agent_outcomes: dict[str, list[float]] = {}
-        for player_key, outcome in result.player_outcomes.items():
-            base = self._base_agent(player_key)
-            agent_outcomes.setdefault(base, []).append(outcome)
-        agg = {a: sum(v) / len(v) for a, v in agent_outcomes.items()}
+        by_agent = self._seat_outcomes_by_agent(result)
+        agg = {a: sum(v) / len(v) for a, v in by_agent.items()}
 
-        # Update ELO and win rates from pairwise (base-agent) outcomes.
         agents = list(agg.keys())
         for i, a in enumerate(agents):
             for j, b in enumerate(agents):

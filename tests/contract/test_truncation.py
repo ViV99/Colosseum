@@ -5,6 +5,15 @@ from colosseum.core.errors import EnvContractError
 from dataflow_helpers import EnvFactory, GridStepEnv, ProbeModel, make_loop, slot_transitions
 
 
+class TermAndTruncEnv(GridStepEnv):
+    """GridStepEnv whose final step reports terminated AND truncated for every seat."""
+
+    def step(self, actions):
+        obs, rew, term, trunc, info = super().step(actions)
+        done = {p: term[p] or trunc[p] for p in term}
+        return obs, rew, done, dict(done), info
+
+
 def test_truncation_adds_the_discounted_value_of_the_final_observation():
     created = []
 
@@ -50,3 +59,49 @@ def test_truncation_without_terminal_observation_is_a_contract_error():
     loop.step()                      # both slots now hold an open transition
     with pytest.raises(EnvContractError, match="terminal_observation"):
         loop._bootstrap_truncation(0, {0: {}, 1: {}})
+
+
+def test_truncation_bootstraps_each_seat_from_its_own_final_observation():
+    # value = t + 100 * player index (from obs): a seat bootstrapped from another
+    # seat's terminal observation would get the wrong bonus.
+    created = []
+
+    def model_factory():
+        model = ProbeModel(obs_coeffs=(0.0, 0.0, 1.0, 100.0))
+        created.append(model)
+        return model
+
+    gamma = 0.9
+    envs = EnvFactory(GridStepEnv, lengths=(3,), truncate_every=1, const_reward=1.0)
+    loop, col = make_loop(envs, model_factory, num_envs=1, chunk_length=3, gamma=gamma)
+    for _ in range(3):
+        loop.step()
+    got = slot_transitions(col.chunks)
+    assert got[(0, 0)][-1]["reward"] == pytest.approx(1.0 + gamma * 3.0)
+    assert got[(0, 1)][-1]["reward"] == pytest.approx(1.0 + gamma * 103.0)
+    assert created[0].calls == [2, 2, 2, 2]   # 3 inference forwards + 1 bootstrap forward
+
+
+def test_terminated_and_truncated_together_get_no_bootstrap():
+    created = []
+
+    def model_factory():
+        model = ProbeModel(obs_coeffs=(0.0, 0.0, 1.0, 100.0))
+        created.append(model)
+        return model
+
+    envs = EnvFactory(TermAndTruncEnv, lengths=(3,), truncate_every=1, const_reward=1.0)
+    loop, col = make_loop(envs, model_factory, num_envs=1, chunk_length=3, gamma=0.9)
+    for _ in range(3):
+        loop.step()
+    got = slot_transitions(col.chunks)
+    for p in range(2):
+        assert got[(0, p)][-1]["done"]
+        assert got[(0, p)][-1]["reward"] == pytest.approx(1.0)   # terminal: no gamma * V bonus
+    assert created[0].calls == [2, 2, 2]   # no extra bootstrap forward
+
+
+def test_gamma_dict_missing_an_agent_is_rejected():
+    with pytest.raises(ValueError, match=r"\['b', 'c'\]"):
+        make_loop(EnvFactory(GridStepEnv), ProbeModel, agent_ids=("a", "b", "c"),
+                  num_envs=1, gamma={"a": 0.9}, slot_agent_map=[["a", "b"]])

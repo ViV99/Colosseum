@@ -18,7 +18,7 @@ import torch
 import torch.nn as nn
 
 from colosseum.core.ipc import assert_no_tensors, put_latest
-from colosseum.core.types import MatchResult, TrajectoryChunk, WeightPayload, WorkerCommand
+from colosseum.core.types import MatchResult, SeatResult, TrajectoryChunk, WeightPayload, WorkerCommand
 from colosseum.envs.base_env import BaseEnv
 from colosseum.networks.distributions import CategoricalDist
 from colosseum.networks.model import PolicyModel, StepOutput
@@ -468,3 +468,30 @@ class InfoLeakEnv(_Base):
                     "action_mask": np.array([False, True, False]),
                     "rank": 1, "outcome": 0.123}}
         return self._obs(), {0: 1.0}, {0: done}, {0: False}, info
+
+
+class FFA4Env(_Base):
+    """4-player simultaneous FFA, 2 steps per episode; terminal rank of seat p is p + 1."""
+
+    NUM_PLAYERS = 4
+
+    def reset(self, seed=None):
+        self.ep += 1
+        self.t = 0
+        return self._obs(), {p: {} for p in range(4)}
+
+    def step(self, actions):
+        self.t += 1
+        done = self.t >= 2
+        rew = {p: (float(3 - p) if done else 0.0) for p in range(4)}
+        info = {p: ({"rank": p + 1} if done else {}) for p in range(4)}
+        return self._obs(), rew, {p: done for p in range(4)}, {p: False for p in range(4)}, info
+
+
+def two_seat_result(agent_a: str, outcome_a: float, agent_b: str, outcome_b: float,
+                    network_b: str = "latest", match_id: str = "m") -> MatchResult:
+    """A 2-seat MatchResult: seat 0 = agent_a (latest), seat 1 = agent_b (network_b)."""
+    return MatchResult(match_id=match_id, episode_length=1, seats=[
+        SeatResult(seat=0, agent_id=agent_a, network_id="latest", outcome=outcome_a, reward=outcome_a),
+        SeatResult(seat=1, agent_id=agent_b, network_id=network_b, outcome=outcome_b, reward=outcome_b),
+    ])

@@ -5,7 +5,7 @@ from colosseum.coordinator.agent_pool import AgentPool
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.coordinator.matchmaker import PFSPMatchmaker
 from colosseum.coordinator.ratings import EloRating, WinRateTracker
-from colosseum.core.types import MatchResult
+from dataflow_helpers import two_seat_result
 from helpers import example_config
 
 
@@ -151,12 +151,7 @@ def test_coordinator_match_reporting():
         coord.agent_pool.register_trainable("a1")
 
         # a0 wins
-        coord.report_match_result(MatchResult(
-            match_id="m1",
-            player_outcomes={"a0": 1.0, "a1": 0.0},
-            total_rewards={"a0": 1.0, "a1": -1.0},
-            episode_length=10,
-        ))
+        coord.report_match_result(two_seat_result("a0", 1.0, "a1", 0.0, match_id="m1"))
 
         assert coord.elo.get("a0") > coord.elo.get("a1")
         assert coord.win_rates.get_win_rate("a0", "a1") == 1.0

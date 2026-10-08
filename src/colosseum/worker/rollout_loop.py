@@ -45,6 +45,7 @@ from colosseum.core.errors import EnvContractError
 from colosseum.core.outcomes import player_outcomes
 from colosseum.core.types import (
     MatchResult,
+    SeatResult,
     TrajectoryChunk,
     WeightPayload,
     WorkerCommand,
@@ -103,6 +104,9 @@ class RolloutLoop:
         self._weight_sync_interval = weight_sync_interval
         # Per-agent discount, used for truncation bootstrapping (B2).
         if isinstance(gamma, dict):
+            missing = [aid for aid in self._agent_ids if aid not in gamma]
+            if missing:
+                raise ValueError(f"gamma dict has no entry for agent(s) {missing}")
             self._gammas = {aid: float(gamma[aid]) for aid in self._agent_ids}
         else:
             self._gammas = {aid: float(gamma) for aid in self._agent_ids}
@@ -552,7 +556,7 @@ class RolloutLoop:
         self._chunks_sent += 1
 
     def _report_result(self, e: int, info_e: dict) -> None:
-        """Report env ``e``'s finished episode; players keyed ``agent_id:network_id``."""
+        """Report env ``e``'s finished episode: one :class:`SeatResult` per seat."""
         if self._io.report_result is None:
             return
         P = self._num_players
@@ -561,15 +565,19 @@ class RolloutLoop:
         }
         rewards = self._ep_rewards[e]
         outcomes = player_outcomes(rewards, terminal_infos, P)
-        player_outcome: dict[str, float] = {}
-        total_rewards: dict[str, float] = {}
+        seats = []
         for p in range(P):
-            key = f"{self._slot_agent_map[e][p]}:{self._slot_network_map[e][p]}"
-            player_outcome[key] = float(outcomes[p])
-            total_rewards[key] = float(rewards[p])
+            rank = terminal_infos[p].get("rank")
+            seats.append(SeatResult(
+                seat=p,
+                agent_id=self._slot_agent_map[e][p],
+                network_id=self._slot_network_map[e][p],
+                outcome=float(outcomes[p]),
+                reward=float(rewards[p]),
+                rank=None if rank is None else int(rank),
+            ))
         self._io.report_result(MatchResult(
             match_id=f"w{self.worker_id}_e{e}_ep{int(self._ep_counter[e])}",
-            player_outcomes=player_outcome,
-            total_rewards=total_rewards,
+            seats=seats,
             episode_length=int(self._ep_lengths[e]),
         ))
