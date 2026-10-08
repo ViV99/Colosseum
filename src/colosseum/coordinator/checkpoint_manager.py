@@ -13,11 +13,14 @@ contain ``.`` (``core.config.check_agent_id``). A ``path`` stored in
 ``meta.json`` (older layouts, copied runs) is never used (R6-06).
 
 Writes go to ``.tmp-<id>-<rand>/`` and are moved into place with ``os.replace``.
-Replacing an existing id first moves it aside to ``.tmp-old-<id>-<rand>/``. On scan,
-a ``.tmp-old-*`` dir is restored when its id is missing (a crash between the two
-moves) and deleted otherwise; a ``.tmp-<id>-*`` dir is deleted only when older than
-``STALE_TMP_AGE_SEC``. (A writer of another process caught exactly between its two
-moves would see its save fail; the previous checkpoint stays intact.)
+Replacing an existing id first moves it aside to ``.tmp-old-<id>-<rand>/``. Eviction
+first renames the victim to ``.tmp-evict-<id>-<rand>/`` and then deletes it, so a crash
+or a partial delete never leaves a half-deleted ``ckpt_v*`` dir (which would make a
+strict run-dir resume fail). On scan, a ``.tmp-old-*`` dir is restored when its id is
+missing (a crash between the two moves) and deleted otherwise; any other ``.tmp-*`` dir
+(write or eviction leftover) is deleted only when older than ``STALE_TMP_AGE_SEC``.
+(A writer of another process caught exactly between its two moves would see its save
+fail; the previous checkpoint stays intact.)
 """
 
 from __future__ import annotations
@@ -251,11 +254,24 @@ class CheckpointManager:
         while len(entries) > self._pool_size:
             victim = next(c for c in entries if c.checkpoint_id != checkpoint_id)
             entries.remove(victim)
-            shutil.rmtree(self._ckpt_dir(agent_id, victim.checkpoint_id), ignore_errors=True)
+            self._evict(agent_id, victim.checkpoint_id)
             logger.debug(f"Evicted checkpoint {victim.checkpoint_id} of {agent_id}")
         self._index[agent_id] = entries
         logger.info(f"Saved checkpoint {checkpoint_id} of {agent_id} (pool {len(entries)}/{self._pool_size})")
         return checkpoint_id
+
+    def _evict(self, agent_id: str, checkpoint_id: str) -> None:
+        """Rename the checkpoint out of the ``ckpt_v*`` namespace, then delete it."""
+        victim = self._ckpt_dir(agent_id, checkpoint_id)
+        doomed = self._agent_dir(agent_id) / f"{_TMP_PREFIX}evict-{checkpoint_id}-{uuid.uuid4().hex[:8]}"
+        try:
+            os.replace(victim, doomed)
+        except FileNotFoundError:
+            return  # already gone (e.g. removed by hand)
+        except OSError as e:  # like the plain rmtree before: an eviction failure never fails the save
+            logger.warning(f"Could not evict {victim}: {e}")
+            return
+        shutil.rmtree(doomed, ignore_errors=True)
 
     def load_model(self, agent_id: str, checkpoint_id: str) -> dict[str, np.ndarray]:
         path = self._ckpt_dir(agent_id, checkpoint_id) / MODEL_FILE
@@ -278,13 +294,12 @@ class CheckpointManager:
 
 
 def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
-    """Resume state from one checkpoint dir; any unreadable part raises ConfigError."""
-    meta_path = ckpt_dir / META_FILE
+    """Resume state from one checkpoint dir; any unreadable part (also a missing
+    ``meta.json``, the only source of the version) raises ConfigError."""
     trainer_path = ckpt_dir / TRAINER_FILE
-    match = _CKPT_RE.fullmatch(ckpt_dir.name)
     try:
-        meta = _parse_meta(ckpt_dir) if meta_path.is_file() else {}
-        version = int(meta.get("policy_version", match.group(1) if match else 0))
+        meta = _parse_meta(ckpt_dir)
+        version = int(meta["policy_version"])
         env_steps = int(meta.get("env_steps") or 0)  # null: unknown (distributed learners)
         state = torch.load(ckpt_dir / MODEL_FILE, map_location="cpu", weights_only=True)
         if not isinstance(state, dict) or not all(isinstance(v, torch.Tensor) for v in state.values()):
@@ -333,7 +348,8 @@ def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
     """Resolve ``training.resume_from`` for one agent.
 
     Accepted forms (see ``classify_resume_source``):
-    - a checkpoint dir (contains ``model.pt``): its weights, trainer state and version;
+    - a checkpoint dir (contains ``model.pt``; ``meta.json`` is required): its weights,
+      trainer state and version;
     - a previous run dir (contains ``checkpoints/``): the agent's latest checkpoint
       there, or ``None`` (with a warning) if the agent has none;
     - a ``.pt`` file (e.g. the output of ``colosseum bc``): weights only, version 0.

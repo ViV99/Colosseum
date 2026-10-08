@@ -160,6 +160,36 @@ def test_interrupted_replace_is_restored_on_scan(tmp_path):
     assert not list((tmp_path / "a").glob(".tmp-*"))
 
 
+def test_interrupted_eviction_never_leaves_a_half_deleted_checkpoint(tmp_path, monkeypatch):
+    """Eviction renames the victim to ``.tmp-evict-*`` before deleting it, so a crash or a
+    partial delete never leaves a ``ckpt_v*`` dir that breaks a strict run-dir resume (T5.4)."""
+    run = tmp_path / "run"
+    mgr = CheckpointManager(run / "checkpoints", pool_size=2)
+    mgr.save("a", 1, sd(1))
+    mgr.save("a", 2, sd(2))
+    deleted: list[Path] = []
+
+    def partial_rmtree(path, ignore_errors=False, **kwargs):  # dies after removing meta.json
+        deleted.append(Path(path))
+        (Path(path) / "meta.json").unlink()
+
+    monkeypatch.setattr(cm_module.shutil, "rmtree", partial_rmtree)
+    mgr.save("a", 3, sd(3))
+    monkeypatch.undo()
+
+    agent_dir = run / "checkpoints" / "a"
+    assert sorted(p.name for p in agent_dir.glob("ckpt_v*")) == ["ckpt_v2", "ckpt_v3"]
+    assert [p.name.startswith(".tmp-evict-ckpt_v1-") for p in deleted] == [True]
+    assert resolve_resume(str(run), "a")["policy_version"] == 3
+    assert [c.checkpoint_id for c in CheckpointManager(run / "checkpoints").list_checkpoints("a")] == [
+        "ckpt_v2", "ckpt_v3"]
+    # The leftover is an ordinary stale tmp dir for the scan.
+    old = time.time() - cm_module.STALE_TMP_AGE_SEC - 60
+    os.utime(deleted[0], (old, old))
+    CheckpointManager(run / "checkpoints")
+    assert not list(agent_dir.glob(".tmp-*"))
+
+
 @pytest.mark.parametrize("bad", ["../x", "/x", "a/b", "..", "", ".hidden"])
 def test_unsafe_ids_are_rejected(tmp_path, bad):
     import pydantic
@@ -311,6 +341,16 @@ def test_resolve_resume_wraps_unreadable_checkpoints_in_config_error(tmp_path):
         resolve_resume(str(ckpt), "a")
     with pytest.raises(ConfigError, match="cannot read checkpoint"):
         resolve_resume(str(tmp_path / "run"), "a")
+
+
+def test_checkpoint_dir_resume_requires_meta_json(tmp_path):
+    """The version comes from meta.json only, never from the dir name (T5.4)."""
+    base = tmp_path / "run" / "checkpoints"
+    CheckpointManager(base).save("a", 5, sd(5))
+    ckpt = base / "a" / "ckpt_v5"
+    (ckpt / "meta.json").unlink()
+    with pytest.raises(ConfigError, match="cannot read checkpoint.*meta.json"):
+        resolve_resume(str(ckpt), "a")
 
 
 def _two_checkpoint_run(tmp_path: Path) -> tuple[Path, Path]:
