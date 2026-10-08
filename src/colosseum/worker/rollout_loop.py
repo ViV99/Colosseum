@@ -120,7 +120,6 @@ class RolloutLoop:
         self._warned_missing: set[tuple[str, str]] = set()
 
         # Initial weights for every agent's latest model (records their policy version, A5).
-        self._last_weight_sync = time.monotonic()
         self.sync_weights()
 
         # Live match assignment; WorkerCommand updates are staged in `_pending_maps`

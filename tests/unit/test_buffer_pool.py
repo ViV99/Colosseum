@@ -78,3 +78,49 @@ def test_pool_recycles_empty_buffers_and_rejects_open_episodes():
 def test_slot_track_defaults():
     t = SlotTrack(buffer=None)
     assert (t.has_open, t.pending_reward, t.state) == (False, 0.0, None)
+
+
+def test_add_reward_and_mark_done_require_a_transition():
+    b = _buf(T=2)
+    with pytest.raises(RuntimeError, match="empty buffer"):
+        b.add_reward(1.0)
+    with pytest.raises(RuntimeError, match="empty buffer"):
+        b.mark_done()
+    assert b.steps == 0
+    b.begin_chunk(None, 0)
+    b.open(np.zeros(2), 0, 0.0, 0.0, None)
+    b.reset()
+    with pytest.raises(RuntimeError, match="empty buffer"):  # also after a reset
+        b.mark_done()
+
+
+def test_built_chunk_is_unaffected_by_reusing_the_buffer():
+    b = _buf(T=2, mask_size=2)
+    b.begin_chunk({"h": torch.ones(1, 3)}, 1)
+    b.open(np.array([1, 1]), 1, -0.1, 0.1, np.array([True, False]), reward=1.0)
+    b.open(np.array([2, 2]), 0, -0.2, 0.2, None, reward=2.0)
+    b.mark_done()
+    first = b.build_chunk("a", 0.0)
+    snapshot = {k: v.clone() for k, v in vars(first).items() if isinstance(v, torch.Tensor)}
+    b.reset()
+    b.begin_chunk({"h": torch.full((1, 3), 7.0)}, 2)
+    b.open(np.array([9, 9]), 2, -0.9, 0.9, np.array([False, True]), reward=9.0)
+    b.open(np.array([8, 8]), 2, -0.8, 0.8, np.array([False, True]), reward=8.0)
+    second = b.build_chunk("a", 0.5)
+    for name, value in snapshot.items():
+        assert torch.equal(getattr(first, name), value), name
+    assert torch.equal(first.initial_state["h"], torch.ones(1, 3))
+    assert first.behavior_policy_version == 1 and second.behavior_policy_version == 2
+    assert second.observations.tolist() == [[9.0, 9.0], [8.0, 8.0]]
+
+
+def test_pool_rejects_parking_a_full_buffer():
+    pool = BufferPool(chunk_length=2, obs_shape=(2,), action_shape=(), action_dtype=np.int64)
+    buf = pool.acquire("a")
+    buf.begin_chunk(None, 0)
+    buf.open(np.zeros(2), 0, 0.0, 0.0, None)
+    buf.open(np.zeros(2), 0, 0.0, 0.0, None)
+    buf.mark_done()
+    with pytest.raises(RuntimeError, match="full buffer"):
+        pool.park("a", buf)
+    assert pool.parked_count() == 0

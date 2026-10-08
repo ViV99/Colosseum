@@ -115,11 +115,17 @@ class RolloutBuffer:
 
     def add_reward(self, reward: float) -> None:
         """Add ``reward`` to the most recent transition."""
+        self._require_transition("add_reward")
         self._rewards[self._cursor - 1] += reward
 
     def mark_done(self) -> None:
         """Mark the most recent transition as the last one of its episode."""
+        self._require_transition("mark_done")
         self._dones[self._cursor - 1] = True
+
+    def _require_transition(self, what: str) -> None:
+        if self._cursor == 0:
+            raise RuntimeError(f"{what}() on an empty buffer: there is no transition to update")
 
     # -- sealing -------------------------------------------------------
     def build_chunk(self, agent_id: str, bootstrap_value: float) -> TrajectoryChunk:
