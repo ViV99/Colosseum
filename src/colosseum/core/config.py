@@ -46,15 +46,23 @@ def check_path_component(value: str, what: str) -> str:
     return value
 
 
+# The metrics record kinds / global metric namespaces (``colosseum.metrics.jsonl.METRIC_KINDS``):
+# an agent with one of these ids would collide with them in metrics.jsonl and WandB (T6.4).
+RESERVED_AGENT_IDS = frozenset({"ratings", "system", "episodes", "train"})
+
+
 def check_agent_id(value: str) -> str:
     """Return ``value`` if it is a valid agent id, else raise ConfigError.
 
     An agent id is a safe path component (:func:`check_path_component`) without ``.``,
-    so every agent is addressable as ``--set agents.<id>.<section>.<key>=...``.
+    so every agent is addressable as ``--set agents.<id>.<section>.<key>=...``, and not
+    one of :data:`RESERVED_AGENT_IDS`.
     """
     check_path_component(value, "agent id")
     if "." in value:
         raise ConfigError(f"Invalid agent id {value!r}: '.' is not allowed (it separates --set path parts)")
+    if value in RESERVED_AGENT_IDS:
+        raise ConfigError(f"Invalid agent id {value!r}: reserved for global metrics")
     return value
 
 

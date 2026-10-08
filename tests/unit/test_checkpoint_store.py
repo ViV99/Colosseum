@@ -183,6 +183,22 @@ def test_unsafe_ids_are_rejected(tmp_path, bad):
     assert sorted(p.name for p in base.iterdir()) == ["a"]
 
 
+def test_reserved_agent_id_is_rejected(tmp_path):
+    """T6.4 fix round 1: the checkpoint store validates agent ids with check_agent_id, so an
+    agent id reserved for global metrics is rejected there too."""
+    base = tmp_path / "base"
+    mgr = CheckpointManager(base)
+    mgr.save("a", 1, sd())
+    msg = r"Invalid agent id 'ratings': reserved for global metrics"
+    with pytest.raises(ConfigError, match=msg):
+        mgr.save("ratings", 1, sd())
+    with pytest.raises(ConfigError, match=msg):
+        mgr.load_model("ratings", "ckpt_v1")
+    with pytest.raises(ConfigError, match=msg):
+        resolve_resume(str(base / "a" / "ckpt_v1"), "ratings")
+    assert sorted(p.name for p in base.iterdir()) == ["a"]
+
+
 def test_dotted_agent_id_is_rejected(tmp_path):
     """T6.1 fix round 1: agent ids may not contain '.' (it separates --set path parts).
     Checkpoint ids keep allowing it."""

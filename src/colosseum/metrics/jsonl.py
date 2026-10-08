@@ -12,7 +12,11 @@ import numpy as np
 
 from colosseum.utils.fs import write_text_atomic
 
-METRIC_KINDS = ("train", "episodes", "ratings", "system")
+# Kinds not tied to one agent's train step: logged on the global ``env_steps`` axis (and the
+# WandB namespaces ``<kind>/*``). Together with "train" they equal
+# ``core.config.RESERVED_AGENT_IDS`` (asserted in tests), so no agent id can collide with them.
+GLOBAL_KINDS = ("episodes", "ratings", "system")
+METRIC_KINDS = ("train", *GLOBAL_KINDS)
 
 REQUIRED_KEYS: dict[str, set[str]] = {
     "train": {"ts", "kind", "agent", "train_step"},

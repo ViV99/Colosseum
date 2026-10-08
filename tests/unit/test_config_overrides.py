@@ -162,6 +162,18 @@ def test_dotted_agent_id_message(tmp_path):
         load_config(write_yaml(tmp_path, base_data(agents={"a.b": None})))
 
 
+@pytest.mark.parametrize("agent_id", sorted(config_module.RESERVED_AGENT_IDS))
+def test_reserved_agent_ids_are_rejected(agent_id):
+    """Agent ids may not equal a global metrics namespace (T6.4 fix round 1)."""
+    with pytest.raises(ConfigError, match=rf"Invalid agent id '{agent_id}': reserved for global metrics"):
+        config_module.check_agent_id(agent_id)
+
+
+def test_reserved_agent_id_is_rejected_on_load(tmp_path):
+    with pytest.raises(ConfigError, match="reserved for global metrics"):
+        load_config(write_yaml(tmp_path, base_data(agents={"system": {}})))
+
+
 def test_apply_overrides_sets_nested_values_and_creates_agent_sections():
     data = apply_overrides(base_data(), {
         "rollout.num_workers": 8,

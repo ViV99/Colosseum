@@ -25,27 +25,20 @@ def test_metrics_jsonl_ratings_json_and_console(tmp_path):
     assert "[agent_0] step" in run.stderr  # console progress (main logs INFO to stderr)
 
 
+
 def test_launch_logs_to_wandb_on_per_agent_axes_and_finishes(tmp_path, monkeypatch):
     """The launcher wires WandBLogger into the hub (T6.4): run name and resolved config at init,
     train rows on ``<agent>/train_step`` and global rows on ``env_steps`` without ``step=``."""
     import sys
-    import types
+
+    from fake_wandb import FakeWandb
 
     from colosseum.core.config import ColosseumConfig, load_config
     from colosseum.launcher import Launcher
+    from colosseum.metrics.jsonl import GLOBAL_KINDS
     from helpers import example_config, make_test_run_dir
 
-    calls: dict = {"init": None, "logged": [], "finished": False}
-
-    def log(row, **kwargs):
-        assert "step" not in kwargs
-        calls["logged"].append(dict(row))
-
-    fake = types.ModuleType("wandb")
-    fake.init = lambda **kw: calls.update(init=kw) or types.SimpleNamespace(
-        finish=lambda: calls.update(finished=True))
-    fake.define_metric = lambda name, step_metric=None: None
-    fake.log = log
+    fake = FakeWandb()
     monkeypatch.setitem(sys.modules, "wandb", fake)
 
     data = load_config(example_config("tic_tac_toe.yaml")).model_dump()
@@ -57,8 +50,19 @@ def test_launch_logs_to_wandb_on_per_agent_axes_and_finishes(tmp_path, monkeypat
     run = make_test_run_dir(config, tmp_path)
     Launcher(config, run).launch()
 
-    assert calls["init"]["name"] == (run.run_name or run.root.name)
-    assert calls["init"]["config"]["training"]["total_timesteps"] == 400
-    assert any("agent_0/train_step" in row for row in calls["logged"])
-    assert any("env_steps" in row and any(k.startswith("system/") for k in row) for row in calls["logged"])
-    assert calls["finished"]
+    assert fake.init_kwargs["name"] == (run.run_name or run.root.name)
+    assert fake.init_kwargs["config"]["training"]["total_timesteps"] == 400
+    assert ("agent_0/*", "agent_0/train_step") in fake.defined
+    assert ("system/*", "env_steps") in fake.defined
+    assert fake.logged and all(kwargs == {} for kwargs in fake.log_kwargs)  # never step= (R5-02)
+    global_prefixes = tuple(f"{kind}/" for kind in GLOBAL_KINDS)
+    for row in fake.logged:  # every row carries exactly one step key, the one of its namespace
+        if any(k.startswith("agent_0/") for k in row):
+            assert "agent_0/train_step" in row and "env_steps" not in row, row
+            assert all(k.startswith("agent_0/") for k in row), row
+        else:
+            assert "env_steps" in row, row
+            assert all(k == "env_steps" or k.startswith(global_prefixes) for k in row), row
+    assert any("agent_0/train_step" in row for row in fake.logged)
+    assert any(any(k.startswith("system/") for k in row) for row in fake.logged)
+    assert fake.finished
