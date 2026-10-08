@@ -46,10 +46,15 @@ class ContextualBandit(BaseEnv):
 
 
 class ShortChain(BaseEnv):
-    """States 0..4, start at 0, actions 0=left 1=right. Reaching 4 gives +1 and ends the
-    episode; 20 steps truncate. The optimal policy always goes right."""
+    """Combination lock: states 0..4, start at 0, actions 0/1. The correct action at state i
+    is ``KEY[i]`` and advances to i+1; a wrong action steps back to max(0, i-1). Reaching 4
+    gives +1 and ends the episode; 20 steps truncate.
 
-    LENGTH = 5
+    The key alternates, so no state-independent bias solves it, and only the last transition
+    is rewarded: solving it needs credit assignment over several steps (gamma > 0)."""
+
+    KEY = (1, 0, 1, 0)
+    LENGTH = len(KEY) + 1
     MAX_STEPS = 20
 
     def __init__(self) -> None:
@@ -79,7 +84,10 @@ class ShortChain(BaseEnv):
 
     def step(self, actions):
         self._t += 1
-        self._pos = min(self.LENGTH - 1, self._pos + 1) if int(actions[0]) == 1 else max(0, self._pos - 1)
+        if int(actions[0]) == self.KEY[self._pos]:
+            self._pos += 1
+        else:
+            self._pos = max(0, self._pos - 1)
         reached = self._pos == self.LENGTH - 1
         reward = 1.0 if reached else 0.0
         truncated = (not reached) and self._t >= self.MAX_STEPS

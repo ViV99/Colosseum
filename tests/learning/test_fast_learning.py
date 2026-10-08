@@ -70,11 +70,21 @@ def test_contextual_bandit_is_solved_in_seconds():
     assert time.monotonic() - start < 60
 
 
+def _lock_solved(model) -> bool:
+    """Greedy action == KEY[i] with p >= 0.8 in every non-terminal state of the lock."""
+    states = torch.eye(ShortChain.LENGTH)[: ShortChain.LENGTH - 1]
+    return greedy_and_confident(model, states, torch.tensor(ShortChain.KEY), 0.8)
+
+
 def test_short_chain_is_solved_in_seconds():
     start = time.monotonic()
-    states = torch.eye(ShortChain.LENGTH)[: ShortChain.LENGTH - 1]  # every non-terminal state
-    updates = train_until_solved(
-        ShortChain, ShortChain.LENGTH,
-        lambda m: greedy_and_confident(m, states, torch.ones(ShortChain.LENGTH - 1, dtype=torch.long), 0.8))
+    updates = train_until_solved(ShortChain, ShortChain.LENGTH, _lock_solved)
     assert updates != -1, "chain not solved within 400 updates"
     assert time.monotonic() - start < 60
+
+
+def test_short_chain_needs_discounting():
+    """Negative control: with gamma=0 only the last move of the lock is ever credited, so the
+    same setup must not solve it within the same 400-update cap (the chain really tests
+    multi-step credit assignment, not a bias learned from the rewarded transition)."""
+    assert train_until_solved(ShortChain, ShortChain.LENGTH, _lock_solved, gamma=0.0) == -1
