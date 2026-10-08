@@ -126,46 +126,55 @@ class RolloutLoop:
             vec_env = VectorEnv(env_fn, num_envs)
         else:
             raise ValueError(f"unknown vec_env_kind {vec_env_kind!r}")
-        spec = vec_env.spec
+        try:
+            spec = vec_env.spec
 
-        specs: dict[str, BufferSpec] = {}
-        for aid in self._agent_ids:
-            role = agent_role_spec(spec, list(agent_roles[aid]))
-            specs[aid] = BufferSpec(
-                obs=ObsSpec.from_space(role.observation_space),
-                action=ActionSpec.from_space(role.action_space),
-                global_state=(
-                    None if role.global_state_space is None else ObsSpec.from_space(role.global_state_space)
-                ),
+            specs: dict[str, BufferSpec] = {}
+            for aid in self._agent_ids:
+                role = agent_role_spec(spec, list(agent_roles[aid]))
+                specs[aid] = BufferSpec(
+                    obs=ObsSpec.from_space(role.observation_space),
+                    action=ActionSpec.from_space(role.action_space),
+                    global_state=(
+                        None if role.global_state_space is None else ObsSpec.from_space(role.global_state_space)
+                    ),
+                )
+            self._pool = BufferPool(chunk_length, specs)
+
+            # Model pool: agent -> network id -> model ("latest" + frozen checkpoints).
+            self._models: dict[str, dict[str, PolicyModel]] = {}
+            self._policy_versions: dict[str, int] = {aid: 0 for aid in self._agent_ids}
+            for aid in self._agent_ids:
+                latest = self._model_factories[aid]()
+                latest.eval()
+                self._models[aid] = {LATEST_NETWORK_ID: latest}
+            for aid, by_id in (checkpoint_state_dicts_by_agent or {}).items():
+                for ckpt_id, sd in by_id.items():
+                    self._add_checkpoint(aid, ckpt_id, sd)
+            self.sync_weights()   # initial weights and policy versions
+
+            self._tracks: list[dict[int, _SeatTrack]] = [{} for _ in range(num_envs)]
+            self._env_steps = 0
+            self._episodes = 0
+            self._chunks_sent = 0
+            self._dropped_reward_episodes = 0
+            self._recorded: dict[str, int] = defaultdict(int)
+            self._runner = MatchRunner(
+                vec_env=vec_env, lineups=lineups, models=self, observer=self, seed=seed,
+                max_idle_steps=max_idle_steps, context=f"worker {worker_id}, ", match_id_prefix=f"w{worker_id}_e",
             )
-        self._pool = BufferPool(chunk_length, specs)
-
-        # Model pool: agent -> network id -> model ("latest" + frozen checkpoints).
-        self._models: dict[str, dict[str, PolicyModel]] = {}
-        self._policy_versions: dict[str, int] = {aid: 0 for aid in self._agent_ids}
-        for aid in self._agent_ids:
-            latest = self._model_factories[aid]()
-            latest.eval()
-            self._models[aid] = {LATEST_NETWORK_ID: latest}
-        for aid, by_id in (checkpoint_state_dicts_by_agent or {}).items():
-            for ckpt_id, sd in by_id.items():
-                self._add_checkpoint(aid, ckpt_id, sd)
-        self.sync_weights()   # initial weights and policy versions
-
-        self._tracks: list[dict[int, _SeatTrack]] = [{} for _ in range(num_envs)]
-        self._env_steps = 0
-        self._episodes = 0
-        self._chunks_sent = 0
-        self._dropped_reward_episodes = 0
-        self._recorded: dict[str, int] = defaultdict(int)
-        self._runner = MatchRunner(
-            vec_env=vec_env, lineups=lineups, models=self, observer=self, seed=seed,
-            max_idle_steps=max_idle_steps, context=f"worker {worker_id}, ", match_id_prefix=f"w{worker_id}_e",
-        )
-        for e in range(num_envs):
-            for seat, assignment in enumerate(self._runner.lineup(e).seats):
-                if assignment.collect:
-                    self._start_collecting(e, seat, assignment.agent_id)
+            for e in range(num_envs):
+                for seat, assignment in enumerate(self._runner.lineup(e).seats):
+                    if assignment.collect:
+                        self._start_collecting(e, seat, assignment.agent_id)
+        except BaseException:
+            # the caller never gets this loop, so nobody else would close the envs (subprocesses!)
+            try:
+                vec_env.close()
+            except Exception:
+                logger.warning(f"Worker {worker_id}: closing the vector env after a failed setup failed",
+                               exc_info=True)
+            raise
 
     # ------------------------------------------------------------------
     # Public API

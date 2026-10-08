@@ -20,7 +20,8 @@ checks the results (one source of truth; the outcome is resolved with ``resolve_
 default team score = mean of the team's seat returns).
 
 A lineup naming a network the model pool cannot provide is seated as the agent's latest
-weights with ``collect=True`` (SP1 rule; one warning per (agent, network)).
+weights with ``collect=True`` (SP1 rule; one warning per (agent, network)). Only ``latest``
+seats may collect: a checkpoint seat with ``collect=True`` is a ``ValueError``.
 
 ``context`` is a prefix ending with ``", "`` (e.g. ``"worker 3, "``); env contract errors
 read ``"worker 3, env 1, seat 2, episode step 7, layout 4p: ..."``.
@@ -211,10 +212,15 @@ class MatchRunner:
                 f"{self._context}env {env}: lineup for layout {lineup.layout!r} has "
                 f"{len(lineup.seats)} seats, the layout has {size}"
             )
-        for assignment in lineup.seats:
+        for seat, assignment in enumerate(lineup.seats):
             if self._models.get(assignment.agent_id, LATEST_NETWORK_ID) is None:
                 raise ValueError(
                     f"{self._context}env {env}: the model pool has no model for agent {assignment.agent_id!r}"
+                )
+            if assignment.collect and assignment.network_id != LATEST_NETWORK_ID:
+                raise ValueError(
+                    f"{self._context}env {env}, seat {seat}: agent {assignment.agent_id!r} plays network "
+                    f"{assignment.network_id!r} with collect=True; only {LATEST_NETWORK_ID!r} seats collect"
                 )
 
     def _resolve(self, lineup: Lineup, env: int) -> Lineup:

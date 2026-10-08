@@ -157,3 +157,32 @@ def test_a_command_with_more_lineups_than_envs_fails():
     col.commands.append(WorkerCommand(lineups=[lineup("2p", "a", "a"), lineup("2p", "a", "a")]))
     with pytest.raises(ValueError, match="1 envs"):
         loop.step()
+
+
+class _ClosingTickGame(TickGame):
+    """TickGame that records ``close()`` calls in a shared list."""
+
+    def __init__(self, closed, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        self._closed = closed
+
+    def close(self) -> None:
+        self._closed.append(self.tag)
+
+
+@pytest.mark.parametrize("bad", ["unknown agent", "missing agent_roles entry"])
+def test_a_failing_constructor_closes_the_vector_env(bad):
+    model = make_test_model(ROLE2)
+    closed, built = [], []
+
+    def env_fn():
+        built.append(_ClosingTickGame(closed, _episode(2), 2, tag=len(built)))
+        return built[-1]
+
+    lu = lineup("2p", "zzz", "a") if bad == "unknown agent" else lineup("2p", "a", "a")
+    roles = {"a": ["player"]} if bad == "unknown agent" else {}
+    with pytest.raises((ValueError, KeyError)):
+        RolloutLoop(worker_id=0, env_fn=env_fn, num_envs=2, chunk_length=4, agent_ids=["a"],
+                    agent_roles=roles, model_factories={"a": lambda: model},
+                    io=Collected().io(), lineups=[lu, lu])
+    assert len(built) == 2 and sorted(closed) == [0, 1]

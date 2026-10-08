@@ -272,6 +272,19 @@ def test_lineups_are_validated():
         _runner(script, 2, [Lineup("2p", [SeatAssignment("a")] * 2)], {("a", "latest"): model}, num_envs=2)
 
 
+def test_a_checkpoint_seat_that_collects_is_rejected():
+    model = make_test_model(_role(2))
+    script = [Tick(acting={0, 1}), Tick(over=True)]
+    models = {("a", "latest"): model, ("a", "ckpt_v1"): model}
+    bad = Lineup("2p", [SeatAssignment("a"), SeatAssignment("a", "ckpt_v1", collect=True)])
+    with pytest.raises(ValueError, match="env 0, seat 1: .*'a'.*'ckpt_v1'.*collect"):
+        _runner(script, 2, [bad], models)
+    runner, _, _ = _runner(script, 2, [Lineup("2p", [SeatAssignment("a")] * 2)], models)
+    with pytest.raises(ValueError, match="env 0, seat 1: .*'a'.*'ckpt_v1'.*collect"):
+        runner.set_next_lineup(0, bad)
+    runner.set_next_lineup(0, Lineup("2p", [SeatAssignment("a"), SeatAssignment("a", "ckpt_v1", collect=False)]))
+
+
 def test_episode_seeds_are_deterministic_per_env_and_episode():
     script = [Tick(acting={0}), Tick(over=True)]
     model = make_test_model(_role(1))
