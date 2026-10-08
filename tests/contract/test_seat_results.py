@@ -53,6 +53,9 @@ def test_coordinator_consumes_seats_without_collisions(tmp_path):
     # Every cross-agent seat pair counts: a holds seats 0 (1st) and 2 (3rd).
     wr = coord.win_rates
     assert (wr.games("a", "b"), wr.games("a", "c"), wr.games("b", "c")) == (2, 2, 1)
+    # a's two seats (0 and 2) are a self-pair: no win-rate game, no past-self game.
+    assert wr.games("a", "a") == 0
+    assert coord.past_win_rate.games("a") == 0
     assert wr.get_win_rate("a", "b") == 0.5   # a0 > b1, a2 < b1
     assert wr.get_win_rate("a", "c") == 1.0
     assert wr.get_win_rate("b", "c") == 1.0
@@ -103,3 +106,10 @@ def test_worker_rejects_env_outcome_outside_unit_interval(bad):
 def test_worker_rejects_non_finite_rank():
     with pytest.raises(EnvContractError, match="rank"):
         _ffa_result(lambda p: {"rank": float("inf") if p == 0 else p + 1})
+
+
+@pytest.mark.parametrize("key", ["outcome", "rank"])
+@pytest.mark.parametrize("bad", [None, "win"])
+def test_worker_rejects_non_numeric_outcome_or_rank(key, bad):
+    with pytest.raises(EnvContractError, match=rf"player 0: terminal info\['{key}'\]"):
+        _ffa_result(lambda p: {key: bad if p == 0 else (0.0 if key == "outcome" else p + 1)})

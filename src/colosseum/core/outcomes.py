@@ -13,6 +13,8 @@ Env convention (all optional, checked in the terminal info dict per player):
   - ``info["rank"]``:    number, 1 = best — converted to [0, 1] (best→1, worst→0).
     Non-integer ranks are allowed (e.g. 2.5 for a two-way tie for 2nd/3rd); a
     non-finite rank raises :class:`~colosseum.core.errors.EnvContractError`.
+  A present but non-numeric value (``None``, ``"win"``, ...) of either key also
+  raises :class:`~colosseum.core.errors.EnvContractError`.
 If neither is present for all players, outcomes are derived from total reward.
 """
 
@@ -34,6 +36,15 @@ def outcomes_from_rewards(total_rewards: Sequence[float]) -> list[float]:
     if mx == mn:
         return [0.5] * len(r)
     return [1.0 if float(x) == mx else 0.0 for x in r]
+
+
+def _number(player: int, key: str, value: object) -> float:
+    """``float(value)``, or EnvContractError naming the player and key."""
+    try:
+        return float(value)  # type: ignore[arg-type]
+    except (TypeError, ValueError) as exc:
+        raise EnvContractError(
+            f"player {player}: terminal info[{key!r}] must be a number, got {value!r}") from exc
 
 
 def outcomes_from_terminal_infos(
@@ -58,7 +69,7 @@ def outcomes_from_terminal_infos(
         if not isinstance(info, dict):
             return None
         if "outcome" in info:
-            outcome = float(info["outcome"])
+            outcome = _number(p, "outcome", info["outcome"])
             if not 0.0 <= outcome <= 1.0:  # also rejects NaN
                 raise EnvContractError(
                     f"player {p}: terminal info['outcome'] must be in [0, 1], got {info['outcome']!r}")
@@ -66,7 +77,7 @@ def outcomes_from_terminal_infos(
         else:
             have_explicit = False
         if "rank" in info:
-            rank = float(info["rank"])
+            rank = _number(p, "rank", info["rank"])
             if not math.isfinite(rank):
                 raise EnvContractError(
                     f"player {p}: terminal info['rank'] must be finite, got {info['rank']!r}")

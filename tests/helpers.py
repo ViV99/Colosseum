@@ -478,3 +478,80 @@ class CrashingAPPO(APPO):
         if self._steps_seen >= self.crash_at_step:
             raise RuntimeError("injected train_step failure")
         return super().train_step(chunks)
+
+
+class AlternatingEnv(BaseEnv):
+    """2-player turn-based toy: seats alternate (seat 0 first), 3 moves each, 6 env steps.
+
+    ``info[p]["active"]`` marks the seat to move. The acting seat's mask allows
+    every action; the waiting seat's mask allows none. Seat 0 always wins
+    (+1 / -1 on the last step). ``self.episodes`` holds one list of
+    ``(seat, action)`` per episode, in move order.
+    """
+
+    MOVES_PER_SEAT = 3
+
+    def __init__(self, num_actions: int = 4) -> None:
+        self._n = num_actions
+        self._t = 0
+        self.episodes: list[list[tuple[int, int]]] = []
+
+    @property
+    def num_players(self) -> int:
+        return 2
+
+    @property
+    def observation_space(self) -> gymnasium.spaces.Space:
+        return gymnasium.spaces.Box(0.0, 1.0, (2,), np.float32)
+
+    @property
+    def action_space(self) -> gymnasium.spaces.Space:
+        return gymnasium.spaces.Discrete(self._n)
+
+    def _obs(self) -> dict[int, np.ndarray]:
+        return {p: np.zeros(2, np.float32) for p in range(2)}
+
+    def _infos(self) -> dict[int, dict]:
+        current = self._t % 2
+        return {
+            p: {"active": p == current, "action_mask": np.full(self._n, p == current, dtype=bool)}
+            for p in range(2)
+        }
+
+    def reset(self, seed=None):
+        self._t = 0
+        self.episodes.append([])
+        return self._obs(), self._infos()
+
+    def step(self, actions):
+        current = self._t % 2
+        self.episodes[-1].append((current, int(np.asarray(actions[current]).reshape(-1)[0])))
+        self._t += 1
+        done = self._t >= 2 * self.MOVES_PER_SEAT
+        rewards = {0: 1.0, 1: -1.0} if done else {0: 0.0, 1: 0.0}
+        return self._obs(), rewards, {0: done, 1: done}, {0: False, 1: False}, self._infos()
+
+
+class MoveCounterModel(PolicyModel):
+    """Stateful toy policy: acts ``(number of own steps so far) % num_actions``.
+
+    Its State is the step counter ``[B, 1]``; it ignores observations.
+    (Named apart from ``tests/unit/test_model.py::CounterModel``.)
+    """
+
+    def __init__(self, num_actions: int = 4) -> None:
+        super().__init__()
+        self.num_actions = num_actions
+
+    def initial_state(self, batch_size: int, device="cpu"):
+        return torch.zeros(batch_size, 1, device=device)
+
+    def step(self, obs, state, action_mask=None):
+        batch = obs.shape[0]
+        idx = state[:, 0].long() % self.num_actions
+        logits = torch.full((batch, self.num_actions), -50.0, device=obs.device)
+        logits[torch.arange(batch), idx] = 50.0
+        dist = CategoricalDist(logits)
+        if action_mask is not None:
+            dist = dist.apply_mask(action_mask)
+        return StepOutput(dist, torch.zeros(batch, device=obs.device), state + 1)

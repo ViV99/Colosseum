@@ -43,6 +43,7 @@ import torch
 from colosseum.core.action_spec import ActionSpec
 from colosseum.core.errors import EnvContractError
 from colosseum.core.outcomes import player_outcomes
+from colosseum.core.seat_info import acting_flags, check_masks, extract_masks
 from colosseum.core.types import (
     LATEST_NETWORK_ID,
     MatchResult,
@@ -205,10 +206,11 @@ class RolloutLoop:
         """One vectorized env step for all envs. Returns env steps taken."""
         self._poll_command()
         obs = self._obs
-        acting = self._acting_flags(self._infos)
-        masks = self._extract_masks(self._infos)
+        E, P = self._num_envs, self._num_players
+        acting = acting_flags(self._infos, E, P)
+        masks = extract_masks(self._infos, E, P, self._action_spec)
         if masks is not None:
-            self._check_masks(masks, acting)
+            check_masks(masks, acting, self._action_spec, self._where)
         actions, log_probs, values, pre_states = self._infer(obs, masks, acting)
         self._open_transitions(obs, actions, log_probs, values, masks, acting, pre_states)
         next_obs, rewards, terminated, truncated, infos = self._vec_env.step(actions)
@@ -356,61 +358,9 @@ class RolloutLoop:
     # Per-step pieces
     # ------------------------------------------------------------------
 
-    def _acting_flags(self, infos: list[dict]) -> np.ndarray:
-        """[E, P] bool: ``info[p]["active"]`` per slot; slots without the key act."""
-        E, P = self._num_envs, self._num_players
-        acting = np.ones((E, P), dtype=bool)
-        for e in range(E):
-            info_e = infos[e] if e < len(infos) else {}
-            for p in range(P):
-                info = info_e.get(p) if isinstance(info_e, dict) else None
-                if isinstance(info, dict) and "active" in info:
-                    acting[e, p] = bool(info["active"])
-        return acting
-
-    def _extract_masks(self, infos: list[dict]) -> np.ndarray | None:
-        """[E*P, mask_size] bool, or None if no slot provides ``action_mask``.
-
-        Slots without a mask get an all-true row.
-        """
-        M = self._action_spec.flat_mask_size
-        if M == 0:
-            return None
-        E, P = self._num_envs, self._num_players
-        out: np.ndarray | None = None
-        for e in range(E):
-            info_e = infos[e] if e < len(infos) else {}
-            for p in range(P):
-                info = info_e.get(p) if isinstance(info_e, dict) else None
-                if not isinstance(info, dict) or info.get("action_mask") is None:
-                    continue
-                if out is None:
-                    out = np.ones((E * P, M), dtype=bool)
-                raw = info["action_mask"]
-                if isinstance(raw, dict):
-                    out[e * P + p] = self._action_spec.flatten_mask(raw)
-                else:
-                    out[e * P + p] = np.asarray(raw, dtype=bool).reshape(M)
-        return out
-
-    def _check_masks(self, masks: np.ndarray, acting: np.ndarray) -> None:
-        """Mask rules (R1-13, ET-08): an empty mask row (per discrete component)
-        on a non-acting slot becomes all-true; on an acting slot it is an error."""
-        acting_flat = acting.reshape(-1)
-        for comp in self._action_spec.components:
-            if comp.mask_size == 0:
-                continue
-            lo, hi = comp.mask_offset, comp.mask_offset + comp.mask_size
-            empty = ~masks[:, lo:hi].any(axis=1)
-            bad = np.flatnonzero(empty & acting_flat)
-            if bad.size:
-                e, p = divmod(int(bad[0]), self._num_players)
-                raise EnvContractError(
-                    f"worker {self.worker_id}, env {e}, slot {p}, episode step "
-                    f"{int(self._ep_lengths[e])}: action_mask has no legal action "
-                    f"(component {comp.name!r}) for an acting slot"
-                )
-            masks[empty, lo:hi] = True
+    def _where(self, e: int, p: int) -> str:
+        """Error-message context for env ``e``, slot ``p``."""
+        return f"worker {self.worker_id}, env {e}, slot {p}, episode step {int(self._ep_lengths[e])}"
 
     def _infer(self, obs: np.ndarray, masks: np.ndarray | None, acting: np.ndarray):
         """Batched inference for acting slots, grouped by (agent, network).

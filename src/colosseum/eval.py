@@ -10,14 +10,18 @@ Pairwise results are extracted from N-player match outcomes.
 
 from __future__ import annotations
 
+import itertools
 import logging
 import math
-from collections.abc import Callable
+from collections import defaultdict, deque
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 
 import numpy as np
 import torch
 
+from colosseum.core.outcomes import player_outcomes
+from colosseum.core.seat_info import acting_flags, check_masks, extract_masks
 from colosseum.envs.base_env import BaseEnv
 from colosseum.envs.vec_env import VectorEnv
 from colosseum.networks.model import PolicyModel, act
@@ -144,37 +148,6 @@ def evaluate_agents(
     return matrix
 
 
-def _extract_action_masks(
-    infos: list[dict],
-    num_envs: int,
-    num_players: int,
-    action_spec=None,
-) -> np.ndarray | None:
-    """Extract action masks from env info dicts into a flat array.
-
-    Convention: info[env_idx][player_idx]["action_mask"] is a bool ndarray
-    or dict of per-component bool ndarrays (for composite action spaces).
-    Returns [num_envs * num_players, num_actions] bool array, or None if no masks.
-    """
-    if not infos:
-        return None
-    first_info = infos[0]
-    if not isinstance(first_info, dict) or 0 not in first_info:
-        return None
-    if "action_mask" not in first_info[0]:
-        return None
-
-    masks = []
-    for env_idx in range(num_envs):
-        for p in range(num_players):
-            raw = infos[env_idx][p]["action_mask"]
-            if isinstance(raw, dict) and action_spec is not None:
-                masks.append(action_spec.flatten_mask(raw))
-            else:
-                masks.append(raw)
-    return np.array(masks, dtype=bool)
-
-
 def _run_matches(
     agents: list[tuple[str, PolicyModel]],
     env_fn: Callable[[], BaseEnv],
@@ -191,10 +164,11 @@ def _run_matches(
     fill the slots. Pairwise statistics are accumulated only over agents that
     actually co-occur in a match, so every pair eventually gathers samples.
 
-    Action masks (``info["action_mask"]``) are applied during inference, and
-    match outcomes prefer the env's authoritative signal (``info["rank"]`` /
-    ``info["outcome"]``) over cumulative reward. Every (env, slot) keeps the
-    model state of the agent playing it; the state is reset when the match ends.
+    Only acting slots (``info["active"]``, default True) run inference, with
+    the worker's mask rules (``core/seat_info.py``), and match outcomes prefer
+    the env's authoritative signal (``info["rank"]`` / ``info["outcome"]``)
+    over cumulative reward. Every (env, slot) keeps the model state of the
+    agent playing it; the state is reset when the match ends.
 
     Args:
         agents: List of (agent_id, model) tuples.
@@ -207,9 +181,6 @@ def _run_matches(
         dict mapping (agent_a, agent_b) -> EvalResult for each ordered pair (i < j).
     """
     import random
-    from collections import defaultdict
-
-    from colosseum.core.outcomes import player_outcomes
 
     vec_env = VectorEnv(env_fn, min(num_envs, num_matches))
     actual_envs = vec_env.num_envs
@@ -262,16 +233,18 @@ def _run_matches(
             (actual_envs, num_players, *action_spec.action_shape),
             dtype=action_spec.numpy_dtype,
         )
-        masks = _extract_action_masks(
-            infos, actual_envs, num_players, action_spec=action_spec,
-        )
+        acting = acting_flags(infos, actual_envs, num_players)
+        masks = extract_masks(infos, actual_envs, num_players, action_spec)
+        if masks is not None:
+            check_masks(masks, acting, action_spec, lambda e, p: f"eval: env {e} seat {p}")
         obs_flat = obs.reshape(-1, *obs.shape[2:])
 
-        # Group (env, slot) pairs by their assigned agent for batched inference.
+        # Group acting (env, slot) pairs by their assigned agent for batched inference.
         groups: dict[int, list[tuple[int, int]]] = defaultdict(list)
         for e in range(actual_envs):
             for p in range(num_players):
-                groups[slot_assign[e][p]].append((e, p))
+                if acting[e, p]:
+                    groups[slot_assign[e][p]].append((e, p))
 
         for agent_idx, slot_pairs in groups.items():
             model = agents[agent_idx][1]
@@ -372,3 +345,172 @@ def _run_matches(
             )
 
     return results
+
+
+# ---------------------------------------------------------------------------
+# Engine (SP1 block 7): per-seat State, seat rotation, active-only inference
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class MatchRecord:
+    """One finished match: agent name, outcome in [0, 1] and return per seat."""
+
+    lineup: tuple[str, ...]
+    outcomes: tuple[float, ...]
+    returns: tuple[float, ...]
+    length: int
+
+
+def schedule_lineups(
+    agent_names: Sequence[str], num_players: int, num_matches: int,
+) -> list[tuple[str, ...]]:
+    """Seat -> agent lineups for an evaluation.
+
+    - One agent, or a 1-player env (solo): ``num_matches`` lineups per agent with
+      the agent in every seat.
+    - Otherwise (pairwise): for every pair (a, b) in ``itertools.combinations``
+      order, ``num_matches`` lineups where match m gives seat s to
+      ``(a, b)[(s + m) % 2]``. With even ``num_matches`` every agent plays every
+      seat equally often.
+    """
+    names = list(agent_names)
+    if not names:
+        raise ValueError("schedule_lineups: no agents")
+    if len(set(names)) != len(names):
+        raise ValueError(f"schedule_lineups: duplicate agent names in {names}")
+    if num_players < 1:
+        raise ValueError(f"schedule_lineups: num_players must be >= 1, got {num_players}")
+    if num_matches < 1:
+        raise ValueError(f"schedule_lineups: num_matches must be >= 1, got {num_matches}")
+    if len(names) == 1 or num_players == 1:
+        return [tuple([name] * num_players) for name in names for _ in range(num_matches)]
+    if num_matches % 2:
+        logger.warning(
+            "eval: num_matches=%d is odd, so seats are balanced only up to one match per pair",
+            num_matches,
+        )
+    lineups: list[tuple[str, ...]] = []
+    for a, b in itertools.combinations(names, 2):
+        pair = (a, b)
+        for m in range(num_matches):
+            lineups.append(tuple(pair[(s + m) % 2] for s in range(num_players)))
+    return lineups
+
+
+def play_matches(
+    models: dict[str, PolicyModel],
+    env_fn: Callable[[], BaseEnv],
+    lineups: Sequence[tuple[str, ...]],
+    num_envs: int = 8,
+    deterministic: bool = False,
+    seed: int | None = None,
+) -> list[MatchRecord]:
+    """Play every lineup once, to completion; one record per lineup, in completion order.
+
+    Each (env, seat) has its own model State: ``initial_state(1)`` at episode
+    start, advanced only when the seat acts (``info[p]["active"]``, default True),
+    reset at episode end. Non-acting seats send the zero action. Masks follow the
+    worker's rules (``core/seat_info.py``): an acting seat without a legal action
+    raises :class:`~colosseum.core.errors.EnvContractError`. Envs left without a
+    scheduled match keep playing their last lineup until the rest finish; those
+    extra episodes are discarded, so short episodes are not favoured.
+    """
+    lineups = [tuple(lu) for lu in lineups]
+    if not lineups:
+        return []
+    unknown = sorted({name for lu in lineups for name in lu} - set(models))
+    if unknown:
+        raise ValueError(f"play_matches: lineups use unknown agents {unknown}")
+    if num_envs < 1:
+        raise ValueError(f"play_matches: num_envs must be >= 1, got {num_envs}")
+    if seed is not None:
+        torch.manual_seed(seed)
+    for model in models.values():
+        model.eval()
+    vec_env = VectorEnv(env_fn, min(num_envs, len(lineups)))
+    try:
+        return _play(vec_env, models, lineups, deterministic, seed)
+    finally:
+        vec_env.close()
+
+
+def _eval_where(e: int, p: int) -> str:
+    return f"eval: env {e} seat {p}"
+
+
+def _play(
+    vec_env: VectorEnv,
+    models: dict[str, PolicyModel],
+    lineups: list[tuple[str, ...]],
+    deterministic: bool,
+    seed: int | None,
+) -> list[MatchRecord]:
+    n_envs, n_players, spec = vec_env.num_envs, vec_env.num_players, vec_env.action_spec
+    bad = [lu for lu in lineups if len(lu) != n_players]
+    if bad:
+        raise ValueError(f"play_matches: lineup {bad[0]} does not have {n_players} seats")
+
+    pending = deque(lineups)
+    playing: list[tuple[str, ...]] = [pending.popleft() for _ in range(n_envs)]
+    counted = [True] * n_envs   # False once an env has no scheduled match left
+    states: list[list[State]] = [
+        [models[playing[e][p]].initial_state(1) for p in range(n_players)]
+        for e in range(n_envs)
+    ]
+    returns = np.zeros((n_envs, n_players), dtype=np.float64)
+    lengths = np.zeros(n_envs, dtype=np.int64)
+    records: list[MatchRecord] = []
+
+    obs, infos = vec_env.reset_all(seed=seed)
+    while len(records) < len(lineups):
+        acting = acting_flags(infos, n_envs, n_players)
+        masks = extract_masks(infos, n_envs, n_players, spec)
+        if masks is not None:
+            check_masks(masks, acting, spec, _eval_where)
+            masks = masks.reshape(n_envs, n_players, -1)
+
+        actions = np.zeros((n_envs, n_players, *spec.action_shape), dtype=spec.numpy_dtype)
+        groups: dict[str, list[tuple[int, int]]] = defaultdict(list)
+        for e in range(n_envs):
+            for p in range(n_players):
+                if acting[e, p]:
+                    groups[playing[e][p]].append((e, p))
+        for name, seats in groups.items():
+            ei = [e for e, _ in seats]
+            pi = [p for _, p in seats]
+            obs_b = torch.from_numpy(np.ascontiguousarray(obs[ei, pi], dtype=np.float32))
+            mask_b = None if masks is None else torch.from_numpy(np.ascontiguousarray(masks[ei, pi]))
+            state_b = cat_batch([states[e][p] for e, p in seats])
+            with torch.no_grad():
+                out = act(models[name], obs_b, state_b, mask_b, deterministic=deterministic)
+            actions[ei, pi] = out.actions.cpu().numpy().astype(spec.numpy_dtype, copy=False)
+            for k, (e, p) in enumerate(seats):
+                states[e][p] = None if out.state is None else slice_batch(out.state, k)
+
+        obs, rewards, terminated, truncated, infos = vec_env.step(actions)
+        returns += rewards
+        lengths += 1
+
+        for e in range(n_envs):
+            if not (terminated[e] or truncated[e]):
+                continue
+            if counted[e]:
+                terminal_infos = {
+                    p: (infos[e].get(p, {}) or {}).get("terminal_info", {}) for p in range(n_players)
+                }
+                outcomes = player_outcomes(returns[e].tolist(), terminal_infos, n_players)
+                records.append(MatchRecord(
+                    lineup=playing[e],
+                    outcomes=tuple(float(x) for x in outcomes),
+                    returns=tuple(float(x) for x in returns[e]),
+                    length=int(lengths[e]),
+                ))
+            if pending:
+                playing[e] = pending.popleft()
+            else:
+                counted[e] = False   # keep the env busy with its last lineup; results ignored
+            states[e] = [models[playing[e][p]].initial_state(1) for p in range(n_players)]
+            returns[e] = 0.0
+            lengths[e] = 0
+    return records
