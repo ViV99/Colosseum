@@ -178,5 +178,5 @@ class EnvFactory:
 def publish_versions(q, n: int, done) -> None:
     """Spawn target: publish WeightPayload v1..vn into a size-1 mailbox as fast as possible."""
     for version in range(1, n + 1):
-        put_latest(q, WeightPayload("a", version, {"w": np.full(64, version, dtype=np.float32)}))
+        assert put_latest(q, WeightPayload("a", version, {"w": np.full(64, version, dtype=np.float32)}))
     done.set()

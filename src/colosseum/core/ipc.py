@@ -53,12 +53,14 @@ def put_latest(q: Any, item: Any, timeout: float = 1.0) -> bool:
             return True
         except queue.Full:
             pass
+        # Check before evicting, so a successful eviction is always followed by a
+        # put attempt and the mailbox is never left empty.
+        if time.monotonic() >= deadline:
+            return False
         try:
             q.get(timeout=0.01)  # evict the stale item (it may still be in flight)
         except queue.Empty:
             pass
-        if time.monotonic() >= deadline:
-            return False
 
 
 def drain_latest(q: Any) -> Any | None:

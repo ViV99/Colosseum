@@ -18,6 +18,35 @@ def test_put_latest_replaces_the_stale_item():
     assert drain_latest(q) is None
 
 
+def test_put_latest_follows_every_eviction_with_a_put():
+    """An eviction that ends past the deadline must still be followed by a put (mailbox never left empty)."""
+    class _SlowEvictQueue(queue.Queue):
+        def get(self, block=True, timeout=None):
+            item = super().get(block, timeout)
+            time.sleep(0.05)  # the eviction finishes after put_latest's deadline
+            return item
+
+    q = _SlowEvictQueue(maxsize=1)
+    q.put("stale")
+    assert put_latest(q, "new", timeout=0.02)
+    assert q.get_nowait() == "new"
+
+
+def test_put_latest_returns_false_after_timeout_when_jammed():
+    """A mailbox that stays Full and never yields its item: give up after about ``timeout``."""
+    class _JammedQueue:
+        def put_nowait(self, item):
+            raise queue.Full
+
+        def get(self, block=True, timeout=None):
+            time.sleep(timeout or 0)
+            raise queue.Empty
+
+    start = time.monotonic()
+    assert put_latest(_JammedQueue(), "x", timeout=0.2) is False
+    assert 0.2 <= time.monotonic() - start < 0.7
+
+
 def test_drain_latest_returns_newest_of_many():
     q = queue.Queue()
     for version in range(3):
@@ -60,18 +89,14 @@ def test_worker_gets_newest_weights_after_a_burst_of_publishes():
     mailbox, done = ctx.Queue(maxsize=1), ctx.Event()
     publisher = ctx.Process(target=publish_versions, args=(mailbox, 50, done))
     publisher.start()
-    last = None
     try:
         assert done.wait(60)
-        deadline = time.monotonic() + 10.0
-        while time.monotonic() < deadline:
-            item = drain_latest(mailbox)
-            if item is not None:
-                last = item
-            if last is not None and last.policy_version == 50:
-                break
-            time.sleep(0.01)
+        publisher.join(timeout=10)  # exit flushes the feeder: v50 is in the pipe
+        assert publisher.exitcode == 0  # every put_latest returned True
+        last = drain_latest(mailbox)
     finally:
-        publisher.join(timeout=10)
+        if publisher.is_alive():
+            publisher.kill()
+            publisher.join()
     assert last is not None and last.policy_version == 50
     assert np.all(last.state_dict["w"] == 50)

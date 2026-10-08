@@ -16,6 +16,7 @@ import time
 
 from colosseum.algorithms.appo import APPO
 from colosseum.core.config import AlgorithmConfig, LearnerConfig
+from colosseum.launcher import _WEIGHT_QUEUE_SIZE
 from colosseum.learner.learner import learner_process
 from dataflow_helpers import TinyModel, chunk_payload
 
@@ -50,7 +51,7 @@ def _cleanup(proc, *queues) -> None:
 
 def test_learner_exits_when_workers_stopped_and_weights_are_unread():
     ctx = mp.get_context("spawn")
-    unread_weights = ctx.Queue(maxsize=2)
+    unread_weights = ctx.Queue(maxsize=_WEIGHT_QUEUE_SIZE)
     stop = ctx.Event()
     stop.set()  # workers are stopping: nobody reads the weight queue any more
     proc, traj = _start_learner(ctx, unread_weights, stop, total_train_steps=1)
@@ -65,7 +66,7 @@ def test_learner_exits_when_workers_stopped_and_weights_are_unread():
 def test_live_slow_reader_gets_final_weights_after_learner_budget_exit():
     """Budget reached, stop_event NOT set: the last payload must arrive whole."""
     ctx = mp.get_context("spawn")
-    weights = ctx.Queue(maxsize=2)
+    weights = ctx.Queue(maxsize=_WEIGHT_QUEUE_SIZE)
     stop = ctx.Event()
     received: list[int] = []
 
@@ -100,7 +101,7 @@ def test_learner_budget_exit_does_not_deadlock_with_a_worker_blocked_on_chunks()
     """
     ctx = mp.get_context("spawn")
     traj = ctx.Queue(maxsize=2)
-    weights = ctx.Queue(maxsize=2)
+    weights = ctx.Queue(maxsize=_WEIGHT_QUEUE_SIZE)
     stop = ctx.Event()
     proc = ctx.Process(target=learner_process, kwargs=dict(
         agent_id="a", algorithm_factory=_big_appo, trajectory_queue=traj,

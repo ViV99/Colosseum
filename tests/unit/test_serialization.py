@@ -206,7 +206,8 @@ def test_weights_payload_rejects_non_numeric_dtypes(value):
 
 
 def test_dimension_too_large_for_numpy_raises_value_error():
-    """(0, 10**30) declares 0 bytes, but numpy cannot represent the dim (OverflowError)."""
+    """(0, 10**30) declares 0 bytes, but the dim exceeds sys.maxsize: rejected by the
+    shape check before numpy would raise OverflowError."""
     import io
     import zipfile
 
@@ -215,5 +216,5 @@ def test_dimension_too_large_for_numpy_raises_value_error():
     blob = io.BytesIO()
     with zipfile.ZipFile(blob, "w") as zf:
         zf.writestr("arr_0.npy", npy.getvalue())
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError, match=r"invalid array shape \(0, 10{30}\) in arr_0\.npy"):
         unpack_payload(_raw_payload({"__nd__": 0}, blob.getvalue()), False)
