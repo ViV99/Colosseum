@@ -45,6 +45,19 @@ def check_path_component(value: str, what: str) -> str:
         )
     return value
 
+
+def check_agent_id(value: str) -> str:
+    """Return ``value`` if it is a valid agent id, else raise ConfigError.
+
+    An agent id is a safe path component (:func:`check_path_component`) without ``.``,
+    so every agent is addressable as ``--set agents.<id>.<section>.<key>=...``.
+    """
+    check_path_component(value, "agent id")
+    if "." in value:
+        raise ConfigError(f"Invalid agent id {value!r}: '.' is not allowed (it separates --set path parts)")
+    return value
+
+
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
@@ -390,6 +403,12 @@ class AgentOverride(StrictModel):
 
     They are deep-merged onto the global section before validation (R5-08), so an
     override that sets only ``learning_rate`` keeps every other global algorithm value.
+
+    Caveat for ``networks``: the merge is key by key, so an override that switches to
+    ``model_class`` still inherits the global ``encoder_class`` / ``policy_class`` /
+    ``value_class`` (and ``core``) unless it sets them to ``null``, and an override that
+    swaps only ``encoder_class`` still inherits the global ``networks.kwargs`` (set
+    ``kwargs`` explicitly if the new classes take different arguments).
     """
 
     networks: dict[str, Any] | None = None
@@ -462,7 +481,7 @@ class ColosseumConfig(StrictModel):
     def _check_agent_ids(cls, agents: dict[str, AgentOverride]) -> dict[str, AgentOverride]:
         for agent_id in agents:
             try:
-                check_path_component(agent_id, "agent id")
+                check_agent_id(agent_id)
             except ConfigError as e:
                 raise ValueError(str(e)) from e
         return agents
@@ -512,21 +531,27 @@ class ColosseumConfig(StrictModel):
 _NUMBER_RE = re.compile(r"[+-]?(\d+(\.\d*)?|\.\d+)([eE][+-]?\d+)?")
 
 
-def parse_override_value(raw: str) -> Any:
+def parse_override_value(raw: str, key: str | None = None) -> Any:
     """Parse a ``--set key=value`` value with YAML semantics.
 
-    ``null`` gives None, lists and dicts are YAML, and numbers include ``1e-4`` (which
-    plain YAML 1.1 would keep as a string). A date-like value stays a string.
+    ``null`` gives None, lists and dicts are YAML, and an unquoted number includes
+    ``1e-4`` (which plain YAML 1.1 would keep as a string). A quoted value stays a
+    string (``'"123"'`` -> ``"123"``), and so does a date-like value. Malformed YAML
+    raises ConfigError naming ``key`` (when given) and the raw value.
     """
-    if not raw.strip():
+    text = raw.strip()
+    if not text:
         return None
-    value = yaml.safe_load(raw)
+    if _NUMBER_RE.fullmatch(text):
+        return int(text) if "." not in text and "e" not in text.lower() else float(text)
+    try:
+        value = yaml.safe_load(raw)
+    except yaml.YAMLError as e:
+        where = f"--set {key}={raw}" if key is not None else f"override value {raw!r}"
+        reason = str(e).splitlines()[0] if str(e) else type(e).__name__
+        raise ConfigError(f"Cannot parse {where}: invalid YAML ({reason})") from e
     if isinstance(value, (datetime.date, datetime.datetime)):
         return raw
-    if isinstance(value, str) and _NUMBER_RE.fullmatch(value.strip()):
-        number = float(value)
-        is_int_literal = "." not in value and "e" not in value.lower()
-        return int(number) if is_int_literal else number
     return value
 
 

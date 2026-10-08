@@ -40,24 +40,6 @@ def base_data(**extra) -> dict:
     return data
 
 
-@pytest.fixture
-def restore_root_logging():
-    """run_training reconfigures the root logger; put pytest's handlers back afterwards."""
-    import logging
-
-    root = logging.getLogger()
-    handlers, level = list(root.handlers), root.level
-    yield
-    for handler in list(root.handlers):
-        if handler not in handlers:
-            root.removeHandler(handler)
-            handler.close()
-    for handler in handlers:
-        if handler not in root.handlers:
-            root.addHandler(handler)
-    root.setLevel(level)
-
-
 def write_yaml(tmp_path, data, name="cfg.yaml") -> Path:
     path = tmp_path / name
     path.write_text(yaml.safe_dump(data))
@@ -142,6 +124,44 @@ def test_parse_override_value(raw, expected):
     assert value == expected and type(value) is type(expected)
 
 
+@pytest.mark.parametrize("raw,expected", [
+    ('"123"', "123"), ("'1e-3'", "1e-3"), ("1e-3", 0.001), ("'null'", "null"), ("  7 ", 7),
+])
+def test_parse_override_value_quoting(raw, expected):
+    """Fix round 1: quoted values stay strings; the number rule applies to unquoted input only."""
+    value = parse_override_value(raw)
+    assert value == expected and type(value) is type(expected)
+
+
+@pytest.mark.parametrize("raw", ["[1,", "*a", "a: b: c"])
+def test_parse_override_value_malformed_yaml_is_config_error(raw):
+    with pytest.raises(ConfigError, match=r"--set rollout\.x=") as info:
+        parse_override_value(raw, key="rollout.x")
+    assert raw in str(info.value)
+
+
+def test_cli_validate_malformed_set_value_exits_1(tmp_path, monkeypatch):
+    from colosseum.cli import main
+
+    monkeypatch.chdir(REPO_ROOT)
+    good = write_yaml(tmp_path, base_data())
+    result = CliRunner().invoke(main, ["validate", "-c", str(good), "--set", "x=[1,"])
+    assert result.exit_code == 1
+    assert "Config error: " in result.output and "x=[1," in result.output
+    assert "Traceback" not in result.output and result.exc_info[0] is SystemExit
+
+
+@pytest.mark.parametrize("agent_id", ["a.b", "../x", ".hidden"])
+def test_bad_agent_ids_are_rejected_on_load(tmp_path, agent_id):
+    with pytest.raises(ConfigError, match="Invalid agent id"):
+        load_config(write_yaml(tmp_path, base_data(agents={agent_id: None})))
+
+
+def test_dotted_agent_id_message(tmp_path):
+    with pytest.raises(ConfigError, match=r"'\.' is not allowed \(it separates --set path parts\)"):
+        load_config(write_yaml(tmp_path, base_data(agents={"a.b": None})))
+
+
 def test_apply_overrides_sets_nested_values_and_creates_agent_sections():
     data = apply_overrides(base_data(), {
         "rollout.num_workers": 8,
@@ -172,8 +192,11 @@ def test_load_config_applies_overrides_before_validation(tmp_path):
     assert cfg.get_agent_config("alpha").learner.batch_chunks == 4
 
 
-def test_seed_is_applied_after_overrides(tmp_path, monkeypatch, restore_root_logging):
+def test_seed_is_applied_after_overrides(tmp_path, monkeypatch, restore_root_logging, restore_global_rng):
     import colosseum.launcher as launcher_module
+
+    # run_training forces the spawn start method; keep the test free of global side effects.
+    monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *args, **kwargs: None)
 
     class FakeLauncher:
         def __init__(self, *args, **kwargs):

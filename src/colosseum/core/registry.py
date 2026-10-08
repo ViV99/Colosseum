@@ -171,18 +171,34 @@ def _check_state_payload(state: Any) -> None:
         raise ConfigError(f"initial_state cannot be sent between processes: {e}") from e
 
 
-def check_env_num_players(config: ColosseumConfig) -> None:
-    """``env.num_players`` in the config must equal the env's own ``num_players`` (R5-16)."""
+def _make_env(config: ColosseumConfig) -> Any:
+    """Instantiate ``config.env``; any failure becomes a ConfigError."""
     try:
-        env = import_class(config.env.env_class)(**config.env.kwargs)
+        return import_class(config.env.env_class)(**config.env.kwargs)
     except Exception as e:
         raise ConfigError(f"Failed to create env {config.env.env_class!r}: {type(e).__name__}: {e}") from e
+
+
+def _close_env(env: Any) -> None:
+    close = getattr(env, "close", None)
+    if callable(close):
+        close()
+
+
+def check_env_num_players(config: ColosseumConfig, env: Any = None) -> None:
+    """``env.num_players`` in the config must equal the env's own ``num_players`` (R5-16).
+
+    Pass an already built ``env`` to reuse it (the caller keeps ownership); otherwise
+    one is built from the config and closed here.
+    """
+    owned = env is None
+    if owned:
+        env = _make_env(config)
     try:
         actual = int(env.num_players)
     finally:
-        close = getattr(env, "close", None)
-        if callable(close):
-            close()
+        if owned:
+            _close_env(env)
     if actual != config.env.num_players:
         raise ConfigError(
             f"env.num_players={config.env.num_players} but {config.env.env_class}.num_players={actual}"
@@ -204,12 +220,9 @@ def validate_config(config: ColosseumConfig) -> None:
     from colosseum.networks.composed import ComposedModel
     from colosseum.networks.distributions import Distribution
 
-    check_env_num_players(config)
+    env = _make_env(config)
     try:
-        env = import_class(config.env.env_class)(**config.env.kwargs)
-    except Exception as e:
-        raise ConfigError(f"Failed to create env {config.env.env_class!r}: {type(e).__name__}: {e}") from e
-    try:
+        check_env_num_players(config, env)
         try:
             model = build_model(config)
         except ConfigError:
@@ -323,4 +336,4 @@ def validate_config(config: ColosseumConfig) -> None:
                     f"{tuple(unrolled.value.shape)} / {tuple(log_probs.shape)}"
                 )
     finally:
-        env.close()
+        _close_env(env)

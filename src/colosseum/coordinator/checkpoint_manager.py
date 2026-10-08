@@ -8,7 +8,8 @@ Layout (``base_dir`` is ``<run_dir>/checkpoints``)::
         meta.json           agent_id, checkpoint_id, policy_version, timestamp, + extras
 
 A checkpoint's path is always ``base_dir/agent_id/checkpoint_id``; both ids must be
-safe path components (``core.config.check_path_component``). A ``path`` stored in
+safe path components (``core.config.check_path_component``), and agent ids may not
+contain ``.`` (``core.config.check_agent_id``). A ``path`` stored in
 ``meta.json`` (older layouts, copied runs) is never used (R6-06).
 
 Writes go to ``.tmp-<id>-<rand>/`` and are moved into place with ``os.replace``.
@@ -35,7 +36,7 @@ from typing import Any
 import numpy as np
 import torch
 
-from colosseum.core.config import check_path_component
+from colosseum.core.config import check_agent_id, check_path_component
 from colosseum.core.errors import ConfigError
 from colosseum.core.types import state_dict_from_numpy, state_dict_to_numpy
 
@@ -185,7 +186,7 @@ class CheckpointManager:
         return list(self._index.keys())
 
     def _agent_dir(self, agent_id: str) -> Path:
-        return self._base_dir / check_path_component(agent_id, "agent id")
+        return self._base_dir / check_agent_id(agent_id)
 
     def _ckpt_dir(self, agent_id: str, checkpoint_id: str) -> Path:
         return self._agent_dir(agent_id) / check_path_component(checkpoint_id, "checkpoint id")
@@ -315,7 +316,7 @@ def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
     The result holds only numpy arrays, bytes and primitives, so it can be passed
     to a learner process.
     """
-    check_path_component(agent_id, "agent id")
+    check_agent_id(agent_id)
     path = Path(resume_from)
     if path.is_dir() and (path / "checkpoints").is_dir():
         try:

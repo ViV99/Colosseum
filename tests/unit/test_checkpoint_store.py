@@ -182,12 +182,32 @@ def test_unsafe_ids_are_rejected(tmp_path, bad):
     assert sorted(p.name for p in base.iterdir()) == ["a"]
 
 
+def test_dotted_agent_id_is_rejected(tmp_path):
+    """T6.1 fix round 1: agent ids may not contain '.' (it separates --set path parts).
+    Checkpoint ids keep allowing it."""
+    import pydantic
+
+    base = tmp_path / "base"
+    mgr = CheckpointManager(base)
+    mgr.save("a", 1, sd())
+    msg = r"Invalid agent id 'a\.b': '\.' is not allowed"
+    with pytest.raises(ConfigError, match=msg):
+        mgr.save("a.b", 1, sd())
+    with pytest.raises(ConfigError, match=msg):
+        mgr.load_model("a.b", "ckpt_v1")
+    with pytest.raises(ConfigError, match=msg):
+        resolve_resume(str(base / "a" / "ckpt_v1"), "a.b")
+    with pytest.raises(pydantic.ValidationError, match=msg):
+        ColosseumConfig.model_validate({**make_config().model_dump(mode="json"), "agents": {"a.b": {}}})
+    assert sorted(p.name for p in base.iterdir()) == ["a"]
+
+
 def test_normal_ids_still_work(tmp_path):
     mgr = CheckpointManager(tmp_path)
-    mgr.save("team-a.v2_0", 5, sd(5))
-    assert float(mgr.load_model("team-a.v2_0", "ckpt_v5")["w"][0, 0]) == 5.0
-    cfg = ColosseumConfig.model_validate({**make_config().model_dump(mode="json"), "agents": {"team-a.v2_0": {}}})
-    assert cfg.get_trainable_agent_ids() == ["team-a.v2_0"]
+    mgr.save("team-a_v2-0", 5, sd(5))
+    assert float(mgr.load_model("team-a_v2-0", "ckpt_v5")["w"][0, 0]) == 5.0
+    cfg = ColosseumConfig.model_validate({**make_config().model_dump(mode="json"), "agents": {"team-a_v2-0": {}}})
+    assert cfg.get_trainable_agent_ids() == ["team-a_v2-0"]
 
 
 def test_duplicate_id_is_replaced_not_duplicated(tmp_path):

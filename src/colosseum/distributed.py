@@ -44,6 +44,7 @@ import torch
 
 from colosseum.core.config import ColosseumConfig, config_hash, load_config
 from colosseum.core.types import WeightPayload
+from colosseum.utils.seeding import apply_global_seed, learner_seed
 
 logger = logging.getLogger(__name__)
 
@@ -148,8 +149,6 @@ def run_distributed_learner(
     )
 
     config = load_config(config_path, overrides)
-    from colosseum.utils.seeding import apply_global_seed
-    apply_global_seed(config.training.seed)
     acfg = config.get_agent_config(agent_id)
     validate_config(acfg)
     max_mb = config.transport.grpc_max_message_mb
@@ -205,6 +204,11 @@ def run_distributed_learner(
 
     stop_event = threading.Event()
     _install_stop_signal_handlers(stop_event)
+
+    # Seed right before learner_process builds the model (validate_config above also draws
+    # from the RNGs). Same per-agent stream as a local-mode learner.
+    agent_index = config.get_trainable_agent_ids().index(agent_id)
+    apply_global_seed(learner_seed(config.training.seed, agent_index))
 
     # Drain checkpoint payloads (learner.make_checkpoint_payload) to disk in the background.
     cfg_hash = config_hash(config)

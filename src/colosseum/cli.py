@@ -11,6 +11,12 @@ def main() -> None:
     pass
 
 
+_SET_HELP_YAML = (
+    " Values are YAML scalars/lists (null, true, 1e-4, [1, 2]); quote a value to force a string, "
+    "e.g. --set run.name='\"123\"'."
+)
+
+
 def _parse_overrides(overrides: tuple[str, ...]) -> dict:
     """Parse ``--set key=value`` pairs; values use YAML semantics (null, numbers, lists)."""
     from colosseum.core.config import parse_override_value
@@ -20,13 +26,15 @@ def _parse_overrides(overrides: tuple[str, ...]) -> dict:
         if "=" not in ov:
             raise click.BadParameter(f"Override must be key=value, got: {ov!r}")
         key, value = ov.split("=", 1)
-        result[key.strip()] = parse_override_value(value)
+        key = key.strip()
+        result[key] = parse_override_value(value, key=key)
     return result
 
 
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
-@click.option("--set", "overrides", multiple=True, help="Override config values (e.g., --set rollout.num_workers=8)")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set rollout.num_workers=8)." + _SET_HELP_YAML)
 def train(config: str, overrides: tuple[str, ...]) -> None:
     """Train an agent using the specified configuration."""
     from colosseum.launcher import run_training
@@ -139,7 +147,8 @@ def eval_cmd(config: str, agents: tuple[str, ...], num_matches: int, num_envs: i
 
 @main.command("validate")
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
-@click.option("--set", "overrides", multiple=True, help="Override config values (e.g., --set env.num_players=2)")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set env.num_players=2)." + _SET_HELP_YAML)
 def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
     """Validate a config: schema, env num_players, and a dummy forward of every agent's model."""
     import sys
@@ -164,7 +173,8 @@ def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
 @click.option("--agent", "-a", default="agent_0", help="Trainable agent id this learner owns")
 @click.option("--traj-port", default=50052, type=int, help="Port for this learner's TrajectoryService")
 @click.option("--weight-store", required=True, help="WeightStore address host:port")
-@click.option("--set", "overrides", multiple=True, help="Override config values (e.g., --set rollout.num_workers=8)")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set rollout.num_workers=8)." + _SET_HELP_YAML)
 def run_learner_cmd(config: str, agent: str, traj_port: int, weight_store: str, overrides: tuple[str, ...]) -> None:
     """Run one agent's learner as a gRPC service (distributed mode)."""
     from colosseum.distributed import run_distributed_learner
@@ -181,7 +191,8 @@ def run_learner_cmd(config: str, agent: str, traj_port: int, weight_store: str, 
 @click.option("--weight-store", required=True, help="WeightStore address host:port")
 @click.option("--learner", "-l", "learners", required=True, multiple=True,
               help="Learner address per agent: agent_id=host:port (repeatable)")
-@click.option("--set", "overrides", multiple=True, help="Override config values")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values." + _SET_HELP_YAML)
 def run_workers_cmd(config: str, weight_store: str, learners: tuple[str, ...], overrides: tuple[str, ...]) -> None:
     """Run rollout workers feeding remote learners over gRPC (distributed mode)."""
     from colosseum.distributed import run_distributed_workers

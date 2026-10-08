@@ -155,11 +155,13 @@ def _learner_target(
     progress_counter: SharedCounter | None = None,
     total_timesteps: int = 0,
     num_learners: int = 1,
+    seed: int | None = None,
 ) -> None:
     """Learner process entry point.
 
     ``num_learners`` (learner processes on this machine) feeds the automatic
-    torch thread count when ``learner.torch_threads`` is unset.
+    torch thread count when ``learner.torch_threads`` is unset. ``seed`` (from
+    ``utils.seeding.learner_seed``) seeds this process before the model is built.
     """
     import sys
     sys.path.insert(0, ".")
@@ -167,6 +169,9 @@ def _learner_target(
     from colosseum.core.registry import import_class
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
     from colosseum.learner.learner import learner_process, resolve_device
+    from colosseum.utils.seeding import apply_global_seed
+
+    apply_global_seed(seed)
 
     device = resolve_device(config.learner.device)
     configure_torch_threads(resolve_learner_threads(
@@ -409,7 +414,8 @@ class Launcher:
         self._checkpoint_queues = checkpoint_queues
 
         # Start one learner per agent
-        for aid in trainable_agents:
+        from colosseum.utils.seeding import learner_seed
+        for agent_index, aid in enumerate(trainable_agents):
             acfg = agent_configs[aid]
             # numpy + bytes only: Process arguments cross the process boundary (R6-02).
             resume_state = resume_states[aid]
@@ -428,6 +434,7 @@ class Launcher:
                     progress_counter=self._env_step_counter,
                     total_timesteps=cfg.training.total_timesteps,
                     num_learners=len(trainable_agents),
+                    seed=learner_seed(cfg.training.seed, agent_index),
                 ),
                 daemon=True,
             )

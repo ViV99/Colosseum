@@ -90,6 +90,38 @@ def _repo_root_stays_clean():
 
 
 @pytest.fixture
+def restore_global_rng():
+    """Put the python / numpy / torch global RNG states back after a test that seeds them."""
+    import random
+
+    import numpy as np
+
+    states = random.getstate(), np.random.get_state(), torch.get_rng_state()
+    yield
+    random.setstate(states[0])
+    np.random.set_state(states[1])
+    torch.set_rng_state(states[2])
+
+
+@pytest.fixture
+def restore_root_logging():
+    """Entry points call logging.basicConfig; put pytest's root handlers and level back afterwards."""
+    import logging
+
+    root = logging.getLogger()
+    handlers, level = list(root.handlers), root.level
+    yield
+    for handler in list(root.handlers):
+        if handler not in handlers:
+            root.removeHandler(handler)
+            handler.close()
+    for handler in handlers:
+        if handler not in root.handlers:
+            root.addHandler(handler)
+    root.setLevel(level)
+
+
+@pytest.fixture
 def run_root(tmp_path: Path) -> Path:
     """Directory for run folders / checkpoints created by a test."""
     root = tmp_path / "runs"
