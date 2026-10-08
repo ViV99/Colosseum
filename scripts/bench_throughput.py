@@ -146,6 +146,7 @@ def _make_config(num_workers: int, checkpoint_dir: str):
             "checkpoint_interval": 10**9,  # no checkpoints: every slot collects
             "pool_size": 10,
             "latest_prob": 0.5,
+            "shuffle_seats": True,  # one agent, every seat latest+collect: shuffling is a no-op
         },
         checkpoint={"dir": checkpoint_dir, "save_optimizer": True},
         metrics={"use_wandb": False, "log_interval": 1},

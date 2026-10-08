@@ -11,16 +11,13 @@ Manages:
 from __future__ import annotations
 
 import logging
+import random
 from collections import deque
+from pathlib import Path
 
 from colosseum.coordinator.agent_pool import AgentPool
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
-from colosseum.coordinator.matchmaker import (
-    BaseMatchmaker,
-    PFSPMatchmaker,
-    SelfPlayMatchmaker,
-    SimpleSelfPlayMatchmaker,
-)
+from colosseum.coordinator.matchmaker import BaseMatchmaker, PFSPMatchmaker, SelfPlayMatchmaker
 from colosseum.coordinator.ratings import EloRating, WinRateTracker
 from colosseum.core.config import ColosseumConfig, TrainingPhase
 from colosseum.core.types import MatchConfig, MatchResult
@@ -31,18 +28,23 @@ logger = logging.getLogger(__name__)
 class Coordinator:
     """Central coordinator for training pipeline."""
 
-    def __init__(self, config: ColosseumConfig) -> None:
+    def __init__(self, config: ColosseumConfig, checkpoint_dir: str | Path | None = None) -> None:
         self._config = config
+        # One RNG for matchmaking and seat shuffling: runs with the same seed get the same schedule.
+        self._rng = random.Random(config.training.seed)
         self._agent_pool = AgentPool()
+        for agent_id in config.get_trainable_agent_ids():
+            self._agent_pool.register_trainable(agent_id)
         self._checkpoint_manager = CheckpointManager(
-            base_dir=config.checkpoint.dir,
+            base_dir=str(checkpoint_dir if checkpoint_dir is not None else config.checkpoint.dir),
             pool_size=config.self_play.pool_size,
             save_optimizer=config.checkpoint.save_optimizer,
         )
-        self._matchmaker: BaseMatchmaker | None = None
         self._match_results: deque[MatchResult] = deque(maxlen=10000)
         self._elo = EloRating()
         self._win_rates = WinRateTracker()
+        self._refresh_round = 0
+        self._matchmaker: BaseMatchmaker = self._build_matchmaker()
 
     @property
     def agent_pool(self) -> AgentPool:
@@ -60,46 +62,51 @@ class Coordinator:
     def win_rates(self) -> WinRateTracker:
         return self._win_rates
 
-    def setup_matchmaker(self, agent_id: str) -> None:
-        """Set up the matchmaker based on training phase and available resources."""
-        phase = self._config.training.phase
+    @property
+    def refresh_round(self) -> int:
+        return self._refresh_round
 
-        if phase == TrainingPhase.LEAGUE:
-            self._matchmaker = PFSPMatchmaker(
+    def next_round(self) -> None:
+        """Advance the owner rotation. The launcher calls this once per match refresh."""
+        self._refresh_round += 1
+
+    def generate_match_configs(self, num_envs: int, env_offset: int) -> list[MatchConfig]:
+        """One match per env. Env ``e`` of this batch has global index ``g = env_offset + e``.
+
+        Its owner is ``agents[(g + refresh_round) % n_trainable]``, so every trainable
+        agent owns envs in every phase, and ownership rotates between refreshes.
+        """
+        agents = [a.agent_id for a in self._agent_pool.list_trainable()]
+        if not agents:
+            raise ValueError("Coordinator has no trainable agents")
+        num_players = self._config.env.num_players
+        shuffle = self._config.self_play.shuffle_seats
+        configs: list[MatchConfig] = []
+        for e in range(num_envs):
+            owner = agents[(env_offset + e + self._refresh_round) % len(agents)]
+            match = self._matchmaker.match_for(owner, num_players)
+            if shuffle:
+                self._rng.shuffle(match.player_slots)
+            configs.append(match)
+        return configs
+
+    def _build_matchmaker(self) -> BaseMatchmaker:
+        sp = self._config.self_play
+        if self._config.training.phase == TrainingPhase.LEAGUE:
+            return PFSPMatchmaker(
                 agent_pool=self._agent_pool,
                 checkpoint_manager=self._checkpoint_manager,
                 win_rate_tracker=self._win_rates,
-                self_play_ratio=self._config.self_play.self_play_ratio,
-                pfsp_exponent=self._config.self_play.pfsp_exponent,
-                latest_prob=self._config.self_play.latest_prob,
+                self_play_ratio=sp.self_play_ratio,
+                pfsp_exponent=sp.pfsp_exponent,
+                latest_prob=sp.latest_prob,
+                rng=self._rng,
             )
-            trainable = self._agent_pool.list_trainable()
-            logger.info(
-                f"Using PFSPMatchmaker with {len(trainable)} trainable agents"
-            )
-        else:
-            # Self-play phase
-            checkpoints = self._checkpoint_manager.list_checkpoints(agent_id)
-            if checkpoints:
-                self._matchmaker = SelfPlayMatchmaker(
-                    checkpoint_manager=self._checkpoint_manager,
-                    latest_prob=self._config.self_play.latest_prob,
-                )
-                logger.info(f"Using SelfPlayMatchmaker with {len(checkpoints)} checkpoints")
-            else:
-                self._matchmaker = SimpleSelfPlayMatchmaker()
-                logger.info("Using SimpleSelfPlayMatchmaker (no checkpoints yet)")
-
-    def generate_match_configs(
-        self,
-        agent_id: str,
-        num_envs: int,
-    ) -> list[MatchConfig]:
-        """Generate match configs using the current matchmaker."""
-        num_players = self._config.env.num_players
-        if self._matchmaker is None:
-            self.setup_matchmaker(agent_id)
-        return self._matchmaker.generate_matches(agent_id, num_envs, num_players)
+        return SelfPlayMatchmaker(
+            checkpoint_manager=self._checkpoint_manager,
+            latest_prob=sp.latest_prob,
+            rng=self._rng,
+        )
 
     def maybe_save_checkpoint(
         self,
@@ -119,8 +126,6 @@ class Coordinator:
                 optimizer_state=optimizer_state,
                 metrics=metrics,
             )
-            # Update matchmaker to use new checkpoints
-            self.setup_matchmaker(agent_id)
             return ckpt_id
         return None
 

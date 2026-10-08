@@ -95,7 +95,6 @@ def test_refresh_commands_carry_numpy_checkpoints(tmp_path):
     coord = Coordinator(cfg)
     coord.agent_pool.register_trainable("agent_0")
     coord.checkpoint_manager.save("agent_0", 50, build_model(cfg).state_dict())
-    coord.setup_matchmaker("agent_0")
     cq = CheckedQueue()
     Launcher(cfg)._refresh_worker_matches(coord, ["agent_0"], [cq], [{"agent_0": set()}])
     cmd = cq.get_nowait()

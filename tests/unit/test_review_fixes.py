@@ -123,14 +123,9 @@ def test_pfsp_uses_win_rates():
             coord.report_match_result(two_seat_result("alpha", 1.0, "beta", 0.0, match_id="m1"))
             coord.report_match_result(two_seat_result("alpha", 0.0, "gamma", 1.0, match_id="m2"))
 
-        coord.setup_matchmaker("alpha")
-        mm = coord._matchmaker
-        candidates = [a for a in coord.agent_pool.list_trainable() if a.agent_id != "alpha"]
-
         import collections
-        picks = collections.Counter()
-        for _ in range(400):
-            picks[mm._select_opponent("alpha", candidates).agent_id] += 1
+        picks = collections.Counter(
+            coord._matchmaker.select_opponents("alpha", ["beta", "gamma"], k=400))
 
         # gamma (win rate 0 → priority 1) should be picked far more than beta
         # (win rate 1 → priority ~0).
@@ -159,10 +154,9 @@ def test_refresh_pushes_new_checkpoint_to_worker():
         coord = Coordinator(cfg)
         coord.agent_pool.register_trainable("agent_0")
 
-        # Save a checkpoint, then refresh the matchmaker so it uses it.
+        # Save a checkpoint; the matchmaker lists checkpoints on every match.
         sd = {k: v.cpu() for k, v in build_model(cfg).state_dict().items()}
         coord.checkpoint_manager.save("agent_0", 50, sd)
-        coord.setup_matchmaker("agent_0")
 
         launcher = Launcher(cfg)
         cq = mp.Queue(maxsize=4)

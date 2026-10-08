@@ -291,6 +291,11 @@ class SelfPlayConfig(BaseModel):
         ge=0.0,
         description="Exponent p in PFSP priority: f(wr) = (1 - wr)^p.",
     )
+    shuffle_seats: bool = Field(
+        default=True,
+        description="Shuffle the seat order of every generated match, so each agent (and each "
+                    "checkpoint opponent) plays every seat equally often.",
+    )
 
 
 class CheckpointConfig(BaseModel):

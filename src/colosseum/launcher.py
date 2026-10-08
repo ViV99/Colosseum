@@ -366,8 +366,6 @@ class Launcher:
 
         # Initialize coordinator
         coordinator = Coordinator(cfg)
-        for aid in trainable_agents:
-            coordinator.agent_pool.register_trainable(aid)
 
         checkpoint_interval = cfg.self_play.checkpoint_interval
 
@@ -435,7 +433,8 @@ class Launcher:
         # Start workers (shared across all agents)
         for worker_id in range(cfg.rollout.num_workers):
             match_configs = coordinator.generate_match_configs(
-                trainable_agents[0], cfg.rollout.envs_per_worker,
+                cfg.rollout.envs_per_worker,
+                env_offset=worker_id * cfg.rollout.envs_per_worker,
             )
 
             (
@@ -630,17 +629,20 @@ class Launcher:
     ) -> None:
         """Re-generate per-worker match assignments and push them to workers.
 
-        Each worker gets a fresh set of slot assignments (reflecting current
-        checkpoints / PFSP win rates) plus any checkpoint state_dicts it does
-        not yet have (deltas only, to avoid resending large payloads).
+        Advances the coordinator's owner rotation (``next_round``) first, then
+        generates matches for worker ``w`` at global env offset
+        ``w * envs_per_worker``. Each worker gets a fresh set of slot
+        assignments (reflecting current checkpoints / PFSP win rates) plus any
+        checkpoint state_dicts it does not yet have (deltas only, to avoid
+        resending large payloads).
         """
         from colosseum.core.types import WorkerCommand
 
         num_envs = self._config.rollout.envs_per_worker
-        primary = agent_ids[0]
 
+        coordinator.next_round()
         for worker_id, cq in enumerate(command_queues):
-            match_configs = coordinator.generate_match_configs(primary, num_envs)
+            match_configs = coordinator.generate_match_configs(num_envs, env_offset=worker_id * num_envs)
             (
                 ckpt_dicts_by_agent,
                 slot_network_map,
