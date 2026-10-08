@@ -678,12 +678,23 @@ class Launcher:
         """Stop children; save every learner's final checkpoint before tearing them down."""
         self._stop_event.set()
         learner_procs = self._processes[: len(self._agent_ids)]
+        # A failed save neither ends the grace window (other learners' final snapshots
+        # still arrive) nor skips teardown; the first error is raised after both.
+        first_error: Exception | None = None
+
+        def drain() -> None:
+            nonlocal first_error
+            try:
+                self._drain_all_checkpoints()
+            except Exception as e:  # noqa: BLE001 - logged by _drain_all_checkpoints, re-raised below
+                first_error = first_error or e
+
         try:
             deadline = time.monotonic() + 10.0
             while time.monotonic() < deadline and any(p.is_alive() for p in learner_procs):
-                self._drain_all_checkpoints()
+                drain()
                 time.sleep(0.1)
-            self._drain_all_checkpoints()
+            drain()
         finally:
             # Teardown runs even if a checkpoint save failed (the error propagates after it).
             # Detach queue feeder threads so a queue still holding undrained data
@@ -700,6 +711,8 @@ class Launcher:
                     proc.terminate()
                     proc.join(timeout=2)
             logger.info("All processes stopped")
+        if first_error is not None:
+            raise first_error
 
 
 def run_training(config_path: str, overrides: dict | None = None) -> None:

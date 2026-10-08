@@ -257,6 +257,49 @@ def test_resolve_resume_wraps_unreadable_checkpoints_in_config_error(tmp_path):
         resolve_resume(str(tmp_path / "run"), "a")
 
 
+def _two_checkpoint_run(tmp_path: Path) -> tuple[Path, Path]:
+    run = tmp_path / "run"
+    mgr = CheckpointManager(run / "checkpoints")
+    mgr.save("a", 1, sd(1))
+    mgr.save("a", 2, sd(2))
+    return run, run / "checkpoints" / "a"
+
+
+@pytest.mark.parametrize("bad_meta", [
+    "{not json",
+    "[]",
+    json.dumps({"policy_version": 2, "timestamp": "yesterday"}),
+    json.dumps({"timestamp": 1.0}),
+    json.dumps({"policy_version": "2"}),
+], ids=["corrupt", "non_object", "bad_timestamp", "no_version", "str_version"])
+def test_run_dir_resume_fails_loudly_on_malformed_latest_meta(tmp_path, bad_meta):
+    """Explicit resume never falls back to an older checkpoint (fix round 2, M6a)."""
+    run, agent_dir = _two_checkpoint_run(tmp_path)
+    (agent_dir / "ckpt_v2" / "meta.json").write_text(bad_meta)
+    with pytest.raises(ConfigError, match="ckpt_v2") as exc:
+        resolve_resume(str(run), "a")
+    assert "resume_from" in str(exc.value)
+
+
+def test_run_dir_resume_with_all_metas_corrupt_is_an_error_not_a_fresh_start(tmp_path):
+    run, agent_dir = _two_checkpoint_run(tmp_path)
+    for d in ("ckpt_v1", "ckpt_v2"):
+        (agent_dir / d / "meta.json").write_text("{not json")
+    with pytest.raises(ConfigError, match="Malformed checkpoint"):
+        resolve_resume(str(run), "a")
+
+
+@pytest.mark.parametrize("bad_meta", ["[]", json.dumps({"policy_version": 2, "timestamp": "yesterday"})],
+                         ids=["non_object", "bad_timestamp"])
+def test_scan_skips_malformed_meta_with_a_warning(tmp_path, caplog, bad_meta):
+    """A background index degrades gracefully (fix round 2, M6b)."""
+    _, agent_dir = _two_checkpoint_run(tmp_path)
+    (agent_dir / "ckpt_v2" / "meta.json").write_text(bad_meta)
+    mgr = CheckpointManager(agent_dir.parent)
+    assert [c.checkpoint_id for c in mgr.list_checkpoints("a")] == ["ckpt_v1"]
+    assert "Skipping malformed checkpoint" in caplog.text and "ckpt_v2" in caplog.text
+
+
 def test_config_hash_is_stable_and_sensitive():
     a, b = make_config(), make_config()
     assert config_hash(a) == config_hash(b) == config_hash(a)
@@ -548,10 +591,14 @@ def test_resume_rejects_architecture_mismatch_before_spawning(tmp_path):
     assert launcher.env_steps_done == 0
 
 
-def _learner_like_checkpoint_sender(cq, stop_event, periodic: dict, final: dict) -> None:
-    """Child process standing in for a learner: one periodic snapshot, the final one after stop."""
-    send_checkpoint(cq, periodic, block=False)
+def _learner_like_checkpoint_sender(cq, stop_event, periodic: dict | None, final: dict,
+                                    final_delay: float = 0.0) -> None:
+    """Child process standing in for a learner: an optional periodic snapshot, then the
+    final one ``final_delay`` seconds after stop."""
+    if periodic is not None:
+        send_checkpoint(cq, periodic, block=False)
     stop_event.wait(timeout=60)
+    time.sleep(final_delay)
     send_checkpoint(cq, final, block=True)
     cq.close()
     cq.join_thread()
@@ -659,6 +706,52 @@ def test_shutdown_tears_children_down_even_if_a_save_fails(tmp_path):
         launcher._shutdown()
     assert calls  # the save was attempted ...
     assert not proc.is_alive() and proc.exitcode is not None  # ... and the child was still torn down
+
+
+def test_shutdown_keeps_draining_after_a_failed_save(tmp_path):
+    """A save failure does not end the grace window: a second learner's final snapshot,
+    delivered later, is still saved; the error propagates after teardown."""
+    from colosseum.launcher import Launcher
+
+    cfg = ColosseumConfig.model_validate({**make_config().model_dump(mode="json"), "agents": {"a0": {}, "a1": {}}})
+    launcher = Launcher(cfg)
+    launcher._coordinator = Coordinator(cfg, checkpoint_dir=tmp_path / "ckpt")
+    launcher._agent_ids = ["a0", "a1"]
+    ctx = mp.get_context("spawn")
+    queues = {aid: ctx.Queue(maxsize=4) for aid in launcher._agent_ids}
+    launcher._checkpoint_queues = queues
+    launcher._all_queues = list(queues.values())
+    real_save = launcher._save_checkpoint
+
+    def save(payload):
+        if payload["agent_id"] == "a0" and not payload["final"]:
+            raise OSError("disk full")
+        real_save(payload)
+
+    launcher._save_checkpoint = save
+    algo = FakeAlgorithm()
+    algo.train_once()
+    procs = [
+        ctx.Process(target=_learner_like_checkpoint_sender, daemon=True, args=(
+            queues["a0"], launcher._stop_event, make_checkpoint_payload("a0", algo),
+            make_checkpoint_payload("a0", algo, final=True))),
+        ctx.Process(target=_learner_like_checkpoint_sender, daemon=True, args=(
+            queues["a1"], launcher._stop_event, None, make_checkpoint_payload("a1", algo, final=True), 1.5)),
+    ]
+    for proc in procs:
+        proc.start()
+    launcher._processes = procs
+    deadline = time.monotonic() + 60
+    while queues["a0"].empty() and time.monotonic() < deadline:
+        time.sleep(0.05)
+    assert not queues["a0"].empty()
+
+    with pytest.raises(OSError, match="disk full"):
+        launcher._shutdown()
+    assert all(not p.is_alive() and p.exitcode == 0 for p in procs)
+    mgr = launcher._coordinator.checkpoint_manager
+    assert [c.meta["final"] for c in mgr.list_checkpoints("a1")] == [True]  # arrived 1.5 s after the failure
+    assert [c.meta["final"] for c in mgr.list_checkpoints("a0")] == [True]
 
 
 def test_learner_sends_final_checkpoint_on_stop():

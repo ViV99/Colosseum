@@ -70,8 +70,48 @@ class CheckpointInfo:
     meta: dict = field(default_factory=dict)
 
 
-def _read_agent_dir(agent_dir: Path) -> list[CheckpointInfo]:
-    """Complete checkpoints of one agent dir (model.pt + meta.json), sorted by version."""
+def _is_int(x: Any) -> bool:
+    return isinstance(x, int) and not isinstance(x, bool)
+
+
+def _is_number(x: Any) -> bool:
+    return isinstance(x, (int, float)) and not isinstance(x, bool)
+
+
+def _parse_meta(ckpt_dir: Path) -> dict:
+    """Read and validate ``ckpt_dir/meta.json``; raise ValueError naming the problem.
+
+    Required: a JSON object with an integer ``policy_version`` (equal to the dir's
+    ``ckpt_v<N>`` when the dir is named so). Optional: a numeric ``timestamp`` and an
+    integer or null ``env_steps``.
+    """
+    try:
+        meta = json.loads((ckpt_dir / META_FILE).read_text())
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as e:
+        raise ValueError(f"unreadable {META_FILE} ({type(e).__name__}: {e})") from e
+    if not isinstance(meta, dict):
+        raise ValueError(f"{META_FILE} is not a JSON object")
+    version = meta.get("policy_version")
+    if not _is_int(version):
+        raise ValueError(f"{META_FILE}: policy_version is missing or not an integer ({version!r})")
+    match = _CKPT_RE.fullmatch(ckpt_dir.name)
+    if match is not None and int(match.group(1)) != version:
+        raise ValueError(f"{META_FILE}: policy_version {version} does not match {ckpt_dir.name}")
+    if not _is_number(meta.get("timestamp", 0.0)):
+        raise ValueError(f"{META_FILE}: timestamp is not a number ({meta.get('timestamp')!r})")
+    env_steps = meta.get("env_steps")
+    if env_steps is not None and not _is_int(env_steps):
+        raise ValueError(f"{META_FILE}: env_steps is not an integer or null ({env_steps!r})")
+    return meta
+
+
+def _read_agent_dir(agent_dir: Path, strict: bool = False) -> list[CheckpointInfo]:
+    """Checkpoints of one agent dir (``ckpt_v<N>/`` with model.pt + valid meta.json), by version.
+
+    A malformed checkpoint (missing file, unreadable or invalid meta.json) is skipped
+    with a warning, or raises ConfigError naming its path when ``strict`` (explicit
+    resume: never silently fall back to an older checkpoint or to a fresh start).
+    """
     infos: list[CheckpointInfo] = []
     if not agent_dir.is_dir():
         return infos
@@ -79,13 +119,15 @@ def _read_agent_dir(agent_dir: Path) -> list[CheckpointInfo]:
         match = _CKPT_RE.fullmatch(d.name)
         if match is None or not d.is_dir():
             continue
-        meta_path = d / META_FILE
-        if not (d / MODEL_FILE).is_file() or not meta_path.is_file():
-            continue
         try:
-            meta = json.loads(meta_path.read_text())
-        except (OSError, json.JSONDecodeError) as e:
-            logger.warning(f"Skipping checkpoint {d}: unreadable {META_FILE} ({e})")
+            missing = [f for f in (MODEL_FILE, META_FILE) if not (d / f).is_file()]
+            if missing:
+                raise ValueError(f"missing {', '.join(missing)}")
+            meta = _parse_meta(d)
+        except ValueError as e:
+            if strict:
+                raise ConfigError(f"Malformed checkpoint {d}: {e}") from e
+            logger.warning(f"Skipping malformed checkpoint {d}: {e}")
             continue
         infos.append(CheckpointInfo(
             checkpoint_id=d.name,
@@ -240,9 +282,7 @@ def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
     trainer_path = ckpt_dir / TRAINER_FILE
     match = _CKPT_RE.fullmatch(ckpt_dir.name)
     try:
-        meta = json.loads(meta_path.read_text()) if meta_path.is_file() else {}
-        if not isinstance(meta, dict):
-            raise ValueError(f"{META_FILE} is not a JSON object")
+        meta = _parse_meta(ckpt_dir) if meta_path.is_file() else {}
         version = int(meta.get("policy_version", match.group(1) if match else 0))
         env_steps = int(meta.get("env_steps") or 0)  # null: unknown (distributed learners)
         state = torch.load(ckpt_dir / MODEL_FILE, map_location="cpu", weights_only=True)
@@ -278,7 +318,10 @@ def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
     check_path_component(agent_id, "agent id")
     path = Path(resume_from)
     if path.is_dir() and (path / "checkpoints").is_dir():
-        infos = _read_agent_dir(path / "checkpoints" / agent_id)
+        try:
+            infos = _read_agent_dir(path / "checkpoints" / agent_id, strict=True)
+        except ConfigError as e:
+            raise ConfigError(f"training.resume_from={resume_from!r}: {e}") from e
         if not infos:
             logger.warning(f"resume_from={resume_from}: no checkpoints for agent '{agent_id}'; starting fresh")
             return None
