@@ -1,0 +1,369 @@
+"""Shared SP2 test kit: toy ``MultiAgentEnv`` games (T1.4), drivers (T1.5), tiny models (T2.3).
+
+Every game is small, pure numpy and deterministic given the reset seed. Games are
+top-level classes, so ``functools.partial(Game, ...)`` or the class itself is a picklable
+``env_fn`` for spawned processes.
+"""
+
+from __future__ import annotations
+
+from collections.abc import Callable, Mapping, Sequence
+from typing import Any
+
+import numpy as np
+from gymnasium.spaces import Box, Dict, Discrete, MultiBinary
+
+from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
+from colosseum.sp2.envs.spaces import Units
+
+
+def _vec(*values: float) -> np.ndarray:
+    return np.array(values, dtype=np.float32)
+
+
+class SoloCounterGame(MultiAgentEnv):
+    """Solo, ``length`` steps. Obs ``[t / length, 1]``; ``Discrete(2)``; reward 1 for action 1.
+
+    With ``truncate_at`` (< length) the episode is cut after that many steps (``truncated``,
+    ``final_obs``).
+    """
+
+    def __init__(self, length: int = 8, truncate_at: int | None = None) -> None:
+        self.length, self.truncate_at = length, truncate_at
+        self.spec = GameSpec.solo(Box(-np.inf, np.inf, (2,), dtype=np.float32), Discrete(2))
+        self.t = 0
+
+    def _obs(self) -> np.ndarray:
+        return _vec(self.t / self.length, 1.0)
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.t = 0
+        return StepResult(acting={0}, obs={0: self._obs()})
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        self.t += 1
+        rewards = {0: float(int(actions[0]) == 1)}
+        if self.t >= self.length:
+            return StepResult(acting=set(), obs={}, rewards=rewards, episode_over=True)
+        if self.truncate_at is not None and self.t >= self.truncate_at:
+            return StepResult(acting=set(), obs={}, rewards=rewards, episode_over=True, truncated=True,
+                              final_obs={0: self._obs()})
+        return StepResult(acting={0}, obs={0: self._obs()}, rewards=rewards)
+
+
+class TurnTakingGame(MultiAgentEnv):
+    """Two seats alternate (seat 0 first). Obs ``[t / length, seat, 1]``; ``Discrete(3)`` where action 2
+    is always masked. The acting seat's action ``a`` pays ``a`` to the WAITING seat (so seat 1 gets a
+    reward before its first move). ``length`` moves in total; outcome from returns (wdl)."""
+
+    def __init__(self, length: int = 6) -> None:
+        self.length = length
+        self.spec = GameSpec.symmetric(2, Box(-np.inf, np.inf, (3,), dtype=np.float32), Discrete(3))
+        self.t = 0
+
+    def _result(self, rewards: dict[int, float]) -> StepResult:
+        seat = self.t % 2
+        return StepResult(acting={seat}, obs={seat: _vec(self.t / self.length, seat, 1.0)},
+                          action_masks={seat: np.array([True, True, False])}, rewards=rewards)
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.t = 0
+        return self._result({})
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        (seat, action), = actions.items()
+        rewards = {1 - seat: float(int(action))}
+        self.t += 1
+        if self.t >= self.length:
+            return StepResult(acting=set(), obs={}, rewards=rewards, episode_over=True)
+        return self._result(rewards)
+
+
+class SimultaneousGame(MultiAgentEnv):
+    """Matching pennies: both seats act every step for ``length`` steps. Obs ``[t / length, seat]``;
+    ``Discrete(2)``; seat 0 gets +1 if the actions match, else -1; seat 1 the opposite."""
+
+    def __init__(self, length: int = 5) -> None:
+        self.length = length
+        self.spec = GameSpec.symmetric(2, Box(-np.inf, np.inf, (2,), dtype=np.float32), Discrete(2))
+        self.t = 0
+
+    def _obs(self) -> dict[int, np.ndarray]:
+        return {p: _vec(self.t / self.length, p) for p in (0, 1)}
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.t = 0
+        return StepResult(acting={0, 1}, obs=self._obs())
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        self.t += 1
+        r = 1.0 if int(actions[0]) == int(actions[1]) else -1.0
+        rewards = {0: r, 1: -r}
+        if self.t >= self.length:
+            return StepResult(acting=set(), obs={}, rewards=rewards, episode_over=True)
+        return StepResult(acting={0, 1}, obs=self._obs(), rewards=rewards)
+
+
+class EliminationFFA(MultiAgentEnv):
+    """FFA with layouts ``"2p"..f"{max_players}p"``; every live seat acts every step.
+
+    Obs ``[t / length, seat, live seats]``; ``Discrete(2)``. Each acting seat gets 0.1 per step.
+    ``eliminate_at`` maps seat -> the step in which it is eliminated (an extra -1 in that step);
+    default: in an n-seat layout seat s (s >= 1) is eliminated at step n - s. The episode ends when
+    at most one seat is live or after ``length`` steps. Outcome: ``team_rank`` by elimination order
+    (survivors share rank 1).
+    """
+
+    def __init__(self, max_players: int = 4, eliminate_at: Mapping[int, int] | None = None,
+                 length: int = 10) -> None:
+        self.max_players, self.length = max_players, length
+        self.eliminate_at = dict(eliminate_at) if eliminate_at is not None else None
+        self.spec = GameSpec.symmetric(range(2, max_players + 1), Box(-np.inf, np.inf, (3,), dtype=np.float32),
+                                       Discrete(2))
+        self.n, self.t = 0, 0
+        self.live: set[int] = set()
+        self.out_step: dict[int, int] = {}
+        self.schedule: dict[int, int] = {}
+
+    def _obs(self) -> dict[int, np.ndarray]:
+        return {p: _vec(self.t / self.length, p, len(self.live)) for p in sorted(self.live)}
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.n = self.spec.layout_size(layout)
+        self.t = 0
+        self.live = set(range(self.n))
+        self.out_step = {}
+        if self.eliminate_at is None:
+            self.schedule = {s: self.n - s for s in range(1, self.n)}
+        else:
+            self.schedule = {s: k for s, k in self.eliminate_at.items() if s < self.n}
+        return StepResult(acting=set(self.live), obs=self._obs())
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        self.t += 1
+        rewards = {p: 0.1 for p in actions}
+        out = {p for p in self.live if self.schedule.get(p) == self.t}
+        for p in out:
+            rewards[p] = rewards.get(p, 0.0) - 1.0
+            self.out_step[p] = self.t
+        self.live -= out
+        if len(self.live) <= 1 or self.t >= self.length:
+            last = {p: self.out_step.get(p, self.t + 1) for p in range(self.n)}
+            rank = {p: float(1 + sum(1 for q in range(self.n) if last[q] > last[p])) for p in range(self.n)}
+            return StepResult(acting=set(), obs={}, rewards=rewards, terminated=out, episode_over=True,
+                              outcome=Outcome(team_rank=rank))
+        return StepResult(acting=set(self.live), obs=self._obs(), rewards=rewards, terminated=out)
+
+
+class TeamDeadTeammateGame(MultiAgentEnv):
+    """``"2v2"`` (seats 0, 1 = team 0; 2, 3 = team 1). Seat 1 stops acting after step ``dead_at`` but is
+    not terminated: every step each seat of a team, the dead one included, gets the mean action of the
+    team's acting seats. Obs ``[t / length, seat]``; ``Discrete(2)``; ``length`` steps."""
+
+    def __init__(self, length: int = 6, dead_at: int = 2) -> None:
+        self.length, self.dead_at = length, dead_at
+        self.spec = GameSpec.teams_of([2, 2], Box(-np.inf, np.inf, (2,), dtype=np.float32), Discrete(2))
+        self.t = 0
+
+    def _acting(self) -> set[int]:
+        return {0, 2, 3} if self.t >= self.dead_at else {0, 1, 2, 3}
+
+    def _result(self, rewards: dict[int, float]) -> StepResult:
+        acting = self._acting()
+        return StepResult(acting=acting, obs={p: _vec(self.t / self.length, p) for p in acting}, rewards=rewards)
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.t = 0
+        return self._result({})
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        rewards: dict[int, float] = {}
+        for team in ((0, 1), (2, 3)):
+            moves = [int(actions[p]) for p in team if p in actions]
+            for p in team:
+                rewards[p] = float(np.mean(moves))
+        self.t += 1
+        if self.t >= self.length:
+            return StepResult(acting=set(), obs={}, rewards=rewards, episode_over=True)
+        return self._result(rewards)
+
+
+class UnitsGame(MultiAgentEnv):
+    """Solo bot with units. Obs ``Dict(grid uint8 [4, 4] (float32 if not uint8_grid), entities [U, 3],
+    entity_mask [U])``. Action ``Dict(base: Discrete(3), units: Units(U, Dict(move: Discrete(4),
+    target: Discrete(U)), only_if target <- move == 3))``.
+
+    Units are born and die: at step t, units ``0 .. (t % U)`` exist. Absent units have ``unit=False``
+    and empty action rows; a unit may target only existing units. Reward: 0.5 for base action 1 plus
+    0.25 per existing unit choosing move 0. ``length`` steps.
+    """
+
+    def __init__(self, max_units: int = 4, uint8_grid: bool = True, length: int = 6) -> None:
+        self.U, self.uint8_grid, self.length = max_units, uint8_grid, length
+        grid = Box(0, 255, (4, 4), dtype=np.uint8) if uint8_grid else Box(0.0, 255.0, (4, 4), dtype=np.float32)
+        obs = Dict([("grid", grid), ("entities", Box(-1.0, 1.0, (max_units, 3), dtype=np.float32)),
+                    ("entity_mask", MultiBinary(max_units))])
+        act = Dict([("base", Discrete(3)),
+                    ("units", Units(max_units, Dict([("move", Discrete(4)), ("target", Discrete(max_units))]),
+                                    only_if={"target": ("move", {3})}))])
+        self.spec = GameSpec.solo(obs, act)
+        self.t = 0
+
+    def _alive(self) -> np.ndarray:
+        return np.arange(self.U) <= (self.t % self.U)
+
+    def _result(self, rewards: dict[int, float]) -> StepResult:
+        alive = self._alive()
+        grid = np.full((4, 4), self.t, dtype=np.uint8 if self.uint8_grid else np.float32)
+        entities = np.zeros((self.U, 3), dtype=np.float32)
+        entities[alive] = [self.t / self.length, 1.0, 0.0]
+        obs = {"grid": grid, "entities": entities, "entity_mask": alive.astype(np.int8)}
+        action = np.zeros((self.U, 4 + self.U), dtype=bool)
+        action[alive, :4] = True
+        action[np.ix_(alive, 4 + np.flatnonzero(alive))] = True
+        mask = {"units": {"unit": alive.copy(), "action": action}}
+        return StepResult(acting={0}, obs={0: obs}, action_masks={0: mask}, rewards=rewards)
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.t = 0
+        return self._result({})
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        a = actions[0]
+        alive = self._alive()
+        reward = 0.5 * float(int(a["base"]) == 1) + 0.25 * float(np.sum((np.asarray(a["units"]["move"]) == 0) & alive))
+        self.t += 1
+        if self.t >= self.length:
+            return StepResult(acting=set(), obs={}, rewards={0: reward}, episode_over=True)
+        return self._result({0: reward})
+
+
+class AsymmetricGame(MultiAgentEnv):
+    """Layout ``"1v2"``: seat 0 = role ``hunter`` (obs ``[4]``, ``Discrete(5)``), seats 1, 2 = role ``prey``
+    (obs ``[3]``, ``Discrete(3)``), all acting each step for ``length`` steps. The hunter gets 1 per
+    prey whose action equals ``hunter_action % 3``; that prey gets -1, the others +0.5."""
+
+    def __init__(self, length: int = 5) -> None:
+        self.length = length
+        self.spec = GameSpec(
+            roles={"hunter": RoleSpec(Box(-np.inf, np.inf, (4,), dtype=np.float32), Discrete(5)),
+                   "prey": RoleSpec(Box(-np.inf, np.inf, (3,), dtype=np.float32), Discrete(3))},
+            layouts={"1v2": (SeatSpec("hunter", 0), SeatSpec("prey", 1), SeatSpec("prey", 1))},
+        )
+        self.t = 0
+
+    def _result(self, rewards: dict[int, float]) -> StepResult:
+        f = self.t / self.length
+        return StepResult(acting={0, 1, 2}, obs={0: _vec(f, 0, 0, 1), 1: _vec(f, 1, 0), 2: _vec(f, 2, 0)},
+                          rewards=rewards)
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.t = 0
+        return self._result({})
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        target = int(actions[0]) % 3
+        rewards = {0: 0.0}
+        for p in (1, 2):
+            caught = int(actions[p]) == target
+            rewards[0] += float(caught)
+            rewards[p] = -1.0 if caught else 0.5
+        self.t += 1
+        if self.t >= self.length:
+            return StepResult(acting=set(), obs={}, rewards=rewards, episode_over=True)
+        return self._result(rewards)
+
+
+class CoopGame(MultiAgentEnv):
+    """One team of ``size`` seats (layout ``"coop<size>"``), all acting for ``length`` steps.
+    Obs ``[t / length, seat]``; ``Discrete(2)``; every seat gets 1 when all actions are 1."""
+
+    def __init__(self, size: int = 2, length: int = 5) -> None:
+        self.size, self.length = size, length
+        self.spec = GameSpec.teams_of([size], Box(-np.inf, np.inf, (2,), dtype=np.float32), Discrete(2))
+        self.t = 0
+
+    def _result(self, rewards: dict[int, float]) -> StepResult:
+        seats = set(range(self.size))
+        return StepResult(acting=seats, obs={p: _vec(self.t / self.length, p) for p in seats}, rewards=rewards)
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.t = 0
+        return self._result({})
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        r = float(all(int(a) == 1 for a in actions.values()))
+        rewards = {p: r for p in range(self.size)}
+        self.t += 1
+        if self.t >= self.length:
+            return StepResult(acting=set(), obs={}, rewards=rewards, episode_over=True)
+        return self._result(rewards)
+
+
+class GlobalStateGame(MultiAgentEnv):
+    """``"2p"``, both seats act; obs ``[t / length, seat]``, ``Discrete(2)``, ``global_state`` ``[4]`` =
+    ``[seat, t / length, last action of seat 0, last action of seat 1]`` for every acting seat (and,
+    with ``truncate_at``, for every live seat with ``final_obs``). Reward: +1 to a seat choosing 1."""
+
+    def __init__(self, length: int = 5, truncate_at: int | None = None) -> None:
+        self.length, self.truncate_at = length, truncate_at
+        self.spec = GameSpec.symmetric(2, Box(-np.inf, np.inf, (2,), dtype=np.float32), Discrete(2),
+                                       global_state=Box(-np.inf, np.inf, (4,), dtype=np.float32))
+        self.t = 0
+        self.last = [0, 0]
+
+    def _obs(self) -> dict[int, np.ndarray]:
+        return {p: _vec(self.t / self.length, p) for p in (0, 1)}
+
+    def _gs(self) -> dict[int, np.ndarray]:
+        return {p: _vec(p, self.t / self.length, *self.last) for p in (0, 1)}
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.t, self.last = 0, [0, 0]
+        return StepResult(acting={0, 1}, obs=self._obs(), global_state=self._gs())
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        self.last = [int(actions[0]), int(actions[1])]
+        rewards = {p: float(self.last[p]) for p in (0, 1)}
+        self.t += 1
+        if self.t >= self.length:
+            return StepResult(acting=set(), obs={}, rewards=rewards, episode_over=True)
+        if self.truncate_at is not None and self.t >= self.truncate_at:
+            return StepResult(acting=set(), obs={}, rewards=rewards, episode_over=True, truncated=True,
+                              final_obs=self._obs(), global_state=self._gs())
+        return StepResult(acting={0, 1}, obs=self._obs(), rewards=rewards, global_state=self._gs())
+
+
+class ScriptedGame(MultiAgentEnv):
+    """Replays prepared results: ``reset`` returns ``script[0]``, the k-th ``step`` returns ``script[k]``.
+    The actions it received are kept in ``received``. For contract-violation tests."""
+
+    def __init__(self, spec: GameSpec, script: Sequence[StepResult]) -> None:
+        self.spec = spec
+        self.script = list(script)
+        self.k = 0
+        self.received: list[dict[int, Any]] = []
+        self.reset_calls: list[tuple[int | None, str]] = []
+
+    def reset(self, seed: int | None, layout: str) -> StepResult:
+        self.k = 0
+        self.reset_calls.append((seed, layout))
+        return self.script[0]
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        self.received.append(dict(actions))
+        self.k += 1
+        return self.script[self.k]
+
+
+TOY_GAMES: dict[str, Callable[[], MultiAgentEnv]] = {
+    "solo": SoloCounterGame,
+    "turns": TurnTakingGame,
+    "simultaneous": SimultaneousGame,
+    "ffa": EliminationFFA,
+    "dead_teammate": TeamDeadTeammateGame,
+    "units": UnitsGame,
+    "asymmetric": AsymmetricGame,
+    "coop": CoopGame,
+    "global_state": GlobalStateGame,
+}
