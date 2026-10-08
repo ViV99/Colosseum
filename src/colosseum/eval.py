@@ -10,6 +10,7 @@ Pairwise results are extracted from N-player match outcomes.
 
 from __future__ import annotations
 
+import contextlib
 import itertools
 import logging
 import math
@@ -148,6 +149,11 @@ def evaluate_agents(
     return matrix
 
 
+def _eval_where(e: int, p: int) -> str:
+    """Error-message context for eval env ``e``, seat ``p``."""
+    return f"eval: env {e} seat {p}"
+
+
 def _run_matches(
     agents: list[tuple[str, PolicyModel]],
     env_fn: Callable[[], BaseEnv],
@@ -236,7 +242,7 @@ def _run_matches(
         acting = acting_flags(infos, actual_envs, num_players)
         masks = extract_masks(infos, actual_envs, num_players, action_spec)
         if masks is not None:
-            check_masks(masks, acting, action_spec, lambda e, p: f"eval: env {e} seat {p}")
+            check_masks(masks, acting, action_spec, _eval_where)
         obs_flat = obs.reshape(-1, *obs.shape[2:])
 
         # Group acting (env, slot) pairs by their assigned agent for batched inference.
@@ -415,6 +421,10 @@ def play_matches(
     raises :class:`~colosseum.core.errors.EnvContractError`. Envs left without a
     scheduled match keep playing their last lineup until the rest finish; those
     extra episodes are discarded, so short episodes are not favoured.
+
+    ``seed`` seeds the env resets and a forked torch RNG, so the caller's global
+    RNG is untouched. Models run in eval mode; their train/eval flags are
+    restored on return, also after an exception.
     """
     lineups = [tuple(lu) for lu in lineups]
     if not lineups:
@@ -424,19 +434,26 @@ def play_matches(
         raise ValueError(f"play_matches: lineups use unknown agents {unknown}")
     if num_envs < 1:
         raise ValueError(f"play_matches: num_envs must be >= 1, got {num_envs}")
-    if seed is not None:
-        torch.manual_seed(seed)
-    for model in models.values():
-        model.eval()
-    vec_env = VectorEnv(env_fn, min(num_envs, len(lineups)))
+    # A seed must not leak into the caller: sample from a forked torch RNG. Only
+    # the CPU generator is forked (``devices=[]``): eval feeds CPU tensors built
+    # from numpy, so models run and sample on the CPU.
+    rng = torch.random.fork_rng(devices=[]) if seed is not None else contextlib.nullcontext()
+    # Restore every submodule's own flag (a caller may mix train/eval submodules).
+    was_training = [(m, m.training) for model in models.values() for m in model.modules()]
     try:
-        return _play(vec_env, models, lineups, deterministic, seed)
+        with rng:
+            if seed is not None:
+                torch.manual_seed(seed)
+            for model in models.values():
+                model.eval()
+            vec_env = VectorEnv(env_fn, min(num_envs, len(lineups)))
+            try:
+                return _play(vec_env, models, lineups, deterministic, seed)
+            finally:
+                vec_env.close()
     finally:
-        vec_env.close()
-
-
-def _eval_where(e: int, p: int) -> str:
-    return f"eval: env {e} seat {p}"
+        for module, training in was_training:
+            module.training = training
 
 
 def _play(
