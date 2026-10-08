@@ -19,6 +19,7 @@ from colosseum.networks.state import (
     tree_map,
     where_done,
 )
+from helpers import CORE_KINDS, make_simple_model
 
 Pair = namedtuple("Pair", ["a", "b"])
 
@@ -253,3 +254,27 @@ def test_state_to_device():
     s = _nested(2)
     moved = state_to(s, "cpu")
     _assert_tree_equal(moved, s)
+
+
+@pytest.mark.gpu
+@pytest.mark.parametrize("core", CORE_KINDS)
+def test_model_and_state_move_between_devices(core):
+    """Model + State pytree: CPU -> CUDA -> CPU keeps devices consistent and outputs equal."""
+    model = make_simple_model(core=core, seed=0)
+    obs = torch.randn(3, 8)
+    state = model.initial_state(3)
+    out_cpu = model.step(obs, state)
+
+    model.to("cuda")
+    state_cuda = state_to(state, "cuda")
+    assert all(t.device.type == "cuda" for t in tree_leaves(state_cuda))
+    out_cuda = model.step(obs.to("cuda"), state_cuda)
+    assert all(t.device.type == "cuda" for t in tree_leaves(out_cuda.state))
+    torch.testing.assert_close(out_cuda.value.cpu(), out_cpu.value, rtol=1e-4, atol=1e-5)
+
+    model.to("cpu")
+    back = state_to(out_cuda.state, "cpu")
+    assert all(t.device.type == "cpu" for t in tree_leaves(back))
+    for x, y in zip(tree_leaves(back), tree_leaves(out_cpu.state), strict=True):
+        torch.testing.assert_close(x, y, rtol=1e-4, atol=1e-5)
+    model.step(obs, back)   # CPU model accepts the moved-back state

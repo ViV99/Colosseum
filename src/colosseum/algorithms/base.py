@@ -1,13 +1,34 @@
 from __future__ import annotations
 
+import copy
 from abc import ABC, abstractmethod
 from typing import TYPE_CHECKING, Any
 
+import numpy as np
 import torch
 
 if TYPE_CHECKING:
     from colosseum.core.types import TrajectoryChunk
     from colosseum.networks.model import PolicyModel
+
+
+def deep_cpu_copy(obj: Any) -> Any:
+    """Recursively copy ``obj`` so it shares no storage with live training state.
+
+    Tensors -> ``.detach().cpu().clone()``; numpy arrays -> ``.copy()``; dicts,
+    lists and tuples are rebuilt; anything else is ``copy.deepcopy``'d.
+    """
+    if isinstance(obj, torch.Tensor):
+        return obj.detach().cpu().clone()
+    if isinstance(obj, np.ndarray):
+        return obj.copy()
+    if isinstance(obj, dict):
+        return {k: deep_cpu_copy(v) for k, v in obj.items()}
+    if isinstance(obj, list):
+        return [deep_cpu_copy(v) for v in obj]
+    if isinstance(obj, tuple):
+        return tuple(deep_cpu_copy(v) for v in obj)
+    return copy.deepcopy(obj)
 
 
 class BaseAlgorithm(ABC):
@@ -57,6 +78,18 @@ class BaseAlgorithm(ABC):
         algorithms with schedules (APPO's learning rate) override it.
         """
         return None
+
+    def state_dict(self) -> dict[str, Any]:
+        """Full training state except model weights, as a deep CPU copy.
+
+        APPO keys: optimizer, progress, scaler, kickstart, policy_version,
+        consumed_samples. Checkpoints store it as ``trainer_state.pt`` (T5.3).
+        """
+        raise NotImplementedError(f"{type(self).__name__} does not implement state_dict()")
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore what :meth:`state_dict` returned (model weights are loaded separately)."""
+        raise NotImplementedError(f"{type(self).__name__} does not implement load_state_dict()")
 
     @property
     def optimizer_state_dict(self) -> dict:

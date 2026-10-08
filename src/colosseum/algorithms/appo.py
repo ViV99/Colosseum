@@ -12,11 +12,12 @@ to OpenAI Five's approach.
 from __future__ import annotations
 
 import math
+from typing import Any
 
 import torch
 import torch.nn.functional as F
 
-from colosseum.algorithms.base import BaseAlgorithm
+from colosseum.algorithms.base import BaseAlgorithm, deep_cpu_copy
 from colosseum.algorithms.vtrace import compute_vtrace
 from colosseum.bc.kickstart import KickstartLoss
 from colosseum.core.config import AlgorithmConfig, LRSchedule
@@ -37,18 +38,36 @@ def _check_teacher_state_layout(student: PolicyModel, teacher: PolicyModel) -> N
         )
 
 
+# Layout of every key ``APPO._prepare_batch`` produces (``_select_chunks`` rejects others).
+_TIME_MAJOR_KEYS = frozenset({
+    "observations", "actions", "behavior_log_probs", "rewards", "dones", "old_values", "action_masks",
+})                                                   # [T, B, ...]
+_CHUNK_MAJOR_KEYS = frozenset({"bootstrap_values"})  # [B, ...]
+_STATE_KEY = "initial_state"                         # State pytree, leaves [B, ...]
+
+
 def _select_chunks(batch: dict, idx: torch.Tensor) -> dict:
     """Rows ``idx`` of the chunk dimension of a prepared batch (``[T, B, ...]`` -> ``[T, b, ...]``)."""
     idx = idx.to(batch["rewards"].device)
     out = {}
     for key, value in batch.items():
-        if key == "initial_state":
+        if key == _STATE_KEY:
             out[key] = slice_batch(value, idx)
-        elif key == "bootstrap_values":
+        elif key in _CHUNK_MAJOR_KEYS:
             out[key] = value[idx]
-        else:
+        elif key in _TIME_MAJOR_KEYS:
             out[key] = value[:, idx]
+        else:
+            raise KeyError(f"_select_chunks: batch key {key!r} has no declared layout")
     return out
+
+
+def _explained_variance(predicted: torch.Tensor, target: torch.Tensor) -> torch.Tensor:
+    """1 - Var(target - predicted) / Var(target); 0 when the target is (near) constant."""
+    var_target = target.float().var(unbiased=False)
+    if var_target < 1e-8:
+        return torch.zeros((), device=target.device)
+    return 1.0 - (target.float() - predicted.float()).var(unbiased=False) / var_target
 
 
 class APPO(BaseAlgorithm):
@@ -69,6 +88,7 @@ class APPO(BaseAlgorithm):
         self._config = config
         self._device = device
         self._policy_version = 0
+        self._consumed_samples = 0
         self._kickstart = kickstart
         self._pin_memory = pin_memory
 
@@ -98,6 +118,11 @@ class APPO(BaseAlgorithm):
     @property
     def policy_version(self) -> int:
         return self._policy_version
+
+    @property
+    def consumed_samples(self) -> int:
+        """Total transitions passed to train_step (sum of chunk lengths)."""
+        return self._consumed_samples
 
     def set_progress(self, progress: float) -> None:
         """Set the share (0..1) of the global env-step budget consumed so far.
@@ -196,19 +221,24 @@ class APPO(BaseAlgorithm):
         _, log_probs, values, _ = self._evaluate(self._prepare_batch(chunks))
         return log_probs.reshape(-1), values.reshape(-1)
 
-    def compute_loss(self, chunks: list[TrajectoryChunk], batch: dict | None = None) -> dict[str, torch.Tensor]:
-        """APPO loss for one minibatch of chunks.
+    def compute_loss(self, chunks: list[TrajectoryChunk]) -> dict[str, torch.Tensor]:
+        """APPO loss and diagnostics for one minibatch of chunks (see ``_loss_from_batch``)."""
+        return self._loss_from_batch(self._prepare_batch(chunks))
 
-        1. Stack chunks to [T, B, ...] (or use ``batch``, the already prepared
-           batch of exactly these chunks, as ``train_step`` passes); unroll the
-           model from the chunks' initial states with the chunks' dones and masks.
+    def _loss_from_batch(self, batch: dict) -> dict[str, torch.Tensor]:
+        """APPO loss for one prepared minibatch (``_prepare_batch`` output or a
+        ``_select_chunks`` slice of it; the batch is the only input, so chunks and
+        tensors cannot disagree).
+
+        1. Unroll the model over the [T, B, ...] batch from the chunks' initial
+           states with the chunks' dones and action masks (``_evaluate``).
         2. V-trace(lambda) targets and advantages from the recomputed log-probs/values.
         3. PPO clipped surrogate on the V-trace advantages, value MSE, entropy bonus.
         4. Optional kickstart KL on the same (masked) student distribution.
+        5. Diagnostics: approx_kl, clip_fraction, rho_mean, rho_clip_frac,
+           explained_variance (of the V-trace targets by the new values).
         """
         cfg = self._config
-        if batch is None:
-            batch = self._prepare_batch(chunks)
         masks = batch.get("action_masks")          # [T, B, A] | None
         dones = batch["dones"].bool()              # [T, B]
         state0 = batch["initial_state"]            # leaves [B, ...]
@@ -259,6 +289,9 @@ class APPO(BaseAlgorithm):
         with torch.no_grad():
             approx_kl = ((ratio - 1) - log_ratio).mean()
             clip_fraction = ((ratio - 1.0).abs() > cfg.eps_clip).float().mean()
+            rho_mean = ratio.mean()
+            rho_clip_frac = (ratio > cfg.vtrace_rho_bar).float().mean()
+            explained_variance = _explained_variance(new_values, vtrace_targets)
 
         result = {
             "total_loss": total_loss,
@@ -267,80 +300,105 @@ class APPO(BaseAlgorithm):
             "entropy": -entropy_loss,
             "approx_kl": approx_kl,
             "clip_fraction": clip_fraction,
+            "rho_mean": rho_mean,
+            "rho_clip_frac": rho_clip_frac,
+            "explained_variance": explained_variance,
         }
         if self._kickstart is not None:
             result["kickstart_loss"] = kickstart_loss.detach()
             result["kickstart_lambda"] = torch.tensor(self._kickstart.current_lambda)
         return result
 
-    def train_step(self, chunks: list[TrajectoryChunk]) -> dict[str, float]:
-        """Full training step with minibatch iterations.
+    def _clip_gradients(self) -> torch.Tensor:
+        """Clip to ``max_grad_norm``; return the total gradient norm BEFORE clipping.
 
-        Performs num_epochs passes over the data, splitting into minibatches.
+        Under AMP the caller must have unscaled the gradients first.
+        """
+        return torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._config.max_grad_norm)
+
+    def train_step(self, chunks: list[TrajectoryChunk]) -> dict[str, float]:
+        """One training step: normalizer update, then num_epochs x minibatches of updates.
+
+        The step's chunks are stacked and moved once; minibatches are slices of
+        that batch over the chunk dimension B, so each chunk's [T] sequence stays
+        intact and stateful models unroll correctly. The LR is set only by
+        ``set_progress`` (called by the learner before each step).
         """
         cfg = self._config
         metrics_accum: dict[str, float] = {}
         num_updates = 0
 
-        # Stack and move the step's chunks once; minibatches are slices of it.
         full_batch = self._prepare_batch(chunks)
 
         # Refresh observation-normalization statistics once per train step, from
         # this step's fresh samples only (never once per epoch/minibatch forward).
         self._model.update_normalizers(full_batch["observations"].flatten(0, 1))
 
+        mb_size = cfg.minibatch_chunks if cfg.minibatch_chunks > 0 else len(chunks)
         for _epoch in range(cfg.num_epochs):
-            # For APPO, we typically do a single pass (num_epochs=1)
-            # because the data is already off-policy. Multiple epochs
-            # further increase the off-policyness.
-            # However, we support multiple epochs for flexibility.
-
-            # Shuffle chunks and create minibatches (minibatching is over the
-            # batch dimension B = number of chunks; each chunk's [T] sequence
-            # stays intact so recurrent training is unaffected).
+            # APPO data is already off-policy, so num_epochs is typically 1;
+            # more epochs increase the off-policyness further.
             indices = torch.randperm(len(chunks))
-            mb_size = cfg.minibatch_chunks if cfg.minibatch_chunks > 0 else len(chunks)
-
             for start in range(0, len(chunks), mb_size):
-                end = min(start + mb_size, len(chunks))
-                mb_indices = indices[start:end]
-                mb_chunks = [chunks[i] for i in mb_indices]
-
-                if not mb_chunks:
-                    continue
-
-                losses = self.compute_loss(mb_chunks, batch=_select_chunks(full_batch, mb_indices))
+                losses = self._loss_from_batch(_select_chunks(full_batch, indices[start:start + mb_size]))
                 total_loss = losses["total_loss"]
 
                 self._optimizer.zero_grad()
-
                 if self._scaler is not None:
                     self._scaler.scale(total_loss).backward()
-                    if cfg.max_grad_norm > 0:
-                        self._scaler.unscale_(self._optimizer)
-                        torch.nn.utils.clip_grad_norm_(self._model.parameters(), cfg.max_grad_norm)
+                    self._scaler.unscale_(self._optimizer)
+                    grad_norm = self._clip_gradients()
                     self._scaler.step(self._optimizer)
                     self._scaler.update()
                 else:
                     total_loss.backward()
-                    if cfg.max_grad_norm > 0:
-                        torch.nn.utils.clip_grad_norm_(self._model.parameters(), cfg.max_grad_norm)
+                    grad_norm = self._clip_gradients()
                     self._optimizer.step()
+                losses["grad_norm"] = grad_norm
 
-                # Accumulate metrics
                 for key, value in losses.items():
-                    if key not in metrics_accum:
-                        metrics_accum[key] = 0.0
-                    metrics_accum[key] += value.item()
+                    metrics_accum[key] = metrics_accum.get(key, 0.0) + value.item()
                 num_updates += 1
 
         if self._kickstart is not None:
             self._kickstart.step()
-
         self._policy_version += 1
+        self._consumed_samples += sum(c.chunk_length for c in chunks)
 
-        # Average metrics
         metrics = {k: v / max(1, num_updates) for k, v in metrics_accum.items()}
         metrics["policy_version"] = float(self._policy_version)
-        metrics["learning_rate"] = self._optimizer.param_groups[0]["lr"]
+        metrics["lr"] = float(self._optimizer.param_groups[0]["lr"])
         return metrics
+
+    def state_dict(self) -> dict[str, Any]:
+        """Deep CPU copy of the training state (model weights excluded).
+
+        Keys: ``optimizer``, ``progress`` (the LR is a function of it),
+        ``scaler`` (None without AMP), ``kickstart`` (None without kickstart),
+        ``policy_version``, ``consumed_samples``.
+        """
+        return deep_cpu_copy({
+            "optimizer": self._optimizer.state_dict(),
+            "progress": float(self._progress),
+            "scaler": self._scaler.state_dict() if self._scaler is not None else None,
+            "kickstart": self._kickstart.state_dict() if self._kickstart is not None else None,
+            "policy_version": int(self._policy_version),
+            "consumed_samples": int(self._consumed_samples),
+        })
+
+    def load_state_dict(self, state: dict[str, Any]) -> None:
+        """Restore :meth:`state_dict` output; the input is copied, never aliased.
+
+        The optimizer moves its state to the parameters' device. A saved scaler
+        or kickstart state is ignored when this run has no AMP / no kickstart.
+        The LR is re-derived from the restored progress.
+        """
+        state = deep_cpu_copy(state)
+        self._optimizer.load_state_dict(state["optimizer"])
+        if self._scaler is not None and state["scaler"] is not None:
+            self._scaler.load_state_dict(state["scaler"])
+        if self._kickstart is not None and state["kickstart"] is not None:
+            self._kickstart.load_state_dict(state["kickstart"])
+        self._policy_version = int(state["policy_version"])
+        self._consumed_samples = int(state["consumed_samples"])
+        self.set_progress(float(state["progress"]))

@@ -210,13 +210,16 @@ def test_appo_rejects_teacher_with_different_state_layout():
 
 
 @pytest.mark.gpu
-def test_kickstart_forward_kl_on_cuda_with_masks_and_lstm():
+@pytest.mark.parametrize("use_amp", [False, True])
+def test_kickstart_forward_kl_on_cuda_with_masks_and_lstm(use_amp):
     model = _masked_toy_model(core="lstm")
     chunks = rollout_chunks(model, MaskedToyEnv, num_chunks=4, chunk_length=8)
     assert all(c.action_masks is not None for c in chunks)
     teacher = _masked_toy_model(core="lstm")
     ks = KickstartLoss(teacher, initial_lambda=1.0, decay_steps=100, direction="forward")
-    algo = APPO(model, AlgorithmConfig(num_epochs=1, minibatch_chunks=0), device="cuda", kickstart=ks)
+    algo = APPO(model, AlgorithmConfig(num_epochs=1, minibatch_chunks=0, use_amp=use_amp),
+                device="cuda", kickstart=ks)
+    assert algo._use_amp == use_amp
     assert next(teacher.parameters()).device.type == "cuda"
     assert next(algo.model.parameters()).device.type == "cuda"
     metrics = algo.train_step(chunks)

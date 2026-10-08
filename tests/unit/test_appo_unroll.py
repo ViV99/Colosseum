@@ -124,7 +124,19 @@ def test_minibatch_slice_of_step_batch_equals_prepared_minibatch(core):
     chunks = rollout_chunks(model, MaskedToyEnv, num_chunks=4, chunk_length=8)
     algo = APPO(model, AlgorithmConfig(), device="cpu")
     idx = torch.tensor([2, 0])
-    sliced = algo.compute_loss([chunks[2], chunks[0]], batch=_select_chunks(algo._prepare_batch(chunks), idx))
+    sliced = algo._loss_from_batch(_select_chunks(algo._prepare_batch(chunks), idx))
     fresh = algo.compute_loss([chunks[2], chunks[0]])
     for key in fresh:
         torch.testing.assert_close(sliced[key], fresh[key], msg=key)
+
+
+def test_select_chunks_rejects_keys_without_a_declared_layout():
+    from colosseum.algorithms.appo import _select_chunks
+
+    batch = {"rewards": torch.zeros(5, 3), "bootstrap_values": torch.zeros(3), "per_chunk_extra": torch.zeros(3)}
+    with pytest.raises(KeyError, match="per_chunk_extra"):
+        _select_chunks(batch, torch.tensor([0, 2]))
+    sliced = _select_chunks({"rewards": torch.arange(15.0).reshape(5, 3), "bootstrap_values": torch.arange(3.0)},
+                            torch.tensor([2, 0]))
+    assert torch.equal(sliced["rewards"][:, 0], torch.arange(15.0).reshape(5, 3)[:, 2])
+    assert torch.equal(sliced["bootstrap_values"], torch.tensor([2.0, 0.0]))

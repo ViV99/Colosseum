@@ -54,7 +54,7 @@ def test_train_step_updates_version():
 
     assert algo.policy_version == 1
     assert "total_loss" in metrics
-    assert "learning_rate" in metrics
+    assert "lr" in metrics
 
 
 def test_loss_is_finite():
