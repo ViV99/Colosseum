@@ -367,6 +367,10 @@ class MetricsConfig(StrictModel):
     wandb_project: str = Field(default="colosseum", description="WandB project name.")
     wandb_entity: str | None = Field(default=None, description="WandB entity (team or user).")
     log_interval: int = Field(default=10, ge=1, description="Log metrics every N training steps.")
+    console_interval_sec: float = Field(
+        default=10.0, ge=0.0,
+        description="Seconds between console progress lines and episodes/system/ratings records.",
+    )
 
 
 class RunConfig(StrictModel):

@@ -21,6 +21,7 @@ import logging
 import multiprocessing as mp
 import queue
 import time
+from typing import Any
 
 import numpy as np
 import torch
@@ -30,7 +31,6 @@ from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.ipc import SharedCounter
 from colosseum.core.run_dir import RunDir
 from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig
-from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import run_child
 
@@ -118,6 +118,7 @@ def _worker_main(
     slot_agent_map: list[list[str]] | None = None,
     results_queue: mp.Queue | None = None,
     command_queue: mp.Queue | None = None,
+    metrics_queue: mp.Queue | None = None,
 ) -> None:
     """Worker process body (see ``_worker_target``).
 
@@ -156,6 +157,7 @@ def _worker_main(
         collect_mask=collect_mask,
         results_queue=results_queue,
         command_queue=command_queue,
+        stats_queue=metrics_queue,
         seed=worker_seed,
         vec_env_kind=config.rollout.vec_env,
         subproc_workers=config.rollout.subproc_workers,
@@ -332,6 +334,17 @@ def _drain_queue(q) -> list:
             return items
 
 
+def _queue_depths(queues: dict[str, Any]) -> dict[str, int]:
+    """Approximate items waiting per queue (-1 where the platform cannot tell)."""
+    depths = {}
+    for name, q in queues.items():
+        try:
+            depths[name] = int(q.qsize())
+        except (NotImplementedError, OSError):
+            depths[name] = -1
+    return depths
+
+
 # =====================================================================
 # Launcher
 # =====================================================================
@@ -356,6 +369,9 @@ class Launcher:
         self._agent_ids: list[str] = []
         self._checkpoint_queues: dict[str, mp.Queue] = {}
         self._checkpoint_meta: dict[str, dict] = {}
+        # Set by launch(): the main process's single metrics sink (T6.3) and its queue-depth source.
+        self._hub = None
+        self._trajectory_queues: dict[str, mp.Queue] = {}
 
     @property
     def env_steps_done(self) -> int:
@@ -431,6 +447,7 @@ class Launcher:
         self._coordinator = coordinator
         self._agent_ids = list(trainable_agents)
         self._checkpoint_queues = checkpoint_queues
+        self._trajectory_queues = trajectory_queues
 
         # Start one learner per agent
         from colosseum.utils.seeding import learner_seed
@@ -508,18 +525,24 @@ class Launcher:
                     slot_agent_map=slot_agent_map,
                     results_queue=results_queue,
                     command_queue=command_queues[worker_id],
+                    metrics_queue=metrics_queue,
                 ),
                 daemon=worker_daemon,
             )
             worker_proc.start()
             self._processes.append(worker_proc)
 
-        # Initialize WandB
-        wandb_logger = WandBLogger(
-            cfg.metrics,
-            run_name=f"colosseum_{'_'.join(trainable_agents)}",
+        from colosseum.metrics.hub import MetricsHub
+        from colosseum.metrics.jsonl import MetricsWriter
+
+        self._hub = MetricsHub(
+            writer=MetricsWriter(self._run_dir.metrics_path),
+            ratings_path=self._run_dir.ratings_path,
+            agent_ids=trainable_agents,
+            total_timesteps=cfg.training.total_timesteps,
+            log_interval=cfg.metrics.log_interval,
+            console_interval_sec=cfg.metrics.console_interval_sec,
         )
-        wandb_logger.log_config(cfg.model_dump())
 
         # Monitor loop
         logger.info("Training started. Press Ctrl+C to stop.")
@@ -527,8 +550,6 @@ class Launcher:
             self._monitor_loop(
                 metrics_queue,
                 results_queue,
-                wandb_logger,
-                cfg.metrics.log_interval,
                 coordinator,
                 trainable_agents,
                 command_queues,
@@ -540,14 +561,16 @@ class Launcher:
             try:
                 self._shutdown()
             finally:
-                wandb_logger.finish()
+                # What arrived during shutdown (final train metrics, last results) is recorded too.
+                self._drain_results_and_metrics(results_queue, metrics_queue, coordinator)
+                self._hub.close(env_steps=int(self._env_step_counter.value),
+                                ratings=coordinator.ratings_snapshot(),
+                                queue_depths=_queue_depths(self._trajectory_queues))
 
     def _monitor_loop(
         self,
         metrics_queue: mp.Queue,
         results_queue: mp.Queue,
-        wandb_logger: WandBLogger,
-        log_interval: int,
         coordinator: Coordinator,
         agent_ids: list[str],
         command_queues: list[mp.Queue] | None = None,
@@ -568,7 +591,6 @@ class Launcher:
         """
         num_learners = len(agent_ids)
         learner_procs = dict(zip(agent_ids, self._processes[:num_learners], strict=True))
-        last_steps: dict[str, int] = {aid: 0 for aid in agent_ids}
 
         refresh_interval = self._config.rollout.match_refresh_interval_sec
         last_refresh = time.time()
@@ -593,27 +615,10 @@ class Launcher:
             # Process per-agent checkpoint saves
             self._drain_all_checkpoints()
 
-            # Process episode results from workers
-            while True:
-                try:
-                    result = results_queue.get_nowait()
-                    coordinator.report_match_result(result)
-                except queue.Empty:
-                    break
-
-            # Drain metrics queue
-            while True:
-                try:
-                    metrics = metrics_queue.get_nowait()
-                    step = int(metrics.get("train_step", 0))
-                    agent_id_m = metrics.pop("agent_id", "agent_0")
-
-                    last = last_steps.get(agent_id_m, 0)
-                    if step - last >= log_interval or step == 1:
-                        wandb_logger.log_train_step(agent_id_m, metrics, step)
-                        last_steps[agent_id_m] = step
-                except queue.Empty:
-                    break
+            self._drain_results_and_metrics(results_queue, metrics_queue, coordinator)
+            self._hub.maybe_tick(env_steps=int(self._env_step_counter.value),
+                                 ratings=coordinator.ratings_snapshot(),
+                                 queue_depths=_queue_depths(self._trajectory_queues))
 
             # Periodically refresh worker match assignments (C1).
             if (command_queues is not None
@@ -635,6 +640,19 @@ class Launcher:
                 break
 
             time.sleep(0.5)
+
+    def _drain_results_and_metrics(self, results_queue: mp.Queue, metrics_queue: mp.Queue,
+                                   coordinator: Coordinator) -> None:
+        """Feed queued match results (coordinator + hub) and metrics items to the hub."""
+        for result in _drain_queue(results_queue):
+            coordinator.report_match_result(result)
+            self._hub.on_match_result(result)
+        # Learner train metrics and worker stats share the metrics queue.
+        for item in _drain_queue(metrics_queue):
+            if item.get("kind") == "worker_stats":
+                self._hub.on_worker_stats(item)
+            else:
+                self._hub.on_train_metrics(item)
 
     def _resolve_resume(self, agent_configs: dict[str, ColosseumConfig]) -> dict[str, dict | None]:
         """Resolve ``training.resume_from`` for every trainable agent (see ``resolve_resume``).

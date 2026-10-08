@@ -115,7 +115,7 @@ def test_resolved_config_records_the_effective_auto_name(tmp_path):
 
 
 def test_resolved_config_write_is_atomic(tmp_path, monkeypatch):
-    import colosseum.core.run_dir as run_dir_module
+    import colosseum.utils.fs as fs_module  # the shared atomic writer (T6.3)
 
     cfg = make_config(tmp_path, name="atomic")
     run = RunDir.create(cfg)
@@ -125,7 +125,7 @@ def test_resolved_config_write_is_atomic(tmp_path, monkeypatch):
     def failing_replace(src, dst):
         raise OSError("disk full")
 
-    monkeypatch.setattr(run_dir_module.os, "replace", failing_replace)
+    monkeypatch.setattr(fs_module.os, "replace", failing_replace)
     changed = cfg.model_copy(update={"training": cfg.training.model_copy(update={"total_timesteps": 7})})
     with pytest.raises(OSError, match="disk full"):
         run.write_resolved_config(changed)

@@ -10,7 +10,6 @@
 
 from __future__ import annotations
 
-import os
 import re
 from dataclasses import dataclass
 from datetime import datetime
@@ -20,6 +19,7 @@ import yaml
 
 from colosseum.core.config import ColosseumConfig, check_path_component
 from colosseum.core.errors import ConfigError
+from colosseum.utils.fs import write_text_atomic
 
 RESOLVED_CONFIG_FILE = "config.resolved.yaml"
 
@@ -120,11 +120,4 @@ class RunDir:
     def write_resolved_config(self, config: ColosseumConfig) -> Path:
         """Write ``config`` (with the effective run name) atomically to ``config.resolved.yaml``."""
         data = self.with_run_name(config).model_dump(mode="json", by_alias=True)
-        path = self.resolved_config_path
-        tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
-        try:
-            tmp.write_text(yaml.safe_dump(data, sort_keys=False), encoding="utf-8")
-            os.replace(tmp, path)
-        finally:
-            tmp.unlink(missing_ok=True)
-        return path
+        return write_text_atomic(self.resolved_config_path, yaml.safe_dump(data, sort_keys=False))

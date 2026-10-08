@@ -555,7 +555,8 @@ Worker pods auto-scale via HPA based on CPU utilization. See `deployment/k8s/` f
 | `use_wandb` | `false` | Enable Weights & Biases logging |
 | `wandb_project` | `"colosseum"` | WandB project name |
 | `wandb_entity` | `null` | WandB entity (team or user) |
-| `log_interval` | `10` | Log metrics every N training steps |
+| `log_interval` | `10` | Write a `train` record to `metrics.jsonl` every N training steps |
+| `console_interval_sec` | `10.0` | Seconds between console progress lines and `episodes`/`system`/`ratings` records (`ratings.json` is rewritten at the same cadence) |
 
 ### `transport`
 

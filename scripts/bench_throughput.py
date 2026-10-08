@@ -3,33 +3,34 @@
 For every worker count the real ``Launcher`` runs (spawned worker and learner
 processes) with a pinned tic-tac-toe workload (``_make_config``: every value
 that affects the workload is set here, not inherited from the example yaml, so
-"before" and "after" runs measure the same work). The learner's metrics are
-captured in this process by replacing ``colosseum.launcher.WandBLogger`` with
-an in-memory recorder (the monitor loop forwards every learner metrics dict to
-it). After a warm-up period the script measures, over ``--duration`` seconds:
+"before" and "after" runs measure the same work). After the run the script reads
+the run's ``metrics.jsonl`` (T6.3): ``train`` records of ``agent_0`` (one per
+learner train step, ``metrics.log_interval=1``) and ``system`` records (one per
+``metrics.console_interval_sec``). Rates use the records' own ``ts``. After a
+warm-up period the script measures, over ``--duration`` seconds:
 
-- ``updates/s``          learner train steps per second;
-- ``env_steps/s``        env steps consumed by the learner per second, i.e.
-  ``chunks_received * chunk_length / num_players`` per second. This assumes
-  every seat records one transition per env step (true while TicTacToeEnv has
-  no ``info["active"]``; T6.3 switches to the global env-step counter).
-  Checkpoints are disabled, so every slot plays the latest policy and collects
-  data, and a full queue blocks the workers, so consumption equals production;
-- ``chunks/update``      chunks per train step. Equal to ``batch_chunks`` means
-  every batch was full (learner-bound); below it means the learner waited for
-  data (worker-bound).
+- ``updates/s``          learner train steps per second (``train`` records);
+- ``env_steps/s``        env steps per second from the global env-step counter
+  (``env_steps`` of the ``system`` records), so envs that mark inactive seats
+  (``info["active"]``) are counted correctly;
+- ``chunks/update``      chunks per train step (informational: since T2.4 every
+  batch has exactly ``batch_chunks`` chunks);
+- ``queue depth``        mean depth of the learner's trajectory queue over the
+  ``system`` records in the window. At or above ``LEARNER_BOUND_QUEUE_FRACTION``
+  of the queue capacity the workers wait for the learner (learner-bound); below
+  it the learner waits for data (worker-bound). ``unknown`` where the platform
+  cannot report queue sizes.
 
-A run whose measurement window is incomplete (too few learner samples, or
-learner metrics starting late / stopping early, e.g. because a learner died)
-is reported as an error, gets no row, and makes the script exit non-zero.
+Checkpoints are disabled, so every slot plays the latest policy and collects data.
+
+A run whose measurement window is incomplete (too few learner or system samples,
+or samples starting late / stopping early, e.g. because a learner died) is
+reported as an error, gets no row, and makes the script exit non-zero.
 
 Usage::
 
     .venv/bin/python scripts/bench_throughput.py                 # 1, 2, 4 workers, 60 s each
     .venv/bin/python scripts/bench_throughput.py --workers 1 2 --duration 30 --json out.json
-
-When the launcher stops reporting learner metrics through ``WandBLogger``
-(metrics.jsonl, block 6), switch ``_Recorder`` to that source.
 """
 
 from __future__ import annotations
@@ -54,35 +55,35 @@ ENVS_PER_WORKER = 8
 CHUNK_LENGTH = 32
 BATCH_CHUNKS = 8
 NUM_PLAYERS = 2
+QUEUE_SIZE = 4 * BATCH_CHUNKS  # learner.queue_size
+AGENT_ID = "agent_0"
+# Cadence of the ``system`` records in metrics.jsonl (measurement resolution, not workload).
+SYSTEM_RECORD_INTERVAL_S = 1.0
 
 # Window validation: minimum learner samples inside the window, and how far the
 # first / last sample may be from the window's start / end.
 MIN_WINDOW_SAMPLES = 5
 WINDOW_EDGE_TOLERANCE_S = 5.0
-# chunks/update at or above this fraction of batch_chunks counts as learner-bound.
-FULL_BATCH_FRACTION = 0.95
-
-# (monotonic time, train_step, chunks_received) per learner metrics message.
-_SAMPLES: list[tuple[float, int, int]] = []
+# Mean learner queue depth at or above this fraction of QUEUE_SIZE counts as learner-bound.
+LEARNER_BOUND_QUEUE_FRACTION = 0.5
 
 
-class _Recorder:
-    """Stand-in for WandBLogger with the same interface; records learner metrics."""
+def load_samples(metrics_path: str | Path, agent_id: str = AGENT_ID) -> tuple[list, list]:
+    """``metrics.jsonl`` -> (train, system) samples of ``agent_id``.
 
-    def __init__(self, config, run_name=None) -> None:
-        pass
-
-    def log_config(self, config) -> None:
-        pass
-
-    def log_metrics(self, metrics, step=None) -> None:
-        pass
-
-    def log_train_step(self, agent_id, metrics, step) -> None:
-        _SAMPLES.append((time.monotonic(), int(step), int(metrics.get("chunks_received", 0))))
-
-    def finish(self) -> None:
-        pass
+    train:  ``(ts, train_step, chunks_received)`` per ``train`` record;
+    system: ``(ts, env_steps, queue_depth)`` per ``system`` record (depth -1 = unknown).
+    """
+    train, system = [], []
+    for line in Path(metrics_path).read_text().splitlines():
+        if not line.strip():
+            continue
+        r = json.loads(line)
+        if r["kind"] == "train" and r["agent"] == agent_id:
+            train.append((float(r["ts"]), int(r["train_step"]), int(r.get("chunks_received") or 0)))
+        elif r["kind"] == "system":
+            system.append((float(r["ts"]), int(r["env_steps"]), int(r["queue_depths"].get(agent_id, -1))))
+    return train, system
 
 
 def _make_config(num_workers: int, run_parent: str):
@@ -134,7 +135,7 @@ def _make_config(num_workers: int, run_parent: str):
         },
         learner={
             "device": "cpu",
-            "queue_size": 4 * BATCH_CHUNKS,
+            "queue_size": QUEUE_SIZE,
             "batch_chunks": BATCH_CHUNKS,
             "weight_push_interval": 5,
             "pin_memory": False,
@@ -153,7 +154,7 @@ def _make_config(num_workers: int, run_parent: str):
         },
         checkpoint={"save_optimizer": True},
         run={"dir": run_parent, "name": f"bench-w{num_workers}"},
-        metrics={"use_wandb": False, "log_interval": 1},
+        metrics={"use_wandb": False, "log_interval": 1, "console_interval_sec": SYSTEM_RECORD_INTERVAL_S},
         transport={"mode": "local"},
     )
 
@@ -162,60 +163,77 @@ def _window(samples: list[tuple[float, int, int]], start: float, end: float) -> 
     return [s for s in samples if start <= s[0] <= end]
 
 
-def validate_window(samples: list[tuple[float, int, int]], start: float, end: float) -> str | None:
-    """Return an error message if the measurement window is incomplete, else None."""
+def validate_window(samples: list[tuple[float, int, int]], start: float, end: float,
+                    source: str = "learner") -> str | None:
+    """Return an error message if the measurement window of ``source`` samples is incomplete, else None."""
     window = _window(samples, start, end)
     if len(window) < MIN_WINDOW_SAMPLES:
-        return f"only {len(window)} learner samples in the window (need >= {MIN_WINDOW_SAMPLES})"
+        return f"only {len(window)} {source} samples in the window (need >= {MIN_WINDOW_SAMPLES})"
     first, last = window[0][0], window[-1][0]
     if first - start > WINDOW_EDGE_TOLERANCE_S:
-        return f"first sample {first - start:.1f}s after the window start (learner started late or stalled)"
+        return f"first sample {first - start:.1f}s after the window start ({source} started late or stalled)"
     if end - last > WINDOW_EDGE_TOLERANCE_S:
-        return f"last sample {end - last:.1f}s before the window end (learner stopped early or stalled)"
+        return f"last sample {end - last:.1f}s before the window end ({source} stopped early or stalled)"
     return None
 
 
-def compute_rates(samples: list[tuple[float, int, int]], start: float, end: float, num_players: int) -> dict:
-    """Rates over the window; call only after ``validate_window`` returned None."""
-    window = _window(samples, start, end)
+def classify_bound(queue_depth_mean: float | None, queue_size: int = QUEUE_SIZE) -> str:
+    """'learner' (queue mostly full), 'worker' (queue mostly empty) or 'unknown' (no depth)."""
+    if queue_depth_mean is None:
+        return "unknown"
+    return "learner" if queue_depth_mean >= LEARNER_BOUND_QUEUE_FRACTION * queue_size else "worker"
+
+
+def compute_rates(train: list[tuple[float, int, int]], system: list[tuple[float, int, int]],
+                  start: float, end: float) -> dict:
+    """Rates over the window; call only after ``validate_window`` returned None for both sample lists."""
+    window = _window(train, start, end)
     (t0, step0, chunks0), (t1, step1, chunks1) = window[0], window[-1]
-    dt = max(t1 - t0, 1e-9)
     steps = step1 - step0
     chunks = chunks1 - chunks0
-    chunks_per_update = chunks / steps if steps else 0.0
+    sys_window = _window(system, start, end)
+    (s0, env0, _), (s1, env1, _) = sys_window[0], sys_window[-1]
+    depths = [d for _, _, d in sys_window]
+    queue_depth_mean = sum(depths) / len(depths) if all(d >= 0 for d in depths) else None
     return {
-        "updates_per_s": steps / dt,
-        "env_steps_per_s": chunks * CHUNK_LENGTH / num_players / dt,
-        "chunks_per_update": chunks_per_update,
-        "bound": "learner" if chunks_per_update >= FULL_BATCH_FRACTION * BATCH_CHUNKS else "worker",
+        "updates_per_s": steps / max(t1 - t0, 1e-9),
+        "env_steps_per_s": (env1 - env0) / max(s1 - s0, 1e-9),
+        "chunks_per_update": chunks / steps if steps else 0.0,
+        "queue_depth_mean": queue_depth_mean,
+        "bound": classify_bound(queue_depth_mean),
         "train_steps": steps,
     }
 
 
 def run_one(num_workers: int, duration: float, warmup: float) -> dict:
     """Run one configuration; raises RuntimeError if the window is incomplete."""
-    import colosseum.launcher as launcher_mod
     from colosseum.core.run_dir import RunDir
+    from colosseum.launcher import Launcher
 
-    _SAMPLES.clear()
-    launcher_mod.WandBLogger = _Recorder
     with tempfile.TemporaryDirectory(prefix="bench-") as tmp:
         config = _make_config(num_workers, tmp)
-        launcher = launcher_mod.Launcher(config, RunDir.create(config))
-        started = time.monotonic()
+        run_dir = RunDir.create(config)
+        launcher = Launcher(config, run_dir)
+        started = time.time()  # metrics.jsonl ``ts`` is Unix time
         timer = threading.Timer(warmup + duration, launcher._stop_event.set)
         timer.start()
         try:
             launcher.launch()
         finally:
             timer.cancel()
+        train, system = load_samples(run_dir.metrics_path)
     start, end = started + warmup, started + warmup + duration
-    error = validate_window(_SAMPLES, start, end)
+    error = validate_window(train, start, end, "learner") or validate_window(system, start, end, "system")
     if error is not None:
         raise RuntimeError(error)
-    result = compute_rates(_SAMPLES, start, end, config.env.num_players)
+    result = compute_rates(train, system, start, end)
     result["workers"] = num_workers
     return result
+
+
+def _fmt_depth(result: dict) -> str:
+    depth = result["queue_depth_mean"]
+    return "-" if depth is None else f"{depth:.1f}/{QUEUE_SIZE}"
 
 
 def main() -> int:
@@ -244,6 +262,7 @@ def main() -> int:
         "envs_per_worker": ENVS_PER_WORKER,
         "chunk_length": CHUNK_LENGTH,
         "batch_chunks": BATCH_CHUNKS,
+        "queue_size": QUEUE_SIZE,
         "warmup_s": args.warmup,
         "duration_s": args.duration,
     }
@@ -262,18 +281,18 @@ def main() -> int:
         results.append(r)
         print(
             f"workers={n}: updates/s={r['updates_per_s']:.2f} env_steps/s={r['env_steps_per_s']:.0f} "
-            f"chunks/update={r['chunks_per_update']:.2f} ({r['bound']}-bound, "
+            f"chunks/update={r['chunks_per_update']:.2f} queue depth={_fmt_depth(r)} ({r['bound']}-bound, "
             f"train_steps in window={r['train_steps']})",
             flush=True,
         )
 
     print()
-    print("| workers | updates/s | env steps/s | chunks/update | bound |")
-    print("|---|---|---|---|---|")
+    print("| workers | updates/s | env steps/s | chunks/update | queue depth | bound |")
+    print("|---|---|---|---|---|---|")
     for r in results:
         print(
             f"| {r['workers']} | {r['updates_per_s']:.2f} | {r['env_steps_per_s']:.0f} "
-            f"| {r['chunks_per_update']:.2f} | {r['bound']} |"
+            f"| {r['chunks_per_update']:.2f} | {_fmt_depth(r)} | {r['bound']} |"
         )
 
     if failed:

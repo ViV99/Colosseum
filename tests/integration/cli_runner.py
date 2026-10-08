@@ -27,6 +27,7 @@ TINY: dict[str, str] = {
     "self_play.checkpoint_interval": "20",
     "self_play.pool_size": "5",
     "metrics.log_interval": "1",
+    "metrics.console_interval_sec": "1.0",
 }
 
 

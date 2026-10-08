@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import queue
 import time
@@ -166,35 +167,16 @@ def test_multi_agent_pipeline(tmp_path):
     assert all(manager.list_checkpoints(aid) for aid in config.get_trainable_agent_ids())
 
 
-class _MetricsRecorder:
-    """Stand-in for ``WandBLogger``: records every learner metrics dict the monitor forwards."""
-
-    records: list[tuple[str, int, dict]] = []
-
-    def __init__(self, *args, **kwargs) -> None:
-        pass
-
-    def log_config(self, config: dict) -> None:
-        pass
-
-    def log_train_step(self, agent_id: str, metrics: dict, step: int) -> None:
-        self.records.append((agent_id, step, dict(metrics)))
-
-    def finish(self) -> None:
-        pass
-
-
 @pytest.mark.timeout(900)
-def test_multi_agent_learners_both_train_until_the_budget(tmp_path, monkeypatch):
+def test_multi_agent_learners_both_train_until_the_budget(tmp_path):
     """Two learners share the workers; both keep training until the global budget stops the run.
 
     Regression (T2.5): with per-learner step budgets, the first learner to finish
     left the workers blocked on its full chunk queue and the other agent starved.
+    Learner metrics are read from the run's ``metrics.jsonl`` (T6.3).
     """
-    import colosseum.launcher as launcher_mod
+    from colosseum.launcher import Launcher
 
-    _MetricsRecorder.records = []
-    monkeypatch.setattr(launcher_mod, "WandBLogger", _MetricsRecorder)
     config = _config(
         "tic_tac_toe_multi.yaml", tmp_path,
         training={"total_timesteps": 3000},
@@ -202,16 +184,18 @@ def test_multi_agent_learners_both_train_until_the_budget(tmp_path, monkeypatch)
         learner={"batch_chunks": 2, "queue_size": 16, "device": "cpu"},
         metrics={"log_interval": 1},
     )
-    launcher = launcher_mod.Launcher(config, make_test_run_dir(config, tmp_path))
+    run = make_test_run_dir(config, tmp_path)
+    launcher = Launcher(config, run)
     launcher.launch()
 
+    records = [json.loads(line) for line in run.metrics_path.read_text().splitlines()]
+    train = [(r["agent"], r["train_step"], r) for r in records if r["kind"] == "train"]
     assert launcher.env_steps_done >= 3000
     agent_ids = config.get_trainable_agent_ids()
     assert len(agent_ids) == 2
-    last_step = {aid: max((s for a, s, _ in _MetricsRecorder.records if a == aid), default=0)
-                 for aid in agent_ids}
-    max_progress = {aid: max((m["progress"] for a, _, m in _MetricsRecorder.records if a == aid),
-                             default=0.0) for aid in agent_ids}
+    last_step = {aid: max((s for a, s, _ in train if a == aid), default=0) for aid in agent_ids}
+    max_progress = {aid: max((m["progress"] for a, _, m in train if a == aid), default=0.0)
+                    for aid in agent_ids}
     # Both learners were still training in the second half of the budget ...
     assert all(p >= 0.5 for p in max_progress.values()), max_progress
     # ... and neither starved: they trained comparable numbers of steps.

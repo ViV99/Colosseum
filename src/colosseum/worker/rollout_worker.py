@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import logging
 import queue
+import time
 from collections.abc import Callable
 from typing import Any
 
@@ -23,7 +24,7 @@ from colosseum.envs.base_env import BaseEnv
 from colosseum.networks.model import PolicyModel
 from colosseum.worker.rollout_loop import LATEST_NETWORK_ID, LoopIO, RolloutLoop
 
-__all__ = ["LATEST_NETWORK_ID", "rollout_worker_process"]
+__all__ = ["LATEST_NETWORK_ID", "report_worker_stats", "rollout_worker_process"]
 
 logger = logging.getLogger(__name__)
 
@@ -47,6 +48,15 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
     if latest is not None:
         latest.new_checkpoints = merged
     return latest
+
+
+def report_worker_stats(q, worker_id: int, stats: dict) -> None:
+    """Best-effort worker stats for the main process (system metrics). Never blocks."""
+    try:
+        q.put_nowait({"kind": "worker_stats", "worker_id": int(worker_id),
+                      **{k: int(v) for k, v in stats.items()}})
+    except queue.Full:
+        pass
 
 
 def rollout_worker_process(
@@ -74,6 +84,8 @@ def rollout_worker_process(
     seed: int | None = None,
     vec_env_kind: str = "sync",
     subproc_workers: int | None = None,
+    stats_queue: Any = None,
+    stats_interval_sec: float = 2.0,
 ) -> None:
     """Worker process entry point (see module docstring).
 
@@ -132,8 +144,17 @@ def rollout_worker_process(
         checkpoint_state_dicts_by_agent=checkpoint_state_dicts_by_agent, seed=seed,
         vec_env_kind=vec_env_kind, subproc_workers=subproc_workers,
     )
+    last_stats = [time.monotonic()]
+
+    def should_stop() -> bool:
+        now = time.monotonic()
+        if stats_queue is not None and now - last_stats[0] >= stats_interval_sec:
+            last_stats[0] = now
+            report_worker_stats(stats_queue, worker_id, loop.stats)
+        return stop_event.is_set()
+
     try:
-        loop.run(should_stop=stop_event.is_set, max_env_steps=max_env_steps)
+        loop.run(should_stop=should_stop, max_env_steps=max_env_steps)
     finally:
         if counter is not None:
             counter.flush()
@@ -142,7 +163,7 @@ def rollout_worker_process(
         finally:
             # Detach feeder threads of queues this worker produced to, so undrained
             # items (e.g. chunks a stopped learner never consumed) cannot block exit.
-            for q in [*trajectory_queues.values(), results_queue]:
+            for q in [*trajectory_queues.values(), results_queue, stats_queue]:
                 if q is not None and hasattr(q, "cancel_join_thread"):
                     q.cancel_join_thread()
     logger.info(f"Worker {worker_id}: finished. {loop.stats}")
