@@ -71,6 +71,13 @@ def test_bc_rejects_non_positive_counts(tmp_path):
         assert result.exit_code == 2 and option in result.output
 
 
+def test_bc_cli_has_no_action_type_option(tmp_path):
+    cfg_path = write_test_config(tmp_path / "cfg.yaml", "turns")
+    write_data(tmp_path / "data.pt", make_test_config("turns"))
+    result = bc("-c", cfg_path, "-d", tmp_path / "data.pt", "-o", tmp_path / "x.pt", "--action-type", "discrete")
+    assert result.exit_code == 2 and "No such option" in result.output
+
+
 def _garbage(tmp_path):
     path = tmp_path / "data.pt"
     path.write_bytes(b"not a torch file")

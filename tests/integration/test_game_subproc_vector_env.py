@@ -1,5 +1,6 @@
 """SubprocessVectorEnv v2: parity with VectorEnv, batched requests, forwarded errors, close (SP2 T1.6)."""
 import functools
+import os
 import time
 
 import numpy as np
@@ -55,6 +56,17 @@ def test_parity_with_vector_env():
         assert _drive(sub, 3) == _drive(ref, 3)
     finally:
         ref.close()
+        sub.close()
+
+
+def test_default_num_workers_is_min_of_envs_and_cpus():
+    """Default ``num_workers = min(num_envs, cpu_count)``; never more than ``num_envs`` (SP1 port)."""
+    sub = SubprocessVectorEnv(SoloCounterGame, num_envs=2)
+    try:
+        assert sub.num_workers == min(2, os.cpu_count() or 1)
+        assert sub.num_workers <= sub.num_envs
+        assert sorted(sub.reset({0: (1, "solo"), 1: (2, "solo")})) == [0, 1]
+    finally:
         sub.close()
 
 
