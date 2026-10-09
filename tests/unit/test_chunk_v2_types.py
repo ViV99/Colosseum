@@ -25,7 +25,9 @@ from colosseum.sp2.core.types import (
     WorkerCommand,
     state_dict_from_numpy,
     state_dict_to_numpy,
+    validate_slot_structure,
 )
+from game_helpers import chunk_v2_payload
 
 
 def _chunk(*, with_gs: bool, with_masks: bool, with_units: bool, state: str) -> TrajectoryChunk:
@@ -154,3 +156,38 @@ def test_weight_payload_and_state_dict_helpers_roundtrip():
     assert torch.equal(other.weight, model.weight)
     sd = {"x": torch.ones(2, dtype=torch.bfloat16)}
     assert state_dict_from_numpy(state_dict_to_numpy(sd))["x"].dtype == torch.float32
+
+
+def _chunk_of(pattern: str, **overrides) -> TrajectoryChunk:
+    payload = chunk_v2_payload(pattern=pattern, agent_id="hero")
+    payload.update(overrides)
+    return TrajectoryChunk.from_payload(payload)
+
+
+@pytest.mark.parametrize("pattern", ["AAAB", "ARTP", "ATPP", "TTTP", "ARAR", "AR", "AB"])
+def test_validate_slot_structure_accepts_worker_shaped_chunks(pattern):
+    validate_slot_structure(_chunk_of(pattern))
+
+
+@pytest.mark.parametrize("pattern,slot,rule", [
+    ("TTA", 2, "an ACT in the last slot"),
+    ("ATAP", 2, "an open ACT followed by a PAD"),
+    ("APTB", 0, "an open ACT followed by a PAD"),
+    ("BAAB", 0, "a BOOT that does not follow an open ACT"),
+    ("TBAB", 1, "a BOOT that does not follow an open ACT"),
+    ("PAAB", 0, "a PAD that does not follow the end of an episode"),
+    ("PPTP", 0, "a PAD that does not follow the end of an episode"),
+    ("ABAB", 1, "a BOOT without reset_after before the last slot"),
+])
+def test_validate_slot_structure_names_the_agent_slot_and_rule(pattern, slot, rule):
+    with pytest.raises(ValueError, match=rf"agent 'hero'.*slots '{pattern}'.*slot {slot}: {rule}"):
+        validate_slot_structure(_chunk_of(pattern))
+
+
+def test_validate_slot_structure_rejects_unknown_kinds_and_inconsistent_flags():
+    with pytest.raises(ValueError, match=r"agent 'hero'.*slots 'A\?TP'.*slot 1: unknown slot kind 7"):
+        validate_slot_structure(_chunk_of("AATP", kind=np.array([0, 7, 0, 2], np.int8)))
+    with pytest.raises(ValueError, match=r"agent 'hero'.*kind, terminal and reset_after"):
+        validate_slot_structure(_chunk_of("AAAB", terminal=np.zeros(3, np.bool_)))
+    with pytest.raises(ValueError, match=r"agent 'hero'.*no slots"):
+        validate_slot_structure(_chunk_of("", obs=np.zeros((0, 4), np.float32)))

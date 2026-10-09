@@ -7,6 +7,7 @@ top-level classes, so ``functools.partial(Game, ...)`` or the class itself is a 
 
 from __future__ import annotations
 
+import math
 import queue
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -20,8 +21,11 @@ from gymnasium.spaces import Box, Dict, Discrete, MultiBinary
 
 from colosseum.core.ipc import assert_no_tensors
 from colosseum.networks.cores import Core, GRUCore, LSTMCore, NoCore, WindowAttentionCore
+from colosseum.sp2.algorithms.appo import APPO
+from colosseum.sp2.core.config import AlgorithmConfig
 from colosseum.sp2.core.specs import ActionSpec, ObsSpec
 from colosseum.sp2.core.tree import Tree, tree_get, tree_leaves, tree_map, tree_to_torch
+from colosseum.sp2.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
 from colosseum.sp2.envs.contract import EpisodeTracker
 from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
 from colosseum.sp2.envs.spaces import Units
@@ -894,3 +898,89 @@ def synthetic_chunk(model, role, pattern: str, *, seed: int = 0, agent_id: str =
         else:
             raise ValueError(f"unknown slot letter {letter!r} in {pattern!r}")
     return buf.build_chunk(agent_id)
+
+
+# ---------------------------------------------------------------------------
+# Part B (T4.4): learner-loop test kit
+# ---------------------------------------------------------------------------
+
+
+LEARNER_OBS_DIM = 4
+_KIND_OF = {"A": SLOT_ACT, "T": SLOT_ACT, "B": SLOT_BOOT, "R": SLOT_BOOT, "P": SLOT_PAD}
+
+
+def learner_role(num_actions: int = 3) -> RoleSpec:
+    """Box(4) observations, Discrete(num_actions) actions: the learner-loop tests' role."""
+    return RoleSpec(gymnasium.spaces.Box(-1e9, 1e9, (LEARNER_OBS_DIM,), np.float32),
+                    gymnasium.spaces.Discrete(num_actions))
+
+
+def chunk_v2_payload(S: int = 4, version: int = 0, agent_id: str = "a", *, pattern: str | None = None,
+                     num_actions: int = 3) -> dict:
+    """A valid chunk v2 payload for ``learner_role(num_actions)`` with random content.
+
+    ``pattern`` spells the slots like ``synthetic_chunk`` (default: ``S - 1`` ACTs and a BOOT).
+    """
+    rng = np.random.default_rng(version)
+    pattern = pattern if pattern is not None else "A" * (S - 1) + "B"
+    S = len(pattern)
+    acts = np.array([c in "AT" for c in pattern])
+    return {
+        "agent_id": agent_id,
+        "policy_version": int(version),
+        "initial_state": None,
+        "obs": rng.standard_normal((S, LEARNER_OBS_DIM)).astype(np.float32),
+        "global_state": None,
+        "actions": np.where(acts, rng.integers(0, num_actions, S), 0).astype(np.int64),
+        "action_masks": np.ones((S, num_actions), np.bool_),
+        "kind": np.array([_KIND_OF[c] for c in pattern], np.int8),
+        "reward": np.where(acts, rng.standard_normal(S), 0.0).astype(np.float32),
+        "terminal": np.array([c == "T" for c in pattern]),
+        "reset_after": np.array([c in "TRP" for c in pattern]),
+        "behavior_logp": np.where(acts, -math.log(num_actions), 0.0).astype(np.float32),
+        "behavior_unit_logp": None,
+    }
+
+
+def learner_appo(num_actions: int = 3, **algo_config: Any) -> APPO:
+    """A real APPO (CPU) around ``make_test_model(learner_role(num_actions))``."""
+    role = learner_role(num_actions)
+    return APPO(make_test_model(role), AlgorithmConfig(**algo_config), ActionSpec.from_space(role.action_space),
+                device="cpu")
+
+
+class RecordingLearnerAlgorithm:
+    """Duck-typed algorithm for learner-loop tests: records what ``train_step`` was given."""
+
+    def __init__(self, start_version: int = 0) -> None:
+        self._model = make_test_model(learner_role())
+        self._policy_version = start_version
+        self._progress = 0.0
+        self.batches: list[int] = []
+        self.behavior_versions: list[list[int]] = []
+        self.progress_at_train: list[float] = []
+
+    @property
+    def model(self):
+        return self._model
+
+    @property
+    def policy_version(self) -> int:
+        return self._policy_version
+
+    @property
+    def is_off_policy(self) -> bool:
+        return False
+
+    def create_replay_buffer(self, capacity: int):
+        return None
+
+    def set_progress(self, progress: float) -> None:
+        self._progress = float(progress)
+
+    def train_step(self, chunks) -> dict[str, float]:
+        self.batches.append(len(chunks))
+        self.behavior_versions.append([c.policy_version for c in chunks])
+        self.progress_at_train.append(self._progress)
+        self._policy_version += 1
+        return {"total_loss": 0.0}

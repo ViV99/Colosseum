@@ -147,6 +147,77 @@ class TrajectoryChunk:
         )
 
 
+_SLOT_RULES = (
+    "an ACT in the last slot",
+    "an open ACT followed by a PAD",
+    "a BOOT that does not follow an open ACT",
+    "a PAD that does not follow the end of an episode",
+    "a BOOT without reset_after before the last slot",
+)
+
+
+def _spell_slots(kind: np.ndarray, terminal: np.ndarray, reset_after: np.ndarray) -> str:
+    """Slot letters as in the SP2 plan: A open ACT, T terminal ACT, B / R BOOT, P PAD, ? unknown."""
+    letters = []
+    for k, term, reset in zip(kind.tolist(), terminal.tolist(), reset_after.tolist(), strict=True):
+        if k == SLOT_ACT:
+            letters.append("T" if term else "A")
+        elif k == SLOT_BOOT:
+            letters.append("R" if reset else "B")
+        else:
+            letters.append("P" if k == SLOT_PAD else "?")
+    return "".join(letters)
+
+
+def validate_slot_structure(chunk: TrajectoryChunk) -> None:
+    """Raise ``ValueError`` (naming the agent) if ``chunk``'s slots break the chunk v2 rules.
+
+    The rules the worker's ``RolloutBuffer`` guarantees and the learner's V-trace relies on:
+    an ACT is never the last slot; an open (non-terminal) ACT is followed by an ACT or a
+    BOOT; a BOOT follows an open ACT; a PAD follows a slot that ends an episode (a terminal
+    ACT or a BOOT with ``reset_after``, possibly after other PADs); a BOOT without
+    ``reset_after`` takes only the last slot. The earliest broken slot is reported. A cheap
+    numpy check over ``kind`` / ``terminal`` / ``reset_after``.
+    """
+    kind = chunk.kind.cpu().numpy()
+    terminal = chunk.terminal.cpu().numpy().astype(bool)
+    reset_after = chunk.reset_after.cpu().numpy().astype(bool)
+    where = f"agent {chunk.agent_id!r}: malformed chunk v2 (policy_version {chunk.policy_version}"
+    if not (kind.ndim == terminal.ndim == reset_after.ndim == 1
+            and kind.shape == terminal.shape == reset_after.shape):
+        raise ValueError(
+            f"{where}): kind, terminal and reset_after must be 1-D arrays of one length, got shapes "
+            f"{kind.shape}, {terminal.shape}, {reset_after.shape}"
+        )
+    if kind.size == 0:
+        raise ValueError(f"{where}): the chunk has no slots")
+    where = f"{where}, slots {_spell_slots(kind, terminal, reset_after)!r})"
+    unknown = np.flatnonzero(~np.isin(kind, (SLOT_ACT, SLOT_BOOT, SLOT_PAD)))
+    if unknown.size:
+        raise ValueError(f"{where}: slot {unknown[0]}: unknown slot kind {kind[unknown[0]]}")
+
+    act, boot, pad = kind == SLOT_ACT, kind == SLOT_BOOT, kind == SLOT_PAD
+    open_act = act & ~terminal
+    ends_episode = (act & terminal) | (boot & reset_after)
+    prev_open = np.concatenate([[False], open_act[:-1]])
+    prev_pad = np.concatenate([[False], pad[:-1]])
+    prev_ends = np.concatenate([[False], ends_episode[:-1]])
+    next_pad = np.concatenate([pad[1:], [False]])
+    not_last = np.arange(kind.size) < kind.size - 1
+    broken = (
+        act & ~not_last,                        # an ACT in the last slot
+        open_act & next_pad,                    # an open ACT followed by a PAD
+        boot & ~prev_open,                      # a BOOT that does not follow an open ACT
+        pad & ~prev_pad & ~prev_ends,           # a PAD (first of a run) not after an episode end
+        boot & ~reset_after & not_last,         # a BOOT without reset_after before the last slot
+    )
+    # Earliest broken slot; ties go to the first rule in _SLOT_RULES.
+    found = [(int(np.argmax(mask)), r) for r, mask in enumerate(broken) if mask.any()]
+    if found:
+        slot, rule = min(found)
+        raise ValueError(f"{where}: slot {slot}: {_SLOT_RULES[rule]}")
+
+
 @dataclass
 class SeatAssignment:
     """Who plays one seat: an agent's latest weights or a checkpoint, and whether it collects."""
