@@ -27,3 +27,7 @@ wandb/
 .idea/
 .vscode/
 .DS_Store
+
+# SP2 compatibility fixtures (SP3 T0.1): a committed SP2 checkpoint inside an SP2-shaped run dir
+!/tests/fixtures/sp2/run/checkpoints/
+!/tests/fixtures/sp2/run/checkpoints/**

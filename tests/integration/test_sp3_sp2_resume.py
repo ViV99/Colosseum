@@ -1,0 +1,24 @@
+"""SP2 compatibility baseline (SP3 T0.1): `colosseum train` resumes from the SP2 fixture run dir."""
+from __future__ import annotations
+
+from cli_runner import run_train
+from game_helpers import SP2_CHECKPOINT_ENV_STEPS, SP2_CHECKPOINT_VERSION, SP2_TTT_TINY, copy_sp2_run
+
+
+def _versions(agent_dir) -> list[int]:
+    return sorted(int(p.name.removeprefix("ckpt_v")) for p in agent_dir.glob("ckpt_v*"))
+
+
+def test_training_resumes_from_the_sp2_run_dir(tmp_path):
+    source = copy_sp2_run(tmp_path)
+    # tiny=False: the fixture config is already tiny, and cli_runner.TINY's new-style keys (checkpoint.keep_last
+    # from T2.1 on) next to the config's SP2 knobs (pool_size) would be "old + new together", a ConfigError.
+    run = run_train(SP2_TTT_TINY, tmp_path, name="resumed", overrides={"training.resume_from": str(source)},
+                    tiny=False)
+    assert run.returncode == 0, run.stderr[-3000:]
+    log = run.log("main")
+    assert "Resume [agent_0]:" in log and f"(policy_version {SP2_CHECKPOINT_VERSION})" in log
+    assert f"env-step counter continues from {SP2_CHECKPOINT_ENV_STEPS}" in log
+    versions = _versions(run.root / "checkpoints" / "agent_0")
+    assert versions and min(versions) > SP2_CHECKPOINT_VERSION       # T2.1: the imported ckpt_v3 joins the pool
+    assert _versions(source / "checkpoints" / "agent_0") == [SP2_CHECKPOINT_VERSION]  # the source is untouched

@@ -9,8 +9,10 @@ from __future__ import annotations
 
 import math
 import queue
+import shutil
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Any
 
 import gymnasium
@@ -1061,8 +1063,6 @@ def make_test_config(game: str, **sections):
 
 def write_test_config(path, game: str, **sections):
     """``make_test_config`` written as YAML to ``path`` (for CLI runs); returns the path."""
-    from pathlib import Path
-
     import yaml
 
     path = Path(path)
@@ -1142,3 +1142,26 @@ class CrashingAPPO(APPO):
         if self._steps_seen >= self.crash_at_step:
             raise RuntimeError("injected train_step failure")
         return super().train_step(chunks)
+
+
+# ---------------------------------------------------------------------------
+# SP3 (T0.1): SP2 compatibility fixtures (read-only inputs; copy before writing)
+# ---------------------------------------------------------------------------
+
+
+SP2_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "sp2"
+SP2_CONFIGS = SP2_FIXTURES / "configs"
+SP2_CONFIG_NAMES = ("chase", "coin_grid", "coop_buttons", "predator_prey", "space_miners", "team_tag",
+                    "tic_tac_toe", "tic_tac_toe_attention", "tic_tac_toe_multi", "tron", "unit_harvest")
+SP2_TTT_TINY = SP2_FIXTURES / "sp2_ttt_tiny.yaml"
+SP2_RUN = SP2_FIXTURES / "run"
+SP2_CHECKPOINT = SP2_RUN / "checkpoints" / "agent_0" / "ckpt_v3"
+SP2_CHECKPOINT_VERSION = 3
+SP2_CHECKPOINT_ENV_STEPS = 1536
+
+
+def copy_sp2_run(tmp_path) -> Path:
+    """A writable copy of the SP2 fixture run dir under ``tmp_path`` (tests never write into tests/fixtures)."""
+    dst = Path(tmp_path) / "sp2_run"
+    shutil.copytree(SP2_RUN, dst)
+    return dst
