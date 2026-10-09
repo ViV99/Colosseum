@@ -15,8 +15,9 @@ Data format: one or more ``.pt`` files (``torch.save`` of a dict of tensors) wit
 
 Loss = minus log-prob of the expert action: the joint log-prob when the action has one decider
 (K = 1); with K > 1 (``Units``) the mean of ``unit_log_prob`` over the valid deciders, so a
-decision weighs the same whatever its number of units. Decisions without a valid decider are
-skipped. The model runs without its value path (``step``, or ``unroll(with_value=False)``).
+decision weighs the same whatever its number of units; with K > 1, decisions without a valid
+decider are skipped (with K = 1 every decision counts, an absent single unit adds NLL 0).
+The model runs without its value path (``step``, or ``unroll(with_value=False)``).
 
 ``add_data`` checks the data against the agent's spaces, independent of the model, and raises
 :class:`DataError` (naming the file in ``load_data`` and the first bad decision): tree structure

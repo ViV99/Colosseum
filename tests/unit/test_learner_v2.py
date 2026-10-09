@@ -88,6 +88,15 @@ def test_collect_batch_rejects_a_chunk_with_a_broken_slot_structure():
         collect_batch(q, 2, threading.Event(), poll_interval=0.05)
 
 
+def test_collect_batch_rejects_a_chunk_of_another_agent():
+    """A misrouted chunk (e.g. ``run-workers -l A=<B's learner>``) must not train the wrong agent."""
+    q = queue.Queue()
+    q.put(chunk_v2_payload(agent_id="a"))
+    q.put(chunk_v2_payload(agent_id="b"))
+    with pytest.raises(ValueError, match=r"learner of agent 'a' received a chunk of agent 'b'"):
+        collect_batch(q, 2, threading.Event(), poll_interval=0.05, agent_id="a")
+
+
 def test_learner_trains_only_on_full_batches():
     algo = RecordingLearnerAlgorithm()
     _run_learner(algo, [chunk_v2_payload(version=v) for v in range(7)], lambda: len(algo.batches) >= 2,

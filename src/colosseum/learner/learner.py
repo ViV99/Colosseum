@@ -175,7 +175,7 @@ def learner_process(
                 break
 
             # Block until exactly batch_chunks chunks arrived (None: stop requested).
-            chunks = collect_batch(trajectory_queue, config.batch_chunks, stop_event)
+            chunks = collect_batch(trajectory_queue, config.batch_chunks, stop_event, agent_id=agent_id)
             if chunks is None:
                 break
             total_chunks_received += len(chunks)
@@ -332,6 +332,7 @@ def collect_batch(
     batch_size: int,
     stop_event: Any,
     poll_interval: float = 0.5,
+    agent_id: str | None = None,
 ) -> list[TrajectoryChunk] | None:
     """Block until exactly ``batch_size`` chunk v2 payloads arrived; decode them.
 
@@ -339,7 +340,8 @@ def collect_batch(
     is set (a partial batch is dropped: no training on incomplete batches).
     Every decoded chunk's slot structure is checked (``validate_slot_structure``):
     a broken chunk raises ``ValueError`` naming its agent instead of silently
-    corrupting the V-trace targets.
+    corrupting the V-trace targets. With ``agent_id``, a chunk of another agent (a
+    misrouted worker in distributed mode) raises ``ValueError``.
     """
     chunks: list[TrajectoryChunk] = []
     while len(chunks) < batch_size:
@@ -354,6 +356,9 @@ def collect_batch(
                 f"trajectory queue item must be a chunk payload dict, got {type(payload).__name__}"
             )
         chunk = TrajectoryChunk.from_payload(payload)
+        if agent_id is not None and chunk.agent_id != agent_id:
+            raise ValueError(f"learner of agent {agent_id!r} received a chunk of agent {chunk.agent_id!r}; "
+                             f"check the workers' learner addresses (run-workers -l AGENT=HOST:PORT)")
         validate_slot_structure(chunk)
         chunks.append(chunk)
     return chunks
