@@ -27,6 +27,13 @@ class _RaisingGame(SoloCounterGame):
         raise EnvContractError("bad step from the env")
 
 
+class _DyingGame(SoloCounterGame):
+    """The process dies on the first step (like a segfault or an OOM kill in a native env)."""
+
+    def step(self, actions):
+        os._exit(7)
+
+
 def _not_an_env():
     return object()
 
@@ -136,3 +143,16 @@ def test_spec_is_checked_in_the_parent_before_spawning():
 def test_env_fn_must_build_multi_agent_envs_in_the_parent():
     with pytest.raises(EnvContractError, match="must return a MultiAgentEnv"):
         SubprocessVectorEnv(_not_an_env, num_envs=1, num_workers=1)
+
+
+def test_a_dead_child_is_reported_with_its_env_range_and_exit_code():
+    sub = SubprocessVectorEnv(_DyingGame, num_envs=3, num_workers=2)   # slices [0, 2) and [2, 3)
+    try:
+        sub.reset({0: (None, "solo"), 2: (None, "solo")})
+        with pytest.raises(RuntimeError, match=r"env child 0 \(envs 0\.\.1\) died \(exit code 7\)"):
+            sub.step({0: {0: 1}})
+        with pytest.raises(RuntimeError, match=r"env child 0 \(envs 0\.\.1\) died \(exit code 7\)"):
+            sub.step({1: {0: 1}})                                      # the pipe is gone: the send fails
+        assert sub.reset({2: (None, "solo")})[2].acting == {0}         # the other child still answers
+    finally:
+        sub.close()

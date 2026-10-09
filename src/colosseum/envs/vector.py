@@ -222,14 +222,33 @@ class SubprocessVectorEnv:
             raise
 
     def _round(self, messages: Mapping[int, tuple[str, Any]]) -> dict[int, Any]:
-        """Send one message per listed child, then collect every reply (re-raising child errors)."""
+        """Send one message per listed child, then collect every reply (re-raising child errors).
+
+        A child that died (segfault, OOM kill) is reported with its env range and exit code."""
+        replies: dict[int, Any] = {}
+        sent = []
         for w, message in messages.items():
-            self._conns[w].send(message)
-        replies = {w: self._conns[w].recv() for w in messages}
-        for reply in replies.values():
-            if isinstance(reply, BaseException):
-                raise reply
-        return replies
+            try:
+                self._conns[w].send(message)
+                sent.append(w)
+            except (BrokenPipeError, EOFError, OSError):
+                replies[w] = self._dead_child(w)
+        for w in sent:
+            try:
+                replies[w] = self._conns[w].recv()
+            except (EOFError, OSError):
+                replies[w] = self._dead_child(w)
+        for w in messages:
+            if isinstance(replies[w], BaseException):
+                raise replies[w]
+        return {w: replies[w] for w in messages}
+
+    def _dead_child(self, w: int) -> RuntimeError:
+        proc = self._procs[w]
+        proc.join(timeout=_JOIN_TIMEOUT)  # reap it, so the exit code is known
+        start, end = self._slices[w]
+        return RuntimeError(f"env child {w} (envs {start}..{end - 1}) died (exit code {proc.exitcode}), "
+                            f"e.g. a crash in native env code or an OOM kill")
 
     def _by_child(self, per_env: Mapping[int, Any]) -> dict[int, dict[int, Any]]:
         out: dict[int, dict[int, Any]] = {}
