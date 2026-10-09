@@ -170,6 +170,10 @@ class PastWinRate:
         self._scores: dict[str, deque[tuple[float, float]]] = {}
 
     def record(self, agent_id: str, score: float, weight: float = 1.0) -> None:
+        if not 0.0 <= score <= 1.0:
+            raise ValueError(f"score must be in [0, 1], got {score}")
+        if not weight > 0.0:
+            raise ValueError(f"weight must be > 0, got {weight}")
         self._scores.setdefault(agent_id, deque(maxlen=self._window)).append((float(score), float(weight)))
 
     def get(self, agent_id: str) -> float | None:
@@ -259,16 +263,19 @@ class RatingBook:
         self._args = (k_factor, initial_rating, past_window)
         self._books = {name: _LayoutRatings(spec.outcome_kind(name), *self._args) for name in spec.layouts}
 
+    def _layout(self, layout: str, context: str) -> _LayoutRatings:
+        book = self._books.get(layout)
+        if book is None:
+            raise ValueError(f"{context}unknown layout {layout!r}; the game has {list(self._books)}")
+        return book
+
     def update(self, result: MatchResult) -> None:
         """Record one finished match in the tables of its layout.
 
         Raises ValueError for a layout the game does not have, or an ``outcome_kind`` that
         differs from the layout's (both mean the result comes from another game).
         """
-        book = self._books.get(result.layout)
-        if book is None:
-            raise ValueError(f"match {result.match_id!r}: unknown layout {result.layout!r}; "
-                             f"the game has {list(self._books)}")
+        book = self._layout(result.layout, f"match {result.match_id!r}: ")
         if result.outcome_kind != book.outcome_kind:
             raise ValueError(f"match {result.match_id!r}: outcome_kind {result.outcome_kind!r} does not match "
                              f"layout {result.layout!r}, which is {book.outcome_kind!r}")
@@ -290,13 +297,13 @@ class RatingBook:
                 book.past.record(p.a, p.score_a, p.weight)
 
     def win_rate(self, layout: str, a: str, b: str) -> float:
-        """a's score rate against b in ``layout``; 0.5 for pairs that never met (SP1 prior)."""
-        book = self._books.get(layout)
-        return 0.5 if book is None else book.win_rates.get_win_rate(a, b)
+        """a's score rate against b in ``layout``; 0.5 for pairs that never met (SP1 prior).
+        ValueError for a layout the game does not have."""
+        return self._layout(layout, "win_rate: ").win_rates.get_win_rate(a, b)
 
     def elo(self, layout: str, agent_id: str) -> float:
-        book = self._books.get(layout)
-        return float(self._args[1]) if book is None else book.elo.get(agent_id)
+        """ELO of ``agent_id`` in ``layout``; ValueError for a layout the game does not have."""
+        return self._layout(layout, "elo: ").elo.get(agent_id)
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         ids = self._agent_ids

@@ -70,6 +70,8 @@ def test_teammates_are_not_compared_and_skipped_pairs_leave_the_divisor():
 def test_latest_vs_own_checkpoint_is_a_past_pair_from_the_latest_side():
     r = result("2p", [seat(0, 0, "a", "ckpt_v3"), seat(1, 1, "a")], {0: 1, 1: 2})
     assert member_pairs(r) == [MemberPair("past", "a", "a", 0.0, 1.0, "player", "player")]
+    latest_first = result("2p", [seat(0, 0, "a"), seat(1, 1, "a", "ckpt_v3")], {0: 1, 1: 2})
+    assert member_pairs(latest_first) == [MemberPair("past", "a", "a", 1.0, 1.0, "player", "player")]
     two_checkpoints = result("2p", [seat(0, 0, "a", "ckpt_v1"), seat(1, 1, "a", "ckpt_v2")], {0: 1, 1: 2})
     assert member_pairs(two_checkpoints) == []
     assert member_pairs(result("solo", [seat(0, 0, "a")], {0: 1})) == []
@@ -93,6 +95,8 @@ def test_win_rates_are_weighted_and_draws_count_half():
     assert w.games("a", "b") == 2 and w.get_win_rate("a", "z") == 0.5
     with pytest.raises(ValueError):
         w.record_pair("a", "b", 1.5)
+    with pytest.raises(ValueError):
+        w.record_pair("a", "b", 1.0, weight=0.0)
 
 
 def test_past_win_rate_window_and_weights():
@@ -103,6 +107,10 @@ def test_past_win_rate_window_and_weights():
     assert past.get("a") == pytest.approx(0.75) and past.games("a") == 2
     past.record("a", 0.0, 1.0)  # the oldest entry falls out of the window
     assert past.get("a") == 0.0
+    with pytest.raises(ValueError):
+        past.record("a", -0.5)
+    with pytest.raises(ValueError):
+        past.record("a", 1.0, weight=0.0)
 
 
 def test_score_tracker_mean_ema_and_ci():
@@ -146,8 +154,12 @@ def test_rating_book_keeps_layouts_apart_and_routes_score_layouts():
     assert snap["coop2"]["scores"]["a"]["mean"] == 6.0 and snap["coop2"]["scores"]["b"]["n"] == 1
     assert snap["coop2"]["cross_play"] == {"a+b": {"n": 1, "mean": 6.0}}
     assert book.win_rate("2p", "a", "b") == 1.0 and book.win_rate("4p", "a", "b") == 0.5
-    assert book.win_rate("unknown", "a", "b") == 0.5
-    assert book.elo("2p", "b") < 1200 and book.elo("unknown", "a") == 1200.0
+    assert book.win_rate("2p", "b", "z") == 0.5  # an unseen pair of a known layout keeps the SP1 prior
+    assert book.elo("2p", "b") < 1200
+    with pytest.raises(ValueError, match=r"unknown layout 'unknown'.*\['2p', '4p', 'coop2'\]"):
+        book.win_rate("unknown", "a", "b")
+    with pytest.raises(ValueError, match=r"unknown layout 'unknown'"):
+        book.elo("unknown", "a")
 
 
 def test_rating_book_records_win_rates_by_role():
@@ -172,3 +184,41 @@ def test_rating_book_rejects_an_unknown_layout_and_a_mismatched_outcome_kind():
     with pytest.raises(ValueError, match=r"outcome_kind 'rank'.*'2p'.*'wdl'"):
         book.update(result("2p", [seat(0, 0, "a"), seat(1, 1, "b")], {0: 1, 1: 2}, kind="rank"))
     assert "3p" not in book.snapshot() and book.snapshot()["2p"]["games"]["a"]["b"] == 0
+
+
+def ffa_spec(*layouts) -> GameSpec:
+    return GameSpec(roles={"player": RoleSpec(OBS, ACT)},
+                    layouts={name: tuple(SeatSpec("player", t) for t in teams) for name, teams in layouts})
+
+
+def test_rating_book_elo_values_for_team_layouts():
+    book = RatingBook(ffa_spec(("2v1v1", (0, 0, 1, 2))), ["a", "b", "c", "d"])
+    book.update(result("2v1v1", [seat(0, 0, "a"), seat(1, 0, "b"), seat(2, 1, "c"), seat(3, 2, "d")],
+                       {0: 1, 1: 2, 2: 3}))
+    assert book.snapshot()["2v1v1"]["elo"] == pytest.approx({"a": 1208.0, "b": 1208.0, "c": 1200.0, "d": 1184.0})
+
+    same = RatingBook(ffa_spec(("2v1v1", (0, 0, 1, 2))), ["a", "b", "c"])
+    same.update(result("2v1v1", [seat(0, 0, "a"), seat(1, 0, "a"), seat(2, 1, "b"), seat(3, 2, "c")],
+                       {0: 1, 1: 2, 2: 3}))
+    assert same.snapshot()["2v1v1"]["elo"] == pytest.approx({"a": 1216.0, "b": 1200.0, "c": 1184.0})
+
+
+def test_rating_book_decisive_past_and_mixed_team_pairs():
+    book = RatingBook(ffa_spec(("2p", (0, 1)), ("2v2", (0, 0, 1, 1))), ["a", "b"])
+    book.update(result("2p", [seat(0, 0, "a"), seat(1, 1, "a", "ckpt_v2")], {0: 1, 1: 2}))
+    assert book.snapshot()["2p"]["wr_vs_past"] == {"a": 1.0, "b": None}
+
+    # team 0: a latest + a checkpoint; team 1: a latest + b. Team 0 wins.
+    mixed = result("2v2", [seat(0, 0, "a"), seat(1, 0, "a", "ckpt_v1"), seat(2, 1, "a"), seat(3, 1, "b")],
+                   {0: 1, 1: 2})
+    third = pytest.approx(1 / 3)
+    assert member_pairs(mixed) == [  # latest a vs latest a is skipped: 3 counted pairs share the weight
+        MemberPair("cross", "a", "b", 1.0, third, "player", "player"),
+        MemberPair("past", "a", "a", 0.0, third, "player", "player"),  # team 1's latest a lost to the checkpoint
+        MemberPair("cross", "a", "b", 1.0, third, "player", "player"),
+    ]
+    book.update(mixed)
+    snap = book.snapshot()["2v2"]
+    assert snap["wr_vs_past"] == {"a": 0.0, "b": None} and snap["past_games"] == {"a": 1, "b": 0}
+    assert snap["win_rates"]["a"]["b"] == 1.0 and snap["games"]["a"]["b"] == 2
+    assert snap["elo"] == pytest.approx({"a": 1200 + 32 * (2 / 3) * 0.5, "b": 1200 - 32 * (2 / 3) * 0.5})
