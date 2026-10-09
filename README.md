@@ -217,11 +217,11 @@ failure logs one warning and disables WandB; it never stops training.
 - Ctrl-C (SIGINT) and SIGTERM stop the run: final checkpoints are saved within a shutdown grace of 7 seconds; no
   process is left after 10 seconds. The exit codes are 130 (SIGINT) and 143 (SIGTERM). Child processes ignore Ctrl-C
   themselves (the main process stops them) and die with the main process if it is killed.
-- A Ctrl-C always ends `train`, `eval`, `bc`, `validate`, `run-learner` and `run-workers` with exit code 130 and
-  `Interrupted` (or `Received SIGINT`), never a traceback, also when it arrives during startup. Rarely, Python loses a
-  Ctrl-C that lands inside an import-time callback: `train` and the distributed roles then still stop as on a normal
-  Ctrl-C, while `eval`, `bc` and `validate` finish their work first and then exit 130 with `Interrupted`.
-  (`serve-weight-store` stops with exit code 0 on Ctrl-C.)
+- A Ctrl-C always ends `train`, `eval`, `bc`, `validate`, `run-learner`, `run-workers` and `serve-weight-store` with
+  exit code 130 and `Interrupted` (or `Received SIGINT`), never a traceback, also when it arrives during startup.
+  Rarely, Python loses a Ctrl-C that lands inside an import-time callback: `train` and the distributed roles then still
+  stop as on a normal Ctrl-C, while `eval`, `bc` and `validate` finish their work first and then exit 130 with
+  `Interrupted` (`serve-weight-store` keeps serving until the next Ctrl-C, then exits 130).
 - An invalid config (or an env that breaks the contract at startup) exits with code 1 and a `Config error: ...`
   message without a traceback.
 - `colosseum eval` uses the same codes (0 / 1 / 130 / 143), plus 2 for bad command-line arguments; `colosseum bc`

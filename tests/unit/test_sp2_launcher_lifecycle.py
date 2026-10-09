@@ -485,6 +485,27 @@ def _raise_keyboard_interrupt(*args, **kwargs):
     raise KeyboardInterrupt
 
 
+def test_ctrl_c_stops_serve_weight_store_with_exit_130(monkeypatch, restore_root_logging):
+    """The CLI-wide rule: Ctrl-C ends serve-weight-store with "Interrupted" and 130, after stopping
+    the server (also when a Ctrl-C lost during startup is taken over afterwards)."""
+    pytest.importorskip("grpc")  # grpc_store imports grpc (an optional extra)
+    import colosseum.weight_store.grpc_store as grpc_store
+
+    stopped = []
+
+    class FakeServer:
+        def wait_for_termination(self):
+            raise KeyboardInterrupt
+
+        def stop(self, grace):
+            stopped.append(grace)
+
+    monkeypatch.setattr(grpc_store, "serve_weight_store", lambda **kwargs: FakeServer())
+    result = CliRunner().invoke(main, ["serve-weight-store", "--port", "1"])
+    assert result.exit_code == 130, result.output
+    assert result.stderr == "Interrupted\n" and stopped == [0]
+
+
 @pytest.mark.parametrize(("args", "target"), [
     (["train"], "colosseum.launcher.run_training"),
     (["run-learner", "--weight-store", "localhost:1"], "colosseum.distributed.run_distributed_learner"),

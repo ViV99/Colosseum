@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 import yaml
 
-from cli_runner import TTT_CONFIG, run_in_session, run_train, training_process, wait_for
+from cli_runner import TTT_CONFIG, child_env, run_in_session, run_train, training_process, wait_for
 
 pytestmark = pytest.mark.skipif(not Path("/proc/self/stat").exists(), reason="needs Linux /proc")
 
@@ -175,7 +175,7 @@ def test_ctrl_c_inside_string_exec_during_startup_still_exits_130(tmp_path, buil
         "def startup():\n"
         f"    {builtin}('(_ for _ in ()).throw(KeyboardInterrupt)', {{}})\n\n"
         "main()\n")
-    env = {"PYTHONPATH": os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))}
+    env = {"PYTHONPATH": os.pathsep.join([str(tmp_path), child_env()["PYTHONPATH"]])}  # extends, not replaces
     proc = run_in_session([sys.executable, "-m", "ki_in_exec_cli", "startup"], timeout=60, env=env)
     assert proc.returncode == 130, proc.stderr[-3000:]
     assert proc.stderr == "Interrupted\n"
@@ -198,7 +198,7 @@ def test_ctrl_c_lost_in_a_weakref_callback_during_startup_still_exits_130(tmp_pa
         "    del target\n"
         "    print('finished', ref() is None)\n\n"
         "main()\n")
-    env = {"PYTHONPATH": os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))}
+    env = {"PYTHONPATH": os.pathsep.join([str(tmp_path), child_env()["PYTHONPATH"]])}  # extends, not replaces
     proc = run_in_session([sys.executable, "-m", "ki_in_callback_cli", "startup"], timeout=60, env=env)
     assert proc.stdout == "finished True\n"
     assert proc.returncode == 130, proc.stderr[-3000:]

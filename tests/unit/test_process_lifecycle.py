@@ -14,6 +14,15 @@ import colosseum.utils.process as process_module
 from colosseum.utils.process import ChildFailure, ProcessSupervisor, init_child_process
 
 
+@pytest.fixture(autouse=True)
+def _no_lost_interrupt_leaks():
+    """The lost-interrupt record is process-global: a failing test must not leave a phantom
+    SIGINT for later in-process tests (FIX-2)."""
+    process_module.take_lost_interrupt()
+    yield
+    process_module.take_lost_interrupt()
+
+
 def spawn(target, *args, name="child"):
     proc = mp.get_context("spawn").Process(target=target, args=args, name=name, daemon=True)
     proc.start()

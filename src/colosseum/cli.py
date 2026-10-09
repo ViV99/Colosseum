@@ -337,7 +337,7 @@ def run_workers_cmd(config: str, weight_store: str, learners: tuple[str, ...], o
 @click.option("--port", default=50051, type=int, help="gRPC port")
 @click.option("--max-message-mb", default=64, type=int, help="Max gRPC message size in MiB")
 def serve_weight_store_cmd(port: int, max_message_mb: int) -> None:
-    """Start a gRPC weight store server."""
+    """Start a gRPC weight store server. Ctrl-C stops it with exit code 130."""
     import logging
 
     from colosseum.weight_store.grpc_store import serve_weight_store
@@ -349,6 +349,7 @@ def serve_weight_store_cmd(port: int, max_message_mb: int) -> None:
         server.wait_for_termination()
     except KeyboardInterrupt:
         server.stop(0)
+        raise  # "Interrupted" and exit code 130, like every command (_interrupts)
 
 
 if __name__ == "__main__":
