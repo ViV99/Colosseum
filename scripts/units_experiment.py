@@ -18,7 +18,7 @@ share vs scripted at least 0.05 higher and a K=8 share at most 0.05 lower.
 Usage (the evaluation imports the test kit, so it puts ``tests/`` and ``tests/learning`` on
 ``sys.path``)::
 
-    .venv/bin/python scripts/units_experiment.py --steps 400000 --seeds 0 --parallel 2 \
+    .venv/bin/python scripts/units_experiment.py --steps 340000 --seeds 0 --parallel 1 \\
         --json docs/benchmarks/units-experiment.json
 """
 from __future__ import annotations
@@ -26,6 +26,7 @@ from __future__ import annotations
 import argparse
 import itertools
 import json
+import math
 import os
 import subprocess
 import sys
@@ -73,14 +74,14 @@ def train(k: int, ratio: str, trace: str, seed: int, *, steps: int, workers: int
 def diagnostics(run) -> dict:
     train_records = run.records("train")
     tail = train_records[-max(1, len(train_records) // 4):]
-    out = {}
     if not tail:
         raise KeyError(f"no train records in {run.root}")
+    out = {}
     for key in DIAG_KEYS:
         values = [r[key] for r in tail]      # KeyError for a metric the run does not log
         out[key] = sum(values) / len(values)
     out["env_steps_per_s"] = run.env_steps_per_sec()
-    out["train_steps"] = train_records[-1]["train_step"] if train_records else 0
+    out["train_steps"] = train_records[-1]["train_step"]
     return out
 
 
@@ -109,19 +110,27 @@ def evaluate(run, matches: int) -> dict:
             "share_vs_scripted": sum(shares) / len(shares)}
 
 
-def recommend(rows: list[dict]) -> tuple[str, str]:
-    """The T8.4 decision rule for the ``unit_trace: auto`` default (with Units)."""
+def recommend(rows: list[dict]) -> tuple[str | None, str, str | None]:
+    """The T8.4 decision rule for the ``unit_trace: auto`` default (with Units).
+
+    Returns ``(choice, detail, note)``. When a share the rule needs is missing (no evaluated
+    ``per_unit`` row for some K and trace, e.g. a recheck grid without K=8), the rule cannot be
+    applied: ``choice`` is None and ``note`` names the missing cells (no silent default)."""
     def share(k: int, trace: str) -> float:
         vals = [r["share_vs_scripted"] for r in rows if "share_vs_scripted" in r
                 and r["k"] == k and r["ratio_mode"] == "per_unit" and r["unit_trace"] == trace]
         return sum(vals) / len(vals) if vals else float("nan")
 
+    detail = "; ".join(f"{t}: K=128 {share(128, t):.3f}, K=8 {share(8, t):.3f}" for t in UNIT_TRACES)
+    missing = [f"K={k} {t}" for k in (128, 8) for t in UNIT_TRACES if math.isnan(share(k, t))]
+    if missing:
+        return None, detail, ("no recommendation: the rule needs share_vs_scripted of every per_unit trace at "
+                              f"K=128 and K=8; missing: {', '.join(missing)}")
     base128, base8 = share(128, DEFAULT_TRACE), share(8, DEFAULT_TRACE)
     better = [t for t in UNIT_TRACES if t != DEFAULT_TRACE
               and share(128, t) >= base128 + MARGIN and share(8, t) >= base8 - MARGIN]
     choice = max(better, key=lambda t: share(128, t)) if better else DEFAULT_TRACE
-    detail = "; ".join(f"{t}: K=128 {share(128, t):.3f}, K=8 {share(8, t):.3f}" for t in UNIT_TRACES)
-    return choice, detail
+    return choice, detail, None
 
 
 def _fmt(v) -> str:
@@ -165,11 +174,16 @@ def main() -> int:
     print("|" + "---|" * len(cols))
     for row in rows:
         print("| " + " | ".join(_fmt(row.get(c, "-")) for c in cols) + " |")
-    choice, detail = recommend(rows)
+    choice, detail, note = recommend(rows)
     print(f"\nunit_trace recommendation (per_unit, share vs scripted): {choice} ({detail})")
+    if note:
+        print(note)
     if args.json:
-        args.json.write_text(json.dumps({"steps": args.steps, "workers": args.workers, "k_kwargs": K_KWARGS,
-                                         "rows": rows, "recommendation": choice}, indent=2, default=str) + "\n")
+        result = {"steps": args.steps, "workers": args.workers, "k_kwargs": K_KWARGS, "rows": rows,
+                  "recommendation": choice}
+        if note:
+            result["recommendation_note"] = note
+        args.json.write_text(json.dumps(result, indent=2, default=str) + "\n")
     return 1 if any(r["returncode"] != 0 for r in rows) else 0
 
 
