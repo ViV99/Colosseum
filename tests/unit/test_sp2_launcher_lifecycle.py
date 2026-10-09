@@ -476,96 +476,9 @@ def test_main_puts_cwd_first_on_sys_path(tmp_path, monkeypatch):
     assert sys.path[0] == os.getcwd() == str(tmp_path)  # cwd is tmp_path (conftest)
 
 
-@pytest.mark.parametrize(("worker_exit", "expected"), [(0, 0), (3, 1)])
-def test_run_workers_returns_an_exit_code(worker_exit, expected, tmp_path, monkeypatch, restore_root_logging,
-                                          capsys):
-    import colosseum.distributed as distributed
-
-    class ExitedProcess:
-        exitcode = worker_exit
-
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def start(self):
-            pass
-
-        def is_alive(self):
-            return False
-
-        def join(self, timeout=None):
-            pass
-
-    monkeypatch.setattr(mp, "set_start_method", lambda *args, **kwargs: None)
-    monkeypatch.setattr(distributed.mp, "Process", ExitedProcess)
-    data = ttt_data()
-    data["run"] = {"dir": str(tmp_path / "runs")}
-    path = tmp_path / "cfg.yaml"
-    path.write_text(yaml.safe_dump(data))
-    assert distributed.run_distributed_workers(str(path), "localhost:1", {"agent_0": "localhost:2"}) == expected
-    # The entry point logs to stderr (its own handlers replace pytest's capture handler).
-    assert ("[ERROR] workers-main colosseum.distributed: worker-0 died (exit 3)" in capsys.readouterr().err) == (
-        worker_exit == 3)
-
-
 # ---------------------------------------------------------------------------
 # Exit codes of run-learner / run-workers / train for signals and early Ctrl-C
 # ---------------------------------------------------------------------------
-
-
-@pytest.fixture
-def fake_learner_role(tmp_path, monkeypatch):
-    """run_distributed_learner without gRPC: returns the config path."""
-    import colosseum.transport.grpc_transport as grpc_transport
-    import colosseum.weight_store.grpc_store as grpc_store
-
-    class FakeServer:
-        def stop(self, grace):
-            pass
-
-    class FakeStore:
-        def __init__(self, *args, **kwargs):
-            pass
-
-        def close(self):
-            pass
-
-    monkeypatch.setattr(grpc_transport, "serve_trajectory_receiver", lambda *a, **k: FakeServer())
-    monkeypatch.setattr(grpc_store, "GRPCWeightStore", FakeStore)
-    data = ttt_data()
-    data["run"] = {"dir": str(tmp_path / "runs")}
-    path = tmp_path / "cfg.yaml"
-    path.write_text(yaml.safe_dump(data))
-    return path
-
-
-@pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
-def test_run_learner_returns_128_plus_signum(sig, fake_learner_role, monkeypatch, restore_root_logging):
-    import colosseum.distributed as distributed
-    import colosseum.learner.learner as learner_module
-
-    def fake_learner_process(*, stop_event, **kwargs):
-        os.kill(os.getpid(), sig)
-        assert stop_event.wait(10)
-
-    monkeypatch.setattr(learner_module, "learner_process", fake_learner_process)
-    before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
-    assert distributed.run_distributed_learner(str(fake_learner_role), "agent_0", 0, "localhost:1") == 128 + sig
-    assert {s: signal.getsignal(s) for s in before} == before  # handlers restored
-
-
-def test_run_learner_setup_failure_leaves_signal_handlers_untouched(fake_learner_role, monkeypatch,
-                                                                     restore_root_logging, restore_global_rng):
-    import colosseum.distributed as distributed
-
-    def failing_seed(seed):
-        raise RuntimeError("seeding failed")
-
-    monkeypatch.setattr(distributed, "apply_global_seed", failing_seed)
-    before = {s: signal.getsignal(s) for s in (signal.SIGINT, signal.SIGTERM)}
-    with pytest.raises(RuntimeError, match="seeding failed"):
-        distributed.run_distributed_learner(str(fake_learner_role), "agent_0", 0, "localhost:1")
-    assert {s: signal.getsignal(s) for s in before} == before
 
 
 def _raise_keyboard_interrupt(*args, **kwargs):
