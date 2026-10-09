@@ -7,7 +7,7 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
@@ -43,7 +43,7 @@ def child_env() -> dict[str, str]:
     return env
 
 
-def train_cmd(config: Path, run_parent: Path, name: str, overrides: dict[str, str] | None = None,
+def train_cmd(config: Path, run_parent: Path, name: str, overrides: Mapping[str, object] | None = None,
               module: str = "colosseum", tiny: bool = True) -> list[str]:
     """``python -m <module> train -c <config>`` with the ``TINY`` settings (unless ``tiny=False``:
     the config's own budget and sizes, as in the slow learning tests), then ``overrides``."""
@@ -54,6 +54,20 @@ def train_cmd(config: Path, run_parent: Path, name: str, overrides: dict[str, st
     return cmd
 
 
+def read_records(root: Path, kind: str | None = None) -> list[dict]:
+    """The ``metrics.jsonl`` records of the run at ``root`` (of one ``kind``, or all)."""
+    path = Path(root) / "metrics.jsonl"
+    if not path.exists():
+        return []
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return [r for r in records if kind is None or r["kind"] == kind]
+
+
+def read_ratings(root: Path) -> dict:
+    """``ratings.json`` of the run at ``root``: ``{"env_steps": N, "layouts": {<layout>: {...}}}``."""
+    return json.loads((Path(root) / "ratings.json").read_text())
+
+
 @dataclass
 class TrainRun:
     returncode: int
@@ -62,20 +76,16 @@ class TrainRun:
     root: Path
 
     def records(self, kind: str | None = None) -> list[dict]:
-        path = self.root / "metrics.jsonl"
-        if not path.exists():
-            return []
-        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-        return [r for r in records if kind is None or r["kind"] == kind]
+        return read_records(self.root, kind)
 
     def log(self, process_name: str) -> str:
         return (self.root / "logs" / f"{process_name}.log").read_text()
 
     def ratings(self) -> dict:
-        return json.loads((self.root / "ratings.json").read_text())
+        return read_ratings(self.root)
 
 
-def run_train(config: Path, tmp_path: Path, name: str = "run", overrides: dict[str, str] | None = None,
+def run_train(config: Path, tmp_path: Path, name: str = "run", overrides: Mapping[str, object] | None = None,
               timeout: float = 240.0, env: dict[str, str] | None = None, module: str = "colosseum",
               tiny: bool = True) -> TrainRun:
     """``env`` entries are added to ``child_env()``; ``tiny`` as in ``train_cmd``."""

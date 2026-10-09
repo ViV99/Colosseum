@@ -18,8 +18,10 @@ from colosseum.networks.heads import UnitsHead, make_distribution
 class UnitsBandit(MultiAgentEnv):
     """Solo, one step. Between 1 and ``max_units`` units exist (random slots); unit ``u`` sees a
     one-hot context ``c_u`` in ``{0..arms-1}`` and should pick arm ``c_u``. The reward is the share
-    of existing units that picked their own arm, so every unit has to get its own decision right
-    from one shared scalar (per-unit credit). Random play scores ``1 / arms``."""
+    of existing units that picked their own arm (one shared scalar). Random play scores ``1 / arms``.
+    Solving it shows that a ``Units`` action learns end to end (per-unit features -> ``UnitsHead`` ->
+    per-unit deciders -> loss); it is not a per-unit credit-assignment test, since the joint ratio
+    solves it as well (the unit heads share weights)."""
 
     def __init__(self, max_units: int = 8, arms: int = 4) -> None:
         self.max_units, self.arms = max_units, arms

@@ -14,7 +14,6 @@
 from __future__ import annotations
 
 import functools
-import json
 import os
 import re
 import time
@@ -28,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 import cli_runner
-from cli_runner import REPO_ROOT, run_train
+from cli_runner import REPO_ROOT, read_ratings, read_records, run_train
 from colosseum.algorithms.appo import APPO
 from colosseum.core.config import AlgorithmConfig, ColosseumConfig, load_config
 from colosseum.core.registry import env_spec, make_env
@@ -161,10 +160,12 @@ class AgentSetup:
 def train_in_process(*, env_fn: Callable[[], MultiAgentEnv], agents: Mapping[str, AgentSetup],
                      lineups: Sequence[Lineup], chunk_length: int = 16, batch_chunks: int = 4,
                      max_updates: int = 300, solved: Callable[[dict[str, PolicyModel]], bool],
-                     check_every: int = 10, seed: int = 0) -> int:
+                     check_every: int = 10, seed: int = 0,
+                     last_metrics: dict[str, dict[str, float]] | None = None) -> int:
     """Collect with one ``RolloutLoop`` (one env per lineup) and train one ``APPO`` per agent.
     Every update trains every agent on exactly ``batch_chunks`` of its chunks. Returns the number
-    of updates after which ``solved(models)`` first held (checked every ``check_every``), or -1."""
+    of updates after which ``solved(models)`` first held (checked every ``check_every``), or -1.
+    ``last_metrics`` (if given) receives each agent's train metrics of the last update."""
     torch.manual_seed(seed)
     algos = {a: APPO(s.model_fn(), s.config, s.action_spec, device="cpu") for a, s in agents.items()}
     pending: dict[str, list[TrajectoryChunk]] = {a: [] for a in agents}
@@ -183,7 +184,9 @@ def train_in_process(*, env_fn: Callable[[], MultiAgentEnv], agents: Mapping[str
                 batch = pending[agent_id][:batch_chunks]
                 del pending[agent_id][:batch_chunks]
                 algo.set_progress(update / max_updates)
-                algo.train_step(batch)
+                metrics = algo.train_step(batch)
+                if last_metrics is not None:
+                    last_metrics[agent_id] = metrics
                 latest[agent_id] = WeightPayload.from_model(agent_id, algo.policy_version, algo.model)
             loop.sync_weights()
             if update % check_every == 0 and solved({a: algo.model for a, algo in algos.items()}):
@@ -208,12 +211,10 @@ class TrainedRun:
         return functools.partial(make_env, self.config)
 
     def records(self, kind: str) -> list[dict]:
-        lines = (self.root / "metrics.jsonl").read_text().splitlines()
-        return [r for r in map(json.loads, filter(str.strip, lines)) if r["kind"] == kind]
+        return read_records(self.root, kind)
 
     def ratings(self) -> dict:
-        """``ratings.json``: ``{"env_steps": N, "layouts": {<layout>: {...}}}``."""
-        return json.loads((self.root / "ratings.json").read_text())
+        return read_ratings(self.root)
 
     def env_steps_per_sec(self) -> float:
         system = self.records("system")
@@ -224,16 +225,16 @@ class TrainedRun:
 
 def train_cmd(config: Path, run_parent: Path, name: str, sets: Mapping[str, Any]) -> list[str]:
     """``cli_runner.train_cmd`` without the ``TINY`` settings: the config's own budget and sizes."""
-    return cli_runner.train_cmd(config, run_parent, name, {k: str(v) for k, v in sets.items()}, tiny=False)
+    return cli_runner.train_cmd(config, run_parent, name, sets, tiny=False)
 
 
 def train_example(name: str, tmp_path: Path, sets: Mapping[str, Any] | None = None,
                   timeout: float = 900.0) -> TrainedRun:
     """``colosseum train -c configs/examples/<name>.yaml`` with ``training.seed=LEARNING_SEED``."""
     config = REPO_ROOT / "configs" / "examples" / f"{name}.yaml"
-    overrides = {k: str(v) for k, v in {"training.seed": LEARNING_SEED, **(sets or {})}.items()}
     start = time.monotonic()
-    proc = run_train(config, tmp_path, name, overrides, timeout=timeout, tiny=False)
+    proc = run_train(config, tmp_path, name, {"training.seed": LEARNING_SEED, **(sets or {})}, timeout=timeout,
+                     tiny=False)
     elapsed = time.monotonic() - start
     assert proc.returncode == 0, proc.stderr[-3000:]
     run = TrainedRun.open(proc.root)

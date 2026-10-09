@@ -1,5 +1,6 @@
-"""Fast SP2 learning checks (spec section 3, criterion 3, and section 6): a Units bandit that needs
-per-unit credit and a cooperative bandit that needs both seats right at once."""
+"""Fast SP2 learning checks (spec section 3, criterion 3, and section 6): a Units bandit (a ``Units``
+action learns end to end with ``ratio_mode: per_unit``; not a credit-assignment test, the joint
+ratio solves it too) and a cooperative bandit that needs both seats right at once."""
 from __future__ import annotations
 
 import time
@@ -30,11 +31,14 @@ def test_units_bandit_is_solved_with_per_unit_ratios():
         return mean_team_score(play(UnitsBandit, {"g": greedy}, _solo("g", 64)), "g") >= 0.95
 
     start = time.monotonic()
+    metrics: dict[str, dict[str, float]] = {}
     updates = train_in_process(
         env_fn=UnitsBandit,
         agents={"agent_0": AgentSetup(["player"], make_units_bandit_model, config, action_spec)},
-        lineups=_solo("agent_0", 16), max_updates=300, solved=solved)
+        lineups=_solo("agent_0", 16), max_updates=300, solved=solved, last_metrics=metrics)
     assert updates != -1, "units bandit not solved within 300 updates (random play scores 0.25)"
+    # The per-unit decider path ran: an act slot has 1..8 live units, about 4.5 on average.
+    assert metrics["agent_0"]["deciders_valid_mean"] > 1.0, metrics["agent_0"]
     assert time.monotonic() - start < 60
 
 

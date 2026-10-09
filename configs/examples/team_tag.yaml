@@ -6,7 +6,9 @@ run:
 
 env:
   env_class: "examples.team_tag.game.TeamTagGame"
-  kwargs: {size: 7, view_radius: 2, max_steps: 30, tag_reward: 0.2, with_global_state: true}
+  # T8.3 calibration: size 6 / view_radius 3 (the class defaults 7 / 2 leave more self-play runs
+  # stuck in a passive, draw-seeking policy; see the SP2 acceptance report)
+  kwargs: {size: 6, view_radius: 3, max_steps: 30, tag_reward: 0.2, with_global_state: true}
 
 networks:
   encoder_class: "examples.team_tag.models.TagEncoder"
@@ -19,7 +21,7 @@ networks:
 algorithm:
   gamma: 0.97
   vtrace_lambda: 0.95
-  entropy_coeff: 0.003     # T8.3 calibration: with 1e-3 / 0.01, 400k steps gave 0.56-0.70 vs a random team
+  entropy_coeff: 0.003     # T8.3 calibration (was 0.01 with learning_rate 1e-3)
   learning_rate: 2.0e-3
   lr_schedule: "constant"
 
@@ -36,7 +38,7 @@ learner:
   batch_chunks: 8
 
 training:
-  total_timesteps: 400000   # global env steps; ~170 s of training on 8 cores (T8.3 calibration)
+  total_timesteps: 400000   # global env steps; about 3 minutes of training on 8 cores (T8.3 calibration)
   seed: null
 
 matchmaking:
