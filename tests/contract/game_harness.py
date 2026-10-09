@@ -171,6 +171,7 @@ class LearnerView:
     unit_log_probs: torch.Tensor | None
     worker_log_probs: torch.Tensor
     worker_unit_log_probs: torch.Tensor | None
+    kind: torch.Tensor
     is_act: torch.Tensor
 
 
@@ -180,6 +181,7 @@ def learner_eval(model: Any, chunks: list[TrajectoryChunk], role: Any, **algo_co
     algo = APPO(model, AlgorithmConfig(**algo_config), ActionSpec.from_space(role.action_space), device="cpu")
     lp, values, unit = algo.evaluate_chunks(chunks)
     S, B = chunks[0].num_slots, len(chunks)
+    kind = torch.stack([c.kind for c in chunks], dim=1).reshape(-1)
     worker_unit = None
     if chunks[0].behavior_unit_logp is not None:
         worker_unit = torch.stack([c.behavior_unit_logp for c in chunks], dim=1).reshape(S * B, -1)
@@ -187,5 +189,6 @@ def learner_eval(model: Any, chunks: list[TrajectoryChunk], role: Any, **algo_co
         log_probs=lp, values=values, unit_log_probs=unit,
         worker_log_probs=torch.stack([c.behavior_logp for c in chunks], dim=1).reshape(-1),
         worker_unit_log_probs=worker_unit,
-        is_act=torch.stack([c.kind for c in chunks], dim=1).reshape(-1) == SLOT_ACT,
+        kind=kind,
+        is_act=kind == SLOT_ACT,
     )

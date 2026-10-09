@@ -25,7 +25,16 @@ from colosseum.sp2.core.tree import tree_map, tree_stack
 from colosseum.sp2.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD, WeightPayload
 from colosseum.sp2.envs.spaces import Units
 from colosseum.sp2.networks.model import PolicyModel
-from game_harness import Collected, GameFactory, kinds, learner_eval, lineup, make_loop, run_until_chunks
+from game_harness import (
+    Collected,
+    GameFactory,
+    kinds,
+    learner_eval,
+    lineup,
+    make_loop,
+    run_until_chunks,
+    slot_steps,
+)
 from game_helpers import CORE_KINDS, GlobalStateGame, Tick, TickGame, make_test_model
 
 TOL = 1e-5
@@ -83,6 +92,11 @@ def test_learner_reproduces_worker_log_probs_at_zero_lag(core, units):
     letters = "".join(kinds(c) for c in chunks)
     for needed in "TBRP":
         assert needed in letters, f"no {needed!r} slot in {[kinds(c) for c in chunks]}"
+    # env 0 runs ELIMINATION_THEN_TRUNCATION: seat 2's ACT at t=1 is closed by its elimination,
+    # and seat 1 (alive, no longer acting) gets a truncation BOOT from its final_obs at t=6.
+    slots = {(s.env, s.seat, s.t, s.final, letter) for c in chunks for s, letter in zip(slot_steps(c), kinds(c))}
+    assert (0, 2, 1, 0, "T") in slots, "no terminal ACT for the eliminated seat"
+    assert (0, 1, 6, 1, "R") in slots, "no truncation BOOT for the dead teammate"
     if core != "none":
         assert any(any(float(x.abs().sum()) > 0 for x in tree_leaves(c.initial_state)) for c in chunks), \
             "no chunk starts mid-episode with a non-zero state"
@@ -129,27 +143,35 @@ def test_bootstrap_uses_the_learners_current_values():
     model, role, chunks = _collect("lstm", units=False)
     gamma, delta = 0.9, 0.75
     S, B = chunks[0].num_slots, len(chunks)
-    kind = torch.stack([c.kind for c in chunks], dim=1)
     terminal = torch.stack([c.terminal for c in chunks], dim=1)
     rewards = torch.stack([c.reward for c in chunks], dim=1)
+
+    def values_and_targets(m):
+        view = learner_eval(m, chunks, role)
+        values = view.values.reshape(S, B)
+        vs = compute_vtrace_slots(log_rhos=torch.zeros(S, B), rewards=rewards, values=values,
+                                  is_act=view.is_act.reshape(S, B), terminal=terminal, gamma=gamma, lam=0.0).vs
+        return view.kind.reshape(S, B), values, vs
+
+    kind, _, before = values_and_targets(model)
     is_act = kind == SLOT_ACT
-
-    def targets(m):
-        values = learner_eval(m, chunks, role).values.reshape(S, B)
-        return compute_vtrace_slots(log_rhos=torch.zeros(S, B), rewards=rewards, values=values, is_act=is_act,
-                                    terminal=terminal, gamma=gamma, lam=0.0).vs
-
-    before = targets(model)
     shifted = copy.deepcopy(model)
     with torch.no_grad():
         _value_bias(shifted).add_(delta)
-    change = targets(shifted) - before
+    _, shifted_values, shifted_vs = values_and_targets(shifted)
+    change = shifted_vs - before
     next_is_boot = torch.zeros_like(is_act)
     next_is_boot[:-1] = kind[1:] == SLOT_BOOT
     open_act, closed = is_act & ~terminal, is_act & terminal
     assert bool((open_act & next_is_boot).any()) and bool(closed.any())
     assert torch.allclose(change[open_act], torch.full_like(change[open_act], gamma * delta), atol=1e-5)
     assert torch.allclose(change[closed], torch.zeros_like(change[closed]), atol=1e-5)
+    # APPO's own target path: its value loss is the ACT mean of (V - vs)^2 with these targets.
+    algo = APPO(shifted, AlgorithmConfig(gamma=gamma, vtrace_lambda=0.0), ActionSpec.from_space(role.action_space))
+    with torch.no_grad():
+        value_loss = float(algo.compute_loss(chunks)["value_loss"])
+    expected = float(((shifted_values - shifted_vs)[is_act] ** 2).mean())
+    assert value_loss == pytest.approx(expected, rel=1e-5, abs=1e-6)
 
 
 class DtypeSpy(PolicyModel):
@@ -223,8 +245,7 @@ def test_global_state_changes_values_but_not_log_probs(core):
 
     assert _max_diff(view.log_probs, view.worker_log_probs, view.is_act) < TOL
     assert torch.equal(other.log_probs, view.log_probs)
-    kind = torch.stack([c.kind for c in chunks], dim=1).reshape(-1)
-    scored = kind != SLOT_PAD
+    scored = view.kind != SLOT_PAD
     assert bool(((other.values - view.values).abs()[scored] > 1e-6).all())
 
 
@@ -298,6 +319,76 @@ def test_per_unit_policy_loss_and_mean_valid_entropy_under_random_unit_masks(cor
     assert float(got["entropy"]) == pytest.approx(float(expected_entropy), abs=1e-5)
     # The check is discriminating: other reductions give clearly different numbers.
     assert abs(float(-(adv * n_act_valid).mean() - expected_policy)) > 1e-3                 # sum over deciders
+    # (raw advantages are small and nearly uncorrelated with the decider count, so the pooled
+    # mean lands ~5e-4 away: still 10x the 1e-5 match tolerance)
+    assert abs(float(-(adv * n_act_valid).sum() / n_act_valid.sum() - expected_policy)) > 10 * 1e-5   # pooled
+    assert abs(float(-(adv * n_act_valid / 3).mean() - expected_policy)) > 10 * 1e-5                  # all K
     assert abs(float(entropy_sum.mean() - expected_entropy)) > 1e-3                          # sum over deciders
     assert abs(float(entropy_sum.sum() / n_act_valid.sum() - expected_entropy)) > 1e-3       # pooled mean
     assert abs(float((entropy_sum / 3).mean() - expected_entropy)) > 1e-3                    # mean over all K
+
+
+# Per-decider log-ratio offsets: e^0.5 > 1 + eps, e^-0.5 < 1 - eps, e^0.1 inside (eps = 0.2).
+LOG_RATIO_OFFSETS = torch.tensor([0.5, -0.5, 0.1])
+
+
+@pytest.mark.parametrize("normalize", [True, False], ids=["normalized", "raw"])
+@pytest.mark.parametrize("core", ["none", "lstm"])
+def test_per_unit_policy_loss_off_policy_under_random_unit_masks(core, normalize):
+    """Off policy: the behavior log-probs of every valid decider are lowered by a known offset
+    (the joint one by their sum), so the per-decider ratios lie on both sides of 1 +- eps.
+    APPO's per_unit policy loss is ``min(r_i A, clip(r_i, 1 +- eps) A)`` per valid decider with
+    the shared V-trace advantage (geo-mean trace, no rho factor), mean over the valid deciders,
+    then mean over ACT slots."""
+    model, role, chunks = _collect(core, units=True, mask_fn=_random_unit_mask)
+    S, B = chunks[0].num_slots, len(chunks)
+    config = AlgorithmConfig(normalize_advantages=normalize)
+    eps = config.eps_clip
+    algo = APPO(model, config, ActionSpec.from_space(role.action_space), device="cpu")
+    assert algo.modes == ("per_unit", "geo_mean", "mean_valid")
+
+    is_act = torch.stack([c.kind for c in chunks], dim=1) == SLOT_ACT
+    unit_valid, _ = _decider_terms(model, chunks)
+    valid = unit_valid & is_act.unsqueeze(-1)                                   # [S, B, K]
+    offsets = torch.where(valid, LOG_RATIO_OFFSETS, torch.zeros(()))
+    shifted = []
+    for b, c in enumerate(chunks):
+        bad = copy.deepcopy(c)
+        bad.behavior_unit_logp = bad.behavior_unit_logp - offsets[:, b]
+        bad.behavior_logp = bad.behavior_logp - offsets[:, b].sum(-1)
+        shifted.append(bad)
+
+    _, values, unit_log_probs = algo.evaluate_chunks(shifted)
+    behavior_unit = torch.stack([c.behavior_unit_logp for c in shifted], dim=1)
+    unit_log_ratio = torch.where(valid, unit_log_probs.reshape(S, B, -1) - behavior_unit, torch.zeros(()))
+    assert torch.allclose(unit_log_ratio, offsets, atol=TOL)                     # the learner is still the worker
+    ratio = torch.exp(unit_log_ratio)
+    assert bool((valid & (ratio > 1 + eps)).any()) and bool((valid & (ratio < 1 - eps)).any())
+    assert bool((valid & ((ratio - 1).abs() < eps) & (ratio != 1)).any())
+
+    n_valid = valid.sum(-1)
+    vt = compute_vtrace_slots(
+        log_rhos=unit_log_ratio.sum(-1) / n_valid.clamp(min=1), rewards=torch.stack([c.reward for c in chunks], dim=1),
+        values=values.reshape(S, B), is_act=is_act, terminal=torch.stack([c.terminal for c in chunks], dim=1).bool(),
+        gamma=config.gamma, rho_bar=config.vtrace_rho_bar, c_bar=config.vtrace_c_bar, lam=config.vtrace_lambda)
+    adv = vt.td                                                                 # per_unit: no rho factor
+    if normalize:
+        act_adv = vt.td[is_act]
+        adv = (adv - act_adv.mean()) / (act_adv.std(unbiased=True) + 1e-8)
+    a = adv.unsqueeze(-1)
+
+    def reduce(unit_surr: torch.Tensor) -> float:
+        per_slot = torch.where(valid, unit_surr, torch.zeros(())).sum(-1) / n_valid.clamp(min=1)
+        return float(-per_slot[is_act].mean())
+
+    expected = reduce(torch.min(ratio * a, torch.clamp(ratio, 1 - eps, 1 + eps) * a))
+    with torch.no_grad():
+        got = float(algo.compute_loss(shifted)["policy_loss"])
+    assert got == pytest.approx(expected, abs=1e-5)
+    # Discriminating: no clipping, or the joint path's rho-weighted advantage, give other numbers.
+    assert abs(reduce(ratio * a) - expected) > 1e-3
+    rho_adv = (vt.td * vt.clipped_rho).unsqueeze(-1)
+    if normalize:
+        act_rho_adv = rho_adv.squeeze(-1)[is_act]
+        rho_adv = (rho_adv - act_rho_adv.mean()) / (act_rho_adv.std(unbiased=True) + 1e-8)
+    assert abs(reduce(torch.min(ratio * rho_adv, torch.clamp(ratio, 1 - eps, 1 + eps) * rho_adv)) - expected) > 1e-3
