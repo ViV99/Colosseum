@@ -7,11 +7,11 @@
 
 ## Итог
 
-**ВСЕ КРИТЕРИИ ВЫПОЛНЕНЫ (ALL PASS).** Три правки документации во время приёмки (`docs:`), шаг 7 после них перезапущен. Владельцу остаются вопросы: проверка team_tag «лучший из двух прогонов», `ratio_mode` при K=128, шумный выбор `unit_trace` (раздел «Открытые пункты»).
+**ВСЕ КРИТЕРИИ ВЫПОЛНЕНЫ (ALL PASS).** Три правки документации во время приёмки (`docs:`), шаг 7 после них перезапущен. После приёмки — финальное ревью ветки и одна волна исправлений (раздел «Финальное ревью ветки»); критерий 3.1 после неё повторён. Владельцу остаются вопросы: проверка team_tag «лучший из двух прогонов», `ratio_mode` при K=128, шумный выбор `unit_trace` (раздел «Открытые пункты»).
 
 | § | Критерий | Результат |
 |---|---|---|
-| 3.1 | Тесты | PASS: 1243 passed, 27 deselected, 342.7 с, exit 0, предупреждений 0; ruff чистый; дерево чистое; ≤ 2 воркеров во всех тестах; счёт 1243 / 9 / 18 совпадает с README и CLAUDE.md (после правки `1311fbb`) |
+| 3.1 | Тесты | PASS: 1243 passed, 27 deselected, 342.7 с, exit 0, предупреждений 0; ruff чистый; дерево чистое; ≤ 2 воркеров во всех тестах; счёт 1243 / 9 / 18 совпадает с README и CLAUDE.md (после правки `1311fbb`). Повтор после финальной волны: 1248 passed, 343.5 с, exit 0, предупреждений 0; счёт 1248 / 9 / 18 |
 | 3.2 | Контрактные тесты | PASS: `tests/contract` 157 passed за 8.2 с; V-trace 33 passed; юнит-файлы с контрактными пунктами 174 passed; у каждого пункта есть зелёный тест |
 | 3.3 | «Учится» | PASS: быстрые 6 тестов, 0.3–4.4 с; медленные 7/7 выше порогов (coin_grid 5.63× ≥ 2×; tic_tac_toe 0.917; unit_harvest 1.000; team_tag 0.920 с первого прогона; tron 0.970 / 0.958; predator_prey 1.000 / 0.990; coop_buttons 7.39 / 7.39 ≥ 4.40), обучение 43–149 с, весь файл 11 мин 34 с |
 | 3.4 | Эксперимент по юнитам | PASS: 12 прогонов (K ∈ {8, 128} × `ratio_mode` × `unit_trace`) в `docs/benchmarks.md` и JSON (12 строк); дефолт `unit_trace` = `joint` (ruling T8.4), закреплён тестом `test_appo_v2.py` |
@@ -43,6 +43,8 @@
   - Итог: ни один тест не запускает больше 2 воркер-процессов.
 
 **PASS.**
+
+**Повтор после финальной волны** (HEAD с правками волны `a461d75`, до коммита документации): та же команда → `exit=0`, **1248 passed, 27 deselected in 343.50s (0:05:43)**; предупреждений нет; `ruff check .` — `All checks passed!`; дерево чистое (кроме `__pycache__`). Сбор по маркерам: `not gpu and not slow` — 1248/1275, `slow` — 9/1275, `gpu` — 18/1275. Волна добавила 10 быстрых тестов и удалила 5 дубликатов (+5); README и CLAUDE.md исправлены на 1248.
 
 ## §3.2 Контрактные тесты
 
@@ -464,6 +466,8 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 35. [FIX-1] Ruling: local budget overshoot of ~1 s worth of steps is harmless for real budgets (LR progress clamped; SP1 budget rule is about counting) — record for CLAUDE.md parked items (SP5 "one budget semantics"): a resume needs a budget above the checkpoint's env_steps to train; optional warning when a resume starts at/past the budget — cost if wrong: tiny-budget runs exceed budget by up to 100%+.
 36. Ruling (T8.4, coded pre-registered rule): unit_trace auto with Units = joint (K=128 per_unit score share vs scripted bot, 2-seed mean: joint 0.206, geo_mean 0.093, none 0.190; K=8 saturated at 0.5) — cost if wrong: run-to-run noise (0.044 vs 0.135 same config) exceeds the rule's 0.05 margin; joint vs none undecided by data; geo_mean consistently worst.
 37. Ruling: T8.6 dropped-reward Important fixed in the docs only (describe the real behaviour: dropped silently at default log level, counted in the worker's dropped_reward_episodes stat); surfacing the counter (warn-once or a metric) parked as a final-review candidate — docs must describe the real state, a code change is outside a docs task — cost if wrong: users keep losing rewards of never-acting seats without a visible signal until the final wave/SP3.
+38. Ruling: T8.7's task review is folded into the final whole-branch review (area C reviewer also checks the acceptance report against its evidence) — the report is the final review's main input anyway; a separate seat would duplicate it — cost if wrong: a report error is caught one stage later (still before the owner sees it).
+39. [Final fix wave] Ruling: `serve-weight-store` — Ctrl-C exits 130 consistently (the CLI-wide "Ctrl-C → 130" rule), whether or not a startup Ctrl-C was lost.
 
 ### Решения (rulings) T8.3–T8.4 (из черновика)
 
@@ -520,9 +524,34 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 - `unit_trace` = `joint`: принять выбор, сделанный на шумных данных (`none` не хуже в пределах разброса)?
 - Прогнать 18 GPU-тестов на машине с CUDA (`docs/GPU_CHECKS.md`).
 
-Кандидаты финального ревью ветки (журнал контролёра отложил их на финальную волну исправлений; в CLAUDE.md их нет, потому что они ещё не перенесены за SP2):
-- счётчик `dropped_reward_episodes` виден только в последней строке лога воркера. Нужен сигнал при потере награды: предупреждение один раз или метрика (решение T8.6);
-- FIX-2:
-  - `serve-weight-store` выходит с 0 на Ctrl-C, но с 130 после Ctrl-C, потерянного при запуске;
-  - autouse-фикстура в `test_process_lifecycle.py` для `take_lost_interrupt()`;
-  - два новых интеграционных теста заменяют `PYTHONPATH`.
+Кандидаты финального ревью ветки (счётчик `dropped_reward_episodes`, мелочи FIX-2) и пункт «контекст `validate`» исправлены финальной волной; см. раздел «Финальное ревью ветки».
+
+---
+
+## Финальное ревью ветки
+
+Три ревьюера по областям (только чтение, диапазон `7430361..7d55974`), отчёты в журнале контролёра (`final-review-{A,B,C}.md`):
+
+| Область | Critical | Important | Minor | Вердикт |
+|---|---|---|---|---|
+| A — контракт игры, деревья данных, модели | 0 | 1 (I-1 `UnitsHead`) | 11 | с исправлениями |
+| B — путь данных обучения | 0 | 0 | 6 | готово (Yes) |
+| C — лига, оркестрация, CLI, документация, отчёт приёмки | 0 | 1 (I-1 расписание eval) | 6 | с исправлениями; отчёт T8.7 точен |
+
+Ревью B сверило V-trace по слотам с IMPALA SP1 на 200 случайных чанках (max |Δ| = 0.0) и воспроизведение log-prob лёрнером при смене составов и парковке буферов (LSTM / GRU / attention, max |Δ| ≤ 3e-7).
+
+Финальная волна исправлений (одна, после ревью; TDD — сначала падающий тест):
+1. A / I-1 — `UnitsHead` падал на именах компонент `type`, `to`, `float`, именах с точкой: подмодули теперь по позиции (`c0`, `c1`, ...), выход — с именами пользователя (`a6a2faa`).
+2. C / I-1 — eval не мог составить пару с частично пересекающимися ролями: каждая ориентация пары заполняет команду одним агентом, при невозможной ориентации используется другая, пара отбрасывается, только если невозможны обе; `default_layouts` по тому же правилу (`d83ad0f`).
+3. A / M-1 (T6.2) — контекст проверок `space.contains` в `validate` в общем порядке «seat, episode step, layout»; ENV_GUIDE, CLAUDE.md и «Открытые пункты» обновлены (`3f32974`).
+4. A / M-2 (T1.4) — `resolve_outcome` с ключами разных типов: `EnvContractError` с контекстом вместо `TypeError` (`52ca7c6`).
+5. A / M-3 (T1.3) — `ObsSpec.check`: рваное наблюдение и `None`/dict в листе — `EnvContractError` с путём листа (`52ca7c6`).
+6. A / M-4 (T1.6) — умерший процесс `SubprocessVectorEnv`: ошибка с номером процесса, диапазоном сред и кодом выхода вместо `EOFError` (`18d1abd`).
+7. B Minor 2 + C (решение T8.6) — потеря наград ни разу не ходившего места: WARNING один раз на воркер с контекстом и ссылкой на ENV_GUIDE; `dropped_reward_episodes` в каждой записи `system` (`metrics.jsonl`, WandB `system/*`); ENV_GUIDE и README обновлены (`c5225e6`).
+8. C / M-1 — удалены три теста-дубликата в `test_sp2_launcher_lifecycle.py` без пропуска при отсутствии gRPC (`d691de9`).
+9. FIX-2b — `serve-weight-store` на Ctrl-C всегда выходит с 130 (`Interrupted`), как все команды (решение контролёра); autouse-фикстура `take_lost_interrupt()` в `test_process_lifecycle.py`; два интеграционных теста дополняют `PYTHONPATH` из `child_env()` (`2fb77c3`).
+10. B Minor 3, 4 — докстринг BC (пропуск решений только при K > 1); лёрнер отвергает чанк чужого агента (`collect_batch(..., agent_id=...)`) (`a461d75`).
+
+Критерий 3.1 повторён после волны: см. §3.1 («Повтор после финальной волны»).
+
+Остаются отложенными (Minor, не блокируют слияние): A M-5..M-11 (NaN-градиенты только при не конечных параметрах, Gaussian в fp16 под AMP, `global_state` без критик-энкодера, `role_signature` без `n`/`nvec`, раннее обнаружение «все выбыли», двойной расчёт `unit_log_prob`, пробел в контрактном тесте с `only_if`/Box в `Units`) и остальные мелочи журнала области A; B Minor 1, 5, 6 (NaN-безопасный backward, проверка ролей в `MatchRunner`, значения слотов от чужого узла — SP5/SP6); C M-2..M-6 (наследие `AgentPool` и мелкие остатки, формулировки «Unused in SP1», распределённый режим молча игнорирует `mode: league`, умолчания `scripts/units_experiment.py`) и прочие мелочи журнала (T0.1, T5.2, T6.1, T6.4). Пункты «Открытые пункты» выше и «Parked during SP2» в CLAUDE.md совпадают.
