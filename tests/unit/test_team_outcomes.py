@@ -47,6 +47,7 @@ def test_single_team_has_rank_one():
     (Outcome(team_score={0: 1.0, 1: 2.0, 2: 3.0, 3: 0.0}), "team_score keys"),
     (Outcome(team_score={0: 1.0, 1: math.nan, 2: 3.0}), r"team_score\[1\] must be finite"),
     (Outcome(team_rank={0: 1, 1: "first", 2: 3}), r"team_rank\[1\] must be a number"),
+    (Outcome(team_rank={0: 1.0, "b": 2.0}), r"team_rank keys \[0, 'b'\] must be exactly the layout's teams"),
 ])
 def test_bad_outcomes_raise_with_context(outcome, message):
     with pytest.raises(EnvContractError, match="worker 0, env 2: outcome") as info:

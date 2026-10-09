@@ -22,6 +22,7 @@ spec order contributes ``max_units`` deciders.
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any, Literal
 
@@ -139,7 +140,15 @@ class ObsSpec:
 
     @staticmethod
     def _check_leaf(leaf: LeafSpec, value: Any, where: str) -> None:
-        shape = np.shape(value)
+        if value is None or isinstance(value, Mapping):
+            what = "None" if value is None else "a dict"
+            raise EnvContractError(f"{where}: leaf {_fmt(leaf.path)} is {what}, expected an array of shape "
+                                   f"{leaf.shape}")
+        try:
+            shape = np.shape(value)
+        except ValueError as e:  # ragged nested sequences
+            raise EnvContractError(f"{where}: leaf {_fmt(leaf.path)} is not an array (ragged nesting?), expected "
+                                   f"shape {leaf.shape}: {e}") from None
         if tuple(shape) != leaf.shape:
             raise EnvContractError(f"{where}: leaf {_fmt(leaf.path)} has shape {tuple(shape)}, "
                                    f"expected {leaf.shape}")

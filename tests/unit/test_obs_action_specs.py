@@ -70,6 +70,20 @@ def test_obs_spec_check_structure_and_shapes():
         bare.check({"x": np.zeros(5)}, "obs")
 
 
+def test_obs_spec_check_rejects_ragged_and_missing_leaves():
+    bare = ObsSpec.from_space(Box(-1.0, 1.0, (2, 2)))
+    with pytest.raises(EnvContractError, match=r"^seat 1: observation: leaf <root> is not an array"):
+        bare.check([[0.0, 1.0], [2.0]], "seat 1: observation")             # ragged nested list
+    scalar = ObsSpec.from_space(Dict([("turn", Discrete(5)), ("x", Box(-1.0, 1.0, (2,)))]))
+    scalar.check({"turn": 3, "x": np.zeros(2)}, "obs")
+    with pytest.raises(EnvContractError, match=r"^seat 0: observation: leaf turn is None"):
+        scalar.check({"turn": None, "x": np.zeros(2)}, "seat 0: observation")
+    with pytest.raises(EnvContractError, match=r"leaf turn is a dict"):
+        scalar.check({"turn": {"value": 3}, "x": np.zeros(2)}, "obs")
+    with pytest.raises(EnvContractError, match=r"leaf <root> is None"):
+        ObsSpec.from_space(Discrete(3)).check(None, "obs")
+
+
 def test_action_groups_and_deciders():
     spec = ActionSpec.from_space(ACT)
     assert [g.path for g in spec.groups] == [("base",), ("aim",), ("workers",), ("build",)]

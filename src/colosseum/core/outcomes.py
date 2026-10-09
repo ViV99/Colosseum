@@ -20,10 +20,18 @@ def _ranks_from_scores(score: Mapping[int, float]) -> dict[int, float]:
     return {t: float(1 + sum(1 for u in score if score[u] > s)) for t, s in score.items()}
 
 
+def _keys(values: Mapping) -> list:
+    """The keys sorted when they are comparable, else in the env's order (mixed key types)."""
+    try:
+        return sorted(values)
+    except TypeError:
+        return list(values)
+
+
 def _checked(values: Mapping[int, float], field: str, num_teams: int, where: str) -> dict[int, float]:
     prefix = f"{where}: " if where else ""
     if not isinstance(values, Mapping) or set(values) != set(range(num_teams)):
-        got = sorted(values) if isinstance(values, Mapping) else type(values).__name__
+        got = _keys(values) if isinstance(values, Mapping) else type(values).__name__
         raise EnvContractError(f"{prefix}outcome.{field} keys {got} must be exactly the layout's teams "
                                f"{list(range(num_teams))}")
     out: dict[int, float] = {}
