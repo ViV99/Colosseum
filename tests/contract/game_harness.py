@@ -11,6 +11,11 @@ from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import Any, NamedTuple
 
+import torch
+
+from colosseum.sp2.algorithms.appo import APPO
+from colosseum.sp2.core.config import AlgorithmConfig
+from colosseum.sp2.core.specs import ActionSpec
 from colosseum.sp2.core.types import (
     SLOT_ACT,
     SLOT_BOOT,
@@ -155,3 +160,32 @@ def slot_steps(chunk: TrajectoryChunk) -> list[Slot]:
 def seat_chunks(col: Collected, seat: int, env: int = 0) -> list[TrajectoryChunk]:
     """Chunks whose first slot belongs to (``env``, ``seat``)."""
     return [c for c in col.chunks if slot_steps(c)[0].seat == seat and slot_steps(c)[0].env == env]
+
+
+@dataclass
+class LearnerView:
+    """Learner re-evaluation of chunks next to what the worker recorded (all time-major ``[S*B]``)."""
+
+    log_probs: torch.Tensor
+    values: torch.Tensor
+    unit_log_probs: torch.Tensor | None
+    worker_log_probs: torch.Tensor
+    worker_unit_log_probs: torch.Tensor | None
+    is_act: torch.Tensor
+
+
+def learner_eval(model: Any, chunks: list[TrajectoryChunk], role: Any, **algo_config: Any) -> LearnerView:
+    """Re-evaluate payload round-tripped ``chunks`` with a real APPO around ``model``."""
+    chunks = [TrajectoryChunk.from_payload(c.to_payload()) for c in chunks]
+    algo = APPO(model, AlgorithmConfig(**algo_config), ActionSpec.from_space(role.action_space), device="cpu")
+    lp, values, unit = algo.evaluate_chunks(chunks)
+    S, B = chunks[0].num_slots, len(chunks)
+    worker_unit = None
+    if chunks[0].behavior_unit_logp is not None:
+        worker_unit = torch.stack([c.behavior_unit_logp for c in chunks], dim=1).reshape(S * B, -1)
+    return LearnerView(
+        log_probs=lp, values=values, unit_log_probs=unit,
+        worker_log_probs=torch.stack([c.behavior_logp for c in chunks], dim=1).reshape(-1),
+        worker_unit_log_probs=worker_unit,
+        is_act=torch.stack([c.kind for c in chunks], dim=1).reshape(-1) == SLOT_ACT,
+    )
