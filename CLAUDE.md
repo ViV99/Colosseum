@@ -342,7 +342,7 @@ SP3 (players, league, warm start), after the owner accepts the SP2 acceptance re
 - **Dev machine and tests:**
   - setup: `scripts/setup-dev.sh` (CPU-only torch from the PyTorch CPU index; `--gpu` for CUDA);
   - CI suite: `.venv/bin/python -m pytest -m "not gpu and not slow" -q -rw` (must pass with zero warnings), plus `-m slow` for the learning test and `.venv/bin/ruff check .`;
-  - test conventions: no `__init__.py` under `tests/`; import support modules by bare name (`from helpers import ...`, `from cli_runner import ...`); test basenames and support-class names are unique; every file goes under `tmp_path`; integration runs start processes through `tests/cli_runner.py` (process-group cleanup);
+  - test conventions: no `__init__.py` under `tests/`; import support modules by bare name (`from game_helpers import ...`, `from cli_runner import ...`); test basenames and support-class names are unique; every file goes under `tmp_path`; integration runs start processes through `tests/cli_runner.py` (process-group cleanup);
   - at most 2 worker processes in tests (the benchmark may use 4); `OMP_NUM_THREADS=1`;
   - any config-schema change also updates `scripts/bench_throughput.py::_make_config` (pinned benchmark workload; guarded by `tests/unit/test_bench_throughput.py`).
 

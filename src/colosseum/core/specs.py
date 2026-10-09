@@ -1,8 +1,8 @@
 """Observation and action specs, and the one set of mask rules (SP2 spec block 2).
 
-Successor of SP1's ``core/action_spec.py`` (flat float32 codec, removed) and
-``core/seat_info.py`` (per-seat mask rules). ``EpisodeTracker`` (worker, eval) and
-``validate`` use these rules; nothing else re-implements them.
+This module is the one home of the mask rules (it replaced SP1's flat float32 action codec and
+per-seat mask helpers). ``colosseum.envs.contract.EpisodeTracker`` (worker, eval) and
+``colosseum.core.validation`` use these rules; nothing else re-implements them.
 
 Observations (``ObsSpec``): ``Box``, ``Discrete``, ``MultiBinary``, ``MultiDiscrete`` or a
 nested ``Dict`` of them; leaf dtypes are preserved end to end.

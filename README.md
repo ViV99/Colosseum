@@ -62,7 +62,7 @@ colosseum train -c configs/examples/tic_tac_toe_multi.yaml --set run.name=ttt-le
 | `coin_grid` | `coin_grid.yaml` | solo | Dict observation with a `uint8` grid, masks, step-limit truncation |
 | `tic_tac_toe` | `tic_tac_toe.yaml` (also `_attention`, `_multi`) | 1v1 turn-based | one acting seat, masks, rewards to the waiting seat |
 | `unit_harvest` | `unit_harvest.yaml` | one bot, many units, simultaneous | `Units`, units born and killed, entity lists with masks |
-| `team_tag` | `team_tag.yaml` | 2v2 | local window per bot, `global_state` for a centralized critic, frozen teammates |
+| `team_tag` | `team_tag.yaml` | 2v2 | local window per bot, `global_state` for a centralized critic, tagged (frozen-in-game) teammates keep team rewards |
 | `tron` | `tron.yaml` | FFA 2p/3p/4p | elimination (`terminated`), ranks by elimination order, several layouts in one run |
 | `predator_prey` | `predator_prey.yaml` | 1 vs 2 | roles with different spaces, one agent per role |
 | `coop_buttons` | `coop_buttons.yaml` | cooperative | one team, `score` outcome, mixed teammates, cross-play table |
@@ -142,8 +142,9 @@ class Value(BaseValue):
 
 Constructors receive by name what their signature declares: the encoder, the critic encoder and the policy get
 `observation_space`, `action_space`, `global_state_space` and `action_spec`; the policy and value heads get `in_dim`
-(the core's output size; for the value head plus the critic encoder's output size); every constructor gets
-`networks.kwargs`. The policy returns a `colosseum.networks.dist.Distribution` (use `make_distribution`); the
+(the core's output size; for the value head plus the critic encoder's output size); all of them, and
+`model_class`, also get `networks.kwargs`. The core gets only `input_dim` (the encoder's `latent_dim`) and its own
+`core.kwargs`. The policy returns a `colosseum.networks.dist.Distribution` (use `make_distribution`); the
 framework applies the action mask to it. Cores (`colosseum.networks.cores`): `null` (no memory), `LSTMCore` /
 `GRUCore` (`hidden_size`, `num_layers`), `WindowAttentionCore` (`d_model`, `window`, `num_heads`, `num_layers`). For
 anything else subclass `colosseum.networks.model.PolicyModel` (`step` and `unroll`) and set `networks.model_class`.
@@ -237,7 +238,7 @@ Inside a list, YAML 1.1 rules apply: `--set x=[1e-4,2]` keeps `1e-4` as a string
 |---|---|
 | `run` | `name` (null → `<config stem>-<YYYYmmdd-HHMMSS>`; an existing explicit name is an error), `dir` (`runs`) |
 | `env` | `env_class`, `kwargs`, `max_idle_steps` 1000 (more consecutive steps without an acting seat and without `episode_over` is an error) |
-| `networks` | `model_class` (null) or `encoder_class` + `core` (`{class, kwargs}` or null) + `policy_class` + `value_class` + `critic_encoder_class` (null; needs a role with `global_state_space`); `kwargs` (passed to every constructor) |
+| `networks` | `model_class` (null) or `encoder_class` + `core` (`{class, kwargs}` or null) + `policy_class` + `value_class` + `critic_encoder_class` (null; needs a role with `global_state_space`); `kwargs` (passed to the encoder, critic encoder, heads and `model_class`; the core gets only `core.kwargs`) |
 | `algorithm` | `name` (`appo`), `algorithm_class` (`colosseum.algorithms.appo.APPO`), `gamma` 0.99, `vtrace_lambda` 1.0, `vtrace_rho_bar` 1.0, `vtrace_c_bar` 1.0, `eps_clip` 0.2, `value_loss_coeff` 0.5, `entropy_coeff` 0.01, `max_grad_norm` 0.5, `num_epochs` 1, `minibatch_chunks` 0 (all chunks), `learning_rate` 3e-4, `lr_schedule` (`linear`; also `constant`, `cosine`), `normalize_advantages` (true), `use_amp` (false), `amp_dtype` (`float16` / `bfloat16`), `use_torch_compile` (false), `ratio_mode` (`auto` = `per_unit` with `Units`, else `joint`), `unit_trace` (`auto` = `joint` with or without `Units`, the units-experiment ruling in `docs/benchmarks.md`; also `geo_mean`, `none`), `entropy_reduction` (`auto` = `sum` for `joint`, `mean_valid` for `per_unit`); with one decider every mode is `joint` (an explicit `unit_trace: none` is kept) |
 | `rollout` | `chunk_length` 256 (>= 2), `num_workers` 4, `envs_per_worker` 8, `torch_threads` 1, `weight_sync_interval_sec` 5, `vec_env` (`sync` / `subprocess`), `subproc_workers` (null), `match_refresh_interval_sec` 30 |
 | `learner` | `device` (`auto`), `batch_chunks` 16 (every update uses exactly this many chunks), `queue_size` 64, `weight_push_interval` 5, `torch_threads` (null = auto), `pin_memory` (false) |
