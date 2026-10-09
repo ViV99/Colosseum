@@ -107,6 +107,47 @@ def test_space_miners_match_ends_by_rule_with_scores():
     assert set(res.outcome.team_score) == {0, 1} and set(res.outcome.team_rank) == {0, 1}
 
 
+@pytest.mark.parametrize("scores, last_change, ranks, rewards", [
+    ((30, 10), (4, 2), {0: 1.0, 1: 2.0}, {0: 1.0, 1: -1.0}),       # higher score wins
+    ((20, 20), (5, 3), {0: 2.0, 1: 1.0}, {0: -1.0, 1: 1.0}),       # equal scores: who scored first wins
+    ((20, 20), (4, 4), {0: 1.0, 1: 1.0}, {0: 0.0, 1: 0.0}),        # full tie: both share the min rank
+], ids=["win", "first_scorer_tie_break", "full_tie"])
+def test_space_miners_outcome_ranks_and_rewards(scores, last_change, ranks, rewards):
+    pytest.importorskip("Box2D")
+    from examples.space_miners.game import MAX_SHIPS, SpaceMinersGame
+
+    env = SpaceMinersGame(max_ticks=2)
+    env.reset(0, "2p")
+    idle = {"accel": np.zeros((MAX_SHIPS, 2), np.float32), "push": np.zeros(MAX_SHIPS, np.int64)}
+    res = env.step({0: idle, 1: idle})
+    assert not res.episode_over
+    for player, score, tick in zip(env._game.players, scores, last_change):
+        player.score, player.last_score_change_tick = score, tick
+    res = env.step({0: idle, 1: idle})                         # the last tick: idle ships score nothing
+    assert res.episode_over and not res.truncated
+    assert res.outcome.team_rank == ranks
+    assert res.outcome.team_score == {0: float(scores[0]), 1: float(scores[1])}
+    assert res.rewards == rewards
+
+
+@pytest.mark.parametrize("preset", ["Round 2", "Final Round"])
+def test_space_miners_energy_and_upgrade_presets(preset):
+    pytest.importorskip("Box2D")
+    import functools
+
+    from examples.space_miners.game import SpaceMinersGame
+
+    env = SpaceMinersGame(preset=preset, max_ticks=8)
+    res = env.reset(0, "2p")
+    assert res.obs[0]["ships"][:, 4].tolist() == [1.0, 1.0, 1.0]              # full energy (100) -> 1
+    if preset == "Final Round":
+        env._game.players[0].ships[0].upgrades["push_force"] = 2
+        assert env._obs(0)["ships"][0, 5:9].tolist() == pytest.approx([0.0, 0.0, 0.4, 0.0])
+        assert env._obs(1)["enemy_ships"][0, 7] == pytest.approx(0.4)
+    results, _ = random_matches(functools.partial(SpaceMinersGame, preset=preset, max_ticks=8), min_episodes=2)
+    assert all(r.layout == "2p" and r.episode_length == 8 for r in results)
+
+
 @pytest.mark.parametrize("kwargs, match", [
     ({"preset": "Round 3"}, r"unknown preset 'Round 3'.*'Round 1', 'Round 2', 'Final Round'"),
     ({"max_ticks": 0}, r"max_ticks must be >= 1"),

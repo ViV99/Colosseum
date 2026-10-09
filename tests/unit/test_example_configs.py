@@ -11,6 +11,7 @@ from click.testing import CliRunner
 
 from colosseum.cli import main
 from colosseum.core.config import load_config
+from colosseum.core.registry import build_model, env_spec
 from examples.composite_action.game import DIRS, GRID, ChaseGame
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -50,6 +51,14 @@ def test_every_example_config_validates(path, monkeypatch):
     monkeypatch.chdir(REPO_ROOT)
     result = CliRunner().invoke(main, ["validate", "-c", str(path)])
     assert result.exit_code == 0, result.output
+
+
+def test_attention_example_builds_a_stateful_model():
+    cfg = load_config(REPO_ROOT / "configs" / "examples" / "tic_tac_toe_attention.yaml")
+    assert cfg.networks.core.class_path == "colosseum.networks.cores.WindowAttentionCore"
+    role = env_spec(cfg).roles["player"]
+    model = build_model(cfg.get_agent_config("agent_0"), role)
+    assert model.is_stateful
 
 
 def test_example_configs_use_run_section_not_checkpoint_dir():

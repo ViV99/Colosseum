@@ -9,14 +9,16 @@ Requires Box2D (``pip install -e ".[examples]"``).
 
 Contract features shown here:
 - ``GameSpec.symmetric(2, ...)``, simultaneous moves, a rule-based end at ``max_ticks``
-  (``truncated=False``) with ``Outcome.team_score`` = game scores (ties broken by the engine's
-  "who scored first" rule through ``Outcome.team_rank``);
+  (``truncated=False``) with ``Outcome.team_score`` = game scores (equal scores broken by the engine's
+  "who scored first" rule through ``Outcome.team_rank``; a full tie gives both teams rank 1);
 - ships as ``Units(3, Dict(accel=Box(2), push=Discrete(2)))``: a continuous component and a
   discrete one per unit (the ``Dict`` is built from a list, so the order is ``accel``, ``push``);
 - asteroids as an entity list with a mask (``asteroids`` + ``asteroid_mask``) in a ``Dict``
   observation;
 - masks inside ``Units``: ``push`` is legal only when an asteroid is within push range (otherwise
-  the push would do nothing; with energy it would also waste energy).
+  the push would do nothing). With energy (``Round 2``, ``Final Round``) a legal push can still be
+  unaffordable: when a ship's energy is below the cost of its acceleration plus push, the engine
+  drops that ship's whole command for the tick, acceleration included.
 
 Observation from the player's perspective (``Dict``, positions in [-1, 1], player 1 mirrored so
 that both players' bases are on the left):
@@ -164,7 +166,7 @@ class SpaceMinersGame(MultiAgentEnv):
         if winner >= 0:
             rewards[winner] += 1.0
             rewards[1 - winner] -= 1.0
-        ranks = {0: 1.5, 1: 1.5} if winner < 0 else {winner: 1.0, 1 - winner: 2.0}
+        ranks = {0: 1.0, 1: 1.0} if winner < 0 else {winner: 1.0, 1 - winner: 2.0}   # ties share the min rank
         scores = {i: float(game.players[i].score) for i in (0, 1)}
         return StepResult(acting=set(), obs={}, rewards=rewards, episode_over=True,
                           outcome=Outcome(team_rank=ranks, team_score=scores))
