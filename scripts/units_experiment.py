@@ -13,7 +13,9 @@ Diagnostics are the means over the last quarter of the run's ``train`` records i
 
 The script prints a Markdown table and the ``unit_trace`` recommendation of the decision rule
 (T8.4): keep ``geo_mean`` unless another trace, with ``ratio_mode=per_unit``, has a K=128 score
-share vs scripted at least 0.05 higher and a K=8 share at most 0.05 lower.
+share vs scripted at least 0.05 higher and a K=8 share at most 0.05 lower. ``geo_mean`` is the
+rule's baseline because it was the spec's default before the experiment; the experiment chose
+``joint``, which is the current default (``unit_trace: auto``, docs/benchmarks.md).
 
 Usage (the evaluation imports the test kit, so it puts ``tests/`` and ``tests/learning`` on
 ``sys.path``)::
@@ -48,7 +50,7 @@ RATIO_MODES = ("joint", "per_unit")
 UNIT_TRACES = ("joint", "geo_mean", "none")
 DIAG_KEYS = ("clip_fraction", "clip_fraction_joint", "ess", "log_rho_abs_p95", "log_rho_joint_abs_mean",
              "c_clip_frac", "deciders_valid_mean")
-DEFAULT_TRACE = "geo_mean"   # the spec's pre-experiment default: the baseline of the decision rule
+DEFAULT_TRACE = "geo_mean"   # the rule's baseline (the spec's pre-experiment default); the current default is joint
 MARGIN = 0.05
 
 

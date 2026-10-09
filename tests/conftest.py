@@ -22,8 +22,8 @@ import torch  # noqa: E402
 TESTS_DIR = Path(__file__).resolve().parent
 REPO_ROOT = TESTS_DIR.parent
 
-# `helpers` (tests/) and `examples.*` (repo root) must be importable from every
-# test module and every spawned child (spawn copies sys.path into the child).
+# Support modules in tests/ (`game_helpers`, `cli_runner`, ...) and `examples.*` (repo root) must be
+# importable from every test module and every spawned child (spawn copies sys.path into the child).
 for _path in (str(REPO_ROOT), str(TESTS_DIR)):
     if _path not in sys.path:
         sys.path.insert(0, _path)
@@ -44,9 +44,9 @@ def pytest_configure(config: pytest.Config) -> None:
     """Abort early if two modules under tests/ share a basename.
 
     Test dirs have no ``__init__.py`` and pytest uses the default "prepend"
-    import mode, so every module there (tests and helpers such as ``harness``)
-    is imported by its bare basename. Unique basenames keep ``from helpers
-    import ...`` style imports and spawn pickling of test-module functions
+    import mode, so every module there (tests and support modules such as
+    ``game_harness``) is imported by its bare basename. Unique basenames keep
+    ``from game_helpers import ...`` style imports and spawn pickling of test-module functions
     working; a clash would otherwise surface as "import file mismatch" or as
     one helper module silently shadowing another.
     """

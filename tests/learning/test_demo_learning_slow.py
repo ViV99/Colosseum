@@ -85,11 +85,11 @@ def _team_tag_win_rate(tmp_path, seed_offset: int) -> float:
 
 @pytest.mark.timeout(2400)
 def test_team_tag_team_beats_random_team_80_percent(tmp_path):
-    """Best of two independent runs (controller ruling, T8.3 fix round 2): about one run in seven
-    settles into a passive draw-seeking policy (0 losses, many draws), and async training is not
-    reproducible per seed. If the first run misses the threshold, train once more from scratch
-    (new run dir, seed offset ``TEAM_TAG_RETRY_SEED_OFFSET``). The threshold itself is the spec's.
-    No other test retries."""
+    """Best of two independent runs (controller ruling, T8.3 fix round 2): about 2 of 9 single runs
+    (the T8.3 record in the SP2 acceptance report) settle into a passive draw-seeking policy (0 losses,
+    many draws), and async training is not reproducible per seed. If the first run misses the
+    threshold, train once more from scratch (new run dir, seed offset ``TEAM_TAG_RETRY_SEED_OFFSET``).
+    The threshold itself is the spec's. No other test retries."""
     first_dir = tmp_path / "run1"
     first_dir.mkdir()
     first = _team_tag_win_rate(first_dir, 0)

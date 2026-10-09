@@ -77,9 +77,10 @@ def test_resume_continues_versions_and_checks_the_role_signature(tmp_path):
     final = metas(first, "agent_0")[-1]
     version, done = final["policy_version"], final["env_steps"]
     # The first run overshoots its budget (workers flush their env steps about every 0.5 s and step
-    # until they see the stop; often by more than 1500 steps here), so the resumed budget counts from
-    # where it really stopped. 2000 more steps cannot pass before the learner trains: while it
-    # consumes nothing, the full trajectory queue stops the worker after about 500 env steps.
+    # until they see the stop; in 3 of 12 measured runs by 1500 steps or more), so the resumed budget
+    # counts from where it really stopped. 2000 more steps cannot pass before the learner trains: while
+    # it consumes nothing, the full trajectory queue stops the worker after about 500 env steps.
+    # That margin depends on the TINY config (learner.queue_size, rollout.chunk_length, envs_per_worker).
     resumed_budget = str(done + 2000)
 
     second = run_train(config, tmp_path, name="second",
