@@ -1,4 +1,4 @@
-"""Shared SP2 test kit: toy ``MultiAgentEnv`` games (T1.4), drivers (T1.5), tiny models (T2.3).
+"""Shared SP2 test kit: toy ``MultiAgentEnv`` games (T1.4), drivers (T1.5), tiny models (T2.3), configs (T5.3).
 
 Every game is small, pure numpy and deterministic given the reset seed. Games are
 top-level classes, so ``functools.partial(Game, ...)`` or the class itself is a picklable
@@ -984,3 +984,140 @@ class RecordingLearnerAlgorithm:
         self.progress_at_train.append(self._progress)
         self._policy_version += 1
         return {"total_loss": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# Part C (T5.3): a config-driven test model and tiny configs for the toy games
+# ---------------------------------------------------------------------------
+
+
+class GameTestModel(PolicyModel):
+    """``make_test_model`` behind ``networks.model_class``: ``build_model`` injects the role's spaces."""
+
+    def __init__(self, observation_space, action_space, global_state_space=None, core: str = "none",
+                 hidden: int = 16) -> None:
+        super().__init__()
+        role = RoleSpec(observation_space, action_space, global_state_space)
+        self.inner = make_test_model(role, core=core, hidden=hidden)
+
+    def initial_state(self, batch_size, device="cpu"):
+        return self.inner.initial_state(batch_size, device)
+
+    def step(self, obs, state, action_mask=None):
+        return self.inner.step(obs, state, action_mask)
+
+    def unroll(self, obs, state0, reset_after, action_mask=None, global_state=None, with_value=True):
+        return self.inner.unroll(obs, state0, reset_after, action_mask, global_state=global_state,
+                                 with_value=with_value)
+
+    def reset_state(self, state, done):
+        return self.inner.reset_state(state, done)
+
+    def update_normalizers(self, obs, global_state=None):
+        self.inner.update_normalizers(obs, global_state)
+
+    @property
+    def is_stateful(self) -> bool:
+        return self.inner.is_stateful
+
+
+# Agents sections of the toy games (``TOY_GAMES`` names) that need more than the default agent.
+TEST_GAME_AGENTS: dict[str, dict] = {
+    "asymmetric": {"hunter": {"roles": ["hunter"]}, "prey": {"roles": ["prey"]}},
+}
+
+
+def make_test_config(game: str, **sections):
+    """A tiny run ``ColosseumConfig`` for a toy game of this module (a ``TOY_GAMES`` name, default kwargs).
+
+    Each keyword is a top-level config section deep-merged onto the defaults below, except
+    ``agents``, which replaces the game's agents section. ``env.env_class`` names this module,
+    so spawned children need ``tests/`` on their path (the test process has it; CLI children get
+    it through ``cli_runner.child_env``).
+    """
+    from colosseum.sp2.core.config import ColosseumConfig, deep_merge
+
+    agents = TEST_GAME_AGENTS.get(game)
+    data = {
+        "env": {"env_class": f"game_helpers.{TOY_GAMES[game].__name__}", "kwargs": {}},
+        "networks": {"model_class": "game_helpers.GameTestModel", "kwargs": {"core": "none", "hidden": 16}},
+        "algorithm": {"learning_rate": 1.0e-3, "lr_schedule": "constant"},
+        "rollout": {"num_workers": 1, "envs_per_worker": 4, "chunk_length": 8,
+                    "weight_sync_interval_sec": 0.5, "match_refresh_interval_sec": 1.0},
+        "learner": {"device": "cpu", "batch_chunks": 2, "queue_size": 16},
+        "training": {"total_timesteps": 2000, "seed": 0},
+        "checkpoint": {"interval": 20, "pool_size": 5},
+        "metrics": {"use_wandb": False, "log_interval": 1, "console_interval_sec": 1.0},
+    }
+    if agents is not None:
+        data["agents"] = {aid: dict(override) for aid, override in agents.items()}
+    for section, values in sections.items():
+        if section == "agents" or not isinstance(data.get(section), dict):
+            data[section] = values
+        else:
+            data[section] = deep_merge(data[section], values)
+    return ColosseumConfig.model_validate(data)
+
+
+def write_test_config(path, game: str, **sections):
+    """``make_test_config`` written as YAML to ``path`` (for CLI runs); returns the path."""
+    from pathlib import Path
+
+    import yaml
+
+    path = Path(path)
+    config = make_test_config(game, **sections)
+    path.write_text(yaml.safe_dump(config.model_dump(mode="json", by_alias=True), sort_keys=False))
+    return path
+
+
+def make_coordinator(config, checkpoint_dir):
+    """``Coordinator`` for ``config`` with the env's spec and the resolved agent roles."""
+    from colosseum.sp2.coordinator.coordinator import Coordinator
+    from colosseum.sp2.core.registry import env_spec
+    from colosseum.sp2.core.roles import resolve_agent_roles
+
+    spec = env_spec(config)
+    return Coordinator(config, spec, resolve_agent_roles(config, spec), checkpoint_dir)
+
+
+def agent_role_of(config, agent_id: str):
+    """``(roles, RoleSpec)`` of a trainable agent of ``config``."""
+    from colosseum.sp2.core.registry import env_spec
+    from colosseum.sp2.core.roles import agent_role_spec, resolve_agent_roles
+
+    spec = env_spec(config)
+    roles = resolve_agent_roles(config, spec)[agent_id]
+    return roles, agent_role_spec(spec, roles)
+
+
+class FakeAlgorithm:
+    """The ``BaseAlgorithm`` members checkpointing uses (``make_checkpoint_payload``,
+    ``apply_resume_state``): a tiny model, an Adam optimizer and a policy version.
+    Shared by the checkpoint (T5.3) and launcher-checkpoint (T5.4) tests."""
+
+    def __init__(self, version: int = 0):
+        self._model = nn.Linear(3, 2)
+        self._opt = torch.optim.Adam(self._model.parameters(), lr=1e-3)
+        self._version = version
+
+    @property
+    def model(self):
+        return self._model
+
+    @property
+    def policy_version(self) -> int:
+        return self._version
+
+    def train_once(self):
+        self._opt.zero_grad()
+        self._model(torch.ones(4, 3)).sum().backward()
+        self._opt.step()
+        self._version += 1
+
+    def state_dict(self):
+        return {"optimizer": self._opt.state_dict(), "policy_version": self._version, "consumed_samples": 0}
+
+    def load_state_dict(self, state):
+        self._opt.load_state_dict(state["optimizer"])
+        self._version = int(state["policy_version"])
