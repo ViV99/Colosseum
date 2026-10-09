@@ -233,6 +233,37 @@ def test_seat_of_a_role_the_core_does_not_play_goes_to_any_latest_player_of_it()
     assert abs(hunters[("h", "h")] / DRAWS - 0.25) < 0.05, hunters
 
 
+@pytest.mark.parametrize(("players", "agents", "config"), [
+    (2, ["a", "b", "c"], {"mode": "league", "self_play_ratio": 0.3}),
+    (2, ["a", "b"], {"mode": "self_play"}),
+    (2, ["a"], {"mode": "self_play", "latest_prob": 0.0}),
+    (4, ["a", "b", "c"], {"mode": "league", "self_play_ratio": 0.0}),
+])
+def test_seats_are_balanced_within_5_percent(players, agents, config):
+    """SP1's seat-balance guarantee (``test_league_matchmaking``): with shuffled seats every agent's
+    collecting seats, and the checkpoint opponents' seats, spread evenly over the seats."""
+    spec = GameSpec.symmetric(players, OBS, ACT)
+    roles = {a: ["player"] for a in agents}
+    mm = make_mm(spec, roles, seed=1, ckpts={a: ["ckpt_v1", "ckpt_v2"] for a in agents}, **config)
+    collecting: dict[str, Counter] = {a: Counter() for a in agents}
+    checkpoints = Counter()
+    for _ in range(9000 // len(agents)):
+        for owner in agents:
+            for index, seat in enumerate(mm.lineup_for(owner).seats):
+                if seat.collect:
+                    collecting[seat.agent_id][index] += 1
+                else:
+                    checkpoints[index] += 1
+    for counts in [*collecting.values(), checkpoints]:
+        total = sum(counts.values())
+        if counts is checkpoints and config["mode"] == "league" and config["self_play_ratio"] == 0.0:
+            assert total == 0  # arena matches have no checkpoint seats
+            continue
+        assert total > 1000, counts
+        for index in range(players):
+            assert abs(counts[index] / total - 1 / players) <= 0.05, counts
+
+
 def test_permute_seats_keeps_team_and_role_structure():
     spec = GameSpec(
         roles={"hunter": HUNTER, "prey": PREY},

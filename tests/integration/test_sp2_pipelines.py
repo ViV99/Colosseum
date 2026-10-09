@@ -1,0 +1,250 @@
+"""SP2 end-to-end runs through real worker / learner processes (spawn start method, T7.1)."""
+
+from __future__ import annotations
+
+import json
+import multiprocessing as mp
+import queue
+import time
+
+import pytest
+
+from cli_runner import REPO_ROOT
+from colosseum.sp2.coordinator.checkpoint_manager import CheckpointManager
+from colosseum.sp2.core.config import ColosseumConfig, load_config
+from colosseum.sp2.core.types import Lineup, SeatAssignment, TrajectoryChunk
+from colosseum.sp2.launcher import setup_run
+from game_helpers import make_test_run_dir
+
+
+def example_config(name: str):
+    return REPO_ROOT / "configs" / "sp2" / name
+
+
+def _config(name: str, tmp_path, **sections: dict) -> ColosseumConfig:
+    """Example config with WandB off and section overrides (runs go to tmp_path via make_test_run_dir)."""
+    data = load_config(example_config(name)).model_dump()
+    data["metrics"]["use_wandb"] = False
+    for section, values in sections.items():
+        data[section].update(values)
+    return ColosseumConfig(**data)
+
+
+def _stop(proc: mp.Process, stop_event) -> None:
+    stop_event.set()
+    proc.join(timeout=10)
+    if proc.is_alive():
+        proc.terminate()
+        proc.join(timeout=5)
+
+
+def test_worker_produces_chunks(tmp_path):
+    """A spawned worker process sends full-length chunks for its agent."""
+    from colosseum.sp2.launcher import _worker_target
+
+    config = _config(
+        "tic_tac_toe.yaml", tmp_path,
+        rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
+    )
+    agent_id = "agent_0"
+    trajectory_queues = {agent_id: mp.Queue(maxsize=16)}
+    weight_queues = {agent_id: mp.Queue(maxsize=2)}
+    stop_event = mp.Event()
+    setup = setup_run(config, validate=False)
+    lineups = [Lineup("2p", [SeatAssignment(agent_id), SeatAssignment(agent_id)]) for _ in range(2)]
+    proc = mp.Process(
+        target=_worker_target,
+        kwargs=dict(
+            worker_id=0, config=config, agent_ids=[agent_id], agent_roles=setup.agent_roles,
+            agent_configs=setup.agent_configs, role_specs=setup.role_specs,
+            trajectory_queues=trajectory_queues, weight_queues=weight_queues,
+            stop_event=stop_event, lineups=lineups,
+        ),
+        daemon=True,
+    )
+    proc.start()
+    try:
+        chunks = [TrajectoryChunk.from_payload(trajectory_queues[agent_id].get(timeout=60)) for _ in range(5)]
+    finally:
+        _stop(proc, stop_event)
+    for chunk in chunks:
+        assert chunk.agent_id == agent_id
+        assert chunk.num_slots == 8
+
+
+def test_worker_multi_agent_routing(tmp_path):
+    """Chunks are routed to the queue of the agent that occupies the slot."""
+    from colosseum.sp2.launcher import _worker_target
+
+    config = _config(
+        "tic_tac_toe_multi.yaml", tmp_path,
+        rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
+    )
+    agent_ids = config.get_trainable_agent_ids()
+    setup = setup_run(config, validate=False)
+    trajectory_queues = {aid: mp.Queue(maxsize=16) for aid in agent_ids}
+    weight_queues = {aid: mp.Queue(maxsize=2) for aid in agent_ids}
+    stop_event = mp.Event()
+    lineups = [Lineup("2p", [SeatAssignment(agent_ids[0]), SeatAssignment(agent_ids[1])]) for _ in range(2)]
+    proc = mp.Process(
+        target=_worker_target,
+        kwargs=dict(
+            worker_id=0, config=config, agent_ids=agent_ids, agent_roles=setup.agent_roles,
+            agent_configs=setup.agent_configs, role_specs=setup.role_specs,
+            trajectory_queues=trajectory_queues, weight_queues=weight_queues,
+            stop_event=stop_event, lineups=lineups,
+        ),
+        daemon=True,
+    )
+    proc.start()
+    chunks_by_agent: dict[str, list] = {aid: [] for aid in agent_ids}
+    deadline = time.time() + 60
+    try:
+        while time.time() < deadline and min(len(v) for v in chunks_by_agent.values()) < 2:
+            for aid in agent_ids:
+                try:
+                    chunks_by_agent[aid].append(
+                        TrajectoryChunk.from_payload(trajectory_queues[aid].get(timeout=0.5)))
+                except queue.Empty:
+                    pass
+    finally:
+        _stop(proc, stop_event)
+    for aid in agent_ids:
+        assert len(chunks_by_agent[aid]) >= 2, f"agent {aid} received too few chunks"
+        assert all(c.agent_id == aid for c in chunks_by_agent[aid])
+
+
+@pytest.mark.timeout(900)
+def test_full_pipeline(tmp_path):
+    """Single-agent self-play training runs to completion and saves checkpoints."""
+    from colosseum.sp2.launcher import Launcher
+
+    config = _config(
+        "tic_tac_toe.yaml", tmp_path,
+        training={"total_timesteps": 3000},
+        rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
+        learner={"batch_chunks": 2, "queue_size": 16},
+    )
+    run = make_test_run_dir(config, tmp_path)
+    Launcher(config, run).launch()
+    assert CheckpointManager(run.checkpoints).list_checkpoints("agent_0")
+
+
+@pytest.mark.timeout(900)
+def test_full_pipeline_with_checkpoint_pool(tmp_path):
+    """Checkpoints are saved every N train steps, plus a final one, and the FIFO pool is respected."""
+    from colosseum.sp2.launcher import Launcher
+
+    config = _config(
+        "tic_tac_toe.yaml", tmp_path,
+        training={"total_timesteps": 5000},
+        rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
+        learner={"batch_chunks": 2, "queue_size": 16},
+        # ~300 train steps before the env-step budget stops the run: checkpoints at
+        # 40, 80, ... and a final one at stop -> the FIFO pool keeps the last 5
+        # (exact versions depend on timing).
+        checkpoint={"interval": 40, "pool_size": 5},
+    )
+    run = make_test_run_dir(config, tmp_path)
+    Launcher(config, run).launch()
+    ckpts = CheckpointManager(run.checkpoints, pool_size=5).list_checkpoints("agent_0")
+    versions = [c.policy_version for c in ckpts]
+    assert len(versions) == 5, versions
+    assert all(a < b for a, b in zip(versions, versions[1:])), versions
+    assert all(v > 0 and v % 40 == 0 for v in versions[:-1]), versions
+    assert ckpts[-1].meta["final"] is True, "the newest checkpoint is the learner's final snapshot"
+    assert not any(c.meta["final"] for c in ckpts[:-1])
+
+
+@pytest.mark.timeout(900)
+def test_multi_agent_pipeline(tmp_path):
+    """Two-agent league training runs to completion."""
+    from colosseum.sp2.launcher import Launcher
+
+    config = _config(
+        "tic_tac_toe_multi.yaml", tmp_path,
+        training={"total_timesteps": 3000},
+        rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
+        learner={"batch_chunks": 2, "queue_size": 16},
+        checkpoint={"interval": 50},
+    )
+    run = make_test_run_dir(config, tmp_path)
+    Launcher(config, run).launch()
+    manager = CheckpointManager(run.checkpoints)
+    assert all(manager.list_checkpoints(aid) for aid in config.get_trainable_agent_ids())
+
+
+@pytest.mark.timeout(900)
+def test_multi_agent_learners_both_train_until_the_budget(tmp_path):
+    """Two learners share the workers; both keep training until the global budget stops the run.
+
+    Regression (T2.5): with per-learner step budgets, the first learner to finish
+    left the workers blocked on its full chunk queue and the other agent starved.
+    Learner metrics are read from the run's ``metrics.jsonl`` (T6.3).
+    """
+    from colosseum.sp2.launcher import Launcher
+
+    config = _config(
+        "tic_tac_toe_multi.yaml", tmp_path,
+        training={"total_timesteps": 3000},
+        rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
+        learner={"batch_chunks": 2, "queue_size": 16, "device": "cpu"},
+        metrics={"log_interval": 1},
+    )
+    run = make_test_run_dir(config, tmp_path)
+    launcher = Launcher(config, run)
+    launcher.launch()
+
+    records = [json.loads(line) for line in run.metrics_path.read_text().splitlines()]
+    train = [(r["agent"], r["train_step"], r) for r in records if r["kind"] == "train"]
+    assert launcher.env_steps_done >= 3000
+    agent_ids = config.get_trainable_agent_ids()
+    assert len(agent_ids) == 2
+    last_step = {aid: max((s for a, s, _ in train if a == aid), default=0) for aid in agent_ids}
+    max_progress = {aid: max((m["progress"] for a, _, m in train if a == aid), default=0.0)
+                    for aid in agent_ids}
+    # Both learners were still training in the second half of the budget ...
+    assert all(p >= 0.5 for p in max_progress.values()), max_progress
+    # ... and neither starved: they trained comparable numbers of steps.
+    assert min(last_step.values()) >= 0.5 * max(last_step.values()) > 0, last_step
+
+
+@pytest.mark.timeout(900)
+def test_subprocess_vec_env_pipeline(tmp_path):
+    """Nested spawn (worker -> env subprocesses) trains to completion."""
+    from colosseum.sp2.launcher import Launcher
+
+    config = _config(
+        "tic_tac_toe.yaml", tmp_path,
+        training={"total_timesteps": 2000},
+        rollout={
+            "num_workers": 1, "envs_per_worker": 4, "chunk_length": 8,
+            "vec_env": "subprocess", "subproc_workers": 2, "match_refresh_interval_sec": 1.0,
+        },
+        learner={"batch_chunks": 2, "queue_size": 16},
+    )
+    run = make_test_run_dir(config, tmp_path)
+    Launcher(config, run).launch()
+    assert CheckpointManager(run.checkpoints).list_checkpoints("agent_0")
+    # Env children log to worker-<i>-env<global offset>.log in the run dir (T6.2).
+    assert "worker-0-env0 started (pid" in (run.logs / "worker-0-env0.log").read_text()
+    assert "worker-0-env2 started (pid" in (run.logs / "worker-0-env2.log").read_text()
+
+
+@pytest.mark.timeout(900)
+def test_full_pipeline_lstm_core(tmp_path):
+    """Recurrent end-to-end run (R1-01): worker chunks with LSTM state train in the learner."""
+    from colosseum.sp2.launcher import Launcher
+
+    config = _config(
+        "tic_tac_toe.yaml", tmp_path,
+        training={"total_timesteps": 3000},
+        rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
+        learner={"batch_chunks": 2, "queue_size": 16},
+    )
+    data = config.model_dump()
+    data["networks"]["core"] = {"class": "colosseum.networks.cores.LSTMCore", "kwargs": {"hidden_size": 32}}
+    lstm_config = ColosseumConfig(**data)
+    run = make_test_run_dir(lstm_config, tmp_path)
+    Launcher(lstm_config, run).launch()
+    assert CheckpointManager(run.checkpoints).list_checkpoints("agent_0")

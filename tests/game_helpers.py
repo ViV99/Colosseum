@@ -1130,3 +1130,15 @@ def make_test_run_dir(config, tmp_path, name: str = "test-run"):
     config.run.dir = str(tmp_path / "runs")
     config.run.name = name
     return RunDir.create(config)
+
+
+class CrashingAPPO(APPO):
+    """APPO whose third ``train_step`` raises: a learner crash in the middle of training."""
+
+    crash_at_step = 3
+
+    def train_step(self, chunks):
+        self._steps_seen = getattr(self, "_steps_seen", 0) + 1
+        if self._steps_seen >= self.crash_at_step:
+            raise RuntimeError("injected train_step failure")
+        return super().train_step(chunks)
