@@ -28,7 +28,7 @@ REQUIRED_KEYS: dict[str, set[str]] = {
                  "seat_counts", "by_layout"},
     "ratings": {"ts", "kind", "env_steps", "layouts"},
     "system": {"ts", "kind", "env_steps", "env_steps_per_sec", "train_steps_per_sec", "queue_depths",
-               "parked_buffers", "workers_reporting"},
+               "parked_buffers", "dropped_reward_episodes", "workers_reporting"},
 }
 
 

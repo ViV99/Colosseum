@@ -7,6 +7,8 @@ R = BOOT with reset_after, P = PAD).
 
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 import torch
@@ -172,7 +174,7 @@ def test_rewards_before_the_first_act_are_carried_into_it():
     assert loop.stats["dropped_reward_episodes"] == 0
 
 
-def test_a_seat_that_never_acts_drops_its_reward_and_is_counted():
+def test_a_seat_that_never_acts_drops_its_reward_and_is_counted(caplog):
     script = [
         Tick(acting={0}),
         Tick(acting={0}, rewards={1: 2.0}),
@@ -180,7 +182,12 @@ def test_a_seat_that_never_acts_drops_its_reward_and_is_counted():
     ]
     model = make_test_model(ROLE2)
     loop, col = make_loop(GameFactory((script, 2)), {"a": lambda: model}, [lineup("2p", "a", "a")])
-    run_steps(loop, 6)                                        # 3 episodes
+    with caplog.at_level(logging.WARNING, logger="colosseum.worker.rollout_loop"):
+        run_steps(loop, 6)                                    # 3 episodes
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 1                                 # once per worker, further drops are only counted
+    assert warnings[0].startswith("worker 0, env 0, seat 1, episode step 2, layout 2p: agent 'a' loses reward 3.0")
+    assert "docs/ENV_GUIDE.md" in warnings[0] and "dropped_reward_episodes" in warnings[0]
     stats = loop.stats
     assert stats["dropped_reward_episodes"] == 3
     assert stats["recorded_transitions"] == 6

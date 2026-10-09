@@ -168,6 +168,8 @@ class SystemStats:
             },
             "queue_depths": dict(queue_depths),
             "parked_buffers": int(sum(int(w.get("parked_buffers", 0)) for _, w in self._workers.values())),
+            "dropped_reward_episodes": int(sum(int(w.get("dropped_reward_episodes", 0))
+                                               for _, w in self._workers.values())),
             "workers_reporting": len(self._workers),
         }
         self._last_t = now

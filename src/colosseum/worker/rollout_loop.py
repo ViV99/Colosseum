@@ -19,7 +19,7 @@ seat (slot rules of spec block 4):
   follows the open ACT.
 - A chunk is sealed as soon as its last slot is taken (always a BOOT or a PAD).
 - A seat that never acted in an episode drops its pending reward at the episode end
-  (counted in ``stats["dropped_reward_episodes"]``).
+  (counted in ``stats["dropped_reward_episodes"]``; the first drop on a worker is a WARNING).
 - Buffers are owned by agents and parked when a lineup change at an episode end stops a
   seat from collecting for its agent; a seat that starts collecting takes a parked buffer
   of that agent first (``BufferPool``).
@@ -158,6 +158,7 @@ class RolloutLoop:
             self._episodes = 0
             self._chunks_sent = 0
             self._dropped_reward_episodes = 0
+            self._dropped_reward_warned = False
             self._recorded: dict[str, int] = defaultdict(int)
             self._runner = MatchRunner(
                 vec_env=vec_env, lineups=lineups, models=self, observer=self, seed=seed,
@@ -320,10 +321,16 @@ class RolloutLoop:
                     buf.mark_terminal()
             if track.pending_reward != 0.0:
                 self._dropped_reward_episodes += 1
-                logger.debug(
-                    f"Worker {self.worker_id}: env {env}, seat {seat}: dropping reward "
-                    f"{track.pending_reward} of an episode the seat never acted in"
-                )
+                message = (f"worker {self.worker_id}, env {env}, seat {seat}, episode step "
+                           f"{end.result.episode_length}, layout {end.result.layout}: agent {track.agent_id!r} "
+                           f"loses reward {track.pending_reward} of an episode in which this seat never acted")
+                if self._dropped_reward_warned:
+                    logger.debug(message)
+                else:
+                    self._dropped_reward_warned = True
+                    logger.warning(f"{message}; further drops on this worker are only counted "
+                                   f"(dropped_reward_episodes in the system metrics); see docs/ENV_GUIDE.md, "
+                                   f"rewards of waiting seats")
             track.pending_reward = 0.0
         self._episodes += 1
         if self._io.report_result is not None:

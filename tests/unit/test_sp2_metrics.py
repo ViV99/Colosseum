@@ -115,11 +115,13 @@ def test_system_stats_rates_and_resume_baselines():
     clock = [0.0]
     stats = SystemStats(clock=lambda: clock[0], initial_env_steps=1000, initial_train_steps={"a": 10})
     stats.on_train_step("a", 14)
-    stats.on_worker_stats({"worker_id": 0, "parked_buffers": 2})
+    stats.on_worker_stats({"worker_id": 0, "parked_buffers": 2, "dropped_reward_episodes": 3})
+    stats.on_worker_stats({"worker_id": 1, "parked_buffers": 0, "dropped_reward_episodes": 4})
     clock[0] = 2.0
     snap = stats.snapshot(2000, {"a": 3})
     assert snap["env_steps_per_sec"] == 500.0 and snap["train_steps_per_sec"] == {"a": 2.0}
-    assert snap["parked_buffers"] == 2 and snap["workers_reporting"] == 1
+    assert snap["parked_buffers"] == 2 and snap["workers_reporting"] == 2
+    assert snap["dropped_reward_episodes"] == 7          # cumulative per worker, summed over workers
     clock[0] = 20.0
     assert stats.snapshot(2000, {})["workers_reporting"] == 0  # silent workers are forgotten
 
@@ -185,6 +187,7 @@ def test_hub_forwards_layout_namespaces_to_wandb(tmp_path):
                      wandb_logger=FakeWandB())
     hub.on_train_metrics({"agent_id": "a", "train_step": 1, "total_loss": 0.5})
     hub.on_match_result(duel("a", "a", 1, 2))
+    hub.on_worker_stats({"kind": "worker_stats", "worker_id": 0, "dropped_reward_episodes": 2})
     hub.maybe_tick(env_steps=5, ratings=RATINGS, queue_depths={"a": 0})
     assert calls[0] == ("train", "a", 1, {"total_loss": 0.5})
     row = calls[1][2]
@@ -192,6 +195,7 @@ def test_hub_forwards_layout_namespaces_to_wandb(tmp_path):
     assert row["ratings/2p/elo/a"] == 1216.0 and row["ratings/4p/games/a/b"] == 3.0
     assert row["episodes/a/by_layout/2p/player/episodes"] == 2.0
     assert row["episodes/a/by_layout/2p/player/length_mean"] == 5.0
+    assert row["system/dropped_reward_episodes"] == 2.0
     assert not any("/wdl" in key for key in row)  # W/D/L counts stay in metrics.jsonl (SP1 behavior)
 
 
