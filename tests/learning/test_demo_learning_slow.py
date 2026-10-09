@@ -14,6 +14,7 @@ from colosseum.core.registry import env_spec
 from colosseum.core.types import Lineup, SeatAssignment
 from colosseum.eval import summarize
 from demo_learning import (
+    LEARNING_SEED,
     greedy_agent,
     mean_team_score,
     play,
@@ -67,15 +68,38 @@ def test_unit_harvest_beats_random_80_percent(tmp_path):
     assert rate >= 0.80
 
 
-def test_team_tag_team_beats_random_team_80_percent(tmp_path):
-    run = train_example("team_tag", tmp_path, TWO_WORKERS)
+TEAM_TAG_RETRY_SEED_OFFSET = 1000
+
+
+def _team_tag_win_rate(tmp_path, seed_offset: int) -> float:
+    sets = {**TWO_WORKERS, "training.seed": LEARNING_SEED + seed_offset}
+    run = train_example("team_tag", tmp_path, sets)
     trained, role = greedy_agent(run, "agent_0")
     spec = env_spec(run.config)
     results = play(run.env_fn(), {"trained": trained, "random": random_model(role)},
                    team_lineups(spec.teams("2v2"), "2v2", "trained", "random", 200))
     rate = win_rate(results, "trained")
-    _report("team_tag", run, win_rate=rate)
-    assert rate >= 0.80
+    _report(f"team_tag seed+{seed_offset}", run, win_rate=rate)
+    return rate
+
+
+@pytest.mark.timeout(2400)
+def test_team_tag_team_beats_random_team_80_percent(tmp_path):
+    """Best of two independent runs (controller ruling, T8.3 fix round 2): about one run in seven
+    settles into a passive draw-seeking policy (0 losses, many draws), and async training is not
+    reproducible per seed. If the first run misses the threshold, train once more from scratch
+    (new run dir, seed offset ``TEAM_TAG_RETRY_SEED_OFFSET``). The threshold itself is the spec's.
+    No other test retries."""
+    first_dir = tmp_path / "run1"
+    first_dir.mkdir()
+    first = _team_tag_win_rate(first_dir, 0)
+    if first >= 0.80:
+        return
+    retry_dir = tmp_path / "run2"
+    retry_dir.mkdir()
+    second = _team_tag_win_rate(retry_dir, TEAM_TAG_RETRY_SEED_OFFSET)
+    print(f"[team_tag] best of two: first run {first:.3f}, retry {second:.3f}")
+    assert second >= 0.80, f"both runs below 0.80: {first:.3f}, {second:.3f}"
 
 
 def test_tron_wins_2p_and_takes_first_place_in_4p(tmp_path):
