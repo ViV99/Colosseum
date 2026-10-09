@@ -269,5 +269,63 @@ def bc(
     click.echo(f"Weights saved to {output}")
 
 
+@main.command("run-learner")
+@click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
+@click.option("--agent", "-a", default="agent_0", help="Trainable agent id this learner owns")
+@click.option("--traj-port", default=50052, type=int, help="Port for this learner's TrajectoryService")
+@click.option("--weight-store", required=True, help="WeightStore address host:port")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set rollout.num_workers=8)." + _SET_HELP_YAML)
+def run_learner_cmd(config: str, agent: str, traj_port: int, weight_store: str, overrides: tuple[str, ...]) -> None:
+    """Run one agent's learner as a gRPC service (distributed mode)."""
+    with _config_errors():
+        from colosseum.sp2.distributed import run_distributed_learner
+
+        code = run_distributed_learner(config, agent, traj_port, weight_store,
+                                       overrides=_parse_overrides(overrides) or None)
+    sys.exit(code)
+
+
+@main.command("run-workers")
+@click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
+@click.option("--weight-store", required=True, help="WeightStore address host:port")
+@click.option("--learner", "-l", "learners", required=True, multiple=True,
+              help="Learner address per agent: agent_id=host:port (repeatable)")
+@click.option("--set", "overrides", multiple=True, help="Override config values." + _SET_HELP_YAML)
+def run_workers_cmd(config: str, weight_store: str, learners: tuple[str, ...], overrides: tuple[str, ...]) -> None:
+    """Run rollout workers feeding remote learners over gRPC (distributed mode)."""
+    learner_addresses: dict[str, str] = {}
+    for spec in learners:
+        if "=" not in spec:
+            raise click.BadParameter(f"--learner must be agent_id=host:port, got {spec!r}")
+        aid, addr = spec.split("=", 1)
+        learner_addresses[aid] = addr
+
+    with _config_errors():
+        from colosseum.sp2.distributed import run_distributed_workers
+
+        code = run_distributed_workers(config, weight_store, learner_addresses,
+                                       overrides=_parse_overrides(overrides) or None)
+    sys.exit(code)
+
+
+@main.command("serve-weight-store")
+@click.option("--port", default=50051, type=int, help="gRPC port")
+@click.option("--max-message-mb", default=64, type=int, help="Max gRPC message size in MiB")
+def serve_weight_store_cmd(port: int, max_message_mb: int) -> None:
+    """Start a gRPC weight store server."""
+    import logging
+
+    from colosseum.sp2.weight_store.grpc_store import serve_weight_store
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    server = serve_weight_store(port=port, max_message_mb=max_message_mb)
+    click.echo(f"Weight store serving on port {port}. Press Ctrl+C to stop.")
+    try:
+        server.wait_for_termination()
+    except KeyboardInterrupt:
+        server.stop(0)
+
+
 if __name__ == "__main__":
     main()
