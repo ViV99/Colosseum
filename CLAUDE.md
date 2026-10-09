@@ -326,8 +326,7 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
   - `ratio_mode` at K=128 on unit_harvest: `joint` beat `per_unit` by ≈0.09–0.13 `share_vs_scripted` (seed 0; noisy); the spec default (`auto` = `per_unit` with `Units`) is kept — owner decision pending;
   - `unit_trace` auto with `Units` = `joint` was chosen on noisy data (run-to-run spread exceeds the rule's 0.05 margin; `joint` vs `none` undecided; `geo_mean` consistently worst);
   - budget overshoot and resume: a local run overshoots `total_timesteps` by about one second of env steps; a resume needs a budget above the checkpoint's `env_steps` to train (optional warning when a resume starts at or past the budget) → SP5 "one budget semantics";
-  - distributed workers get identical per-env seeds across machines when `training.seed` is set (ruling PR-3) → SP5;
-  - `colosseum validate` prints the context of its `space.contains` checks as "layout, episode step, seat" instead of the global "seat, episode step, layout" order.
+  - distributed workers get identical per-env seeds across machines when `training.seed` is set (ruling PR-3) → SP5.
 
 ### Next step
 SP3 (players, league, warm start), after the owner accepts the SP2 acceptance report and SP2 is merged. Like SP1 and SP2, it starts with a brainstorm and a written spec before any plan or code (see Development Workflow). The owner still has to run `docs/GPU_CHECKS.md` on a CUDA machine.

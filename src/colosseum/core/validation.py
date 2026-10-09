@@ -89,21 +89,26 @@ def _contains(space: Any, value: Any, what: str, where: str) -> None:
         )
 
 
-def _check_spaces(spec: GameSpec, layout: str, result: StepResult, where: str) -> None:
+def _check_spaces(spec: GameSpec, layout: str, result: StepResult, step: int) -> None:
     """Full ``space.contains`` checks of what the pipeline uses: the acting seats' observations and
-    global states, and on truncation the final observations and global states (the BOOT slots)."""
+    global states, and on truncation the final observations and global states (the BOOT slots).
+    The context follows the global order "seat, episode step, layout"."""
+
+    def where(seat: int) -> str:
+        return f"validate, seat {seat}, episode step {step}, layout {layout}"
+
     global_state = result.global_state or {}
     for seat in sorted(result.acting):
         role = spec.roles[spec.role_of(layout, seat)]
-        _contains(role.observation_space, result.obs[seat], "observation", f"{where}, seat {seat}")
+        _contains(role.observation_space, result.obs[seat], "observation", where(seat))
         if role.global_state_space is not None:
-            _contains(role.global_state_space, global_state[seat], "global_state", f"{where}, seat {seat}")
+            _contains(role.global_state_space, global_state[seat], "global_state", where(seat))
     if result.truncated:
         for seat, obs in (result.final_obs or {}).items():
             role = spec.roles[spec.role_of(layout, seat)]
-            _contains(role.observation_space, obs, "final_obs", f"{where}, seat {seat}")
+            _contains(role.observation_space, obs, "final_obs", where(seat))
             if role.global_state_space is not None and seat in global_state:
-                _contains(role.global_state_space, global_state[seat], "final global_state", f"{where}, seat {seat}")
+                _contains(role.global_state_space, global_state[seat], "final global_state", where(seat))
 
 
 def _exercise_env(config: ColosseumConfig, spec: GameSpec, layouts: Sequence[str]) -> dict[str, tuple]:
@@ -119,7 +124,6 @@ def _exercise_env(config: ColosseumConfig, spec: GameSpec, layouts: Sequence[str
     env = make_env(config)
     try:
         for layout in layouts:
-            where = f"validate, layout {layout}"
             tracker = EpisodeTracker(spec, max_idle_steps=config.env.max_idle_steps, context="validate")
             try:
                 result = env.reset(seed=0, layout=layout)
@@ -130,7 +134,7 @@ def _exercise_env(config: ColosseumConfig, spec: GameSpec, layouts: Sequence[str
                                   f"{type(e).__name__}: {e}") from e
             masks = tracker.on_reset(layout, result)
             for step in range(VALIDATE_STEPS + 1):
-                _check_spaces(spec, layout, result, f"{where}, episode step {step}")
+                _check_spaces(spec, layout, result, step)
                 for seat in sorted(result.acting):
                     gs = (result.global_state or {}).get(seat)
                     samples.setdefault(spec.role_of(layout, seat), (result.obs[seat], masks[seat], gs))

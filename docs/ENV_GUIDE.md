@@ -353,7 +353,7 @@ colosseum train -c configs/examples/<game>.yaml --set training.total_timesteps=2
 
 Ошибки контракта приходят как `EnvContractError` с контекстом «воркер, среда, место, шаг эпизода,
 вариант» (`worker 3, env 1, seat 2, episode step 7, layout 4p: ...`) — по нему видно, какое правило
-нарушено. В `validate` контекст начинается с `validate`; полная проверка пространств
-(`space.contains`) пишет его в другом порядке: `validate, layout 4p, episode step 7, seat 2`.
+нарушено. В `validate` контекст начинается с `validate`, порядок тот же, в том числе у полной
+проверки пространств (`space.contains`): `validate, seat 2, episode step 7, layout 4p`.
 Исключение из `reset`/`step` самой среды `validate` показывает одной строкой `Config error: ...` с
 вариантом и шагом.

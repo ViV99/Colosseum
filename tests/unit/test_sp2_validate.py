@@ -105,7 +105,9 @@ def test_a_bounded_env_passes():
 
 
 def test_observation_outside_the_space_is_an_env_contract_error():
-    with pytest.raises(EnvContractError, match="observation is not in the role's space"):
+    # The global context order "seat, episode step, layout", as in the tracker's own errors.
+    with pytest.raises(EnvContractError, match=r"^validate, seat 0, episode step 2, layout solo: observation is not "
+                                               r"in the role's space"):
         validate_config(solo_config(env={"kwargs": {"bad": "out_of_bounds"}}))
 
 
