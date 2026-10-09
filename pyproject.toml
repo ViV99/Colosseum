@@ -61,7 +61,7 @@ ignore = [
 ]
 
 [tool.ruff.lint.isort]
-known-first-party = ["cli_runner", "colosseum", "examples", "game_harness", "game_helpers", "game_learning_envs"]
+known-first-party = ["cli_runner", "colosseum", "demo_checks", "examples", "game_harness", "game_helpers", "game_learning_envs"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
