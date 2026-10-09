@@ -148,6 +148,10 @@ class TrajectoryChunk:
 
 
 _SLOT_RULES = (
+    "a terminal ACT without reset_after",
+    "an open ACT with reset_after",
+    "a PAD without reset_after",
+    "a terminal flag on a non-ACT slot",
     "an ACT in the last slot",
     "an open ACT followed by a PAD",
     "a BOOT that does not follow an open ACT",
@@ -176,8 +180,11 @@ def validate_slot_structure(chunk: TrajectoryChunk) -> None:
     an ACT is never the last slot; an open (non-terminal) ACT is followed by an ACT or a
     BOOT; a BOOT follows an open ACT; a PAD follows a slot that ends an episode (a terminal
     ACT or a BOOT with ``reset_after``, possibly after other PADs); a BOOT without
-    ``reset_after`` takes only the last slot. The earliest broken slot is reported. A cheap
-    numpy check over ``kind`` / ``terminal`` / ``reset_after``.
+    ``reset_after`` takes only the last slot. The flags must match the slot kind (APPO
+    resets the recurrent state from ``reset_after``): a terminal ACT and a PAD have
+    ``reset_after``, an open ACT has not, and only ACTs are ``terminal``. The earliest broken
+    slot is reported. A cheap numpy check over ``kind`` / ``terminal`` / ``reset_after``; the
+    slot letters for the message are spelled only on failure.
     """
     kind = chunk.kind.cpu().numpy()
     terminal = chunk.terminal.cpu().numpy().astype(bool)
@@ -191,10 +198,13 @@ def validate_slot_structure(chunk: TrajectoryChunk) -> None:
         )
     if kind.size == 0:
         raise ValueError(f"{where}): the chunk has no slots")
-    where = f"{where}, slots {_spell_slots(kind, terminal, reset_after)!r})"
+
+    def fail(slot: int, problem: str) -> ValueError:
+        return ValueError(f"{where}, slots {_spell_slots(kind, terminal, reset_after)!r}): slot {slot}: {problem}")
+
     unknown = np.flatnonzero(~np.isin(kind, (SLOT_ACT, SLOT_BOOT, SLOT_PAD)))
     if unknown.size:
-        raise ValueError(f"{where}: slot {unknown[0]}: unknown slot kind {kind[unknown[0]]}")
+        raise fail(int(unknown[0]), f"unknown slot kind {kind[unknown[0]]}")
 
     act, boot, pad = kind == SLOT_ACT, kind == SLOT_BOOT, kind == SLOT_PAD
     open_act = act & ~terminal
@@ -205,6 +215,10 @@ def validate_slot_structure(chunk: TrajectoryChunk) -> None:
     next_pad = np.concatenate([pad[1:], [False]])
     not_last = np.arange(kind.size) < kind.size - 1
     broken = (
+        act & terminal & ~reset_after,          # a terminal ACT without reset_after
+        open_act & reset_after,                 # an open ACT with reset_after
+        pad & ~reset_after,                     # a PAD without reset_after
+        ~act & terminal,                        # a terminal flag on a non-ACT slot
         act & ~not_last,                        # an ACT in the last slot
         open_act & next_pad,                    # an open ACT followed by a PAD
         boot & ~prev_open,                      # a BOOT that does not follow an open ACT
@@ -215,7 +229,7 @@ def validate_slot_structure(chunk: TrajectoryChunk) -> None:
     found = [(int(np.argmax(mask)), r) for r, mask in enumerate(broken) if mask.any()]
     if found:
         slot, rule = min(found)
-        raise ValueError(f"{where}: slot {slot}: {_SLOT_RULES[rule]}")
+        raise fail(slot, _SLOT_RULES[rule])
 
 
 @dataclass

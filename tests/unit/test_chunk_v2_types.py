@@ -190,4 +190,24 @@ def test_validate_slot_structure_rejects_unknown_kinds_and_inconsistent_flags():
     with pytest.raises(ValueError, match=r"agent 'hero'.*kind, terminal and reset_after"):
         validate_slot_structure(_chunk_of("AAAB", terminal=np.zeros(3, np.bool_)))
     with pytest.raises(ValueError, match=r"agent 'hero'.*no slots"):
-        validate_slot_structure(_chunk_of("", obs=np.zeros((0, 4), np.float32)))
+        validate_slot_structure(_chunk_of(""))
+
+
+def _flags(pattern: str, name: str, slot: int, value: bool) -> np.ndarray:
+    flags = chunk_v2_payload(pattern=pattern)[name].copy()
+    flags[slot] = value
+    return flags
+
+
+@pytest.mark.parametrize("pattern,name,slot,value,rule", [
+    ("ATAB", "reset_after", 1, False, "a terminal ACT without reset_after"),
+    ("AAAB", "reset_after", 1, True, "an open ACT with reset_after"),
+    ("ATPP", "reset_after", 3, False, "a PAD without reset_after"),
+    ("AAAB", "terminal", 3, True, "a terminal flag on a non-ACT slot"),
+    ("AAAR", "terminal", 3, True, "a terminal flag on a non-ACT slot"),
+    ("ATPP", "terminal", 2, True, "a terminal flag on a non-ACT slot"),
+])
+def test_validate_slot_structure_checks_flags_against_the_slot_kind(pattern, name, slot, value, rule):
+    chunk = _chunk_of(pattern, **{name: _flags(pattern, name, slot, value)})
+    with pytest.raises(ValueError, match=rf"agent 'hero'.*slots '{pattern}'.*slot {slot}: {rule}$"):
+        validate_slot_structure(chunk)
