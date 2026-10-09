@@ -13,9 +13,11 @@ future ``colosseum tournament`` (SP4) use.
 Schedules (CLI, ``schedule_lineups``)
 -------------------------------------
 - Two or more teams, two or more agents: for every pair (a, b) and match m, team i gets the core
-  ``(a, b)[(i + m) % 2]``; a seat whose role the core does not play goes to the other agent of the
-  pair, so an asymmetric pair (hunter and prey) is never rotated. Pairs that cannot fill every
-  seat, or that leave one of the two out, are not scheduled for the layout.
+  ``(a, b)[(i + m) % 2]``; a team whose roles the core does not all play goes as a whole to the
+  other agent of the pair, so every team is homogeneous. An orientation that cannot fill a team
+  with one agent, or that leaves one of the two out, is replaced by the other orientation (so an
+  asymmetric pair, hunter and prey, is never rotated); a pair with no valid orientation is not
+  scheduled for the layout.
 - Two or more teams, one agent: every team is that agent.
 - One team (solo, cooperative): each agent alone (homogeneous team), then, with two or more
   agents and a team of two or more seats, every mixed composition (cross-play), rotating its
@@ -81,25 +83,34 @@ def _eval_seat(agent_id: str) -> SeatAssignment:
     return SeatAssignment(agent_id=agent_id, network_id=LATEST_NETWORK_ID, collect=False)
 
 
-def _pair_lineup(spec: GameSpec, layout: str, pair: tuple[str, str], m: int,
+def _pair_lineup(spec: GameSpec, layout: str, pair: tuple[str, str], orientation: int,
                  players: Mapping[str, Sequence[str]]) -> Lineup | None:
+    """Orientation 0 or 1 of a pair: team i goes as a whole to its core ``pair[(i + orientation) % 2]``,
+    or to the other agent when the core does not play every role of the team. ``None`` when a team
+    cannot be filled by one agent or the lineup leaves one of the two out."""
     seat_specs = spec.layouts[layout]
     seats: list[SeatAssignment | None] = [None] * len(seat_specs)
     for team, members in enumerate(spec.teams(layout)):
-        core = pair[(team + m) % 2]
-        other = pair[1 - (team + m) % 2]
+        core = pair[(team + orientation) % 2]
+        roles = {seat_specs[s].role for s in members}
+        name = next((n for n in (core, pair[1 - (team + orientation) % 2]) if roles <= set(players[n])), None)
+        if name is None:
+            return None
         for s in members:
-            role = seat_specs[s].role
-            if role in players[core]:
-                seats[s] = _eval_seat(core)
-            elif role in players[other]:
-                seats[s] = _eval_seat(other)
-            else:
-                return None
-    names = {seat.agent_id for seat in seats}  # type: ignore[union-attr]
-    if names != set(pair):
+            seats[s] = _eval_seat(name)
+    if {seat.agent_id for seat in seats} != set(pair):  # type: ignore[union-attr]
         return None
     return Lineup(layout=layout, seats=seats)  # type: ignore[arg-type]
+
+
+def _pair_lineups(spec: GameSpec, layout: str, pair: tuple[str, str], num_matches: int,
+                  players: Mapping[str, Sequence[str]]) -> list[Lineup]:
+    """Match m uses orientation ``m % 2``, or the other one when that is invalid; ``[]`` if both are."""
+    orientations = [_pair_lineup(spec, layout, pair, o, players) for o in (0, 1)]
+    if all(lineup is None for lineup in orientations):
+        return []
+    picked = [orientations[m % 2] or orientations[1 - m % 2] for m in range(num_matches)]
+    return [Lineup(layout, list(lineup.seats)) for lineup in picked]  # type: ignore[union-attr]
 
 
 def _homogeneous(spec: GameSpec, layout: str, name: str, roles: Sequence[str]) -> Lineup | None:
@@ -133,9 +144,7 @@ def schedule_lineups(spec: GameSpec, layout: str, players: Mapping[str, Sequence
     lineups: list[Lineup] = []
     if spec.num_teams(layout) >= 2 and len(names) >= 2:
         for pair in itertools.combinations(names, 2):
-            pair_lineups = [_pair_lineup(spec, layout, pair, m, players) for m in range(num_matches)]
-            if all(lineup is not None for lineup in pair_lineups):
-                lineups.extend(pair_lineups)  # type: ignore[arg-type]
+            lineups.extend(_pair_lineups(spec, layout, pair, num_matches, players))
         return lineups
     for name in names:
         lineup = _homogeneous(spec, layout, name, players[name])

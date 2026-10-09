@@ -82,3 +82,31 @@ def test_default_layouts_and_errors():
         schedule_lineups(spec, "9p", {"a": ["player"]}, 1)
     with pytest.raises(ValueError, match="num_matches"):
         schedule_lineups(spec, "2p", {"a": ["player"]}, 0)
+
+
+# Roles that share spaces but differ in meaning; "gen" plays both, "defn" only "def" (final review C / I-1).
+ATT_DEF = {"att": RoleSpec(OBS, ACT), "def": RoleSpec(OBS, ACT)}
+GEN_DEFN = {"gen": ["att", "def"], "defn": ["def"]}
+
+
+def test_partly_overlapping_roles_fall_back_to_the_valid_orientation():
+    spec = GameSpec(roles=ATT_DEF, layouts={"1v1": (SeatSpec("att", 0), SeatSpec("def", 1))})
+    lineups = schedule_lineups(spec, "1v1", GEN_DEFN, 4)
+    assert [agents(lu) for lu in lineups] == [["gen", "defn"]] * 4   # gen on every seat is not a pair match
+    assert default_layouts(spec, GEN_DEFN) == ["1v1"]
+
+
+def test_partly_overlapping_roles_never_mix_a_team():
+    spec = GameSpec(roles=ATT_DEF,
+                    layouts={"1v1": (SeatSpec("att", 0), SeatSpec("def", 1)),
+                             "2v2": (SeatSpec("att", 0), SeatSpec("def", 0), SeatSpec("att", 1), SeatSpec("def", 1))})
+    assert schedule_lineups(spec, "2v2", GEN_DEFN, 2) == []          # defn cannot fill a team of its own
+    assert default_layouts(spec, GEN_DEFN) == ["1v1"]
+
+
+def test_mixed_role_teams_are_filled_by_one_agent_each():
+    spec = GameSpec(roles=ATT_DEF,
+                    layouts={"2v2": (SeatSpec("att", 0), SeatSpec("def", 0), SeatSpec("att", 1), SeatSpec("def", 1))})
+    lineups = schedule_lineups(spec, "2v2", {"a": ["att", "def"], "b": ["att", "def"]}, 2)
+    assert [agents(lu) for lu in lineups] == [["a", "a", "b", "b"], ["b", "b", "a", "a"]]
+    assert schedule_lineups(spec, "2v2", {"a": ["att"], "b": ["def"]}, 2) == []    # only mixed teams possible

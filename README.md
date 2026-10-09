@@ -311,8 +311,9 @@ Matches run on the same engine as training (`MatchRunner`): per-seat model state
 architecture and roles come from its checkpoint's `meta.json`; a `.pt` is built from the config agent of the same
 name, or from the global `networks` with every role. By default every layout the agents can fill is played.
 - Two or more teams, two or more agents: for every pair (a, b) match m gives team i to `(a, b)[(i + m) % 2]` where
-  the roles allow; teams are filled homogeneously; `--num-matches` is per pair and layout (an odd count is rounded
-  up, so every agent plays every side equally often).
+  the roles allow; teams are filled homogeneously; when only one orientation of the pair can fill the layout
+  (hunter and prey, or an agent that plays only some roles), every match uses it; `--num-matches` is per pair and
+  layout (an odd count is rounded up, so every agent plays every side equally often).
 - Two or more teams, one agent: all teams are that agent.
 - One team: each agent in a homogeneous team, plus mixed compositions for cross-play.
 
