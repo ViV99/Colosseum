@@ -12,7 +12,8 @@ class ConfigError(ColosseumError):
 
 
 class EnvContractError(ColosseumError):
-    """An environment violated the ``BaseEnv`` contract (shapes, masks, flags)."""
+    """An environment violated the ``MultiAgentEnv`` contract (``GameSpec`` / ``StepResult`` rules: seats,
+    shapes, masks, flags), as checked by ``colosseum.envs.contract.EpisodeTracker``."""
 
 
 class DataError(ConfigError, ValueError):

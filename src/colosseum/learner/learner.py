@@ -17,8 +17,9 @@ total_timesteps)`` from the shared counter that workers increment; the main
 process is the only budget authority and sets ``stop_event`` at the budget, so
 the learner runs until ``stop_event``. In distributed mode there is no shared
 counter: ``progress = consumed_samples / total_timesteps``, where
-``consumed_samples`` counts this learner's transitions, and the learner stops
-by itself once ``consumed_samples >= total_timesteps``.
+``consumed_samples`` counts this learner's ACT slots (decisions, not env steps;
+one budget semantics for distributed mode is SP5), and the learner stops by
+itself once ``consumed_samples >= total_timesteps``.
 """
 
 from __future__ import annotations
@@ -38,7 +39,13 @@ import torch
 from colosseum.algorithms.base import BaseAlgorithm
 from colosseum.core.config import LearnerConfig
 from colosseum.core.ipc import SharedCounter, put_latest
-from colosseum.core.types import TrajectoryChunk, WeightPayload, state_dict_from_numpy, state_dict_to_numpy
+from colosseum.core.types import (
+    TrajectoryChunk,
+    WeightPayload,
+    state_dict_from_numpy,
+    state_dict_to_numpy,
+    validate_slot_structure,
+)
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, flush_queue, parent_alive
 
 logger = logging.getLogger(__name__)
@@ -168,13 +175,13 @@ def learner_process(
                 break
 
             # Block until exactly batch_chunks chunks arrived (None: stop requested).
-            chunks = collect_batch(trajectory_queue, config.batch_chunks, stop_event)
+            chunks = collect_batch(trajectory_queue, config.batch_chunks, stop_event, agent_id=agent_id)
             if chunks is None:
                 break
             total_chunks_received += len(chunks)
-            consumed_samples += sum(c.chunk_length for c in chunks)
+            consumed_samples += sum(c.num_acts for c in chunks)
             # Policy lag of the batch, measured before this train step bumps the version.
-            lags = [algorithm.policy_version - c.behavior_policy_version for c in chunks]
+            lags = [algorithm.policy_version - c.policy_version for c in chunks]
 
             progress = _progress(progress_counter, consumed_samples, total_timesteps)
             algorithm.set_progress(progress)
@@ -325,11 +332,16 @@ def collect_batch(
     batch_size: int,
     stop_event: Any,
     poll_interval: float = 0.5,
+    agent_id: str | None = None,
 ) -> list[TrajectoryChunk] | None:
-    """Block until exactly ``batch_size`` chunk payloads arrived; decode them.
+    """Block until exactly ``batch_size`` chunk v2 payloads arrived; decode them.
 
     Waits in ``poll_interval`` slices and returns None as soon as ``stop_event``
     is set (a partial batch is dropped: no training on incomplete batches).
+    Every decoded chunk's slot structure is checked (``validate_slot_structure``):
+    a broken chunk raises ``ValueError`` naming its agent instead of silently
+    corrupting the V-trace targets. With ``agent_id``, a chunk of another agent (a
+    misrouted worker in distributed mode) raises ``ValueError``.
     """
     chunks: list[TrajectoryChunk] = []
     while len(chunks) < batch_size:
@@ -343,7 +355,12 @@ def collect_batch(
             raise TypeError(
                 f"trajectory queue item must be a chunk payload dict, got {type(payload).__name__}"
             )
-        chunks.append(TrajectoryChunk.from_payload(payload))
+        chunk = TrajectoryChunk.from_payload(payload)
+        if agent_id is not None and chunk.agent_id != agent_id:
+            raise ValueError(f"learner of agent {agent_id!r} received a chunk of agent {chunk.agent_id!r}; "
+                             f"check the workers' learner addresses (run-workers -l AGENT=HOST:PORT)")
+        validate_slot_structure(chunk)
+        chunks.append(chunk)
     return chunks
 
 

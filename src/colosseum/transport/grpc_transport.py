@@ -57,7 +57,7 @@ class TrajectoryServicer(colosseum_pb2_grpc.TrajectoryServiceServicer):
                 if not isinstance(payload, dict):
                     raise ValueError(f"chunk payload must be a dict, got {type(payload).__name__}")
                 payload["agent_id"] = proto_chunk.agent_id
-                payload["behavior_policy_version"] = int(proto_chunk.behavior_policy_version)
+                payload["policy_version"] = int(proto_chunk.behavior_policy_version)  # proto name kept
                 validate_chunk_payload(payload)
             except ValueError as e:
                 logger.warning(f"Rejected chunk for {proto_chunk.agent_id!r}: {e}")
@@ -126,7 +126,7 @@ class GRPCTransport(BaseTransport):
         data, compressed = serialize_chunk_payload(payload)
         return colosseum_pb2.TrajectoryChunkProto(
             agent_id=agent_id,
-            behavior_policy_version=int(payload["behavior_policy_version"]),
+            behavior_policy_version=int(payload["policy_version"]),
             tensor_data=data,
             compressed=compressed,
         )

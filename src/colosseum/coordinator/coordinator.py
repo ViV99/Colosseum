@@ -1,11 +1,11 @@
-"""Coordinator: central orchestrator for the training pipeline.
+"""Coordinator: matchmaking, checkpoint storage and ratings of a training run.
 
 Manages:
-- Agent pool (trainable, frozen, scripted agents)
-- Matchmaking (self-play, PFSP)
-- Checkpoint storage (learner checkpoint payloads -> CheckpointManager)
-- Match result tracking
-- Pairwise ELO, win-rate matrix and latest-vs-past win rate (from per-seat results)
+- the agent pool (trainable agents) and their roles;
+- owner rotation over the trainable agents and one ``Lineup`` per env (``LineupMatchmaker``);
+- checkpoint storage (learner checkpoint payloads -> ``CheckpointManager``; ``meta.json`` gets the
+  agent's roles and their role signature);
+- match results and per-layout ratings (``RatingBook``).
 """
 
 from __future__ import annotations
@@ -13,38 +13,49 @@ from __future__ import annotations
 import logging
 import random
 from collections import deque
+from collections.abc import Mapping, Sequence
 from pathlib import Path
 
 from colosseum.coordinator.agent_pool import AgentPool
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
-from colosseum.coordinator.matchmaker import BaseMatchmaker, PFSPMatchmaker, SelfPlayMatchmaker
-from colosseum.coordinator.ratings import EloRating, PastWinRate, WinRateTracker, pairwise_score
-from colosseum.core.config import ColosseumConfig, TrainingPhase
-from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig, MatchResult
+from colosseum.coordinator.matchmaker import LineupMatchmaker
+from colosseum.coordinator.ratings import RatingBook
+from colosseum.core.config import ColosseumConfig
+from colosseum.core.errors import ConfigError
+from colosseum.core.roles import agent_role_spec, role_signature
+from colosseum.core.types import Lineup, MatchResult
+from colosseum.envs.game import GameSpec
 
 logger = logging.getLogger(__name__)
 
 
 class Coordinator:
-    """Central coordinator for training pipeline."""
+    """Central coordinator of a single-machine training run."""
 
-    def __init__(self, config: ColosseumConfig, checkpoint_dir: str | Path) -> None:
+    def __init__(self, config: ColosseumConfig, spec: GameSpec, agent_roles: Mapping[str, Sequence[str]],
+                 checkpoint_dir: str | Path) -> None:
         self._config = config
-        # One RNG for matchmaking and seat shuffling: runs with the same seed get the same schedule.
+        self._spec = spec
+        trainable = config.get_trainable_agent_ids()
+        missing = [a for a in trainable if a not in agent_roles]
+        if missing:
+            raise ConfigError(f"Coordinator: no roles resolved for agents {missing}")
+        self._agent_roles = {a: list(agent_roles[a]) for a in trainable}
+        # One RNG for matchmaking and seat permutations: runs with the same seed get the same schedule.
         self._rng = random.Random(config.training.seed)
         self._agent_pool = AgentPool()
-        for agent_id in config.get_trainable_agent_ids():
+        for agent_id in trainable:
             self._agent_pool.register_trainable(agent_id)
-        self._checkpoint_manager = CheckpointManager(
-            base_dir=checkpoint_dir,
-            pool_size=config.self_play.pool_size,
-        )
+        self._checkpoint_manager = CheckpointManager(base_dir=checkpoint_dir, pool_size=config.checkpoint.pool_size)
+        self._ratings = RatingBook(spec, trainable)
+        self._role_signatures = {a: role_signature(agent_role_spec(spec, roles))
+                                 for a, roles in self._agent_roles.items()}
         self._match_results: deque[MatchResult] = deque(maxlen=10000)
-        self._elo = EloRating()
-        self._win_rates = WinRateTracker()
-        self._past = PastWinRate()
         self._refresh_round = 0
-        self._matchmaker: BaseMatchmaker = self._build_matchmaker()
+        self._matchmaker = LineupMatchmaker(
+            spec=spec, agent_roles=self._agent_roles, config=config.matchmaking,
+            checkpoints=self._checkpoint_ids, win_rate=self._ratings.win_rate, rng=self._rng,
+        )
 
     @property
     def agent_pool(self) -> AgentPool:
@@ -55,122 +66,72 @@ class Coordinator:
         return self._checkpoint_manager
 
     @property
-    def elo(self) -> EloRating:
-        return self._elo
+    def ratings(self) -> RatingBook:
+        return self._ratings
 
     @property
-    def win_rates(self) -> WinRateTracker:
-        return self._win_rates
+    def matchmaker(self) -> LineupMatchmaker:
+        return self._matchmaker
 
     @property
-    def past_win_rate(self) -> PastWinRate:
-        return self._past
+    def spec(self) -> GameSpec:
+        return self._spec
+
+    @property
+    def agent_roles(self) -> dict[str, list[str]]:
+        return {a: list(r) for a, r in self._agent_roles.items()}
 
     @property
     def refresh_round(self) -> int:
         return self._refresh_round
 
+    def role_signature(self, agent_id: str) -> str:
+        return self._role_signatures[agent_id]
+
+    def _checkpoint_ids(self, agent_id: str) -> list[str]:
+        return [c.checkpoint_id for c in self._checkpoint_manager.list_checkpoints(agent_id)]
+
     def next_round(self) -> None:
         """Advance the owner rotation. The launcher calls this once per match refresh."""
         self._refresh_round += 1
 
-    def generate_match_configs(self, num_envs: int, env_offset: int) -> list[MatchConfig]:
-        """One match per env. Env ``e`` of this batch has global index ``g = env_offset + e``.
-
-        Its owner is ``agents[(g + refresh_round) % n_trainable]``, so every trainable
-        agent owns envs in every phase, and ownership rotates between refreshes.
-        """
+    def generate_lineups(self, num_envs: int, env_offset: int) -> list[Lineup]:
+        """One lineup per env. Env ``e`` of this batch has global index ``g = env_offset + e``;
+        its owner is ``agents[(g + refresh_round) % n_trainable]`` (SP1 rotation), so every
+        trainable agent owns envs, and ownership rotates between refreshes."""
         agents = [a.agent_id for a in self._agent_pool.list_trainable()]
         if not agents:
             raise ValueError("Coordinator has no trainable agents")
-        num_players = self._config.env.num_players
-        shuffle = self._config.self_play.shuffle_seats
-        configs: list[MatchConfig] = []
-        for e in range(num_envs):
-            owner = agents[(env_offset + e + self._refresh_round) % len(agents)]
-            match = self._matchmaker.match_for(owner, num_players)
-            if shuffle:
-                self._rng.shuffle(match.player_slots)
-            configs.append(match)
-        return configs
+        return [self._matchmaker.lineup_for(agents[(env_offset + e + self._refresh_round) % len(agents)])
+                for e in range(num_envs)]
 
-    def _build_matchmaker(self) -> BaseMatchmaker:
-        sp = self._config.self_play
-        if self._config.training.phase == TrainingPhase.LEAGUE:
-            return PFSPMatchmaker(
-                agent_pool=self._agent_pool,
-                checkpoint_manager=self._checkpoint_manager,
-                win_rate_tracker=self._win_rates,
-                self_play_ratio=sp.self_play_ratio,
-                pfsp_exponent=sp.pfsp_exponent,
-                latest_prob=sp.latest_prob,
-                rng=self._rng,
-            )
-        return SelfPlayMatchmaker(
-            checkpoint_manager=self._checkpoint_manager,
-            latest_prob=sp.latest_prob,
-            rng=self._rng,
-        )
+    def report_match_result(self, result: MatchResult) -> None:
+        """Keep the result and update the ratings of its layout."""
+        self._match_results.append(result)
+        self._ratings.update(result)
+
+    @property
+    def match_results(self) -> list[MatchResult]:
+        return list(self._match_results)
+
+    def ratings_snapshot(self) -> dict:
+        """``RatingBook.snapshot()``: JSON-serializable tables per layout."""
+        return self._ratings.snapshot()
 
     def save_checkpoint_payload(self, payload: dict, meta_extra: dict | None = None) -> str:
         """Persist a learner checkpoint payload (see ``learner.make_checkpoint_payload``).
 
-        The trainer state is kept only when ``checkpoint.save_optimizer`` is true.
+        ``meta.json`` gets ``final``, ``meta_extra``, and the agent's ``roles`` and
+        ``role_signature``. The trainer state is kept only when ``checkpoint.save_optimizer``.
         """
-        trainer_state = None
-        if self._config.checkpoint.save_optimizer:
-            trainer_state = payload.get("trainer_state_bytes")
-        meta = {"final": bool(payload.get("final", False)), **(meta_extra or {})}
+        agent_id = payload["agent_id"]
+        trainer_state = payload.get("trainer_state_bytes") if self._config.checkpoint.save_optimizer else None
+        meta = {"final": bool(payload.get("final", False)), **(meta_extra or {}),
+                "roles": list(self._agent_roles[agent_id]), "role_signature": self._role_signatures[agent_id]}
         return self._checkpoint_manager.save(
-            agent_id=payload["agent_id"],
+            agent_id=agent_id,
             policy_version=int(payload["policy_version"]),
             model_state=payload["model_state"],
             trainer_state=trainer_state,
             meta_extra=meta,
         )
-
-    def report_match_result(self, result: MatchResult) -> None:
-        """Update ratings from one finished match.
-
-        Every pair of seats is compared by ``outcome`` (higher 1, equal 0.5, lower 0).
-        - Different base agents: update the win-rate matrix and ELO. ELO deltas are
-          computed from the pre-match ratings with K scaled by 1/(N-1).
-        - Same agent, one seat ``latest`` and the other a checkpoint: update
-          ``wr_vs_past`` from the latest seat's point of view.
-        - Two ``latest`` seats of one agent carry no signal and are skipped.
-        """
-        self._match_results.append(result)
-        seats = result.seats
-        n = len(seats)
-        if n < 2:
-            return
-        cross: list[tuple[str, str, float]] = []
-        for i in range(n):
-            for j in range(i + 1, n):
-                a, b = seats[i], seats[j]
-                score = pairwise_score(a.outcome, b.outcome)
-                if a.agent_id != b.agent_id:
-                    cross.append((a.agent_id, b.agent_id, score))
-                elif a.network_id == LATEST_NETWORK_ID and b.network_id != LATEST_NETWORK_ID:
-                    self._past.record(a.agent_id, score)
-                elif b.network_id == LATEST_NETWORK_ID and a.network_id != LATEST_NETWORK_ID:
-                    self._past.record(b.agent_id, 1.0 - score)
-        for a_id, b_id, score in cross:
-            self._win_rates.record_pair(a_id, b_id, score)
-        if cross:
-            self._elo.update_pairs(cross, k_scale=1.0 / (n - 1))
-
-    @property
-    def match_results(self) -> list[MatchResult]:
-        return self._match_results
-
-    def ratings_snapshot(self) -> dict:
-        """JSON-serializable ratings of all trainable agents (persisted by the metrics hub)."""
-        ids = [a.agent_id for a in self._agent_pool.list_trainable()]
-        return {
-            "elo": {a: self._elo.get(a) for a in ids},
-            "win_rates": self._win_rates.get_win_rate_matrix(ids),
-            "games": self._win_rates.get_games_matrix(ids),
-            "wr_vs_past": {a: self._past.get(a) for a in ids},
-            "past_games": {a: self._past.games(a) for a in ids},
-        }

@@ -4,15 +4,14 @@ run:
   dir: "runs"
 
 env:
-  env_class: "examples.tic_tac_toe.env.TicTacToeEnv"
-  num_players: 2
+  env_class: "examples.tic_tac_toe.game.TicTacToeGame"
   kwargs: {}
 
 networks:
-  encoder_class: "examples.tic_tac_toe.networks.TicTacToeEncoder"
+  encoder_class: "examples.tic_tac_toe.models.TicTacToeEncoder"
   core: null
-  policy_class: "examples.tic_tac_toe.networks.TicTacToePolicy"
-  value_class: "examples.tic_tac_toe.networks.TicTacToeValue"
+  policy_class: "examples.tic_tac_toe.models.TicTacToePolicy"
+  value_class: "examples.tic_tac_toe.models.TicTacToeValue"
   kwargs: {}
 
 algorithm:
@@ -36,18 +35,18 @@ learner:
   batch_chunks: 8
 
 training:
-  phase: "league"
   total_timesteps: 300000
 
-self_play:
-  checkpoint_interval: 100
-  pool_size: 5
-  latest_prob: 0.8
+matchmaking:
+  mode: league
   self_play_ratio: 0.0
+  latest_prob: 0.8
   pfsp_exponent: 1.0
   shuffle_seats: true
 
 checkpoint:
+  interval: 100
+  pool_size: 5
   save_optimizer: false
 
 metrics:

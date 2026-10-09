@@ -1,4 +1,4 @@
-"""Launcher: reads config, instantiates all components, starts processes.
+"""Launcher (SP2): reads config, instantiates all components, starts processes.
 
 This is the top-level entry point that wires together:
 - Coordinator (matchmaking, checkpoint management)
@@ -19,12 +19,11 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
-import multiprocessing.queues
 import queue
 import signal
-import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import numpy as np
@@ -32,9 +31,10 @@ import torch
 
 from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
-from colosseum.core.ipc import SharedCounter
+from colosseum.core.ipc import QueueReader, SharedCounter, queue_depths, release_command_queues
 from colosseum.core.run_dir import RunDir
-from colosseum.core.types import LATEST_NETWORK_ID, MatchConfig
+from colosseum.core.types import LATEST_NETWORK_ID, Lineup, SeatAssignment
+from colosseum.envs.game import GameSpec, RoleSpec
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
@@ -86,28 +86,45 @@ def warn_static_ownership_skew(config: ColosseumConfig) -> None:
         )
 
 
-def trainable_agent_configs(config: ColosseumConfig) -> dict[str, ColosseumConfig]:
-    """Effective config (overrides merged) of every trainable agent, without validation."""
-    return {aid: config.get_agent_config(aid) for aid in config.get_trainable_agent_ids()}
+@dataclass(frozen=True)
+class RunSetup:
+    """What a run needs before any process starts: the game's spec, every trainable agent's
+    roles, effective config (overrides merged) and role spec (the spaces its model is built for)."""
+
+    spec: GameSpec
+    agent_roles: dict[str, list[str]]
+    agent_configs: dict[str, ColosseumConfig]
+    role_specs: dict[str, RoleSpec]
 
 
-def validate_agent_configs(config: ColosseumConfig) -> dict[str, ColosseumConfig]:
-    """Effective config of every trainable agent, each checked by ``validate_config``.
+def validate_run_config(config: ColosseumConfig) -> None:
+    """Fail fast (ConfigError / EnvContractError) before any process starts: ``registry.validate_config``
+    (looked up at call time, so tests can count or replace it)."""
+    from colosseum.core import registry
 
-    Fails fast (ConfigError) on structural errors, e.g. a head/encoder dim mismatch.
-    """
-    from colosseum.core.registry import validate_config
-
-    agent_configs = trainable_agent_configs(config)
-    for acfg in agent_configs.values():
-        validate_config(acfg)
-    return agent_configs
+    registry.validate_config(config)
 
 
-def _create_model(config: ColosseumConfig):
-    """Create the agent's PolicyModel inside a worker/learner process."""
-    from colosseum.core.registry import build_model
-    return build_model(config)
+def setup_run(config: ColosseumConfig, validate: bool = True) -> RunSetup:
+    """``RunSetup`` of ``config``; ``validate`` first runs ``validate_run_config``."""
+    from colosseum.core.registry import env_spec
+    from colosseum.core.roles import agent_role_spec, resolve_agent_roles
+
+    if validate:
+        validate_run_config(config)
+    spec = env_spec(config)
+    agent_roles = resolve_agent_roles(config, spec)
+    agent_ids = config.get_trainable_agent_ids()
+    return RunSetup(
+        spec=spec,
+        agent_roles={aid: list(agent_roles[aid]) for aid in agent_ids},
+        agent_configs={aid: config.get_agent_config(aid) for aid in agent_ids},
+        role_specs={aid: agent_role_spec(spec, agent_roles[aid]) for aid in agent_ids},
+    )
+
+
+
+
 
 
 def _worker_target(*, worker_id: int, log_dir: str | None = None, **kwargs) -> None:
@@ -120,24 +137,24 @@ def _worker_main(
     worker_id: int,
     config: ColosseumConfig,
     agent_ids: list[str],
+    agent_roles: dict[str, list[str]],
     agent_configs: dict[str, ColosseumConfig],
+    role_specs: dict[str, RoleSpec],
     trajectory_queues: dict[str, mp.Queue],
     weight_queues: dict[str, mp.Queue],
     stop_event: mp.Event,
+    lineups: list[Lineup],
     env_step_counter: SharedCounter | None = None,
     checkpoint_state_dicts_by_agent: dict[str, dict[str, dict]] | None = None,
-    slot_network_map: list[list[str]] | None = None,
-    collect_mask: list[list[bool]] | None = None,
-    slot_agent_map: list[list[str]] | None = None,
     results_queue: mp.Queue | None = None,
     command_queue: mp.Queue | None = None,
     metrics_queue: mp.Queue | None = None,
 ) -> None:
     """Worker process body (see ``_worker_target``).
 
-    Env and model factories are built INSIDE the process (``functools.partial``
-    over top-level functions is picklable under spawn, which the subprocess
-    vec_env needs to ship ``env_fn`` to its children).
+    Env and model factories are built INSIDE the process (``functools.partial`` over top-level
+    functions is picklable under spawn, which the subprocess vector env needs to ship ``env_fn``
+    to its children). Models are built for each agent's role spec.
     """
     from functools import partial
 
@@ -154,24 +171,23 @@ def _worker_main(
         num_envs=config.rollout.envs_per_worker,
         chunk_length=config.rollout.chunk_length,
         agent_ids=agent_ids,
-        model_factories={aid: partial(build_model, agent_configs[aid]) for aid in agent_ids},
+        agent_roles=agent_roles,
+        model_factories={aid: partial(build_model, agent_configs[aid], role_specs[aid]) for aid in agent_ids},
         trajectory_queues=trajectory_queues,
         weight_queues=weight_queues,
         stop_event=stop_event,
-        gamma={aid: agent_configs[aid].algorithm.gamma for aid in agent_ids},
         weight_sync_interval=config.rollout.weight_sync_interval_sec,
         torch_threads=config.rollout.torch_threads,
         env_step_counter=env_step_counter,
         checkpoint_state_dicts_by_agent=checkpoint_state_dicts_by_agent,
-        slot_agent_map=slot_agent_map,
-        slot_network_map=slot_network_map,
-        collect_mask=collect_mask,
+        lineups=lineups,
         results_queue=results_queue,
         command_queue=command_queue,
         stats_queue=metrics_queue,
         seed=worker_seed,
         vec_env_kind=config.rollout.vec_env,
         subproc_workers=config.rollout.subproc_workers,
+        max_idle_steps=config.env.max_idle_steps,
     )
 
 
@@ -184,6 +200,7 @@ def _learner_main(
     *,
     agent_id: str,
     config: ColosseumConfig,
+    role_spec: RoleSpec,
     trajectory_queue: mp.Queue,
     weight_queues: list[mp.Queue],
     stop_event: mp.Event,
@@ -198,11 +215,13 @@ def _learner_main(
 ) -> None:
     """Learner process body (see ``_learner_target``).
 
-    ``num_learners`` (learner processes on this machine) feeds the automatic
-    torch thread count when ``learner.torch_threads`` is unset. ``seed`` (from
-    ``utils.seeding.learner_seed``) seeds this process before the model is built.
+    ``num_learners`` (learner processes on this machine) feeds the automatic torch thread count
+    when ``learner.torch_threads`` is unset. ``seed`` (from ``utils.seeding.learner_seed``) seeds
+    this process before the model is built. The model (and a kickstart teacher) is built for
+    ``role_spec``, the spaces of the agent's roles.
     """
-    from colosseum.core.registry import import_class
+    from colosseum.core.registry import build_model, import_class
+    from colosseum.core.specs import ActionSpec
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
     from colosseum.learner.learner import learner_process, resolve_device
     from colosseum.utils.seeding import apply_global_seed
@@ -215,7 +234,6 @@ def _learner_main(
         config.rollout.torch_threads, num_learners,
     ))
 
-    # Resolve algorithm class from config
     algo_class_path = config.algorithm.algorithm_class
     if not algo_class_path:
         raise ValueError(
@@ -223,17 +241,16 @@ def _learner_main(
             "Provide a dotted import path (e.g. 'colosseum.algorithms.appo.APPO')."
         )
     algo_cls = import_class(algo_class_path)
-
+    action_spec = ActionSpec.from_space(role_spec.action_space)
     teacher_path = config.training.kickstart_teacher
 
     def algorithm_factory():
-        model = _create_model(config)
+        model = build_model(config, role_spec)
         kickstart = None
         if teacher_path:
             from colosseum.bc.kickstart import KickstartLoss
-            teacher = _create_model(config)
-            teacher_sd = torch.load(teacher_path, weights_only=True, map_location=device)
-            teacher.load_state_dict(teacher_sd)
+            teacher = build_model(config, role_spec)
+            teacher.load_state_dict(torch.load(teacher_path, weights_only=True, map_location=device))
             teacher.to(device)
             kickstart = KickstartLoss(
                 teacher,
@@ -245,7 +262,7 @@ def _learner_main(
         kwargs = {"device": device, "pin_memory": config.learner.pin_memory}
         if kickstart is not None:
             kwargs["kickstart"] = kickstart
-        return algo_cls(model, config.algorithm, **kwargs)
+        return algo_cls(model, config.algorithm, action_spec, **kwargs)
 
     learner_process(
         agent_id=agent_id,
@@ -265,240 +282,50 @@ def _learner_main(
 
 
 # =====================================================================
-# Match config helpers
+# Lineup helpers
 # =====================================================================
 
-def _derive_worker_configs(
-    match_configs: list[MatchConfig],
+def _resolve_lineups(
+    lineups: list[Lineup],
     coordinator: Coordinator,
     agent_ids: list[str],
     already_sent: dict[str, set[str]] | None = None,
-) -> tuple[
-    dict[str, dict[str, dict[str, np.ndarray]]],  # new checkpoints by agent: {agent_id: {ckpt_id: numpy state_dict}}
-    list[list[str]],             # slot_network_map
-    list[list[bool]],            # collect_mask
-    list[list[str]],             # slot_agent_map
-]:
-    """Turn match configs into worker slot maps.
+) -> tuple[dict[str, dict[str, dict[str, np.ndarray]]], list[Lineup]]:
+    """Load the checkpoints the lineups need; returns ``(new checkpoints by agent, lineups)``.
 
     Checkpoint weights cross the process boundary (worker Process arguments and
-    ``WorkerCommand.new_checkpoints``), so they are numpy, never torch.
-    Checkpoints listed in ``already_sent[agent]`` are referenced but not reloaded.
-    A checkpoint that cannot be loaded (evicted or missing) is replaced by the
-    latest weights with ``collect=True`` and a warning (R4-19).
+    ``WorkerCommand.new_checkpoints``), so they are numpy, never torch. Checkpoints listed in
+    ``already_sent[agent]`` are referenced but not reloaded. A checkpoint that cannot be loaded
+    (evicted or missing) is replaced by the latest weights with ``collect=True`` and a warning
+    (SP1 rule, R4-19).
     """
     already_sent = already_sent or {}
     new_ckpts: dict[str, dict[str, dict[str, np.ndarray]]] = {aid: {} for aid in agent_ids}
     missing: set[tuple[str, str]] = set()
-    collect_mask: list[list[bool]] = []
-    slot_network_map: list[list[str]] = []
-    slot_agent_map: list[list[str]] = []
-
-    for mc in match_configs:
-        env_collect: list[bool] = []
-        env_nets: list[str] = []
-        env_agents: list[str] = []
-        for slot in mc.player_slots:
-            net_id = LATEST_NETWORK_ID
-            collect = slot.collect_trajectories
-            ckpt_id = slot.checkpoint_id
-            if ckpt_id is not None:
-                agent_new = new_ckpts.setdefault(slot.agent_id, {})
-                available = ckpt_id in already_sent.get(slot.agent_id, set()) or ckpt_id in agent_new
-                if not available and (slot.agent_id, ckpt_id) not in missing:
-                    try:
-                        agent_new[ckpt_id] = coordinator.checkpoint_manager.load_model(slot.agent_id, ckpt_id)
-                        available = True
-                    except FileNotFoundError:
-                        missing.add((slot.agent_id, ckpt_id))
-                        logger.warning(
-                            f"Checkpoint {ckpt_id} of {slot.agent_id} is missing; that slot plays "
-                            f"the latest weights and collects trajectories"
-                        )
-                if available:
-                    net_id = ckpt_id
-                else:
-                    collect = True
-            env_collect.append(collect)
-            env_nets.append(net_id)
-            env_agents.append(slot.agent_id)
-        collect_mask.append(env_collect)
-        slot_network_map.append(env_nets)
-        slot_agent_map.append(env_agents)
-
-    return new_ckpts, slot_network_map, collect_mask, slot_agent_map
-
-
-class _QueueReader:
-    """Drains one ``mp.Queue`` on a helper thread, so the main process never blocks on it.
-
-    ``mp.Queue.get`` reads a whole message in ``recv_bytes`` and ignores any timeout once
-    the first bytes are there. A producer killed mid-message (OOM, SIGKILL) therefore
-    blocks the reader forever: the main process holds the pipe's write end too, so no EOF
-    ever arrives. Here ``drain`` waits at most ``wait`` seconds; a read still in progress
-    (a large payload arriving or being unpickled) is collected by a later call. Only the
-    shutdown gives up on it (``abandon``, after its deadline), once every producer is gone.
-
-    After ``abandon`` no further item can arrive: the dead producer was killed inside the
-    feeder's ``send_bytes``, i.e. while holding the queue's cross-process write lock, so no
-    other producer can ever write to that pipe again. Should the stuck read finish anyway,
-    the items it got are logged as dropped.
-    """
-
-    def __init__(self, q: Any, label: str, dead_producers: Callable[[], list[str]]) -> None:
-        self._q = q
-        self._label = label
-        self._dead_producers = dead_producers
-        self._thread: threading.Thread | None = None
-        self._items: list = []
-        self._error: BaseException | None = None
-        self._salvaged: list = []
-        self.abandoned = False
-
-    @property
-    def busy(self) -> bool:
-        """A read is in progress (possibly stuck on an incomplete message)."""
-        return self._thread is not None and self._thread.is_alive()
-
-    def _read(self) -> None:
-        try:
-            while True:
-                try:
-                    item = self._q.get_nowait()
-                except queue.Empty:
-                    break
-                except (EOFError, OSError) as e:
-                    if self.abandoned:  # ended by release(): the incomplete item was already reported
-                        logger.debug(f"Abandoned read on the {self._label} queue ended: {e!r}")
-                    else:
-                        logger.warning(f"Dropped an unreadable {self._label} queue item: {e!r}")
-                    break
-                self._items.append(item)
-        except BaseException as e:  # noqa: BLE001 - re-raised by drain() in the main thread
-            self._error = e
-        if self.abandoned and self._items:
-            logger.warning(f"{len(self._items)} item(s) completed on the abandoned {self._label} queue "
-                           f"after shutdown gave up on it; dropped")
-
-    def _take(self) -> list:
-        items, self._items = self._items, []
-        return items
-
-    def drain(self, wait: float = 0.05) -> list:
-        """Items read so far; starts a read when the queue has data.
-
-        A new read gets up to ``wait`` seconds to finish, so small items come back from this
-        call; a read already in progress is only checked, never waited for, so a stuck
-        reader costs nothing per poll. Non-``mp.Queue`` objects (e.g. ``queue.Queue``),
-        whose ``get_nowait`` never blocks, are read synchronously.
-        """
-        if self.abandoned:
-            salvaged, self._salvaged = self._salvaged, []
-            return salvaged  # complete items read before the stuck message
-        if not isinstance(self._q, mp.queues.Queue):
-            self._read()
-        else:
-            if self._thread is None:
-                if self._q.empty():
-                    return []
-                self._thread = threading.Thread(target=self._read, name=f"drain-{self._label}", daemon=True)
-                self._thread.start()
-                self._thread.join(wait)
-            if self._thread.is_alive():
-                return []  # still reading: a large item is arriving, or the message is incomplete
-            self._thread = None
-        error, self._error = self._error, None
-        items = self._take()
-        if error is not None:
-            raise error
-        return items
-
-    def abandon(self) -> None:
-        """Give up on a read that never completed; the next ``drain`` returns the items read before it."""
-        self._salvaged = self._take()
-        self.abandoned = True
-        dead = self._dead_producers()
-        source = f" ({', '.join(dead)} died while sending)" if dead else ""
-        logger.error(f"An incomplete item on the {self._label} queue was never completed{source}; "
-                     f"it and the rest of that queue are skipped")
-
-    def release(self, timeout: float) -> bool:
-        """End an abandoned read; True once no read thread is left (``timeout`` bounds the wait).
-
-        An abandoned read means every producer is gone, so this process holds the pipe's last
-        write end (it never writes to the queues it reads): closing it makes the stuck
-        ``recv_bytes`` hit end-of-file and the thread exit. The queue can then be closed and
-        freed on the calling thread, rather than its semaphores being finalized with this
-        daemon thread at interpreter exit. Should a producer still hold a write end, the
-        read stays stuck and False is returned.
-        """
-        if self.busy and self.abandoned:
-            try:
-                self._q._writer.close()
-            except (AttributeError, OSError):
-                pass
-            self._thread.join(timeout)
-        return not self.busy
-
-
-def _release_command_queues(queues: list, timeout: float) -> list:
-    """Close the queues this process writes to (worker command queues, maxsize 1) and wait,
-    bounded by ``timeout`` per step, until their feeder threads have exited.
-
-    A feeder thread still running when its queue is freed, or at interpreter exit, drops the
-    last references to the queue's semaphores on that daemon thread, which then unlinks them
-    during interpreter shutdown ("leaked semaphore objects" warning). A command its worker
-    never took would keep the feeder busy (a large one blocks in the pipe write), so it is
-    read back first. A queue still full at the deadline (its reader died holding the read
-    lock) or whose feeder does not exit in time is detached instead (``cancel_join_thread``,
-    the previous behaviour). Returns the queues that were detached.
-    """
-    deadline = time.monotonic() + timeout
-    detached: list = []
-    joiners: list[tuple[Any, threading.Thread]] = []
-    for q in queues:
-        try:
-            while q.full() and time.monotonic() < deadline:
-                try:
-                    q.get(timeout=0.05)
-                except queue.Empty:
-                    pass
-            if q.full():
-                detached.append(q)
+    resolved: list[Lineup] = []
+    for lineup in lineups:
+        seats: list[SeatAssignment] = []
+        for seat in lineup.seats:
+            if seat.network_id == LATEST_NETWORK_ID:
+                seats.append(SeatAssignment(seat.agent_id, LATEST_NETWORK_ID, seat.collect))
                 continue
-            q.close()
-        except Exception as e:  # noqa: BLE001 - best effort: a release never replaces the run's outcome
-            logger.debug(f"Could not drain and close a command queue: {e!r}")
-            detached.append(q)
-            continue
-        joiner = threading.Thread(target=q.join_thread, name="queue-release", daemon=True)
-        joiner.start()
-        joiners.append((q, joiner))
-    join_deadline = time.monotonic() + timeout
-    for q, joiner in joiners:
-        joiner.join(max(0.0, join_deadline - time.monotonic()))
-        if joiner.is_alive():
-            detached.append(q)
-    for q in detached:
-        try:
-            q.cancel_join_thread()
-        except AttributeError:
-            pass
-    if detached:
-        logger.debug(f"{len(detached)} command queue(s) could not be drained and closed in time; "
-                     f"their feeder threads are detached")
-    return detached
-
-
-def _queue_depths(queues: dict[str, Any]) -> dict[str, int]:
-    """Approximate items waiting per queue (-1 where the platform cannot tell)."""
-    depths = {}
-    for name, q in queues.items():
-        try:
-            depths[name] = int(q.qsize())
-        except (NotImplementedError, OSError):
-            depths[name] = -1
-    return depths
+            agent_new = new_ckpts.setdefault(seat.agent_id, {})
+            ckpt_id = seat.network_id
+            available = ckpt_id in already_sent.get(seat.agent_id, set()) or ckpt_id in agent_new
+            if not available and (seat.agent_id, ckpt_id) not in missing:
+                try:
+                    agent_new[ckpt_id] = coordinator.checkpoint_manager.load_model(seat.agent_id, ckpt_id)
+                    available = True
+                except FileNotFoundError:
+                    missing.add((seat.agent_id, ckpt_id))
+                    logger.warning(f"Checkpoint {ckpt_id} of {seat.agent_id} is missing; that seat plays "
+                                   f"the latest weights and collects trajectories")
+            if available:
+                seats.append(SeatAssignment(seat.agent_id, ckpt_id, seat.collect))
+            else:
+                seats.append(SeatAssignment(seat.agent_id, LATEST_NETWORK_ID, True))
+        resolved.append(Lineup(layout=lineup.layout, seats=seats))
+    return new_ckpts, resolved
 
 
 # =====================================================================
@@ -513,16 +340,16 @@ class Launcher:
     """
 
     def __init__(self, config: ColosseumConfig, run_dir: RunDir, validated: bool = False) -> None:
-        """``validated``: the trainable agent configs were already checked by
-        ``validate_agent_configs`` (``run_training`` does it before the run dir exists),
-        so ``launch`` does not repeat the dummy forward passes."""
+        """``validated``: the config was already checked by ``validate_run_config``
+        (``run_training`` does it before the run dir exists), so ``launch`` does not repeat
+        the env spec checks and the dummy forward passes."""
         self._config = config
         self._run_dir = run_dir
         self._validated = validated
         self._stop_event = mp.Event()
         # Named children (learner-<agent>, worker-<id>), signals and teardown (T6.5).
         self._supervisor = ProcessSupervisor(self._stop_event, log_dir=run_dir.logs)
-        self._readers: dict[int, _QueueReader] = {}
+        self._readers: dict[int, QueueReader] = {}
         self._reported_failures: set[str] = set()
         self._signal_logged = False
         self._all_queues: list[mp.Queue] = []
@@ -530,6 +357,7 @@ class Launcher:
         self._env_step_counter = SharedCounter()
         # Set by launch(); used by the monitor loop and _shutdown to save checkpoints.
         self._coordinator: Coordinator | None = None
+        self._setup: RunSetup | None = None
         self._agent_ids: list[str] = []
         self._checkpoint_queues: dict[str, mp.Queue] = {}
         self._checkpoint_meta: dict[str, dict] = {}
@@ -563,53 +391,48 @@ class Launcher:
         logger.info(f"  Envs per worker: {cfg.rollout.envs_per_worker}")
         logger.info(f"  Chunk length: {cfg.rollout.chunk_length}")
 
-        # Per-agent effective configs (overrides merged), validated before any process starts
-        # (run_training validates them before the run dir exists and passes validated=True).
-        agent_configs = trainable_agent_configs(cfg) if self._validated else validate_agent_configs(cfg)
+        # Spec, roles and per-agent effective configs, validated before any process starts
+        # (run_training validates before the run dir exists and passes validated=True).
+        setup = setup_run(cfg, validate=not self._validated)
+        self._setup = setup
+        logger.info(f"  Roles: {setup.agent_roles}; layouts: {sorted(setup.spec.layouts)}")
         warn_static_ownership_skew(cfg)
 
-        # Initialize coordinator
-        coordinator = Coordinator(cfg, checkpoint_dir=self._run_dir.checkpoints)
+        coordinator = Coordinator(cfg, setup.spec, setup.agent_roles, checkpoint_dir=self._run_dir.checkpoints)
 
         # Resume (before any process starts: a bad resume source fails fast).
-        resume_states = self._resolve_resume(agent_configs)
+        resume_states = self._resolve_resume(setup.agent_configs, setup.role_specs)
 
         from colosseum.core.config import config_hash
         cfg_hash = config_hash(cfg)
         self._checkpoint_meta = {
-            aid: {"networks": agent_configs[aid].networks.model_dump(mode="json", by_alias=True),
+            aid: {"networks": setup.agent_configs[aid].networks.model_dump(mode="json", by_alias=True),
                   "config_hash": cfg_hash}
             for aid in trainable_agents
         }
 
-        # Per-agent queues
         trajectory_queues: dict[str, mp.Queue] = {}
         checkpoint_queues: dict[str, mp.Queue] = {}
         weight_queues_per_agent: dict[str, list[mp.Queue]] = {}
-
         for aid in trainable_agents:
-            acfg = agent_configs[aid]
+            acfg = setup.agent_configs[aid]
             trajectory_queues[aid] = mp.Queue(maxsize=acfg.learner.queue_size)
             checkpoint_queues[aid] = mp.Queue(maxsize=_CHECKPOINT_QUEUE_SIZE)
             weight_queues_per_agent[aid] = [
                 mp.Queue(maxsize=_WEIGHT_QUEUE_SIZE) for _ in range(cfg.rollout.num_workers)
             ]
-
-        # Shared queues
         metrics_queue = mp.Queue(maxsize=_METRICS_QUEUE_SIZE)
         results_queue = mp.Queue(maxsize=_RESULTS_QUEUE_SIZE)
-
-        # Per-worker command queues (runtime match re-assignment, C1) and the
-        # set of checkpoint ids already shipped to each worker (to send deltas).
+        # Per-worker command queues (runtime lineup re-assignment) and the set of checkpoint ids
+        # already shipped to each worker (to send deltas).
         command_queues: list[mp.Queue] = [
             mp.Queue(maxsize=_COMMAND_QUEUE_SIZE) for _ in range(cfg.rollout.num_workers)
         ]
         worker_sent_ckpts: list[dict[str, set]] = [
             {aid: set() for aid in trainable_agents} for _ in range(cfg.rollout.num_workers)
         ]
-
-        # Track every queue so shutdown can cancel feeder threads and avoid the
-        # interpreter blocking on unflushed data when consumers have exited.
+        # Track every queue so shutdown can cancel feeder threads and avoid the interpreter
+        # blocking on unflushed data when consumers have exited.
         self._all_queues = [metrics_queue, results_queue, *command_queues]
         for aid in trainable_agents:
             self._all_queues.append(trajectory_queues[aid])
@@ -627,15 +450,15 @@ class Launcher:
         code = 1
         try:
             # SIGINT / SIGTERM only set stop_event from here on: children ignore SIGINT and the
-            # shutdown below saves their final checkpoints (T6.5).
+            # shutdown below saves their final checkpoints.
             self._supervisor.install_signal_handlers()
-            # The metrics hub (and its file) exists before any child starts: an open failure
-            # here cannot orphan children (T6.3). _finish_metrics closes whatever was opened.
+            # The metrics hub (and its file) exists before any child starts: an open failure here
+            # cannot orphan children. _finish_metrics closes whatever was opened.
             self._open_metrics(resume_states)
             started = False
             try:
                 self._start_children(
-                    agent_configs, resume_states, trajectory_queues, checkpoint_queues,
+                    setup.agent_configs, resume_states, trajectory_queues, checkpoint_queues,
                     weight_queues_per_agent, metrics_queue, results_queue, command_queues,
                     worker_sent_ckpts,
                 )
@@ -643,8 +466,8 @@ class Launcher:
                 logger.info("Training started. Press Ctrl+C to stop.")
                 code = self._monitor_loop(coordinator, trainable_agents, command_queues, worker_sent_ckpts)
             except BaseException as error:
-                # Also after a failed start or a monitor error the started children are
-                # stopped (final checkpoints saved); then the original error propagates.
+                # Also after a failed start or a monitor error the started children are stopped
+                # (final checkpoints saved); then the original error propagates.
                 if not started:
                     logger.error(f"Starting the child processes failed; stopping the "
                                  f"{len(self._supervisor.names)} already started")
@@ -705,30 +528,31 @@ class Launcher:
     ) -> None:
         """Start one learner per trainable agent, then the workers shared by all agents.
 
-        Every started child is registered with the supervisor right away, so a failure
-        part-way through tears down exactly the children that exist.
+        Every started child is registered with the supervisor right away, so a failure part-way
+        through tears down exactly the children that exist.
         """
         from colosseum.utils.seeding import learner_seed
 
         cfg = self._config
+        setup = self._setup
         trainable_agents = self._agent_ids
         coordinator = self._coordinator
         for agent_index, aid in enumerate(trainable_agents):
-            acfg = agent_configs[aid]
-            # numpy + bytes only: Process arguments cross the process boundary (R6-02).
+            # numpy + bytes only: Process arguments cross the process boundary.
             learner_proc = mp.Process(
                 target=_learner_target,
                 name=f"learner-{aid}",
                 kwargs=dict(
                     agent_id=aid,
                     log_dir=str(self._run_dir.logs),
-                    config=acfg,
+                    config=agent_configs[aid],
+                    role_spec=setup.role_specs[aid],
                     trajectory_queue=trajectory_queues[aid],
                     weight_queues=weight_queues_per_agent[aid],
                     stop_event=self._stop_event,
                     metrics_queue=metrics_queue,
                     checkpoint_queue=checkpoint_queues[aid],
-                    checkpoint_interval=cfg.self_play.checkpoint_interval,
+                    checkpoint_interval=cfg.checkpoint.interval,
                     resume_state=resume_states[aid],
                     progress_counter=self._env_step_counter,
                     total_timesteps=cfg.training.total_timesteps,
@@ -743,31 +567,17 @@ class Launcher:
             self._supervisor.add(f"learner-{aid}", learner_proc)
             logger.info(f"Learner started for agent {aid}")
 
-        # Workers (shared across all agents)
         for worker_id in range(cfg.rollout.num_workers):
-            match_configs = coordinator.generate_match_configs(
-                cfg.rollout.envs_per_worker,
-                env_offset=worker_id * cfg.rollout.envs_per_worker,
+            lineups = coordinator.generate_lineups(
+                cfg.rollout.envs_per_worker, env_offset=worker_id * cfg.rollout.envs_per_worker,
             )
-
-            (
-                ckpt_dicts_by_agent,
-                slot_network_map,
-                collect_mask,
-                slot_agent_map,
-            ) = _derive_worker_configs(match_configs, coordinator, trainable_agents)
+            ckpt_dicts_by_agent, lineups = _resolve_lineups(lineups, coordinator, trainable_agents)
             # Initial checkpoints travel as process arguments: delivered by construction.
             for aid, ckpts in ckpt_dicts_by_agent.items():
                 worker_sent_ckpts[worker_id].setdefault(aid, set()).update(ckpts)
-
-            worker_weight_queues: dict[str, mp.Queue] = {
-                aid: weight_queues_per_agent[aid][worker_id]
-                for aid in trainable_agents
-            }
-
-            # Subprocess vec_env makes the worker spawn its own children, which
-            # daemonic processes are not allowed to do — so run such workers
-            # non-daemon (the shutdown path joins/terminates them explicitly).
+            worker_weight_queues = {aid: weight_queues_per_agent[aid][worker_id] for aid in trainable_agents}
+            # A subprocess vector env makes the worker spawn its own children, which daemonic
+            # processes may not do, so such workers run non-daemon (the shutdown joins them).
             worker_daemon = cfg.rollout.vec_env != "subprocess"
             worker_proc = mp.Process(
                 target=_worker_target,
@@ -777,15 +587,15 @@ class Launcher:
                     log_dir=str(self._run_dir.logs),
                     config=cfg,
                     agent_ids=trainable_agents,
+                    agent_roles=setup.agent_roles,
                     agent_configs=agent_configs,
+                    role_specs=setup.role_specs,
                     trajectory_queues=trajectory_queues,
                     weight_queues=worker_weight_queues,
                     stop_event=self._stop_event,
+                    lineups=lineups,
                     env_step_counter=self._env_step_counter,
                     checkpoint_state_dicts_by_agent=ckpt_dicts_by_agent,
-                    slot_network_map=slot_network_map,
-                    collect_mask=collect_mask,
-                    slot_agent_map=slot_agent_map,
                     results_queue=results_queue,
                     command_queue=command_queues[worker_id],
                     metrics_queue=metrics_queue,
@@ -805,7 +615,7 @@ class Launcher:
         """Run until the budget is reached, a signal arrives, or a child dies.
 
         Saves checkpoints, feeds results and metrics to the coordinator and the hub, and
-        periodically re-generates match assignments for the workers (C1), so
+        periodically re-generates the workers' lineups, so
         self-play-vs-history and PFSP opponent selection evolve during training.
 
         The main process is the only budget authority: learners and workers run until
@@ -824,7 +634,7 @@ class Launcher:
             self._drain_metrics()
             env_steps = int(self._env_step_counter.value)
             self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot(),
-                                 queue_depths=_queue_depths(self._trajectory_queues))
+                                 queue_depths=queue_depths(self._trajectory_queues))
             if self._supervisor.received_signal is not None:
                 return self._signal_exit_code()
             if self._stop_event.is_set():
@@ -891,7 +701,7 @@ class Launcher:
         """Everything currently in ``q``, read without ever blocking on a dead producer."""
         reader = self._readers.get(id(q))
         if reader is None:
-            reader = self._readers[id(q)] = _QueueReader(q, label, lambda: self._dead_producers(producers()))
+            reader = self._readers[id(q)] = QueueReader(q, label, lambda: self._dead_producers(producers()))
         return reader.drain()
 
     def _drain_results(self) -> None:
@@ -923,7 +733,7 @@ class Launcher:
                 self._drain_metrics()
                 self._hub.close(env_steps=int(self._env_step_counter.value),
                                 ratings=self._coordinator.ratings_snapshot(),
-                                queue_depths=_queue_depths(self._trajectory_queues))
+                                queue_depths=queue_depths(self._trajectory_queues))
         finally:
             try:
                 if self._metrics_writer is not None:
@@ -932,24 +742,27 @@ class Launcher:
                 if self._wandb is not None:
                     self._wandb.finish()
 
-    def _resolve_resume(self, agent_configs: dict[str, ColosseumConfig]) -> dict[str, dict | None]:
+    def _resolve_resume(self, agent_configs: Mapping[str, ColosseumConfig],
+                        role_specs: Mapping[str, RoleSpec]) -> dict[str, dict | None]:
         """Resolve ``training.resume_from`` for every trainable agent (see ``resolve_resume``).
 
-        Checks each resumed agent's weights against its architecture (ConfigError
-        before any process starts) and continues the global env-step counter from
-        the largest resumed ``env_steps``, so the budget and LR progress continue (D3).
+        A checkpoint source must carry the role signature of the agent's roles (ConfigError naming
+        the checkpoint otherwise); every resumed agent's weights are checked against its
+        architecture (ConfigError before any process starts); the global env-step counter
+        continues from the largest resumed ``env_steps``, so the budget and LR progress continue.
         """
         from colosseum.coordinator.checkpoint_manager import check_model_state, resolve_resume
         from colosseum.core.registry import build_model
+        from colosseum.core.roles import role_signature
 
         resume_from = self._config.training.resume_from
         resume_states: dict[str, dict | None] = {aid: None for aid in agent_configs}
         if not resume_from:
             return resume_states
         for aid, acfg in agent_configs.items():
-            state = resolve_resume(resume_from, aid)
+            state = resolve_resume(resume_from, aid, expected_signature=role_signature(role_specs[aid]))
             if state is not None:
-                check_model_state(build_model(acfg), state["model_state"], state["source"])
+                check_model_state(build_model(acfg, role_specs[aid]), state["model_state"], state["source"])
                 logger.info(f"Resume [{aid}]: {state['source']} (policy_version {state['policy_version']})")
             resume_states[aid] = state
         start_env_steps = max((s["env_steps"] for s in resume_states.values() if s), default=0)
@@ -990,13 +803,12 @@ class Launcher:
         command_queues: list[mp.Queue],
         worker_sent_ckpts: list[dict[str, set]],
     ) -> None:
-        """Advance the owner rotation and send every worker fresh slot maps.
+        """Advance the owner rotation and send every worker fresh lineups.
 
-        Matches for worker ``w`` are generated at global env offset
-        ``w * envs_per_worker``. Each command carries only checkpoints that the
-        worker does not have yet. A checkpoint counts as delivered only after its
-        command was put successfully; a full command queue means the worker skips
-        this round and gets the deltas with the next refresh (D9).
+        Lineups for worker ``w`` are generated at global env offset ``w * envs_per_worker``. Each
+        command carries only checkpoints that the worker does not have yet. A checkpoint counts as
+        delivered only after its command was put successfully; a full command queue means the
+        worker skips this round and gets the deltas with the next refresh.
         """
         from colosseum.core.types import WorkerCommand
 
@@ -1004,16 +816,9 @@ class Launcher:
         coordinator.next_round()
         for worker_id, cq in enumerate(command_queues):
             sent = worker_sent_ckpts[worker_id]
-            match_configs = coordinator.generate_match_configs(num_envs, env_offset=worker_id * num_envs)
-            new_ckpts, slot_network_map, collect_mask, slot_agent_map = _derive_worker_configs(
-                match_configs, coordinator, agent_ids, already_sent=sent,
-            )
-            cmd = WorkerCommand(
-                slot_agent_map=slot_agent_map,
-                slot_network_map=slot_network_map,
-                collect_mask=collect_mask,
-                new_checkpoints={aid: c for aid, c in new_ckpts.items() if c},
-            )
+            lineups = coordinator.generate_lineups(num_envs, env_offset=worker_id * num_envs)
+            new_ckpts, lineups = _resolve_lineups(lineups, coordinator, agent_ids, already_sent=sent)
+            cmd = WorkerCommand(lineups=list(lineups), new_checkpoints={aid: c for aid, c in new_ckpts.items() if c})
             try:
                 cq.put_nowait(cmd)
             except queue.Full:
@@ -1085,8 +890,8 @@ class Launcher:
         - Command queues (this process is their producer): unread commands are read back,
           then the queue is closed and its feeder thread joined, so no feeder outlives
           ``launch`` to unlink the semaphores during interpreter shutdown
-          (``_release_command_queues``).
-        - A read abandoned on an incomplete message is ended first (``_QueueReader.release``).
+          (``release_command_queues``).
+        - A read abandoned on an incomplete message is ended first (``QueueReader.release``).
           Should it stay stuck (a producer still holds a write end), its queue stays open:
           closing the pipe under that thread is unsafe.
         """
@@ -1094,7 +899,7 @@ class Launcher:
             reader.release(_QUEUE_RELEASE_SEC)
         busy = {key: reader for key, reader in self._readers.items() if reader.busy}
         produced_here = {id(q) for q in self._command_queues}
-        _release_command_queues(self._command_queues, _QUEUE_RELEASE_SEC)
+        release_command_queues(self._command_queues, _QUEUE_RELEASE_SEC)
         for q in self._all_queues:
             if id(q) in produced_here:
                 continue
@@ -1124,7 +929,7 @@ class Launcher:
 
 
 def run_training(config_path: str, overrides: dict | None = None) -> int:
-    """Entry point of ``colosseum train``. Returns the process exit code (D10).
+    """Entry point of ``python -m colosseum train``. Returns the process exit code.
 
     The run directory is printed (and logged) once it exists.
     """
@@ -1133,13 +938,13 @@ def run_training(config_path: str, overrides: dict | None = None) -> int:
     mp.set_start_method("spawn", force=True)
     setup_process_logging(None, "main", console_level=logging.INFO)
     config = load_config(config_path, overrides)
-    # Before the run dir exists: an invalid config leaves nothing behind, so a corrected
-    # retry with the same run.name works. Launcher.launch does not validate again.
-    validate_agent_configs(config)
+    # Before the run dir exists: an invalid config leaves nothing behind, so a corrected retry
+    # with the same run.name works. Launcher.launch does not validate again.
+    validate_run_config(config)
     if config.training.resume_from:
         from colosseum.coordinator.checkpoint_manager import classify_resume_source
         classify_resume_source(config.training.resume_from)  # exists and has a known layout (nothing loaded)
-    apply_global_seed(config.training.seed)  # after overrides: --set training.seed works (R3-27)
+    apply_global_seed(config.training.seed)  # after overrides: --set training.seed works
     run_dir = RunDir.create(config, config_path)
     config = run_dir.with_run_name(config)  # the resolved config and checkpoint hashes agree
     setup_process_logging(run_dir.logs, "main", console_level=logging.INFO)

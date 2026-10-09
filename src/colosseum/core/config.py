@@ -1,9 +1,16 @@
-"""Pydantic v2 configuration models for the Colosseum framework.
+"""Pydantic v2 configuration models for the Colosseum framework (config v2, SP2).
 
 Every section of the training pipeline (algorithm, environment, network,
-rollout, learner, self-play, checkpointing, metrics, transport, run) has its own
+rollout, learner, matchmaking, checkpointing, metrics, transport, run) has its own
 model with sensible defaults.  The top-level :class:`ColosseumConfig` combines
 them all and can be loaded from a YAML file via :func:`load_config`.
+
+Changes from SP1: ``env.num_players``, ``training.phase`` and the ``self_play``
+section are gone (the game structure comes from the env's ``GameSpec``); new are
+``env.max_idle_steps``, ``matchmaking``, ``checkpoint.interval`` / ``pool_size``,
+``agents.<id>.roles``, ``algorithm.ratio_mode`` / ``unit_trace`` /
+``entropy_reduction`` and ``networks.critic_encoder_class``; ``rollout.chunk_length``
+is at least 2.
 """
 
 from __future__ import annotations
@@ -69,14 +76,6 @@ def check_agent_id(value: str) -> str:
 # ---------------------------------------------------------------------------
 # Enums
 # ---------------------------------------------------------------------------
-
-
-class TrainingPhase(str, Enum):
-    """High-level training phase."""
-
-    BC = "bc"
-    SELF_PLAY = "self_play"
-    LEAGUE = "league"
 
 
 class LRSchedule(str, Enum):
@@ -150,6 +149,23 @@ class AlgorithmConfig(StrictModel):
     )
     use_amp: bool = Field(default=False, description="Enable automatic mixed precision training.")
     amp_dtype: str = Field(default="float16", description="AMP dtype: 'float16' or 'bfloat16'.")
+    ratio_mode: Literal["auto", "joint", "per_unit"] = Field(
+        default="auto",
+        description="Policy loss over deciders: 'joint' = PPO clip on the joint ratio, advantage times the "
+                    "clipped scalar rho; 'per_unit' = ratio and clip per decider with a shared advantage and no "
+                    "rho factor, mean over valid deciders. 'auto' = per_unit with Units actions, else joint.",
+    )
+    unit_trace: Literal["auto", "joint", "geo_mean", "none"] = Field(
+        default="auto",
+        description="Scalar rho for the V-trace targets: 'joint' = exp(sum of decider log-ratios), 'geo_mean' = "
+                    "exp(mean), 'none' = rho = c = 1. 'auto' = joint (also with Units: units-experiment "
+                    "ruling, docs/benchmarks.md).",
+    )
+    entropy_reduction: Literal["auto", "mean_valid", "sum"] = Field(
+        default="auto",
+        description="How entropy and the kickstart KL are reduced over deciders. 'auto' = sum with "
+                    "ratio_mode joint, mean_valid with per_unit.",
+    )
 
 
 class EnvConfig(StrictModel):
@@ -157,10 +173,14 @@ class EnvConfig(StrictModel):
 
     env_class: str = Field(
         ...,
-        description="Dotted import path to the environment class (e.g. 'examples.tic_tac_toe.env.TicTacToeEnv').",
+        description="Dotted import path to a MultiAgentEnv class (e.g. 'examples.tic_tac_toe.game.TicTacToe').",
     )
-    num_players: int = Field(default=2, ge=1, description="Number of player slots per match.")
     kwargs: dict[str, Any] = Field(default_factory=dict, description="Extra kwargs forwarded to the env constructor.")
+    max_idle_steps: int = Field(
+        default=1000, ge=1,
+        description="Max steps in a row without acting seats and without episode_over before the env is "
+                    "reported as broken (EnvContractError).",
+    )
 
 
 class CoreConfig(StrictModel):
@@ -194,6 +214,12 @@ class NetworkConfig(StrictModel):
     )
     policy_class: str | None = Field(default=None, description="Dotted path to the policy head class.")
     value_class: str | None = Field(default=None, description="Dotted path to the value head class.")
+    critic_encoder_class: str | None = Field(
+        default=None,
+        description="Optional dotted path to a BaseCriticEncoder: the value head then sees core features plus "
+                    "the encoded global_state (centralized critic). Composed models only; the agent's role must "
+                    "declare a global_state_space.",
+    )
     kwargs: dict[str, Any] = Field(
         default_factory=dict,
         description="Extra kwargs forwarded to the model (or encoder and head) constructors.",
@@ -206,6 +232,7 @@ class NetworkConfig(StrictModel):
             "core": self.core,
             "policy_class": self.policy_class,
             "value_class": self.value_class,
+            "critic_encoder_class": self.critic_encoder_class,
         }
         if self.model_class:
             extra = [name for name, value in parts.items() if value is not None]
@@ -226,7 +253,11 @@ class NetworkConfig(StrictModel):
 class RolloutConfig(StrictModel):
     """Worker / rollout collection settings."""
 
-    chunk_length: int = Field(default=256, ge=1, description="Timesteps per trajectory chunk (T).")
+    chunk_length: int = Field(
+        default=256, ge=2,
+        description="Slots per trajectory chunk (S >= 2): decisions (act), bootstrap observations (boot) and "
+                    "padding (pad).",
+    )
     num_workers: int = Field(default=4, ge=1, description="Number of worker processes.")
     envs_per_worker: int = Field(default=8, ge=1, description="Vectorised envs per worker process.")
     weight_sync_interval_sec: float = Field(
@@ -290,7 +321,6 @@ class LearnerConfig(StrictModel):
 class TrainingConfig(StrictModel):
     """Top-level training loop settings."""
 
-    phase: TrainingPhase = Field(default=TrainingPhase.SELF_PLAY, description="Current training phase.")
     total_timesteps: int = Field(default=10_000_000, ge=1, description="Total env timesteps before training ends.")
     seed: int | None = Field(default=None, description="Global random seed for reproducibility.")
     resume_from: str | None = Field(
@@ -320,46 +350,62 @@ class TrainingConfig(StrictModel):
     )
 
 
-class SelfPlayConfig(StrictModel):
-    """Self-play and PFSP / league settings."""
+class MatchmakingConfig(StrictModel):
+    """How the coordinator builds lineups (layout, match type, team cores, teammates, seats)."""
 
-    checkpoint_interval: int = Field(
-        default=1000,
-        ge=1,
-        description="Save a new checkpoint to the self-play pool every N TRAINING steps "
-                    "(optimizer updates / policy versions), NOT env steps. Note one training "
-                    "step consumes chunk_length * batch_chunks env steps, so pick a value well "
-                    "below total_timesteps / (chunk_length * batch_chunks) to actually fill the "
-                    "self-play pool.",
+    mode: Literal["self_play", "league"] = Field(
+        default="self_play",
+        description="'self_play' = every match is self-play (self_play_ratio is treated as 1); "
+                    "'league' = self-play with probability self_play_ratio, else an arena match.",
     )
-    pool_size: int = Field(default=20, ge=1, description="Max checkpoints kept in the FIFO pool per agent.")
-    latest_prob: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=1.0,
-        description="Probability of sampling the latest policy as an opponent (vs. a historical checkpoint).",
+    layouts: dict[str, float] = Field(
+        default_factory=dict,
+        description="Layout weights, e.g. {2p: 0.5, 4p: 0.5}. Empty = every layout with equal weight. Only "
+                    "layouts with a seat for the data owner's role are drawn.",
     )
     self_play_ratio: float = Field(
-        default=0.5,
-        ge=0.0,
-        le=1.0,
-        description="Fraction of matches that are solo self-play (rest are arena matches).",
+        default=0.5, ge=0.0, le=1.0,
+        description="Probability of a self-play match in 'league' mode (the rest are arena matches).",
     )
-    pfsp_exponent: float = Field(
-        default=1.0,
-        ge=0.0,
-        description="Exponent p in PFSP priority: f(wr) = (1 - wr)^p.",
+    pfsp_exponent: float = Field(default=1.0, ge=0.0, description="Exponent p in PFSP priority: f(wr) = (1 - wr)^p.")
+    latest_prob: float = Field(
+        default=0.5, ge=0.0, le=1.0,
+        description="Self-play: probability that an opposing team core is the owner's latest policy "
+                    "(else one of its checkpoints).",
+    )
+    teammates: Literal["self", "mixed"] = Field(
+        default="self",
+        description="'self' = the team core takes every seat of the team it can play; 'mixed' = each such "
+                    "seat goes to the core with probability teammate_self_prob, else to another candidate.",
+    )
+    teammate_self_prob: float = Field(
+        default=0.5, ge=0.0, le=1.0, description="With teammates: mixed, probability that a seat goes to the core.",
     )
     shuffle_seats: bool = Field(
         default=True,
-        description="Shuffle the seat order of every generated match, so each agent (and each "
-                    "checkpoint opponent) plays every seat equally often.",
+        description="Permute teams with equal role composition and seats of the same role within a team.",
     )
+
+    @field_validator("layouts")
+    @classmethod
+    def _check_layout_weights(cls, layouts: dict[str, float]) -> dict[str, float]:
+        bad = {name: weight for name, weight in layouts.items() if not weight > 0}
+        if bad:
+            raise ValueError(f"matchmaking.layouts weights must be > 0, got {bad}")
+        return layouts
 
 
 class CheckpointConfig(StrictModel):
     """Checkpoint settings. Checkpoints are stored in the run dir (``<run>/checkpoints/``)."""
 
+    interval: int = Field(
+        default=1000, ge=1,
+        description="Save a checkpoint every N TRAINING steps (optimizer updates / policy versions), not env "
+                    "steps (was self_play.checkpoint_interval).",
+    )
+    pool_size: int = Field(
+        default=20, ge=1, description="Max checkpoints kept in the FIFO pool per agent (was self_play.pool_size).",
+    )
     save_optimizer: bool = Field(
         default=True,
         description="Whether checkpoints include the trainer state (optimizer, LR progress, AMP scaler, "
@@ -405,17 +451,17 @@ class RunConfig(StrictModel):
 class TransportConfig(StrictModel):
     """Communication backend settings.
 
-    ``mode`` and ``grpc_port`` are unused in SP1; kept for SP5 (distribution). Distributed
+    ``mode`` and ``grpc_port`` are unused since SP1; kept for SP5 (distribution). Distributed
     roles take their ports as command-line flags.
     """
 
     mode: TransportMode = Field(
         default=TransportMode.LOCAL,
-        description="Transport backend to use. Unused in SP1; kept for SP5 (distribution).",
+        description="Transport backend to use. Unused since SP1; kept for SP5 (distribution).",
     )
     grpc_port: int = Field(
         default=50051, ge=1, le=65535,
-        description="Port for gRPC services. Unused in SP1; kept for SP5 (distribution).",
+        description="Port for gRPC services. Unused since SP1; kept for SP5 (distribution).",
     )
     grpc_max_message_mb: int = Field(
         default=64,
@@ -445,6 +491,22 @@ class AgentOverride(StrictModel):
     networks: dict[str, Any] | None = None
     algorithm: dict[str, Any] | None = None
     learner: dict[str, Any] | None = None
+    roles: list[str] | None = Field(
+        default=None,
+        description="Roles this agent plays (all must have the same spaces). Omitted = every role of the game, "
+                    "which then must all have the same spaces.",
+    )
+
+    @field_validator("roles")
+    @classmethod
+    def _check_roles(cls, roles: list[str] | None) -> list[str] | None:
+        if roles is not None:
+            if not roles:
+                raise ValueError("roles must not be empty (omit it to play every role)")
+            duplicates = sorted({r for r in roles if roles.count(r) > 1})
+            if duplicates:
+                raise ValueError(f"roles lists {duplicates} more than once")
+        return roles
 
 
 _AGENT_SECTIONS = ("networks", "algorithm", "learner")
@@ -488,7 +550,7 @@ class ColosseumConfig(StrictModel):
     rollout: RolloutConfig = Field(default_factory=RolloutConfig)
     learner: LearnerConfig = Field(default_factory=LearnerConfig)
     training: TrainingConfig = Field(default_factory=TrainingConfig)
-    self_play: SelfPlayConfig = Field(default_factory=SelfPlayConfig)
+    matchmaking: MatchmakingConfig = Field(default_factory=MatchmakingConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     bc: BCConfig = Field(default_factory=BCConfig)
@@ -526,14 +588,18 @@ class ColosseumConfig(StrictModel):
                 raise ValueError(f"agents.{agent_id}: invalid override:\n{e}") from None
         return self
 
-    def get_agent_config(self, agent_id: str) -> ColosseumConfig:
-        """Effective config of one agent: global sections deep-merged with its override."""
+    def _require_known_agent(self, agent_id: str) -> None:
+        """Raise ConfigError unless ``agent_id`` is a configured agent (or ``agent_0`` without ``agents``)."""
         if self.agents and agent_id not in self.agents:
             raise ConfigError(f"Unknown agent '{agent_id}'. Known agents: {sorted(self.agents)}")
         if not self.agents and agent_id != "agent_0":
             raise ConfigError(
                 f"Unknown agent '{agent_id}': without an 'agents' section the only agent is 'agent_0'"
             )
+
+    def get_agent_config(self, agent_id: str) -> ColosseumConfig:
+        """Effective config of one agent: global sections deep-merged with its override."""
+        self._require_known_agent(agent_id)
         data = self.model_dump(by_alias=True)
         override = self.agents.get(agent_id)
         if override is not None:
@@ -543,6 +609,15 @@ class ColosseumConfig(StrictModel):
                     data[section] = deep_merge(data[section], part)
         data["agents"] = {}
         return ColosseumConfig.model_validate(data)
+
+    def agent_roles(self, agent_id: str) -> list[str] | None:
+        """``agents.<id>.roles`` (None when omitted: the agent plays every role).
+
+        Call it on the top-level config, not on a ``get_agent_config()`` result (which has ``agents == {}``).
+        """
+        self._require_known_agent(agent_id)
+        override = self.agents.get(agent_id)
+        return None if override is None or override.roles is None else list(override.roles)
 
     def get_trainable_agent_ids(self) -> list[str]:
         """Return list of trainable agent IDs.

@@ -1,46 +1,55 @@
+"""Base classes for the parts of a ``ComposedModel`` (SP2 spec block 3)."""
+
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
-import torch
 import torch.nn as nn
+from torch import Tensor
+
+from colosseum.core.tree import Tree
 
 if TYPE_CHECKING:
-    from colosseum.networks.distributions import Distribution
+    from colosseum.networks.dist import Distribution
+
+
+class EncoderOutput(NamedTuple):
+    latent: Tensor                 # [B, D]: goes through the core
+    aux: dict[str, Tensor]         # bypasses the core, e.g. unit embeddings [B, U, E] or spatial maps
 
 
 class BaseEncoder(nn.Module, ABC):
-    """Transforms raw observation into a latent vector."""
+    """Observation tree (torch, batch first, env dtypes) -> latent ``[B, D]`` (or an ``EncoderOutput``)."""
 
     @abstractmethod
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        """obs: [B, *obs_shape] -> latent: [B, latent_dim]"""
-        ...
+    def forward(self, obs: Tree) -> Tensor | EncoderOutput: ...
 
     @property
     @abstractmethod
-    def latent_dim(self) -> int:
-        """Dimension of the latent vector output."""
-        ...
+    def latent_dim(self) -> int: ...
 
 
 class BasePolicy(nn.Module, ABC):
-    """Maps latent vector to action distribution."""
+    """Core features ``[B, F]`` plus the encoder's ``aux`` -> action distribution (batch ``[B]``)."""
 
     @abstractmethod
-    def forward(self, latent: torch.Tensor) -> Distribution:
-        """latent: [B, latent_dim] -> distribution over actions.
-
-        Must return an object with sample(), log_prob(actions), entropy() methods.
-        """
-        ...
+    def forward(self, features: Tensor, aux: dict[str, Tensor]) -> Distribution: ...
 
 
 class BaseValue(nn.Module, ABC):
-    """Maps latent vector to scalar value estimate."""
+    """Value input ``[B, F (+ G)]`` -> values ``[B]``."""
 
     @abstractmethod
-    def forward(self, latent: torch.Tensor) -> torch.Tensor:
-        """latent: [B, latent_dim] -> values: [B]"""
-        ...
+    def forward(self, features: Tensor) -> Tensor: ...
+
+
+class BaseCriticEncoder(nn.Module, ABC):
+    """Global-state tree -> ``[B, G]`` features for the value head only (centralized critic)."""
+
+    @abstractmethod
+    def forward(self, global_state: Tree) -> Tensor: ...
+
+    @property
+    @abstractmethod
+    def output_dim(self) -> int: ...

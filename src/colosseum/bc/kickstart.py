@@ -1,26 +1,20 @@
-"""Online behavioral cloning via kickstarting (Schmitt et al., 2018).
+"""Online behavioral cloning via kickstarting (Schmitt et al., 2018), on chunk v2.
 
-Adds ``lambda * KL`` between a frozen teacher policy and the student to the RL
-loss. Lambda decays linearly from ``initial_lambda`` to 0 over ``decay_steps``
-train steps.
+Adds ``lambda * KL`` between a frozen teacher policy and the student to the RL loss.
+Lambda decays linearly from ``initial_lambda`` to 0 over ``decay_steps`` train steps.
 
 Direction (``training.kickstart_kl``):
-- ``"forward"`` (default): KL(teacher || student), i.e. the teacher-to-student
-  cross-entropy minus a constant, as in Kickstarting, AlphaStar and VPT. It is
-  mode-covering, so the student keeps the teacher's diversity.
+- ``"forward"`` (default): KL(teacher || student), mode-covering (Kickstarting, AlphaStar, VPT);
 - ``"reverse"``: KL(student || teacher), mode-seeking.
 
-The teacher is a ``PolicyModel`` unrolled over the same ``[T, B]`` sequences as
-the student, with the chunks' action masks, episode resets (``dones``) and initial
-states. The student distribution is passed in from the algorithm's main forward,
-so there is no second student pass. Both distributions are masked, and the masked
-KL is computed over legal actions only.
+The teacher is unrolled with ``with_value=False`` over the same ``[S, B]`` slots as the
+student, with the chunks' action masks, ``reset_after`` flags and initial states. The KL is
+computed per decider (``Distribution.unit_kl``, 0 where a decider is invalid), reduced over
+deciders per ``reduction`` (``"sum"`` or ``"mean_valid"``) and averaged over ACT slots only.
 
-In SP1 the teacher is built from the student's config, so both share one state
-layout and the chunk's ``initial_state``, recorded by the student's behavior
-policy, is used as the teacher's ``state0``. That is exact when teacher == student
-(the usual BC -> RL start) and an approximation afterwards. A separate teacher
-config with its own state is SP3.
+In SP2 the teacher stays global and is built from the student's networks config, so both
+share one state layout and the chunk's ``initial_state`` (recorded by the student's behavior
+policy) is the teacher's ``state0``: exact when teacher == student, an approximation after.
 """
 
 from __future__ import annotations
@@ -28,8 +22,10 @@ from __future__ import annotations
 from typing import Literal
 
 import torch
+from torch import Tensor
 
-from colosseum.networks.distributions import Distribution
+from colosseum.core.tree import Tree
+from colosseum.networks.dist import Distribution
 from colosseum.networks.model import PolicyModel
 from colosseum.networks.state import State
 
@@ -91,29 +87,43 @@ class KickstartLoss:
 
     def compute(
         self,
+        *,
         student_dist: Distribution,
-        observations: torch.Tensor,
-        dones: torch.Tensor,
+        obs: Tree,
+        reset_after: Tensor,
         state0: State,
-        action_mask: torch.Tensor | None = None,
-    ) -> torch.Tensor:
-        """Scaled kickstart loss ``lambda * mean(KL)``.
+        action_mask: Tree | None,
+        actions: Tree,
+        is_act: Tensor,
+        reduction: Literal["mean_valid", "sum"],
+    ) -> Tensor:
+        """Scaled kickstart loss ``lambda * mean over ACT slots of the reduced per-decider KL``.
 
         Args:
-            student_dist: the student's (masked) distribution over ``T*B`` time-major
-                rows, from the algorithm's main ``unroll``.
-            observations: ``[T, B, *obs_shape]``.
-            dones: ``[T, B]`` bool; the state is reset after a done step.
-            state0: initial state for the teacher's unroll (leaves ``[B, ...]``).
-            action_mask: ``[T, B, mask_size]`` bool or None.
+            student_dist: the student's masked distribution over ``S*B`` time-major rows,
+                from the algorithm's main ``unroll``.
+            obs: observation tree, leaves ``[S, B, ...]``.
+            reset_after: ``[S, B]`` bool; the state is reset after slot s.
+            state0: the teacher's initial state (leaves ``[B, ...]``).
+            action_mask: mask tree, leaves ``[S, B, ...]``, or None.
+            actions: the recorded actions, leaves ``[S*B, ...]`` (they gate ``only_if`` children).
+            is_act: ``[S, B]`` bool; only ACT slots contribute.
+            reduction: ``"sum"`` or ``"mean_valid"`` over the valid deciders of a slot.
         """
         lam = self.current_lambda
         if lam <= 0:
-            return torch.zeros((), device=observations.device)
+            return torch.zeros((), device=reset_after.device)
         with torch.no_grad():
-            teacher_dist = self._teacher.unroll(observations, state0, dones.bool(), action_mask).dist
+            teacher_dist = self._teacher.unroll(obs, state0, reset_after.bool(), action_mask, with_value=False).dist
         if self._direction == "forward":
-            kl = teacher_dist.kl_divergence(student_dist)
+            kl = teacher_dist.unit_kl(student_dist, actions)
         else:
-            kl = student_dist.kl_divergence(teacher_dist)
-        return lam * kl.mean()
+            kl = student_dist.unit_kl(teacher_dist, actions)
+        kl = kl.float()                                             # [S*B, K]
+        valid = student_dist.unit_valid(actions)
+        per_slot = torch.where(valid, kl, torch.zeros_like(kl)).sum(-1)
+        if reduction == "mean_valid":
+            per_slot = per_slot / valid.sum(-1).clamp(min=1).to(per_slot.dtype)
+        act = is_act.reshape(-1)
+        mean = torch.where(act, per_slot, torch.zeros_like(per_slot)).sum() / act.sum().clamp(min=1)
+        return lam * mean

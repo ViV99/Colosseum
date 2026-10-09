@@ -1,25 +1,24 @@
+# Space Miners: 1v1 with ships as Units (Box acceleration + discrete push) and asteroids as an
+# entity list. A reference example without a learning threshold.
 # Requires Box2D: pip install -e ".[examples]"
 run:
   name: null
   dir: "runs"
 
 env:
-  env_class: "examples.space_miners.env.SpaceMinersEnv"
-  num_players: 2
-  kwargs:
-    preset: "Round 1"
-    max_ticks: 1000
+  env_class: "examples.space_miners.game.SpaceMinersGame"
+  kwargs: {preset: "Round 1", max_ticks: 1000}
 
 networks:
-  encoder_class: "examples.space_miners.networks.SpaceMinersEncoder"
+  encoder_class: "examples.space_miners.models.MinersEncoder"
   core: null
-  policy_class: "examples.space_miners.networks.SpaceMinersPolicy"
-  value_class: "examples.space_miners.networks.SpaceMinersValue"
+  policy_class: "examples.space_miners.models.MinersPolicy"
+  value_class: "examples.space_miners.models.MinersValue"
   kwargs: {}
 
 algorithm:
   gamma: 0.99
-  vtrace_lambda: 1.0
+  vtrace_lambda: 0.95
   entropy_coeff: 0.01
   learning_rate: 3.0e-4
   lr_schedule: "linear"
@@ -37,14 +36,19 @@ learner:
   batch_chunks: 16
 
 training:
-  phase: "self_play"
   total_timesteps: 500000
+  seed: null
 
-self_play:
-  checkpoint_interval: 100
-  pool_size: 10
+matchmaking:
+  mode: self_play
   latest_prob: 0.5
+
+checkpoint:
+  interval: 100
+  pool_size: 10
+  save_optimizer: true
 
 metrics:
   use_wandb: false
   log_interval: 50
+  console_interval_sec: 10.0

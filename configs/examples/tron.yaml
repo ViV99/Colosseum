@@ -1,0 +1,53 @@
+# Tron light cycles: FFA with elimination; 2, 3 and 4 players in one run (one network).
+run:
+  name: null
+  dir: "runs"
+
+env:
+  env_class: "examples.tron.game.TronGame"
+  kwargs: {size: 10, view_radius: 3}
+
+networks:
+  encoder_class: "examples.tron.models.TronEncoder"
+  core: null
+  policy_class: "examples.tron.models.TronPolicy"
+  value_class: "examples.tron.models.TronValue"
+  kwargs: {}
+
+algorithm:
+  gamma: 0.97
+  vtrace_lambda: 0.95
+  entropy_coeff: 0.01
+  learning_rate: 1.0e-3
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 32
+  num_workers: 2
+  envs_per_worker: 16
+  weight_sync_interval_sec: 1.0
+  torch_threads: 1
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  total_timesteps: 400000
+  seed: null
+
+matchmaking:
+  mode: self_play
+  layouts: {2p: 0.4, 3p: 0.2, 4p: 0.4}   # weights of the layouts the matchmaker picks
+  latest_prob: 0.8
+
+checkpoint:
+  interval: 100           # train steps between snapshots
+  pool_size: 10
+  save_optimizer: true
+
+metrics:
+  use_wandb: false
+  log_interval: 10
+  console_interval_sec: 10.0

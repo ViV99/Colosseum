@@ -7,12 +7,13 @@ import signal
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Iterator
+from collections.abc import Callable, Iterator, Mapping
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parents[1]
+TESTS_DIR = Path(__file__).resolve().parent
 TTT_CONFIG = REPO_ROOT / "configs" / "examples" / "tic_tac_toe.yaml"
 TTT_MULTI_CONFIG = REPO_ROOT / "configs" / "examples" / "tic_tac_toe_multi.yaml"
 
@@ -26,25 +27,45 @@ TINY: dict[str, str] = {
     "rollout.match_refresh_interval_sec": "1.0",
     "learner.batch_chunks": "2",
     "learner.queue_size": "16",
-    "self_play.checkpoint_interval": "20",
-    "self_play.pool_size": "5",
+    "checkpoint.interval": "20",
+    "checkpoint.pool_size": "5",
     "metrics.log_interval": "1",
     "metrics.console_interval_sec": "1.0",
 }
 
 
 def child_env() -> dict[str, str]:
+    """The test process's environment for a CLI child; ``tests/`` goes on PYTHONPATH, so configs
+    may name support modules (``game_helpers.*``)."""
     env = dict(os.environ)
     env.update({"WANDB_MODE": "disabled", "OMP_NUM_THREADS": "1", "PYTHONUNBUFFERED": "1"})
+    env["PYTHONPATH"] = os.pathsep.join(filter(None, [str(TESTS_DIR), os.environ.get("PYTHONPATH")]))
     return env
 
 
-def train_cmd(config: Path, run_parent: Path, name: str, overrides: dict[str, str] | None = None) -> list[str]:
-    sets = {**TINY, **(overrides or {}), "run.dir": str(run_parent), "run.name": name}
-    cmd = [sys.executable, "-m", "colosseum", "train", "-c", str(config)]
+def train_cmd(config: Path, run_parent: Path, name: str, overrides: Mapping[str, object] | None = None,
+              module: str = "colosseum", tiny: bool = True) -> list[str]:
+    """``python -m <module> train -c <config>`` with the ``TINY`` settings (unless ``tiny=False``:
+    the config's own budget and sizes, as in the slow learning tests), then ``overrides``."""
+    sets = {**(TINY if tiny else {}), **(overrides or {}), "run.dir": str(run_parent), "run.name": name}
+    cmd = [sys.executable, "-m", module, "train", "-c", str(config)]
     for key, value in sets.items():
         cmd += ["--set", f"{key}={value}"]
     return cmd
+
+
+def read_records(root: Path, kind: str | None = None) -> list[dict]:
+    """The ``metrics.jsonl`` records of the run at ``root`` (of one ``kind``, or all)."""
+    path = Path(root) / "metrics.jsonl"
+    if not path.exists():
+        return []
+    records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
+    return [r for r in records if kind is None or r["kind"] == kind]
+
+
+def read_ratings(root: Path) -> dict:
+    """``ratings.json`` of the run at ``root``: ``{"env_steps": N, "layouts": {<layout>: {...}}}``."""
+    return json.loads((Path(root) / "ratings.json").read_text())
 
 
 @dataclass
@@ -55,24 +76,21 @@ class TrainRun:
     root: Path
 
     def records(self, kind: str | None = None) -> list[dict]:
-        path = self.root / "metrics.jsonl"
-        if not path.exists():
-            return []
-        records = [json.loads(line) for line in path.read_text().splitlines() if line.strip()]
-        return [r for r in records if kind is None or r["kind"] == kind]
+        return read_records(self.root, kind)
 
     def log(self, process_name: str) -> str:
         return (self.root / "logs" / f"{process_name}.log").read_text()
 
     def ratings(self) -> dict:
-        return json.loads((self.root / "ratings.json").read_text())
+        return read_ratings(self.root)
 
 
-def run_train(config: Path, tmp_path: Path, name: str = "run", overrides: dict[str, str] | None = None,
-              timeout: float = 240.0, env: dict[str, str] | None = None) -> TrainRun:
-    """``env`` entries are added to ``child_env()``."""
+def run_train(config: Path, tmp_path: Path, name: str = "run", overrides: Mapping[str, object] | None = None,
+              timeout: float = 240.0, env: dict[str, str] | None = None, module: str = "colosseum",
+              tiny: bool = True) -> TrainRun:
+    """``env`` entries are added to ``child_env()``; ``tiny`` as in ``train_cmd``."""
     run_parent = tmp_path / "runs"
-    proc = run_in_session(train_cmd(config, run_parent, name, overrides), timeout, env)
+    proc = run_in_session(train_cmd(config, run_parent, name, overrides, module, tiny), timeout, env)
     return TrainRun(proc.returncode, proc.stdout, proc.stderr, run_parent / name)
 
 
@@ -98,12 +116,12 @@ def _kill_group(proc: subprocess.Popen) -> None:
 
 
 def start_train(config: Path, tmp_path: Path, name: str = "run", overrides: dict[str, str] | None = None,
-                env: dict[str, str] | None = None) -> tuple[subprocess.Popen, Path]:
+                env: dict[str, str] | None = None, module: str = "colosseum") -> tuple[subprocess.Popen, Path]:
     """Start training in its own session; stdout/stderr go to files next to the run dir."""
     run_parent = tmp_path / "runs"
     # The child keeps its own copies of the descriptors; the parent's handles close here.
     with open(tmp_path / f"{name}.stdout", "w") as out, open(tmp_path / f"{name}.stderr", "w") as err:
-        proc = subprocess.Popen(train_cmd(config, run_parent, name, overrides), cwd=REPO_ROOT,
+        proc = subprocess.Popen(train_cmd(config, run_parent, name, overrides, module), cwd=REPO_ROOT,
                                 env={**child_env(), **(env or {})},
                                 stdout=out, stderr=err, text=True, start_new_session=True)
     return proc, run_parent / name
@@ -111,10 +129,11 @@ def start_train(config: Path, tmp_path: Path, name: str = "run", overrides: dict
 
 @contextmanager
 def training_process(config: Path, tmp_path: Path, name: str = "run", overrides: dict[str, str] | None = None,
-                     env: dict[str, str] | None = None) -> Iterator[tuple[subprocess.Popen, Path]]:
+                     env: dict[str, str] | None = None,
+                     module: str = "colosseum") -> Iterator[tuple[subprocess.Popen, Path]]:
     """``start_train`` whose whole process group (main, children, env grandchildren) is
     SIGKILLed and reaped on exit, so a failing test leaves no orphans behind."""
-    proc, root = start_train(config, tmp_path, name, overrides, env)
+    proc, root = start_train(config, tmp_path, name, overrides, env, module)
     try:
         yield proc, root
     finally:

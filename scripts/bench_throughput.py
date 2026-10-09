@@ -11,8 +11,8 @@ warm-up period the script measures, over ``--duration`` seconds:
 
 - ``updates/s``          learner train steps per second (``train`` records);
 - ``env_steps/s``        env steps per second from the global env-step counter
-  (``env_steps`` of the ``system`` records), so envs that mark inactive seats
-  (``info["active"]``) are counted correctly;
+  (``env_steps`` of the ``system`` records), so turn-based envs (only the acting seat
+  decides) are counted correctly;
 - ``chunks/update``      chunks per train step (informational: since T2.4 every
   batch has exactly ``batch_chunks`` chunks);
 - ``queue depth``        mean depth of the learner's trajectory queue over the
@@ -54,7 +54,7 @@ if str(REPO_ROOT) not in sys.path:
 ENVS_PER_WORKER = 8
 CHUNK_LENGTH = 32
 BATCH_CHUNKS = 8
-NUM_PLAYERS = 2
+LAYOUT = "2p"  # tic-tac-toe has one layout; agent_0 plays both seats
 QUEUE_SIZE = 4 * BATCH_CHUNKS  # learner.queue_size
 AGENT_ID = "agent_0"
 # Cadence of the ``system`` records in metrics.jsonl (measurement resolution, not workload).
@@ -95,14 +95,14 @@ def _make_config(num_workers: int, run_parent: str):
 
     return ColosseumConfig(
         env={
-            "env_class": "examples.tic_tac_toe.env.TicTacToeEnv",
-            "num_players": NUM_PLAYERS,
+            "env_class": "examples.tic_tac_toe.game.TicTacToeGame",
             "kwargs": {},
+            "max_idle_steps": 1000,
         },
         networks={
-            "encoder_class": "examples.tic_tac_toe.networks.TicTacToeEncoder",
-            "policy_class": "examples.tic_tac_toe.networks.TicTacToePolicy",
-            "value_class": "examples.tic_tac_toe.networks.TicTacToeValue",
+            "encoder_class": "examples.tic_tac_toe.models.TicTacToeEncoder",
+            "policy_class": "examples.tic_tac_toe.models.TicTacToePolicy",
+            "value_class": "examples.tic_tac_toe.models.TicTacToeValue",
             "kwargs": {},
             "core": None,
         },
@@ -123,6 +123,9 @@ def _make_config(num_workers: int, run_parent: str):
             "use_torch_compile": False,
             "normalize_advantages": True,
             "use_amp": False,
+            "ratio_mode": "auto",
+            "unit_trace": "auto",
+            "entropy_reduction": "auto",
         },
         rollout={
             "chunk_length": CHUNK_LENGTH,
@@ -142,17 +145,20 @@ def _make_config(num_workers: int, run_parent: str):
             "torch_threads": None,  # auto: (cpu_count - num_workers * 1) // 1
         },
         training={
-            "phase": "self_play",
             "total_timesteps": 10**12,  # stopped by the timer, not the budget
             "seed": 0,
         },
-        self_play={
-            "checkpoint_interval": 10**9,  # no checkpoints: every slot collects
-            "pool_size": 10,
+        matchmaking={
+            "mode": "self_play",
+            "layouts": {LAYOUT: 1.0},
             "latest_prob": 0.5,
             "shuffle_seats": True,  # one agent, every seat latest+collect: shuffling is a no-op
         },
-        checkpoint={"save_optimizer": True},
+        checkpoint={
+            "interval": 10**9,  # no checkpoints: every seat collects
+            "pool_size": 10,
+            "save_optimizer": True,
+        },
         run={"dir": run_parent, "name": f"bench-w{num_workers}"},
         metrics={"use_wandb": False, "log_interval": 1, "console_interval_sec": SYSTEM_RECORD_INTERVAL_S},
         transport={"mode": "local"},
@@ -231,6 +237,20 @@ def run_one(num_workers: int, duration: float, warmup: float) -> dict:
     return result
 
 
+def workload_summary(warmup: float, duration: float) -> dict:
+    """The workload as printed and written to the JSON output (comparable across runs)."""
+    return {
+        "env": "tic_tac_toe",
+        "layout": LAYOUT,
+        "envs_per_worker": ENVS_PER_WORKER,
+        "chunk_length": CHUNK_LENGTH,
+        "batch_chunks": BATCH_CHUNKS,
+        "queue_size": QUEUE_SIZE,
+        "warmup_s": warmup,
+        "duration_s": duration,
+    }
+
+
 def _fmt_depth(result: dict) -> str:
     depth = result["queue_depth_mean"]
     return "-" if depth is None else f"{depth:.1f}/{QUEUE_SIZE}"
@@ -256,16 +276,7 @@ def main() -> int:
         "torch": torch.__version__,
         "torch_threads_default": torch.get_num_threads(),
     }
-    workload = {
-        "env": "tic_tac_toe",
-        "num_players": NUM_PLAYERS,
-        "envs_per_worker": ENVS_PER_WORKER,
-        "chunk_length": CHUNK_LENGTH,
-        "batch_chunks": BATCH_CHUNKS,
-        "queue_size": QUEUE_SIZE,
-        "warmup_s": args.warmup,
-        "duration_s": args.duration,
-    }
+    workload = workload_summary(args.warmup, args.duration)
     print(f"machine: {machine}", flush=True)
     print(f"workload: {workload}", flush=True)
 

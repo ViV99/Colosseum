@@ -1,18 +1,18 @@
-# Composite Dict action space (direction: Discrete(4), speed: Box(1)).
+# Chase: 1v1 with a tree action, Dict(direction: Discrete(4), speed: Box(1)). A reference example
+# without a learning threshold.
 run:
   name: null
   dir: "runs"
 
 env:
-  env_class: "examples.composite_action.env.ChaseEnv"
-  num_players: 2
+  env_class: "examples.composite_action.game.ChaseGame"
   kwargs: {}
 
 networks:
-  encoder_class: "examples.composite_action.networks.ChaseEncoder"
+  encoder_class: "examples.composite_action.models.ChaseEncoder"
   core: null
-  policy_class: "examples.composite_action.networks.ChasePolicy"
-  value_class: "examples.composite_action.networks.ChaseValue"
+  policy_class: "examples.composite_action.models.ChasePolicy"
+  value_class: "examples.composite_action.models.ChaseValue"
   kwargs: {}
 
 algorithm:
@@ -35,14 +35,19 @@ learner:
   batch_chunks: 8
 
 training:
-  phase: "self_play"
   total_timesteps: 50000
+  seed: null
 
-self_play:
-  checkpoint_interval: 10
-  pool_size: 5
+matchmaking:
+  mode: self_play
   latest_prob: 0.5
+
+checkpoint:
+  interval: 10
+  pool_size: 5
+  save_optimizer: true
 
 metrics:
   use_wandb: false
   log_interval: 10
+  console_interval_sec: 10.0

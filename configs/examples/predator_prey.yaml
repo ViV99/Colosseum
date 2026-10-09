@@ -1,0 +1,58 @@
+# Predator and prey: 1 hunter vs 2 prey. The roles have different observation and action spaces,
+# so each role has its own agent (agents.<id>.roles). With mode self_play the owner's opponents
+# come from the other agent, because the owner cannot play the other role.
+run:
+  name: null
+  dir: "runs"
+
+env:
+  env_class: "examples.predator_prey.game.PredatorPreyGame"
+  kwargs: {size: 7, max_steps: 30, catch_radius: 1}
+
+networks:
+  encoder_class: "examples.predator_prey.models.PPEncoder"
+  core: null
+  policy_class: "examples.predator_prey.models.PPPolicy"
+  value_class: "examples.predator_prey.models.PPValue"
+  kwargs: {}
+
+algorithm:
+  gamma: 0.97
+  vtrace_lambda: 0.95
+  entropy_coeff: 0.01
+  learning_rate: 1.0e-3
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 32
+  num_workers: 2
+  envs_per_worker: 16
+  weight_sync_interval_sec: 1.0
+  torch_threads: 1
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  total_timesteps: 400000
+  seed: null
+
+matchmaking:
+  mode: self_play
+  latest_prob: 0.8
+
+agents:
+  hunter: {roles: [hunter]}
+  prey: {roles: [prey]}
+
+checkpoint:
+  interval: 100           # train steps between snapshots
+  pool_size: 10
+  save_optimizer: true
+
+metrics:
+  use_wandb: false
+  log_interval: 10
+  console_interval_sec: 10.0

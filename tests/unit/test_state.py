@@ -4,10 +4,12 @@ from __future__ import annotations
 
 from collections import namedtuple
 
+import gymnasium
 import numpy as np
 import pytest
 import torch
 
+from colosseum.envs.game import RoleSpec
 from colosseum.networks.state import (
     batch_size_of,
     cat_batch,
@@ -19,7 +21,7 @@ from colosseum.networks.state import (
     tree_map,
     where_done,
 )
-from helpers import CORE_KINDS, make_simple_model
+from game_helpers import CORE_KINDS, make_test_model
 
 Pair = namedtuple("Pair", ["a", "b"])
 
@@ -259,9 +261,12 @@ def test_state_to_device():
 @pytest.mark.gpu
 @pytest.mark.parametrize("core", CORE_KINDS)
 def test_model_and_state_move_between_devices(core):
-    """Model + State pytree: CPU -> CUDA -> CPU keeps devices consistent and outputs equal."""
-    model = make_simple_model(core=core, seed=0)
+    """Model + State pytree: CPU -> CUDA -> CPU keeps devices consistent and log-probs equal."""
+    torch.manual_seed(0)
+    role = RoleSpec(gymnasium.spaces.Box(-5.0, 5.0, (8,), np.float32), gymnasium.spaces.Discrete(4))
+    model = make_test_model(role, core=core)
     obs = torch.randn(3, 8)
+    actions = torch.tensor([0, 1, 2])
     state = model.initial_state(3)
     out_cpu = model.step(obs, state)
 
@@ -270,11 +275,12 @@ def test_model_and_state_move_between_devices(core):
     assert all(t.device.type == "cuda" for t in tree_leaves(state_cuda))
     out_cuda = model.step(obs.to("cuda"), state_cuda)
     assert all(t.device.type == "cuda" for t in tree_leaves(out_cuda.state))
-    torch.testing.assert_close(out_cuda.value.cpu(), out_cpu.value, rtol=1e-4, atol=1e-5)
+    torch.testing.assert_close(out_cuda.dist.log_prob(actions.to("cuda")).cpu(), out_cpu.dist.log_prob(actions),
+                               rtol=1e-4, atol=1e-5)
 
     model.to("cpu")
     back = state_to(out_cuda.state, "cpu")
     assert all(t.device.type == "cpu" for t in tree_leaves(back))
     for x, y in zip(tree_leaves(back), tree_leaves(out_cpu.state), strict=True):
         torch.testing.assert_close(x, y, rtol=1e-4, atol=1e-5)
-    model.step(obs, back)   # CPU model accepts the moved-back state
+    model.step(obs, back)  # the CPU model accepts the moved-back state

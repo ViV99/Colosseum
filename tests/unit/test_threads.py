@@ -80,68 +80,8 @@ def test_configure_torch_threads_is_silent_when_interop_matches(monkeypatch, cap
 
 
 # ---------------------------------------------------------------------------
-# Learner process entry: explicit thread call and device resolution
+# Learner device resolution (the learner-entry thread tests are in test_sp2_learner_entry.py)
 # ---------------------------------------------------------------------------
-
-def _ttt_config(**sections):
-    from colosseum.core.config import ColosseumConfig, load_config
-    from helpers import example_config
-
-    data = load_config(example_config("tic_tac_toe.yaml")).model_dump()
-    data["metrics"]["use_wandb"] = False
-    for section, values in sections.items():
-        data[section].update(values)
-    return ColosseumConfig(**data)
-
-
-def _run_learner_target(monkeypatch, config, num_learners, seen=None):
-    """Call the learner body ``_learner_main`` in-process with ``learner_process`` stubbed out.
-
-    Returns the torch thread count and the algorithm seen by the learner loop;
-    ``seen`` (if given) also receives the ``learner_process`` kwargs.
-    """
-    import sys
-
-    import colosseum.learner.learner as learner_mod
-    from colosseum.launcher import _learner_main
-
-    seen = {} if seen is None else seen
-
-    def fake_learner_process(**kwargs):
-        seen["kwargs"] = kwargs
-        seen["threads"] = torch.get_num_threads()
-        seen["algorithm"] = kwargs["algorithm_factory"]()
-
-    monkeypatch.setattr(learner_mod, "learner_process", fake_learner_process)
-    monkeypatch.setattr(sys, "path", list(sys.path))  # _learner_main prepends "."
-    before = torch.get_num_threads()
-    try:
-        _learner_main(
-            agent_id="agent_0", config=config, trajectory_queue=None, weight_queues=[],
-            stop_event=None, metrics_queue=None, num_learners=num_learners,
-        )
-    finally:
-        torch.set_num_threads(before)
-    return seen["threads"], seen["algorithm"]
-
-
-def test_learner_target_sets_explicit_torch_threads(monkeypatch):
-    config = _ttt_config(learner={"device": "cpu", "torch_threads": 3})
-    threads, algorithm = _run_learner_target(monkeypatch, config, num_learners=1)
-    assert threads == 3
-    assert next(algorithm.model.parameters()).device.type == "cpu"
-
-
-def test_learner_target_auto_threads_and_auto_device_resolve_to_cpu(monkeypatch):
-    import colosseum.core.threads as threads_mod
-
-    monkeypatch.setattr(torch.cuda, "is_available", lambda: False)
-    monkeypatch.setattr(threads_mod.os, "cpu_count", lambda: 8)  # 3 != the default 1 on any runner
-    config = _ttt_config(learner={"device": "auto", "torch_threads": None},
-                         rollout={"num_workers": 2, "torch_threads": 1})
-    threads, algorithm = _run_learner_target(monkeypatch, config, num_learners=2)
-    assert threads == 3  # (8 - 2 workers * 1 thread) // 2 learners
-    assert next(algorithm.model.parameters()).device.type == "cpu"
 
 
 def test_resolve_device_auto_without_cuda_is_cpu(monkeypatch):
@@ -151,11 +91,3 @@ def test_resolve_device_auto_without_cuda_is_cpu(monkeypatch):
     assert resolve_device("auto") == "cpu"
     assert resolve_device("cpu") == "cpu"
     assert resolve_device("cuda:1") == "cuda:1"  # explicit devices pass through unchanged
-
-
-def test_learner_target_passes_weight_sync_interval(monkeypatch):
-    """The learner's exit flush wait is sized from the workers' weight sync interval (T2.2)."""
-    config = _ttt_config(learner={"device": "cpu", "torch_threads": 1}, rollout={"weight_sync_interval_sec": 90.0})
-    seen = {}
-    _run_learner_target(monkeypatch, config, num_learners=1, seen=seen)
-    assert seen["kwargs"]["weight_sync_interval"] == 90.0

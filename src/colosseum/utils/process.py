@@ -10,7 +10,8 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -79,6 +80,41 @@ def start_process(proc: Any) -> None:
         proc.start()
     finally:
         signal.pthread_sigmask(signal.SIG_SETMASK, previous_mask)
+
+
+# A Ctrl-C raised where Python cannot propagate an exception (a weakref or GC callback, a
+# ``__del__``; importlib runs such callbacks during imports) is only printed as "Exception
+# ignored ... KeyboardInterrupt" and lost. ``catch_lost_interrupts`` records it instead.
+_lost_interrupt = False
+
+
+@contextmanager
+def catch_lost_interrupts() -> Iterator[None]:
+    """Record (instead of printing) every KeyboardInterrupt that ends up unraisable while
+    active; other unraisable exceptions go to the previous ``sys.unraisablehook``. The record is
+    taken over by ``ProcessSupervisor.install_signal_handlers`` (as a received SIGINT) or by
+    ``take_lost_interrupt`` (FIX-2)."""
+    previous = sys.unraisablehook
+
+    def hook(unraisable: Any) -> None:
+        global _lost_interrupt
+        if unraisable.exc_type is not None and issubclass(unraisable.exc_type, KeyboardInterrupt):
+            _lost_interrupt = True
+        else:
+            previous(unraisable)
+
+    sys.unraisablehook = hook
+    try:
+        yield
+    finally:
+        sys.unraisablehook = previous
+
+
+def take_lost_interrupt() -> bool:
+    """True once for a KeyboardInterrupt recorded by ``catch_lost_interrupts``; clears it."""
+    global _lost_interrupt
+    lost, _lost_interrupt = _lost_interrupt, False
+    return lost
 
 
 def parent_alive() -> bool:
@@ -180,7 +216,8 @@ class ProcessSupervisor:
         thread started here sets ``stop_event``. The handler runs in the main thread between
         bytecodes, possibly while that thread holds the event's non-reentrant lock (inside
         ``stop_event.set()`` / ``is_set()``), so setting the event there could deadlock.
-        Callers log the signal (``received_signal``). Off the main thread (where Python
+        Callers log the signal (``received_signal``). A Ctrl-C that ``catch_lost_interrupts``
+        recorded before is taken over as a received SIGINT. Off the main thread (where Python
         cannot install handlers) this is a no-op.
         """
         if threading.current_thread() is not threading.main_thread():
@@ -192,8 +229,6 @@ class ProcessSupervisor:
         read_fd, write_fd = os.pipe()
         os.set_blocking(write_fd, False)
         self._pipe = (read_fd, write_fd)
-        self._watcher = threading.Thread(target=self._watch, args=(read_fd,), name="stop-on-signal", daemon=True)
-        self._watcher.start()
 
         def _handler(signum, _frame):
             if self.received_signal is None:
@@ -203,8 +238,16 @@ class ProcessSupervisor:
             except OSError:  # pipe full: a wake-up is already pending
                 pass
 
+        # The handlers go in before the watcher starts: a Ctrl-C during ``Thread.start`` is then
+        # recorded (the watcher reads its byte once running) instead of raising a
+        # KeyboardInterrupt out of here with an unstarted watcher (FIX-2).
         for sig in (signal.SIGINT, signal.SIGTERM):
             self._old_handlers[sig] = signal.signal(sig, _handler)
+        if take_lost_interrupt():  # a Ctrl-C lost during startup (catch_lost_interrupts)
+            _handler(signal.SIGINT, None)
+        watcher = threading.Thread(target=self._watch, args=(read_fd,), name="stop-on-signal", daemon=True)
+        watcher.start()
+        self._watcher = watcher
 
     def _watch(self, read_fd: int) -> None:
         while True:

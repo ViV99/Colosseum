@@ -1,33 +1,22 @@
-"""Observation normalization (running mean/std).
+"""Observation normalization (running mean/std) for one leaf of the observation or global-state tree.
 
-``NormalizeObs`` keeps its running statistics in registered *buffers*, so they
-are part of the model ``state_dict`` and ride along with the normal weight sync
-(learner -> workers) and checkpoints.
+``NormalizeObs`` keeps its statistics in registered buffers, so they are part of the model
+``state_dict`` (weight sync, checkpoints). They change only in :meth:`NormalizeObs.update`;
+``forward`` is a pure function of the current statistics. The learner calls
+``PolicyModel.update_normalizers(obs, global_state)`` once per train step; the default
+implementation feeds every ``NormalizeObs`` the leaf at its ``path`` of its ``source`` tree.
 
-The statistics change only through :meth:`NormalizeObs.update`; ``forward`` is
-a pure function of the current statistics, in train and eval mode alike. The
-algorithm calls ``PolicyModel.update_normalizers(obs)`` exactly once per train
-step with the batch's fresh observations, before any loss forward. So every
-sample is counted once, whatever the number of epochs and minibatches, and the
-learner's forward uses the same statistics for every minibatch of a step.
+Usage inside an encoder::
 
-Usage: put it inside your encoder::
-
-    class MyEncoder(BaseEncoder):
-        def __init__(self, obs_dim=...):
-            super().__init__()
-            self.norm = NormalizeObs(shape=(obs_dim,))
-            self.net = nn.Sequential(nn.Linear(obs_dim, 128), nn.ReLU())
-
-        def forward(self, obs):
-            return self.net(self.norm(obs))
-
-The default ``PolicyModel.update_normalizers`` feeds the raw observations to
-every ``NormalizeObs`` submodule. If a normalizer sees something else (a slice
-or a transform of the observation), override ``update_normalizers``.
+    self.norm = NormalizeObs(shape=(F,), path=("entities",))
+    ...
+    x = self.norm(obs["entities"])
 """
 
 from __future__ import annotations
+
+from collections.abc import Sequence
+from typing import Literal
 
 import torch
 import torch.nn as nn
@@ -48,52 +37,46 @@ class RunningMeanStd(nn.Module):
         batch_mean = x.mean(dim=0)
         batch_var = x.var(dim=0, unbiased=False)
         batch_count = x.shape[0]
-
         delta = batch_mean - self.mean
         tot = self.count + batch_count
         new_mean = self.mean + delta * batch_count / tot
-        m_a = self.var * self.count
-        m_b = batch_var * batch_count
-        m2 = m_a + m_b + delta.pow(2) * self.count * batch_count / tot
+        m2 = self.var * self.count + batch_var * batch_count + delta.pow(2) * self.count * batch_count / tot
         self.mean.copy_(new_mean)
         self.var.copy_(m2 / tot)
         self.count.copy_(tot)
 
 
 class NormalizeObs(nn.Module):
-    """Normalize observations by running mean/std; statistics change only in ``update``.
+    """Normalize one tree leaf by running mean/std (any input dtype; the output is float32)."""
 
-    Args:
-        shape: per-observation feature shape (e.g. ``(obs_dim,)`` or ``(C, H, W)``).
-        clip: clip normalized values to ``[-clip, clip]`` (0 disables).
-        epsilon: numerical floor for the variance.
-    """
-
-    def __init__(self, shape: tuple[int, ...], clip: float = 10.0, epsilon: float = 1e-8) -> None:
+    def __init__(self, shape: Sequence[int], path: tuple[str, ...] = (),
+                 source: Literal["obs", "global_state"] = "obs", eps: float = 1e-8, clip: float = 10.0) -> None:
         super().__init__()
+        if source not in ("obs", "global_state"):
+            raise ValueError(f"NormalizeObs: source must be 'obs' or 'global_state', got {source!r}")
         self.shape: tuple[int, ...] = tuple(int(s) for s in shape)
+        self.path: tuple[str, ...] = tuple(path)
+        self.source = source
         self.rms = RunningMeanStd(self.shape)
         self._clip = clip
-        self._eps = epsilon
+        self._eps = eps
 
     @torch.no_grad()
-    def update(self, obs: torch.Tensor) -> None:
-        """Add a batch of observations ``[..., *shape]`` (any leading dims) to the statistics."""
+    def update(self, x: torch.Tensor) -> None:
+        """Add samples ``[..., *shape]`` (any leading dims) to the statistics."""
         n = len(self.shape)
-        if obs.dim() < n or tuple(obs.shape[obs.dim() - n:]) != self.shape:
+        if x.dim() < n or tuple(x.shape[x.dim() - n:]) != self.shape:
             raise ValueError(
-                f"NormalizeObs(shape={self.shape}) cannot update from observations of shape "
-                f"{tuple(obs.shape)}: the trailing dims must equal {self.shape}. If this "
-                f"normalizer sees a transformed observation, override "
-                f"PolicyModel.update_normalizers for your model."
+                f"NormalizeObs(shape={self.shape}, path={self.path}) cannot update from a leaf of shape "
+                f"{tuple(x.shape)}: the trailing dims must equal {self.shape}. If it normalizes a transformed "
+                f"leaf, override PolicyModel.update_normalizers."
             )
-        flat = obs.reshape(-1, *self.shape).to(self.rms.mean.dtype)
-        if flat.shape[0] == 0:
-            return
-        self.rms.update(flat)
+        flat = x.reshape(-1, *self.shape).to(self.rms.mean.dtype)
+        if flat.shape[0]:
+            self.rms.update(flat)
 
-    def forward(self, obs: torch.Tensor) -> torch.Tensor:
-        normed = (obs - self.rms.mean) / torch.sqrt(self.rms.var + self._eps)
+    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        normed = (x.to(self.rms.mean.dtype) - self.rms.mean) / torch.sqrt(self.rms.var + self._eps)
         if self._clip > 0:
             normed = torch.clamp(normed, -self._clip, self._clip)
         return normed

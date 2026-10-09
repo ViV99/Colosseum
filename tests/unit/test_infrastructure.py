@@ -13,7 +13,11 @@ from pathlib import Path
 import pytest
 import torch
 
-from helpers import REPO_ROOT, example_config
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def example_config(name: str) -> Path:
+    return REPO_ROOT / "configs" / "examples" / name
 
 
 def test_spawn_start_method():

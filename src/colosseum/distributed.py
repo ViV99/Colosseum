@@ -15,15 +15,17 @@ Roles (separate processes / machines):
                            weight push to the store.
 - ``run-workers``        : N rollout workers feeding the learner(s).
 
-Scope: distributed mode currently runs self-play with the latest policy of each
-agent (opponents = latest weights pulled from the store). The dynamic
-coordinator-driven matchmaking (PFSP / historical-checkpoint opponents, C1) is a
-single-machine feature; closing that loop across machines would require running
-the coordinator as its own service and is left as future work.
+Scope (SP2, spec block 10): self-play on the latest weights, without a coordinator, for games
+where every agent of the run plays every role of the enabled layouts. Each worker env gets a
+fixed lineup: a layout drawn by ``matchmaking.layouts`` and every seat the latest weights of one
+agent (agents in rotation over the envs). Anything else (asymmetric agents, leagues across
+machines) is a ConfigError pointing to SP5. Layouts are drawn once per worker env (ruling
+PR-3) from an RNG seeded by ``training.seed + worker_id``, and the agent rotation starts at env 0
+of worker 0, so every worker machine of a run starts with the same layout mix and rotation.
 
 Budget and progress: there is no shared env-step counter across machines. Each
 distributed learner uses progress = consumed_samples / training.total_timesteps
-(its own transitions, which drives the LR schedule) and stops by itself once
+(its own ACT slots, which drives the LR schedule) and stops by itself once
 consumed_samples >= total_timesteps. Each worker stops after
 total_timesteps / num_workers env steps. These numbers differ from the local
 mode budget (env steps summed over workers); a single semantics comes with the
@@ -35,17 +37,21 @@ from __future__ import annotations
 import logging
 import multiprocessing as mp
 import queue
+import random
 import signal
 import socket
 import threading
 import time
+from dataclasses import dataclass
 from functools import partial
 
 import torch
 
 from colosseum.core.config import ColosseumConfig, config_hash, load_config
+from colosseum.core.errors import ConfigError
 from colosseum.core.run_dir import RunDir, safe_path_component
-from colosseum.core.types import WeightPayload
+from colosseum.core.types import LATEST_NETWORK_ID, Lineup, SeatAssignment, WeightPayload
+from colosseum.envs.game import GameSpec, RoleSpec
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
 from colosseum.utils.seeding import apply_global_seed, learner_seed
@@ -64,7 +70,8 @@ class GRPCTrajectorySink:
 
     Transient RPC failures (e.g. the learner restarting or shutting down) drop
     the chunk rather than crashing the worker — trajectory data is replaceable,
-    and a worker should survive a learner blip.
+    and a worker should survive a learner blip. A chunk the learner refuses
+    (e.g. ``INVALID_ARGUMENT``) is dropped too, with a WARNING.
     """
 
     def __init__(self, transport, agent_id: str) -> None:
@@ -76,7 +83,11 @@ class GRPCTrajectorySink:
         try:
             self._transport.send_chunk(self._agent_id, chunk)
         except grpc.RpcError as e:
-            logger.debug(f"Dropping chunk for {self._agent_id}: {e.code()}")
+            transient = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.CANCELLED)
+            if e.code() in transient:  # the learner is down or restarting
+                logger.debug(f"Dropping chunk for {self._agent_id}: {e.code()}")
+            else:  # e.g. INVALID_ARGUMENT: the learner refused the chunk itself
+                logger.warning(f"Chunk for {self._agent_id} rejected by the learner: {e.code()}: {e.details()}")
 
     def put(self, chunk, timeout: float | None = None) -> None:  # noqa: ARG002
         self._send(chunk)
@@ -124,6 +135,65 @@ class GRPCWeightSink:
 
 
 # =====================================================================
+# Scope check and fixed lineups (spec block 10, ruling PR-3)
+# =====================================================================
+
+
+@dataclass(frozen=True)
+class DistributedSetup:
+    """Spec, layouts and per-agent roles / role specs of a distributed role."""
+
+    spec: GameSpec
+    layouts: dict[str, float]
+    agent_roles: dict[str, list[str]]
+    role_specs: dict[str, RoleSpec]
+
+
+def distributed_setup(config: ColosseumConfig, agent_ids: list[str]) -> DistributedSetup:
+    """Validate the config and check the distributed scope (module docstring); ConfigError otherwise."""
+    from colosseum.coordinator.matchmaker import enabled_layouts
+    from colosseum.core.registry import env_spec, validate_config
+    from colosseum.core.roles import agent_role_spec, resolve_agent_roles
+
+    validate_config(config)
+    spec = env_spec(config)
+    all_roles = resolve_agent_roles(config, spec)
+    unknown = sorted(set(agent_ids) - set(all_roles))
+    if unknown:
+        raise ConfigError(f"agents {unknown} are not trainable agents of the config ({sorted(all_roles)})")
+    layouts = enabled_layouts(spec, config.matchmaking)
+    needed = {seat.role for name in layouts for seat in spec.layouts[name]}
+    for aid in agent_ids:
+        missing = sorted(needed - set(all_roles[aid]))
+        if missing:
+            raise ConfigError(
+                f"distributed mode supports only games where every agent plays every role of the enabled "
+                f"layouts; agent {aid!r} does not play {missing}. Asymmetric agents and leagues across "
+                f"machines come with SP5 (train such configs with 'train' on one machine)"
+            )
+    return DistributedSetup(
+        spec=spec, layouts=layouts,
+        agent_roles={aid: list(all_roles[aid]) for aid in agent_ids},
+        role_specs={aid: agent_role_spec(spec, all_roles[aid]) for aid in agent_ids},
+    )
+
+
+def distributed_lineups(setup: DistributedSetup, agent_ids: list[str], num_envs: int,
+                        rng: random.Random) -> list[Lineup]:
+    """Fixed lineups of one worker: env ``e`` plays a layout drawn by the layout weights, every
+    seat the latest weights of ``agent_ids[e % n]`` (collecting)."""
+    names = list(setup.layouts)
+    weights = [setup.layouts[name] for name in names]
+    lineups = []
+    for e in range(num_envs):
+        layout = rng.choices(names, weights=weights, k=1)[0]
+        agent_id = agent_ids[e % len(agent_ids)]
+        seats = [SeatAssignment(agent_id, LATEST_NETWORK_ID, True) for _ in setup.spec.layouts[layout]]
+        lineups.append(Lineup(layout=layout, seats=seats))
+    return lineups
+
+
+# =====================================================================
 # Learner role
 # =====================================================================
 
@@ -138,20 +208,25 @@ def run_distributed_learner(
     """Run one trainable agent's learner as a standalone gRPC service; returns the exit code
     (0 when it stopped at its budget, 128 + signum after SIGINT / SIGTERM).
 
-    Starts a TrajectoryService on ``traj_port`` (workers send chunks here),
-    trains with the configured algorithm, and pushes weights to the WeightStore
-    at ``weight_store_address``.
+    Starts a TrajectoryService on ``traj_port`` (workers send chunks here), trains with the
+    configured algorithm, and pushes weights to the WeightStore at ``weight_store_address``.
     """
-    from colosseum.core.registry import build_model, import_class, validate_config
+    from colosseum.core.registry import build_model, import_class
+    from colosseum.core.roles import role_signature
+    from colosseum.core.specs import ActionSpec
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
     from colosseum.learner.learner import learner_process, resolve_device
-    from colosseum.transport.grpc_transport import serve_trajectory_receiver
-    from colosseum.weight_store.grpc_store import GRPCWeightStore
 
     setup_process_logging(None, f"learner-{agent_id}", console_level=logging.INFO)
     config = load_config(config_path, overrides)
+    setup = distributed_setup(config, [agent_id])  # before the run dir exists: a bad config leaves nothing
+    # gRPC (an optional extra) is imported only after the scope check: a bad config is a
+    # ConfigError even where grpc is not installed.
+    from colosseum.transport.grpc_transport import serve_trajectory_receiver
+    from colosseum.weight_store.grpc_store import GRPCWeightStore
+
     acfg = config.get_agent_config(agent_id)
-    validate_config(acfg)  # before the run dir exists: a bad config leaves nothing behind
+    role_spec = setup.role_specs[agent_id]
     run_dir = RunDir.create(config, config_path, role=f"learner-{agent_id}")
     config = run_dir.with_run_name(config)
     setup_process_logging(run_dir.logs, f"learner-{agent_id}", console_level=logging.INFO)
@@ -169,9 +244,7 @@ def run_distributed_learner(
 
     # Trajectory inbox filled by the gRPC server, drained by learner_process.
     chunk_queue: queue.Queue = queue.Queue(maxsize=acfg.learner.queue_size)
-    traj_server = serve_trajectory_receiver(
-        chunk_queue, port=traj_port, max_message_mb=max_mb,
-    )
+    traj_server = serve_trajectory_receiver(chunk_queue, port=traj_port, max_message_mb=max_mb)
 
     store = GRPCWeightStore(weight_store_address, max_message_mb=max_mb)
     weight_sink = [GRPCWeightSink(store, agent_id)]
@@ -180,21 +253,18 @@ def run_distributed_learner(
     # the learner's final snapshot is saved even without periodic checkpoints.
     from colosseum.coordinator.checkpoint_manager import CheckpointManager
     checkpoint_queue: queue.Queue = queue.Queue(maxsize=16)
-    coordinator_ckpt = CheckpointManager(
-        base_dir=run_dir.checkpoints,
-        pool_size=config.self_play.pool_size,
-    )
+    coordinator_ckpt = CheckpointManager(base_dir=run_dir.checkpoints, pool_size=config.checkpoint.pool_size)
 
-    algo_class_path = acfg.algorithm.algorithm_class
-    algo_cls = import_class(algo_class_path)
+    algo_cls = import_class(acfg.algorithm.algorithm_class)
+    action_spec = ActionSpec.from_space(role_spec.action_space)
     teacher_path = acfg.training.kickstart_teacher
 
     def algorithm_factory():
-        model = build_model(acfg)
+        model = build_model(acfg, role_spec)
         kickstart = None
         if teacher_path:
             from colosseum.bc.kickstart import KickstartLoss
-            teacher = build_model(acfg)
+            teacher = build_model(acfg, role_spec)
             teacher.load_state_dict(torch.load(teacher_path, weights_only=True, map_location=device))
             teacher.to(device)
             kickstart = KickstartLoss(
@@ -206,18 +276,18 @@ def run_distributed_learner(
         kwargs = {"device": device, "pin_memory": acfg.learner.pin_memory}
         if kickstart is not None:
             kwargs["kickstart"] = kickstart
-        return algo_cls(model, acfg.algorithm, **kwargs)
+        return algo_cls(model, acfg.algorithm, action_spec, **kwargs)
 
     stop_event = threading.Event()
     supervisor = ProcessSupervisor(stop_event)
 
-    # Seed right before learner_process builds the model (validate_config above also draws
-    # from the RNGs). Same per-agent stream as a local-mode learner.
+    # Seed right before learner_process builds the model (validation above also draws from the
+    # RNGs). Same per-agent stream as a local-mode learner.
     agent_index = config.get_trainable_agent_ids().index(agent_id)
     apply_global_seed(learner_seed(config.training.seed, agent_index))
 
-    # Drain checkpoint payloads (learner.make_checkpoint_payload) to disk in the background.
     cfg_hash = config_hash(config)
+    roles_meta = {"roles": setup.agent_roles[agent_id], "role_signature": role_signature(role_spec)}
 
     def _save(data: dict) -> None:
         """Persist one payload; a failure is logged and never kills the caller."""
@@ -229,12 +299,11 @@ def run_distributed_learner(
                 model_state=data["model_state"],
                 trainer_state=trainer_state,
                 # env_steps is null: a distributed learner has no global env-step count
-                # (its consumed_samples counts transitions of its own seats, a different
-                # quantity), so a resume from it does not seed the env-step budget.
+                # (consumed_samples counts ACT slots of its own seats, a different quantity),
+                # so a resume from it does not seed the env-step budget.
                 meta_extra={"final": bool(data.get("final", False)),
                             "networks": acfg.networks.model_dump(mode="json", by_alias=True),
-                            "config_hash": cfg_hash,
-                            "env_steps": None},
+                            "config_hash": cfg_hash, "env_steps": None, **roles_meta},
             )
         except Exception:  # noqa: BLE001 - one failed save must not stop checkpointing
             logger.exception(f"Distributed learner [{agent_id}]: failed to save checkpoint "
@@ -251,10 +320,8 @@ def run_distributed_learner(
     drainer = threading.Thread(target=_drain_checkpoints, daemon=True)
     drainer.start()
 
-    logger.info(
-        f"Distributed learner [{agent_id}] serving trajectories on :{traj_port}, "
-        f"weights -> {weight_store_address}"
-    )
+    logger.info(f"Distributed learner [{agent_id}] serving trajectories on :{traj_port}, "
+                f"weights -> {weight_store_address}")
     try:
         # SIGINT / SIGTERM set stop_event (and are remembered for the exit code); installed
         # inside the try so the finally always restores them.
@@ -270,7 +337,7 @@ def run_distributed_learner(
             progress_counter=None,
             total_timesteps=config.training.total_timesteps,
             checkpoint_queue=checkpoint_queue,
-            checkpoint_interval=config.self_play.checkpoint_interval,
+            checkpoint_interval=config.checkpoint.interval,
             weight_sync_interval=acfg.rollout.weight_sync_interval_sec,
         )
     finally:
@@ -307,12 +374,14 @@ def _dist_worker_main(
     worker_id: int,
     config: ColosseumConfig,
     agent_ids: list[str],
+    agent_roles: dict[str, list[str]],
     agent_configs: dict[str, ColosseumConfig],
+    role_specs: dict[str, RoleSpec],
     weight_store_address: str,
     learner_addresses: dict[str, str],
     stop_event,
     total_timesteps: int,
-    slot_agent_map: list[list[str]],
+    lineups: list[Lineup],
 ) -> None:
     """Worker process body: gRPC clients in, rollout_worker_process unchanged."""
     from colosseum.core.registry import build_model
@@ -323,10 +392,7 @@ def _dist_worker_main(
 
     max_mb = config.transport.grpc_max_message_mb
     store = GRPCWeightStore(weight_store_address, max_message_mb=max_mb)
-    transports = {
-        aid: GRPCTransport(learner_addresses[aid], max_message_mb=max_mb)
-        for aid in agent_ids
-    }
+    transports = {aid: GRPCTransport(learner_addresses[aid], max_message_mb=max_mb) for aid in agent_ids}
 
     worker_seed = None
     if config.training.seed is not None:
@@ -338,18 +404,19 @@ def _dist_worker_main(
         num_envs=config.rollout.envs_per_worker,
         chunk_length=config.rollout.chunk_length,
         agent_ids=agent_ids,
-        model_factories={aid: partial(build_model, agent_configs[aid]) for aid in agent_ids},
+        agent_roles=agent_roles,
+        model_factories={aid: partial(build_model, agent_configs[aid], role_specs[aid]) for aid in agent_ids},
         trajectory_queues={aid: GRPCTrajectorySink(transports[aid], aid) for aid in agent_ids},
         weight_queues={aid: GRPCWeightSource(store, aid) for aid in agent_ids},
         stop_event=stop_event,
-        gamma={aid: agent_configs[aid].algorithm.gamma for aid in agent_ids},
         weight_sync_interval=config.rollout.weight_sync_interval_sec,
         torch_threads=config.rollout.torch_threads,
         max_env_steps=total_timesteps,
-        slot_agent_map=slot_agent_map,
+        lineups=lineups,
         seed=worker_seed,
         vec_env_kind=config.rollout.vec_env,
         subproc_workers=config.rollout.subproc_workers,
+        max_idle_steps=config.env.max_idle_steps,
     )
 
 
@@ -367,17 +434,13 @@ def run_distributed_workers(
     Args:
         config_path: path to the YAML config.
         weight_store_address: ``host:port`` of the WeightStore service.
-        learner_addresses: ``{agent_id: host:port}`` of each agent's
-            TrajectoryService.
+        learner_addresses: ``{agent_id: host:port}`` of each agent's TrajectoryService.
     """
-    from colosseum.core.registry import validate_config
-
     setup_process_logging(None, "workers-main", console_level=logging.INFO)
     config = load_config(config_path, overrides)
     agent_ids = list(learner_addresses.keys()) or config.get_trainable_agent_ids()
+    setup = distributed_setup(config, agent_ids)  # before the run dir exists
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_ids}
-    for aid in agent_ids:
-        validate_config(agent_configs[aid])  # before the run dir exists
     # One dir per machine: worker hosts sharing a run.name on a shared filesystem never collide.
     run_dir = RunDir.create(config, config_path, role=workers_role())
     config = run_dir.with_run_name(config)
@@ -385,14 +448,6 @@ def run_distributed_workers(
     run_dir.write_resolved_config(config)
     print(f"Run directory: {run_dir.root}", flush=True)
     mp.set_start_method("spawn", force=True)
-
-    num_players = config.env.num_players
-    num_envs = config.rollout.envs_per_worker
-    # Round-robin agents across slots so every agent's learner receives data.
-    slot_agent_map = [
-        [agent_ids[(e * num_players + p) % len(agent_ids)] for p in range(num_players)]
-        for e in range(num_envs)
-    ]
 
     stop_event = mp.Event()
     supervisor = ProcessSupervisor(stop_event, log_dir=run_dir.logs)
@@ -403,6 +458,12 @@ def run_distributed_workers(
     code = 0
     try:
         for worker_id in range(config.rollout.num_workers):
+            seed = None if config.training.seed is None else config.training.seed + worker_id
+            # Rotation continues across the workers of this machine, so every agent gets envs
+            # even when envs_per_worker < number of agents.
+            shift = worker_id * config.rollout.envs_per_worker % len(agent_ids)
+            lineups = distributed_lineups(setup, agent_ids[shift:] + agent_ids[:shift],
+                                          config.rollout.envs_per_worker, random.Random(seed))
             proc = mp.Process(
                 target=_dist_worker_target,
                 name=f"worker-{worker_id}",
@@ -411,12 +472,14 @@ def run_distributed_workers(
                     log_dir=str(run_dir.logs),
                     config=config,
                     agent_ids=agent_ids,
+                    agent_roles=setup.agent_roles,
                     agent_configs=agent_configs,
+                    role_specs=setup.role_specs,
                     weight_store_address=weight_store_address,
                     learner_addresses=learner_addresses,
                     stop_event=stop_event,
                     total_timesteps=per_worker_steps,
-                    slot_agent_map=slot_agent_map,
+                    lineups=lineups,
                 ),
                 daemon=worker_daemon,
             )

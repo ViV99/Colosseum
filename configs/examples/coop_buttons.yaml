@@ -1,0 +1,59 @@
+# Coop buttons: one team of two seats, no opponent (outcome kind "score"). Two agents with
+# teammates: mixed, so teams are sometimes mixed; ratings.json gets a cross-play table.
+run:
+  name: null
+  dir: "runs"
+
+env:
+  env_class: "examples.coop_buttons.game.CoopButtonsGame"
+  kwargs: {size: 5, max_steps: 40, button_reward: 0.05}
+
+networks:
+  encoder_class: "examples.coop_buttons.models.CoopEncoder"
+  core: null
+  policy_class: "examples.coop_buttons.models.CoopPolicy"
+  value_class: "examples.coop_buttons.models.CoopValue"
+  kwargs: {}
+
+algorithm:
+  gamma: 0.97
+  vtrace_lambda: 0.95
+  entropy_coeff: 0.01
+  learning_rate: 1.0e-3
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 32
+  num_workers: 2
+  envs_per_worker: 16
+  weight_sync_interval_sec: 1.0
+  torch_threads: 1
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  total_timesteps: 400000
+  seed: null
+
+matchmaking:
+  mode: self_play
+  teammates: mixed
+  teammate_self_prob: 0.5
+  latest_prob: 0.8
+
+agents:
+  coop_a: {}
+  coop_b: {}
+
+checkpoint:
+  interval: 100           # train steps between snapshots
+  pool_size: 10
+  save_optimizer: true
+
+metrics:
+  use_wandb: false
+  log_interval: 10
+  console_interval_sec: 10.0

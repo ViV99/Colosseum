@@ -1,120 +1,73 @@
-"""Deriving per-player match outcomes from rewards or env-provided signals.
+"""Team ranks and scores of a finished episode (SP2 spec block 1, "Конец эпизода").
 
-ELO / win-rate tracking needs a per-player outcome in ``[0, 1]`` (1 = win,
-0 = loss, 0.5 = draw).  The most robust source is the environment itself: a
-game usually knows the authoritative result (winner / final ranking), which
-can differ from "who accumulated the most shaped reward".  These helpers prefer
-an explicit env signal and fall back to cumulative reward only when none is
-provided.
-
-Env convention (all optional, checked in the terminal info dict per player):
-  - ``info["outcome"]``: float in [0, 1] — used directly. A value outside [0, 1]
-    (or NaN) raises :class:`~colosseum.core.errors.EnvContractError`.
-  - ``info["rank"]``:    number, 1 = best — converted to [0, 1] (best→1, worst→0).
-    Non-integer ranks are allowed (e.g. 2.5 for a two-way tie for 2nd/3rd); a
-    non-finite rank raises :class:`~colosseum.core.errors.EnvContractError`.
-  A present but non-numeric value (``None``, ``"win"``, ...) of either key also
-  raises :class:`~colosseum.core.errors.EnvContractError`.
-If neither is present for all players, outcomes are derived from total reward.
+- No ``Outcome`` (or neither field set): team score = mean of its seats' episode returns
+  (the mean, so teams of different sizes compare fairly), ranks from the scores.
+- Only ``team_score``: ranks from the scores (higher is better).
+- Only ``team_rank``: score = the same mean of returns.
+Ranks from scores: ``rank = 1 + number of strictly better teams`` (ties share a rank).
 """
 
 from __future__ import annotations
 
 import math
-from collections.abc import Sequence
-
-import numpy as np
+from collections.abc import Mapping, Sequence
 
 from colosseum.core.errors import EnvContractError
+from colosseum.envs.game import Outcome
 
 
-def outcomes_from_rewards(total_rewards: Sequence[float]) -> list[float]:
-    """1.0 to the max-reward player(s), 0.0 to others, 0.5 to all if tied."""
-    r = np.asarray(total_rewards, dtype=float)
-    mx = float(r.max())
-    mn = float(r.min())
-    if mx == mn:
-        return [0.5] * len(r)
-    return [1.0 if float(x) == mx else 0.0 for x in r]
+def _ranks_from_scores(score: Mapping[int, float]) -> dict[int, float]:
+    return {t: float(1 + sum(1 for u in score if score[u] > s)) for t, s in score.items()}
 
 
-def _number(player: int, key: str, value: object) -> float:
-    """``float(value)``, or EnvContractError naming the player and key."""
+def _keys(values: Mapping) -> list:
+    """The keys sorted when they are comparable, else in the env's order (mixed key types)."""
     try:
-        return float(value)  # type: ignore[arg-type]
-    except (TypeError, ValueError) as exc:
-        raise EnvContractError(
-            f"player {player}: terminal info[{key!r}] must be a number, got {value!r}") from exc
+        return sorted(values)
+    except TypeError:
+        return list(values)
 
 
-def outcomes_from_terminal_infos(
-    terminal_infos: dict[int, dict],
-    num_players: int,
-) -> list[float] | None:
-    """Try to derive outcomes from env-provided ``outcome`` or ``rank`` keys.
-
-    Returns a list of per-player outcomes in ``[0, 1]``, or ``None`` if the env
-    did not provide an authoritative signal for every player.
-    """
-    if not terminal_infos:
-        return None
-
-    explicit: list[float] = []
-    ranks: list[float] = []
-    have_explicit = True
-    have_rank = True
-
-    for p in range(num_players):
-        info = terminal_infos.get(p, {})
-        if not isinstance(info, dict):
-            return None
-        if "outcome" in info:
-            outcome = _number(p, "outcome", info["outcome"])
-            if not 0.0 <= outcome <= 1.0:  # also rejects NaN
-                raise EnvContractError(
-                    f"player {p}: terminal info['outcome'] must be in [0, 1], got {info['outcome']!r}")
-            explicit.append(outcome)
-        else:
-            have_explicit = False
-        if "rank" in info:
-            rank = _number(p, "rank", info["rank"])
-            if not math.isfinite(rank):
-                raise EnvContractError(
-                    f"player {p}: terminal info['rank'] must be finite, got {info['rank']!r}")
-            ranks.append(rank)
-        else:
-            have_rank = False
-
-    if have_explicit and len(explicit) == num_players:
-        return explicit
-
-    if have_rank and len(ranks) == num_players:
-        rmin, rmax = min(ranks), max(ranks)
-        if rmax == rmin:
-            return [0.5] * num_players
-        # rank 1 (best) → 1.0, worst → 0.0
-        return [(rmax - rk) / (rmax - rmin) for rk in ranks]
-
-    return None
+def _checked(values: Mapping[int, float], field: str, num_teams: int, where: str) -> dict[int, float]:
+    prefix = f"{where}: " if where else ""
+    if not isinstance(values, Mapping) or set(values) != set(range(num_teams)):
+        got = _keys(values) if isinstance(values, Mapping) else type(values).__name__
+        raise EnvContractError(f"{prefix}outcome.{field} keys {got} must be exactly the layout's teams "
+                               f"{list(range(num_teams))}")
+    out: dict[int, float] = {}
+    for team in range(num_teams):
+        try:
+            value = float(values[team])
+        except (TypeError, ValueError):
+            raise EnvContractError(f"{prefix}outcome.{field}[{team}] must be a number, "
+                                   f"got {values[team]!r}") from None
+        if not math.isfinite(value):
+            raise EnvContractError(f"{prefix}outcome.{field}[{team}] must be finite, got {value}")
+        out[team] = value
+    return out
 
 
-def player_outcomes(
-    total_rewards: Sequence[float],
-    terminal_infos: dict[int, dict] | None = None,
-    num_players: int | None = None,
-) -> list[float]:
-    """Authoritative per-player outcomes: prefer env signal, else reward.
+def resolve_outcome(outcome: Outcome | None, teams: list[list[int]], seat_returns: Sequence[float],
+                    where: str = "") -> tuple[dict[int, float], dict[int, float]]:
+    """``(team_rank, team_score)`` for the layout's ``teams`` (team index -> seats)."""
+    mean_returns = {t: sum(float(seat_returns[s]) for s in seats) / len(seats) for t, seats in enumerate(teams)}
+    rank = score = None
+    if outcome is not None:
+        if outcome.team_score is not None:
+            score = _checked(outcome.team_score, "team_score", len(teams), where)
+        if outcome.team_rank is not None:
+            rank = _checked(outcome.team_rank, "team_rank", len(teams), where)
+    if score is None:
+        score = mean_returns
+    if rank is None:
+        rank = _ranks_from_scores(score)
+    return rank, score
 
-    Args:
-        total_rewards: cumulative reward per player slot.
-        terminal_infos: optional ``{player_idx: terminal_info_dict}`` from the
-            episode's final step (VectorEnv stores this under
-            ``info[p]["terminal_info"]`` on auto-reset).
-        num_players: number of player slots (defaults to ``len(total_rewards)``).
-    """
-    n = num_players if num_players is not None else len(total_rewards)
-    if terminal_infos is not None:
-        out = outcomes_from_terminal_infos(terminal_infos, n)
-        if out is not None:
-            return out
-    return outcomes_from_rewards(total_rewards)
+
+def pairwise_rank_score(rank_a: float, rank_b: float) -> float:
+    """Score of A against B from team ranks: 1 (A better), 0.5 (tie), 0 (B better)."""
+    if rank_a < rank_b:
+        return 1.0
+    if rank_a == rank_b:
+        return 0.5
+    return 0.0

@@ -6,6 +6,7 @@ Layout (``base_dir`` is ``<run_dir>/checkpoints``)::
         model.pt            torch.save of the model state_dict (CPU tensors)
         trainer_state.pt    torch.save of BaseAlgorithm.state_dict() (optional)
         meta.json           agent_id, checkpoint_id, policy_version, timestamp, + extras
+                            (SP2: roles and role_signature of the agent; required by resume and eval)
 
 A checkpoint's path is always ``base_dir/agent_id/checkpoint_id``; both ids must be
 safe path components (``core.config.check_path_component``), and agent ids may not
@@ -106,6 +107,12 @@ def _parse_meta(ckpt_dir: Path) -> dict:
     env_steps = meta.get("env_steps")
     if env_steps is not None and not _is_int(env_steps):
         raise ValueError(f"{META_FILE}: env_steps is not an integer or null ({env_steps!r})")
+    roles = meta.get("roles")
+    if roles is not None and not (isinstance(roles, list) and roles and all(isinstance(r, str) for r in roles)):
+        raise ValueError(f"{META_FILE}: roles is not a non-empty list of strings ({roles!r})")
+    signature = meta.get("role_signature")
+    if signature is not None and not isinstance(signature, str):
+        raise ValueError(f"{META_FILE}: role_signature is not a string ({signature!r})")
     return meta
 
 
@@ -318,7 +325,8 @@ def _read_checkpoint(ckpt_dir: Path) -> tuple[dict, dict[str, np.ndarray]]:
 def load_checkpoint_dir(ckpt_dir: str | Path) -> dict[str, Any]:
     """Read one checkpoint dir (e.g. ``<run>/checkpoints/<agent>/ckpt_v<N>``) without touching it.
 
-    Returns ``{"model_state": numpy state_dict, "meta": validated meta.json}``. Unlike
+    Returns ``{"model_state": numpy state_dict, "meta": validated meta.json, "roles": list | None,
+    "role_signature": str | None}`` (the last two from ``meta.json``; None when absent). Unlike
     ``CheckpointManager`` (whose scan cleans up and restores ``.tmp-*`` dirs), nothing is
     written, so it is safe on a live run. A missing dir or file, an invalid ``meta.json``
     or an unreadable ``model.pt`` raises ConfigError naming the dir.
@@ -330,7 +338,8 @@ def load_checkpoint_dir(ckpt_dir: str | Path) -> dict[str, Any]:
         meta, model_state = _read_checkpoint(path)
     except ValueError as e:
         raise ConfigError(f"Malformed checkpoint {path}: {e}") from e
-    return {"model_state": model_state, "meta": meta}
+    return {"model_state": model_state, "meta": meta,
+            "roles": meta.get("roles"), "role_signature": meta.get("role_signature")}
 
 
 def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
@@ -353,7 +362,29 @@ def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
         "policy_version": version,
         "env_steps": env_steps,
         "source": str(ckpt_dir),
+        "roles": meta.get("roles"),
+        "role_signature": meta.get("role_signature"),
     }
+
+
+def check_role_signature(state: dict, expected: str, context: str) -> None:
+    """ConfigError naming ``state["source"]`` unless the checkpoint's role signature is ``expected``.
+
+    ``state`` is a ``resolve_resume`` result (or anything with ``source`` and ``role_signature``).
+    A checkpoint without a signature (written before SP2) is rejected too.
+    """
+    signature = state.get("role_signature")
+    if signature is None:
+        raise ConfigError(
+            f"{context}: checkpoint {state['source']} has no role_signature in its meta.json "
+            f"(written before SP2); SP1 checkpoints cannot be resumed: drop training.resume_from to start fresh"
+        )
+    if signature != expected:
+        raise ConfigError(
+            f"{context}: checkpoint {state['source']} has role signature {signature!r}, but the agent's "
+            f"roles in this game have {expected!r}: the observation/action/global-state spaces differ; "
+            f"resume from a checkpoint of an agent with the same roles, or drop training.resume_from"
+        )
 
 
 RESUME_RUN_DIR = "run_dir"
@@ -381,7 +412,7 @@ def classify_resume_source(resume_from: str | Path) -> str:
     )
 
 
-def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
+def resolve_resume(resume_from: str, agent_id: str, expected_signature: str | None = None) -> dict | None:
     """Resolve ``training.resume_from`` for one agent.
 
     Accepted forms (see ``classify_resume_source``):
@@ -391,8 +422,12 @@ def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
       there, or ``None`` (with a warning) if the agent has none;
     - a ``.pt`` file (e.g. the output of ``colosseum bc``): weights only, version 0.
 
-    The result holds only numpy arrays, bytes and primitives, so it can be passed
-    to a learner process.
+    With ``expected_signature`` (``core.roles.role_signature`` of the agent's roles), a checkpoint
+    source must carry exactly that ``role_signature`` in its ``meta.json`` (``check_role_signature``);
+    a ``.pt`` file has no signature and is checked only by ``check_model_state``.
+
+    The result holds only numpy arrays, bytes and primitives (plus ``roles`` and
+    ``role_signature``, None for a ``.pt``), so it can be passed to a learner process.
     """
     check_agent_id(agent_id)
     path = Path(resume_from)
@@ -405,15 +440,19 @@ def resolve_resume(resume_from: str, agent_id: str) -> dict | None:
         if not infos:
             logger.warning(f"resume_from={resume_from}: no checkpoints for agent '{agent_id}'; starting fresh")
             return None
-        return _load_checkpoint_dir(infos[-1].path, resume_from)
-    if kind == RESUME_CHECKPOINT_DIR:
-        return _load_checkpoint_dir(path, resume_from)
-    try:
-        model_state = read_weights_file(path)
-    except ValueError as e:
-        raise ConfigError(f"training.resume_from={resume_from!r}: {e}") from e
-    return {"model_state": model_state, "trainer_state": None,
-            "policy_version": 0, "env_steps": 0, "source": str(path)}
+        state = _load_checkpoint_dir(infos[-1].path, resume_from)
+    elif kind == RESUME_CHECKPOINT_DIR:
+        state = _load_checkpoint_dir(path, resume_from)
+    else:
+        try:
+            model_state = read_weights_file(path)
+        except ValueError as e:
+            raise ConfigError(f"training.resume_from={resume_from!r}: {e}") from e
+        return {"model_state": model_state, "trainer_state": None, "policy_version": 0, "env_steps": 0,
+                "source": str(path), "roles": None, "role_signature": None}
+    if expected_signature is not None:
+        check_role_signature(state, expected_signature, f"training.resume_from={resume_from!r} [{agent_id}]")
+    return state
 
 
 def check_model_state(model: torch.nn.Module, model_state: dict[str, np.ndarray], source: str) -> None:

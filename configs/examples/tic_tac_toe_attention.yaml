@@ -4,17 +4,16 @@ run:
   dir: "runs"
 
 env:
-  env_class: "examples.tic_tac_toe.env.TicTacToeEnv"
-  num_players: 2
+  env_class: "examples.tic_tac_toe.game.TicTacToeGame"
   kwargs: {}
 
 networks:
-  encoder_class: "examples.tic_tac_toe.networks.TicTacToeEncoder"
+  encoder_class: "examples.tic_tac_toe.models.TicTacToeEncoder"
   core:
     class: "colosseum.networks.cores.WindowAttentionCore"
     kwargs: {d_model: 64, window: 8, num_heads: 4, num_layers: 1}
-  policy_class: "examples.tic_tac_toe.networks.TicTacToePolicy"   # gets in_dim = core.output_dim
-  value_class: "examples.tic_tac_toe.networks.TicTacToeValue"
+  policy_class: "examples.tic_tac_toe.models.TicTacToePolicy"   # gets in_dim = core.output_dim
+  value_class: "examples.tic_tac_toe.models.TicTacToeValue"
   kwargs: {}
 
 algorithm:
@@ -37,13 +36,15 @@ learner:
   batch_chunks: 8
 
 training:
-  phase: "self_play"
   total_timesteps: 600000
 
-self_play:
-  checkpoint_interval: 100
-  pool_size: 10
+matchmaking:
+  mode: self_play
   latest_prob: 0.8
+
+checkpoint:
+  interval: 100
+  pool_size: 10
 
 metrics:
   use_wandb: false
