@@ -12,16 +12,16 @@ import numpy as np
 import pytest
 import torch
 
-import colosseum.sp2.algorithms.appo as appo_module
+import colosseum.algorithms.appo as appo_module
+from colosseum.algorithms.appo import APPO, _select_chunks, resolve_modes
+from colosseum.algorithms.vtrace import VTraceOut
+from colosseum.core.config import AlgorithmConfig
+from colosseum.core.specs import ActionSpec
+from colosseum.core.tree import tree_leaves
+from colosseum.core.types import SLOT_ACT, TrajectoryChunk
+from colosseum.envs.game import RoleSpec
+from colosseum.envs.spaces import Units
 from colosseum.networks.state import slice_batch
-from colosseum.sp2.algorithms.appo import APPO, _select_chunks, resolve_modes
-from colosseum.sp2.algorithms.vtrace import VTraceOut
-from colosseum.sp2.core.config import AlgorithmConfig
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.core.tree import tree_leaves
-from colosseum.sp2.core.types import SLOT_ACT, TrajectoryChunk
-from colosseum.sp2.envs.game import RoleSpec
-from colosseum.sp2.envs.spaces import Units
 from game_helpers import CORE_KINDS, make_test_model, synthetic_chunk
 
 OBS = gymnasium.spaces.Box(-1.0, 1.0, (5,), np.float32)

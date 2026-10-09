@@ -6,15 +6,15 @@ import pytest
 import torch
 import torch.nn as nn
 
+from colosseum.core.specs import ActionSpec
+from colosseum.core.tree import tree_index, tree_map, tree_stack, tree_to_torch
+from colosseum.networks.base import BaseEncoder, BasePolicy, EncoderOutput
+from colosseum.networks.composed import ComposedModel
 from colosseum.networks.cores import LSTMCore, NoCore
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.core.tree import tree_index, tree_map, tree_stack, tree_to_torch
-from colosseum.sp2.networks.base import BaseEncoder, BasePolicy, EncoderOutput
-from colosseum.sp2.networks.composed import ComposedModel
-from colosseum.sp2.networks.dist import make_distribution
-from colosseum.sp2.networks.heads import UnitsHead
-from colosseum.sp2.networks.model import act
-from colosseum.sp2.networks.normalization import NormalizeObs
+from colosseum.networks.dist import make_distribution
+from colosseum.networks.heads import UnitsHead
+from colosseum.networks.model import act
+from colosseum.networks.normalization import NormalizeObs
 from game_helpers import (
     CORE_KINDS,
     GenericValue,

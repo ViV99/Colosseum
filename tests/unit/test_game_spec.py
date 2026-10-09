@@ -6,7 +6,7 @@ import pytest
 from gymnasium.spaces import Box, Discrete, Tuple
 
 from colosseum.core.errors import EnvContractError
-from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv, RoleSpec, SeatSpec, StepResult
+from colosseum.envs.game import GameSpec, MultiAgentEnv, RoleSpec, SeatSpec, StepResult
 
 OBS = Box(-1.0, 1.0, (3,), dtype=np.float32)
 ACT = Discrete(4)

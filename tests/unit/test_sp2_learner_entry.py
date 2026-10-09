@@ -7,7 +7,7 @@ import numpy as np
 import pytest
 import torch
 
-from colosseum.sp2.core.config import ColosseumConfig, load_config
+from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.utils.seeding import derive_seed, learner_seed
 from game_helpers import agent_role_of, make_test_config, make_test_run_dir, write_test_config
 
@@ -20,7 +20,7 @@ def _flat(state: dict) -> np.ndarray:
 def capture_learner_model(monkeypatch):
     """Replace learner_process with one that builds the algorithm and records its initial weights."""
     import colosseum.core.threads as threads_module
-    import colosseum.sp2.learner.learner as learner_module
+    import colosseum.learner.learner as learner_module
 
     captured: list[np.ndarray] = []
 
@@ -44,7 +44,7 @@ def test_learner_seed_streams_are_deterministic_and_distinct():
 
 
 def _learner_main(config: ColosseumConfig, agent_id: str = "agent_0", **kwargs) -> None:
-    from colosseum.sp2.launcher import _learner_main as main
+    from colosseum.launcher import _learner_main as main
 
     _roles, role = agent_role_of(config, agent_id)
     main(agent_id=agent_id, config=config.get_agent_config(agent_id), role_spec=role, trajectory_queue=None,
@@ -65,7 +65,7 @@ def test_local_learner_weights_follow_training_seed(capture_learner_model, resto
 
 
 def test_launcher_gives_each_learner_its_own_seed_stream(tmp_path, monkeypatch, restore_global_rng):
-    import colosseum.sp2.launcher as launcher_module
+    import colosseum.launcher as launcher_module
 
     learner_kwargs: list[dict] = []
 
@@ -110,9 +110,9 @@ def test_launcher_gives_each_learner_its_own_seed_stream(tmp_path, monkeypatch, 
 
 def test_run_learner_seeds_before_building_the_model(tmp_path, monkeypatch, capture_learner_model,
                                                       restore_global_rng, restore_root_logging):
-    import colosseum.sp2.distributed as distributed
-    import colosseum.sp2.transport.grpc_transport as grpc_transport
-    import colosseum.sp2.weight_store.grpc_store as grpc_store
+    import colosseum.distributed as distributed
+    import colosseum.transport.grpc_transport as grpc_transport
+    import colosseum.weight_store.grpc_store as grpc_store
 
     class FakeServer:
         def stop(self, grace):
@@ -154,7 +154,7 @@ def test_run_learner_seeds_before_building_the_model(tmp_path, monkeypatch, capt
 
 
 def _run_learner_target(monkeypatch, config, num_learners, seen=None):
-    import colosseum.sp2.learner.learner as learner_mod
+    import colosseum.learner.learner as learner_mod
 
     seen = {} if seen is None else seen
 
@@ -202,7 +202,7 @@ def test_learner_target_passes_weight_sync_interval(monkeypatch):
 def test_learner_target_builds_and_uses_the_kickstart_teacher(monkeypatch, tmp_path, restore_global_rng):
     """``training.kickstart_teacher``: the learner loads the teacher for the agent's role and the
     algorithm adds its KL term (the ``_learner_main`` kickstart branch, T5.4 review item)."""
-    from colosseum.sp2.core.registry import build_model
+    from colosseum.core.registry import build_model
     from game_helpers import synthetic_chunk
 
     base = make_test_config("turns", learner={"device": "cpu", "torch_threads": 1})

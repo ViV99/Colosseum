@@ -1,15 +1,15 @@
-"""Smoke: `python -m colosseum.sp2 eval` loads checkpoints written by a real SP2 `train` run (T7.1)."""
+"""Smoke: `python -m colosseum eval` loads checkpoints written by a real SP2 `train` run (T7.1)."""
 from __future__ import annotations
 
 import json
 import re
 import sys
 
-from cli_runner import TTT_SP2_CONFIG, run_in_session, run_train
+from cli_runner import TTT_CONFIG, run_in_session, run_train
 
 
 def test_eval_loads_launcher_checkpoints(tmp_path):
-    run = run_train(TTT_SP2_CONFIG, tmp_path, name="eval-smoke", module="colosseum.sp2")
+    run = run_train(TTT_CONFIG, tmp_path, name="eval-smoke")
     assert run.returncode == 0, run.stderr[-2000:]
     agent_dir = run.root / "checkpoints" / "agent_0"
     ckpts = sorted((d for d in agent_dir.iterdir() if re.fullmatch(r"ckpt_v\d+", d.name)),
@@ -20,7 +20,7 @@ def test_eval_loads_launcher_checkpoints(tmp_path):
 
     out = tmp_path / "out.json"
     proc = run_in_session([
-        sys.executable, "-m", "colosseum.sp2", "eval", "-c", str(TTT_SP2_CONFIG),
+        sys.executable, "-m", "colosseum", "eval", "-c", str(TTT_CONFIG),
         "-a", f"x={ckpts[0]}", "-a", f"y={ckpts[-1]}", "-n", "4", "--num-envs", "2", "--seed", "0",
         "-o", str(out),
     ], timeout=120)

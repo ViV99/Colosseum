@@ -5,10 +5,10 @@ import pytest
 import torch
 from gymnasium.spaces import Box, Dict, Discrete, MultiDiscrete
 
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.core.tree import tree_to_torch
-from colosseum.sp2.envs.spaces import Units
-from colosseum.sp2.networks.dist import UnitsDist, make_distribution
+from colosseum.core.specs import ActionSpec
+from colosseum.core.tree import tree_to_torch
+from colosseum.envs.spaces import Units
+from colosseum.networks.dist import UnitsDist, make_distribution
 
 LOG2, LOG3 = math.log(2), math.log(3)
 

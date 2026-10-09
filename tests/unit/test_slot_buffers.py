@@ -7,10 +7,10 @@ import numpy as np
 import pytest
 import torch
 
-from colosseum.sp2.core.specs import ActionSpec, ObsSpec
-from colosseum.sp2.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
-from colosseum.sp2.envs.spaces import Units
-from colosseum.sp2.worker.buffers import BufferPool, BufferSpec, RolloutBuffer
+from colosseum.core.specs import ActionSpec, ObsSpec
+from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
+from colosseum.envs.spaces import Units
+from colosseum.worker.buffers import BufferPool, BufferSpec, RolloutBuffer
 
 OBS_SPACE = gymnasium.spaces.Dict({
     "grid": gymnasium.spaces.Box(0, 255, (2, 2), np.uint8),

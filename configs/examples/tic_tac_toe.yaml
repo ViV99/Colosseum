@@ -1,20 +1,19 @@
-# Tic-tac-toe self-play. README quickstart: about 70 s on 8 CPU cores (2 workers), then the latest
-# checkpoint, played greedily with the mask, beats a random legal-move player in >= 80% of games
-# (measured 86-93% over 4 runs, <= 1.25% losses; tests/learning/test_ttt_slow.py).
+# Tic-tac-toe self-play (SP2 contract: examples/tic_tac_toe/game.py). Same workload and
+# hyperparameters as SP1's example (LR 1e-3, constant), which beat a random legal-move player in
+# >= 80% of games after 600k env steps (tests/learning, slow test ported in T8.3).
 run:
   name: null              # default: tic_tac_toe-<YYYYmmdd-HHMMSS>
   dir: "runs"
 
 env:
-  env_class: "examples.tic_tac_toe.env.TicTacToeEnv"
-  num_players: 2
+  env_class: "examples.tic_tac_toe.game.TicTacToeGame"
   kwargs: {}
 
 networks:
-  encoder_class: "examples.tic_tac_toe.networks.TicTacToeEncoder"
+  encoder_class: "examples.tic_tac_toe.models.TicTacToeEncoder"
   core: null              # stateless (MLP); see tic_tac_toe_attention.yaml for a core
-  policy_class: "examples.tic_tac_toe.networks.TicTacToePolicy"
-  value_class: "examples.tic_tac_toe.networks.TicTacToeValue"
+  policy_class: "examples.tic_tac_toe.models.TicTacToePolicy"
+  value_class: "examples.tic_tac_toe.models.TicTacToeValue"
   kwargs: {}
 
 algorithm:
@@ -45,17 +44,17 @@ learner:
   batch_chunks: 8
 
 training:
-  phase: "self_play"
   total_timesteps: 600000   # global env steps across all workers
   seed: null
 
-self_play:
-  checkpoint_interval: 100  # train steps
-  pool_size: 10
+matchmaking:
+  mode: self_play
   latest_prob: 0.8
   shuffle_seats: true
 
 checkpoint:
+  interval: 100            # train steps
+  pool_size: 10
   save_optimizer: true
 
 metrics:

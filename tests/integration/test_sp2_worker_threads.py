@@ -14,10 +14,10 @@ import numpy as np
 import pytest
 import torch
 
-from colosseum.sp2.core.types import Lineup, SeatAssignment
-from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv, StepResult
-from colosseum.sp2.envs.vector import SubprocessVectorEnv
-from colosseum.sp2.worker.rollout_worker import rollout_worker_process
+from colosseum.core.types import Lineup, SeatAssignment
+from colosseum.envs.game import GameSpec, MultiAgentEnv, StepResult
+from colosseum.envs.vector import SubprocessVectorEnv
+from colosseum.worker.rollout_worker import rollout_worker_process
 from game_helpers import GameTestModel
 
 _PARENT_OMP = "3"

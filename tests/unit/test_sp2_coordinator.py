@@ -7,11 +7,11 @@ from collections import Counter
 import numpy as np
 import pytest
 
+from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.errors import ConfigError
-from colosseum.sp2.coordinator.coordinator import Coordinator
-from colosseum.sp2.core.registry import env_spec
-from colosseum.sp2.core.roles import agent_role_spec, resolve_agent_roles, role_signature
-from colosseum.sp2.core.types import LATEST_NETWORK_ID, MatchResult, SeatResult, TeamResult
+from colosseum.core.registry import env_spec
+from colosseum.core.roles import agent_role_spec, resolve_agent_roles, role_signature
+from colosseum.core.types import LATEST_NETWORK_ID, MatchResult, SeatResult, TeamResult
 from game_helpers import make_coordinator, make_test_config
 
 

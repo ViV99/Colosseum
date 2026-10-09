@@ -3,10 +3,10 @@ import numpy as np
 import pytest
 from gymnasium.spaces import Box, Discrete
 
+from colosseum.core.config import ColosseumConfig
 from colosseum.core.errors import ConfigError
-from colosseum.sp2.core.config import ColosseumConfig
-from colosseum.sp2.core.roles import agent_role_spec, resolve_agent_roles, role_signature
-from colosseum.sp2.envs.game import GameSpec, RoleSpec, SeatSpec
+from colosseum.core.roles import agent_role_spec, resolve_agent_roles, role_signature
+from colosseum.envs.game import GameSpec, RoleSpec, SeatSpec
 from game_helpers import AsymmetricGame, EliminationFFA, GlobalStateGame
 
 ASYM = AsymmetricGame().spec

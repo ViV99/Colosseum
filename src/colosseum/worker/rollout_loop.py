@@ -1,31 +1,29 @@
-"""In-process rollout loop: vectorized envs, batched inference, per-slot transitions.
+"""In-process rollout loop: a MatchRunner plus agent-owned chunk v2 buffers (spec blocks 4-5).
 
-All I/O goes through :class:`LoopIO` callbacks, so the loop runs unchanged in a
-worker process (``rollout_worker_process``) and in-process in tests.
+All I/O goes through :class:`LoopIO` callbacks, so the loop runs unchanged in a worker
+process (``rollout_worker_process``) and in-process in tests.
 
-Multi-agent: several agents can occupy different player slots of the same
-environments. Inference is grouped by (agent_id, network_id) for batching, and
-each chunk is routed to the agent that produced it.
+``RolloutLoop`` is the :class:`MatchRunner`'s model pool (each agent's latest model plus
+frozen checkpoints) and its observer. As observer it writes the slots of every collecting
+seat (slot rules of spec block 4):
 
-Transition model (spec block 3):
-- Only *acting* slots (``info["active"]``; absent = all act) run inference; the
-  others send the default action (zeros) and their model state is unchanged.
-- A collecting slot's transition stays *open* until that slot acts again, so
-  rewards produced on other players' turns land on it. Rewards that arrive
-  before the slot's first action in an episode accumulate in ``pending_reward``
-  and are added to that first transition.
-- A full buffer is sealed when the slot acts again: ``bootstrap_value`` is the
-  value from that inference. At episode end every open transition is marked
-  ``done`` (truncation adds ``gamma * V(final_obs)`` to its reward, with the
-  slot agent's gamma) and a full buffer is sealed with ``bootstrap_value = 0``.
-  No separate bootstrap forward.
-- Final rewards and ``done`` therefore reach every collecting slot *that acted
-  in the episode*. A slot that never acted in an episode has no transition to
-  carry them: its ``pending_reward`` is dropped at the episode end (counted in
-  ``stats["dropped_reward_episodes"]``).
-- Buffers are owned by agents (``worker/slots.py``) and parked on match
-  re-assignment instead of being discarded (block 2). A chunk's
-  ``behavior_policy_version`` is the version at its FIRST transition.
+- **The seat acts.** With an open ACT and exactly one free slot: a BOOT with the current
+  observation and ``global_state``, the chunk is sealed, and the new ACT goes into the same
+  buffer after the reset (never into a parked buffer). Without an open ACT and exactly one
+  free slot: a PAD, seal, then the ACT. Otherwise the ACT goes into the next slot (the
+  previous transition closes implicitly). The first ACT carries the seat's pending reward.
+- **Rewards** go to the seat's open ACT, or to its pending reward before its first ACT of
+  the episode.
+- **Elimination, or an episode that ends by the rules:** the open ACT becomes terminal.
+- **Truncation:** a BOOT with ``final_obs`` / final ``global_state`` and ``reset_after``
+  follows the open ACT.
+- A chunk is sealed as soon as its last slot is taken (always a BOOT or a PAD).
+- A seat that never acted in an episode drops its pending reward at the episode end
+  (counted in ``stats["dropped_reward_episodes"]``).
+- Buffers are owned by agents and parked when a lineup change at an episode end stops a
+  seat from collecting for its agent; a seat that starts collecting takes a parked buffer
+  of that agent first (``BufferPool``).
+- A chunk's ``policy_version`` is the agent's version at its first slot.
 """
 
 from __future__ import annotations
@@ -34,30 +32,29 @@ import logging
 import random
 import time
 from collections import defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
+from typing import Literal
 
 import numpy as np
 import torch
 
-from colosseum.core.action_spec import ActionSpec
-from colosseum.core.errors import EnvContractError
-from colosseum.core.outcomes import player_outcomes
-from colosseum.core.seat_info import acting_flags, check_masks, extract_masks
+from colosseum.core.roles import agent_role_spec
+from colosseum.core.specs import ActionSpec, ObsSpec
 from colosseum.core.types import (
     LATEST_NETWORK_ID,
+    Lineup,
     MatchResult,
-    SeatResult,
     TrajectoryChunk,
     WeightPayload,
     WorkerCommand,
     state_dict_from_numpy,
 )
-from colosseum.envs.base_env import BaseEnv
-from colosseum.envs.vec_env import VectorEnv
-from colosseum.networks.model import PolicyModel, act
-from colosseum.networks.state import State, cat_batch, slice_batch
-from colosseum.worker.slots import BufferPool, RolloutBuffer, SlotTrack
+from colosseum.envs.game import MultiAgentEnv
+from colosseum.envs.vector import SubprocessVectorEnv, VectorEnv
+from colosseum.networks.model import PolicyModel
+from colosseum.worker.buffers import BufferPool, BufferSpec, RolloutBuffer
+from colosseum.worker.match_runner import ActRecord, EpisodeEnd, MatchRunner
 
 logger = logging.getLogger(__name__)
 
@@ -75,43 +72,48 @@ class LoopIO:
     add_env_steps: Callable[[int], None] | None = None  # global env-step budget counter
 
 
+@dataclass
+class _SeatTrack:
+    """Rollout state of one collecting (env, seat)."""
+
+    agent_id: str
+    buffer: RolloutBuffer
+    pending_reward: float = 0.0
+
+
 class RolloutLoop:
-    """One worker's rollout loop over ``num_envs`` vectorized envs."""
+    """One worker's rollout loop over ``num_envs`` envs (module docstring).
+
+    ``lineups`` holds exactly one lineup per env (``ValueError`` before any env is built);
+    a ``WorkerCommand`` may carry fewer lineups than envs (missing = unchanged), never more.
+    """
 
     def __init__(
         self,
         *,
         worker_id: int,
-        env_fn: Callable[[], BaseEnv],
+        env_fn: Callable[[], MultiAgentEnv],
         num_envs: int,
         chunk_length: int,
         agent_ids: list[str],
-        model_factories: dict[str, Callable[[], PolicyModel]],
+        agent_roles: Mapping[str, Sequence[str]],
+        model_factories: Mapping[str, Callable[[], PolicyModel]],
         io: LoopIO,
-        gamma: float | dict[str, float] = 0.99,
+        lineups: Sequence[Lineup],
         weight_sync_interval: float = 5.0,
-        slot_agent_map: list[list[str]] | None = None,
-        slot_network_map: list[list[str]] | None = None,
-        collect_mask: list[list[bool]] | None = None,
-        checkpoint_state_dicts_by_agent: dict[str, dict[str, dict[str, np.ndarray]]] | None = None,
+        checkpoint_state_dicts_by_agent: Mapping[str, Mapping[str, Mapping[str, np.ndarray]]] | None = None,
         seed: int | None = None,
-        vec_env_kind: str = "sync",
+        vec_env_kind: Literal["sync", "subprocess"] = "sync",
         subproc_workers: int | None = None,
+        max_idle_steps: int = 1000,
     ) -> None:
+        if len(lineups) != num_envs:
+            raise ValueError(f"worker {worker_id}: need one lineup per env: {len(lineups)} lineups for {num_envs} envs")
         self.worker_id = worker_id
         self._io = io
         self._agent_ids = list(agent_ids)
-        self._model_factories = model_factories
-        self._chunk_length = chunk_length
+        self._model_factories = dict(model_factories)
         self._weight_sync_interval = weight_sync_interval
-        # Per-agent discount, used for truncation bootstrapping (B2).
-        if isinstance(gamma, dict):
-            missing = [aid for aid in self._agent_ids if aid not in gamma]
-            if missing:
-                raise ValueError(f"gamma dict has no entry for agent(s) {missing}")
-            self._gammas = {aid: float(gamma[aid]) for aid in self._agent_ids}
-        else:
-            self._gammas = {aid: float(gamma) for aid in self._agent_ids}
 
         if seed is not None:
             torch.manual_seed(seed)
@@ -119,104 +121,69 @@ class RolloutLoop:
             random.seed(seed)
 
         if vec_env_kind == "subprocess":
-            from colosseum.envs.subproc_vec_env import SubprocessVectorEnv
-            self._vec_env = SubprocessVectorEnv(env_fn, num_envs, num_workers=subproc_workers)
+            vec_env = SubprocessVectorEnv(env_fn, num_envs, num_workers=subproc_workers)
         elif vec_env_kind == "sync":
-            self._vec_env = VectorEnv(env_fn, num_envs)
+            vec_env = VectorEnv(env_fn, num_envs)
         else:
             raise ValueError(f"unknown vec_env_kind {vec_env_kind!r}")
-        self._num_envs = num_envs
-        self._num_players = self._vec_env.num_players
-        self._action_spec = ActionSpec.from_space(self._vec_env.action_space)
-        E, P = self._num_envs, self._num_players
+        try:
+            spec = vec_env.spec
 
-        # Model pool: agent -> network id -> model ("latest" + frozen checkpoints).
-        self._models: dict[str, dict[str, PolicyModel]] = {}
-        self._policy_versions: dict[str, int] = {aid: 0 for aid in self._agent_ids}
-        for aid in self._agent_ids:
-            latest = model_factories[aid]()
-            latest.eval()
-            self._models[aid] = {LATEST_NETWORK_ID: latest}
-        for aid, by_id in (checkpoint_state_dicts_by_agent or {}).items():
-            for ckpt_id, sd in by_id.items():
-                self._add_checkpoint(aid, ckpt_id, sd)
-        self._warned_missing: set[tuple[str, str]] = set()
+            specs: dict[str, BufferSpec] = {}
+            for aid in self._agent_ids:
+                role = agent_role_spec(spec, list(agent_roles[aid]))
+                specs[aid] = BufferSpec(
+                    obs=ObsSpec.from_space(role.observation_space),
+                    action=ActionSpec.from_space(role.action_space),
+                    global_state=(
+                        None if role.global_state_space is None else ObsSpec.from_space(role.global_state_space)
+                    ),
+                )
+            self._pool = BufferPool(chunk_length, specs)
 
-        # Initial weights for every agent's latest model (records their policy version, A5).
-        self.sync_weights()
+            # Model pool: agent -> network id -> model ("latest" + frozen checkpoints).
+            self._models: dict[str, dict[str, PolicyModel]] = {}
+            self._policy_versions: dict[str, int] = {aid: 0 for aid in self._agent_ids}
+            for aid in self._agent_ids:
+                latest = self._model_factories[aid]()
+                latest.eval()
+                self._models[aid] = {LATEST_NETWORK_ID: latest}
+            for aid, by_id in (checkpoint_state_dicts_by_agent or {}).items():
+                for ckpt_id, sd in by_id.items():
+                    self._add_checkpoint(aid, ckpt_id, sd)
+            self.sync_weights()   # initial weights and policy versions
 
-        # Live match assignment; WorkerCommand updates are staged in `_pending_maps`
-        # and applied per env at its next episode boundary.
-        if slot_agent_map is None:
-            slot_agent_map = [[self._agent_ids[0]] * P for _ in range(E)]
-        if collect_mask is None:
-            collect_mask = [[True] * P for _ in range(E)]
-        if slot_network_map is None:
-            # Non-collecting slots default to the agent's first checkpoint, if any.
-            ckpts = checkpoint_state_dicts_by_agent or {}
-            slot_network_map = [
-                [
-                    LATEST_NETWORK_ID
-                    if collect_mask[e][p] or not ckpts.get(slot_agent_map[e][p])
-                    else next(iter(ckpts[slot_agent_map[e][p]]))
-                    for p in range(P)
-                ]
-                for e in range(E)
-            ]
-        self._slot_agent_map = [list(r) for r in slot_agent_map]
-        self._slot_network_map = [list(r) for r in slot_network_map]
-        self._collect_mask = [[bool(c) for c in r] for r in collect_mask]
-        for e in range(E):
-            for p in range(P):
-                self._slot_network_map[e][p], self._collect_mask[e][p] = self._seat_network(
-                    self._slot_agent_map[e][p], self._slot_network_map[e][p], self._collect_mask[e][p])
-        self._pending_maps: tuple[list, list, list] | None = None
-
-        self._obs, self._infos = self._vec_env.reset_all(seed=seed)
-        self._pool = BufferPool(
-            chunk_length=chunk_length,
-            obs_shape=tuple(self._obs.shape[2:]),
-            action_shape=tuple(self._action_spec.action_shape),
-            action_dtype=self._action_spec.numpy_dtype,
-            mask_size=self._action_spec.flat_mask_size,
-        )
-        self._tracks: list[list[SlotTrack]] = []
-        for e in range(E):
-            row = []
-            for p in range(P):
-                track = SlotTrack(buffer=None, state=self._initial_state(e, p))
-                if self._collect_mask[e][p]:
-                    track.buffer = self._pool.acquire(self._slot_agent_map[e][p])
-                row.append(track)
-            self._tracks.append(row)
-
-        self._ep_rewards = np.zeros((E, P), dtype=np.float64)
-        self._ep_lengths = np.zeros(E, dtype=np.int64)
-        self._ep_counter = np.zeros(E, dtype=np.int64)
-        self._env_steps = 0
-        self._chunks_sent = 0
-        self._dropped_reward_episodes = 0
-        self._recorded: dict[str, int] = defaultdict(int)
+            self._tracks: list[dict[int, _SeatTrack]] = [{} for _ in range(num_envs)]
+            self._env_steps = 0
+            self._episodes = 0
+            self._chunks_sent = 0
+            self._dropped_reward_episodes = 0
+            self._recorded: dict[str, int] = defaultdict(int)
+            self._runner = MatchRunner(
+                vec_env=vec_env, lineups=lineups, models=self, observer=self, seed=seed,
+                max_idle_steps=max_idle_steps, context=f"worker {worker_id}, ", match_id_prefix=f"w{worker_id}_e",
+            )
+            for e in range(num_envs):
+                for seat, assignment in enumerate(self._runner.lineup(e).seats):
+                    if assignment.collect:
+                        self._start_collecting(e, seat, assignment.agent_id)
+        except BaseException:
+            # the caller never gets this loop, so nobody else would close the envs (subprocesses!)
+            try:
+                vec_env.close()
+            except Exception:
+                logger.warning(f"Worker {worker_id}: closing the vector env after a failed setup failed",
+                               exc_info=True)
+            raise
 
     # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
     def step(self) -> int:
-        """One vectorized env step for all envs. Returns env steps taken."""
+        """One step of every env. Returns the env steps taken."""
         self._poll_command()
-        obs = self._obs
-        E, P = self._num_envs, self._num_players
-        acting = acting_flags(self._infos, E, P)
-        masks = extract_masks(self._infos, E, P, self._action_spec)
-        if masks is not None:
-            check_masks(masks, acting, self._action_spec, self._where)
-        actions, log_probs, values, pre_states = self._infer(obs, masks, acting)
-        self._open_transitions(obs, actions, log_probs, values, masks, acting, pre_states)
-        next_obs, rewards, terminated, truncated, infos = self._vec_env.step(actions)
-        self._after_env_step(rewards, terminated, truncated, infos)
-        self._obs, self._infos = next_obs, infos
-        n = self._num_envs
+        n = self._runner.step()
         self._env_steps += n
         if self._io.add_env_steps is not None:
             self._io.add_env_steps(n)
@@ -241,28 +208,40 @@ class RolloutLoop:
             self.step()
 
     def close(self) -> None:
-        self._vec_env.close()
+        self._runner.close()
 
     @property
     def stats(self) -> dict[str, int]:
         out = {
             "chunks_sent": self._chunks_sent,
             "env_steps": self._env_steps,
-            "episodes": int(self._ep_counter.sum()),
+            "episodes": self._episodes,
             "parked_buffers": self._pool.parked_count(),
             "dropped_reward_episodes": self._dropped_reward_episodes,
             "recorded_transitions": sum(self._recorded.values()),
         }
         for aid in self._agent_ids:
             out[f"recorded_transitions/{aid}"] = self._recorded[aid]
-            out[f"buffered_transitions/{aid}"] = self._buffered_transitions(aid)
+            out[f"buffered_transitions/{aid}"] = self._buffered_acts(aid)
         return out
 
+    def buffered_reward(self, agent_id: str) -> float:
+        """Rewards of ``agent_id`` recorded in buffers but not sent yet (seat + parked buffers)."""
+        total = self._pool.parked_reward(agent_id)
+        for tracks in self._tracks:
+            for track in tracks.values():
+                if track.agent_id == agent_id:
+                    total += track.buffer.reward_sum
+        return total
+
     # ------------------------------------------------------------------
-    # Models
+    # ModelPool
     # ------------------------------------------------------------------
 
-    def _add_checkpoint(self, aid: str, ckpt_id: str, sd: dict[str, np.ndarray]) -> None:
+    def get(self, agent_id: str, network_id: str) -> PolicyModel | None:
+        return self._models.get(agent_id, {}).get(network_id)
+
+    def _add_checkpoint(self, aid: str, ckpt_id: str, sd: Mapping[str, np.ndarray]) -> None:
         if aid not in self._models or ckpt_id in self._models[aid]:
             return
         model = self._model_factories[aid]()
@@ -271,38 +250,8 @@ class RolloutLoop:
         self._models[aid][ckpt_id] = model
         logger.info(f"Worker {self.worker_id}: agent {aid}: loaded checkpoint {ckpt_id}")
 
-    def _seat_network(self, aid: str, net_id: str, collect: bool) -> tuple[str, bool]:
-        """The (network id, collect) actually seated for an assigned slot.
-
-        A network that is not loaded is replaced by the latest weights, which then
-        collect trajectories (as the launcher's missing-checkpoint fallback does), so
-        the slot maps, chunks and ``SeatResult.network_id`` all name what really played.
-        """
-        if net_id in self._models[aid]:
-            return net_id, collect
-        if (aid, net_id) not in self._warned_missing:
-            self._warned_missing.add((aid, net_id))
-            logger.warning(
-                f"Worker {self.worker_id}: network {net_id!r} of {aid!r} is not loaded; "
-                f"seating {LATEST_NETWORK_ID!r} (collecting) instead"
-            )
-        return LATEST_NETWORK_ID, True
-
-    def _resolve_model(self, aid: str, net_id: str) -> PolicyModel:
-        """The model seated for (agent, network id); slot maps only hold loaded networks."""
-        return self._models[aid][net_id]
-
-    def _initial_state(self, e: int, p: int) -> State:
-        """Episode-start state of the model actually seated in slot (e, p)."""
-        model = self._resolve_model(self._slot_agent_map[e][p], self._slot_network_map[e][p])
-        return model.initial_state(1)
-
-    # ------------------------------------------------------------------
-    # Commands / re-assignment
-    # ------------------------------------------------------------------
-
     def _poll_command(self) -> None:
-        """Load a command's new checkpoints now; stage its slot maps for episode ends."""
+        """Load a command's new checkpoints now; stage its lineups for the envs' episode ends."""
         if self._io.poll_command is None:
             return
         cmd = self._io.poll_command()
@@ -311,235 +260,106 @@ class RolloutLoop:
         for aid, ckpts in cmd.new_checkpoints.items():
             for ckpt_id, sd in ckpts.items():
                 self._add_checkpoint(aid, ckpt_id, sd)
-        if cmd.slot_agent_map:
-            self._pending_maps = (
-                [list(r) for r in cmd.slot_agent_map],
-                [list(r) for r in cmd.slot_network_map],
-                [[bool(c) for c in r] for r in cmd.collect_mask],
+        if len(cmd.lineups) > self._runner.num_envs:
+            raise ValueError(
+                f"worker {self.worker_id}: a command has {len(cmd.lineups)} lineups for "
+                f"{self._runner.num_envs} envs"
             )
-
-    def _apply_pending_assignment(self, e: int) -> None:
-        """Apply the staged assignment to env ``e`` (called at its episode end).
-
-        A slot that stops collecting for its agent parks its partial buffer
-        (whose last transition is done) in the pool; a slot that starts
-        collecting acquires a buffer, preferring a parked one of its agent.
-        """
-        if self._pending_maps is None:
-            return
-        agents, nets, collect = self._pending_maps
-        if e >= len(agents):
-            return
-        for p in range(self._num_players):
-            track = self._tracks[e][p]
-            old_aid = self._slot_agent_map[e][p]
-            new_aid = agents[e][p]
-            new_net, new_collect = self._seat_network(new_aid, nets[e][p], collect[e][p])
-            if track.buffer is not None and (not new_collect or new_aid != old_aid):
-                self._pool.park(old_aid, track.buffer)
-                track.buffer = None
-            self._slot_agent_map[e][p] = new_aid
-            self._slot_network_map[e][p] = new_net
-            self._collect_mask[e][p] = new_collect
-            if new_collect and track.buffer is None:
-                track.buffer = self._pool.acquire(new_aid)
-
-    def _buffered_transitions(self, aid: str) -> int:
-        """Transitions of ``aid`` recorded but not yet sent (slot + parked buffers)."""
-        n = self._pool.parked_transitions(aid)
-        for e in range(self._num_envs):
-            for p in range(self._num_players):
-                buf = self._tracks[e][p].buffer
-                if buf is not None and self._slot_agent_map[e][p] == aid:
-                    n += buf.steps
-        return n
+        for e, lineup in enumerate(cmd.lineups):
+            if lineup is not None:
+                self._runner.set_next_lineup(e, lineup)
 
     # ------------------------------------------------------------------
-    # Per-step pieces
+    # MatchObserver
     # ------------------------------------------------------------------
 
-    def _where(self, e: int, p: int) -> str:
-        """Error-message context for env ``e``, slot ``p``."""
-        return f"worker {self.worker_id}, env {e}, slot {p}, episode step {int(self._ep_lengths[e])}"
+    def on_act(self, env: int, seat: int, record: ActRecord) -> None:
+        track = self._tracks[env].get(seat)
+        if track is None:
+            return
+        buf = track.buffer
+        if buf.free_slots == 1:
+            if buf.has_open:
+                buf.write_boot(record.obs, record.global_state, reset_after=False)
+            else:
+                buf.write_pad()
+            self._seal(track.agent_id, buf)
+        if buf.slots_used == 0:
+            buf.begin(record.pre_state, self._policy_versions[track.agent_id])
+        buf.write_act(record.obs, record.global_state, record.mask, record.action, record.log_prob,
+                      record.unit_log_probs, track.pending_reward)
+        track.pending_reward = 0.0
+        self._recorded[track.agent_id] += 1
 
-    def _infer(self, obs: np.ndarray, masks: np.ndarray | None, acting: np.ndarray):
-        """Batched inference for acting slots, grouped by (agent, network).
+    def on_rewards(self, env: int, rewards: dict[int, float]) -> None:
+        for seat, r in rewards.items():
+            track = self._tracks[env].get(seat)
+            if track is None:
+                continue
+            if track.buffer.has_open:
+                track.buffer.add_reward(r)
+            else:
+                track.pending_reward += r
 
-        Non-acting slots keep the default action (zeros) and their model state.
-        Returns (actions [E,P,*A], log_probs [E,P], values [E,P], pre_states)
-        where ``pre_states[(e, p)]`` is the acting slot's state BEFORE this step.
-        """
-        E, P = self._num_envs, self._num_players
-        spec = self._action_spec
-        actions = np.zeros((E, P, *spec.action_shape), dtype=spec.numpy_dtype)
-        log_probs = np.zeros((E, P), dtype=np.float32)
-        values = np.zeros((E, P), dtype=np.float32)
-        pre_states: dict[tuple[int, int], State] = {}
-        masks3 = None if masks is None else masks.reshape(E, P, -1)
+    def on_terminated(self, env: int, seats: list[int]) -> None:
+        for seat in seats:
+            track = self._tracks[env].get(seat)
+            if track is not None and track.buffer.has_open:
+                track.buffer.mark_terminal()
 
-        groups: dict[tuple[str, str], list[tuple[int, int]]] = defaultdict(list)
-        for e in range(E):
-            for p in range(P):
-                if acting[e, p]:
-                    groups[(self._slot_agent_map[e][p], self._slot_network_map[e][p])].append((e, p))
-
-        for (aid, net_id), slots in groups.items():
-            model = self._resolve_model(aid, net_id)
-            ei = [e for e, _ in slots]
-            pi = [p for _, p in slots]
-            obs_b = torch.from_numpy(np.ascontiguousarray(obs[ei, pi], dtype=np.float32))
-            mask_b = None if masks3 is None else torch.from_numpy(np.ascontiguousarray(masks3[ei, pi]))
-            state_b = cat_batch([self._tracks[e][p].state for e, p in slots])
-            with torch.no_grad():
-                out = act(model, obs_b, state_b, mask_b)
-            actions[ei, pi] = out.actions.cpu().numpy().astype(spec.numpy_dtype, copy=False)
-            log_probs[ei, pi] = out.log_probs.float().cpu().numpy()
-            values[ei, pi] = out.values.float().cpu().numpy()
-            for j, (e, p) in enumerate(slots):
-                track = self._tracks[e][p]
-                pre_states[(e, p)] = track.state
-                track.state = None if out.state is None else slice_batch(out.state, j)
-        return actions, log_probs, values, pre_states
-
-    def _open_transitions(self, obs, actions, log_probs, values, masks, acting, pre_states) -> None:
-        """For every acting collecting slot: if its buffer is full, seal it with
-        ``bootstrap_value`` = the value from this step's inference; then open a
-        new transition carrying the slot's ``pending_reward``. The previous
-        transition (if any) closes implicitly.
-
-        Slots that report ``info["active"] = False`` are not recorded, and their
-        open transition (if any) stays open. A buffer's first transition records
-        the slot's pre-step state and the agent's current policy version.
-        """
-        E, P = self._num_envs, self._num_players
-        masks3 = None if masks is None else masks.reshape(E, P, -1)
-        for e in range(E):
-            for p in range(P):
-                if not (acting[e, p] and self._collect_mask[e][p]):
-                    continue
-                track = self._tracks[e][p]
-                aid = self._slot_agent_map[e][p]
-                buf = track.buffer
-                if buf.is_full:
-                    self._seal(aid, buf, bootstrap_value=float(values[e, p]))
-                if buf.steps == 0:
-                    buf.begin_chunk(pre_states[(e, p)], self._policy_versions[aid])
-                buf.open(
-                    obs[e, p], actions[e, p], float(log_probs[e, p]), float(values[e, p]),
-                    None if masks3 is None else masks3[e, p],
-                    reward=track.pending_reward,
-                )
-                track.pending_reward = 0.0
-                track.has_open = True
-                self._recorded[aid] += 1
-
-    def _after_env_step(self, rewards, terminated, truncated, infos) -> None:
-        """Add each collecting slot's reward to its open transition, or to its
-        ``pending_reward`` before its first action in the episode; then end
-        finished episodes. Transitions stay open until the slot acts again."""
-        E, P = self._num_envs, self._num_players
-        self._ep_rewards += rewards
-        self._ep_lengths += 1
-        for e in range(E):
-            for p in range(P):
-                if not self._collect_mask[e][p]:
-                    continue
-                track = self._tracks[e][p]
-                r = float(rewards[e, p])
-                if track.has_open:
-                    track.buffer.add_reward(r)
+    def on_episode_end(self, env: int, end: EpisodeEnd) -> None:
+        for seat, track in self._tracks[env].items():
+            buf = track.buffer
+            if buf.has_open:
+                if end.truncated:
+                    gs = None if end.final_global_state is None else end.final_global_state.get(seat)
+                    buf.write_boot(end.final_obs[seat], gs, reset_after=True)
+                    if buf.is_full:
+                        self._seal(track.agent_id, buf)
                 else:
-                    track.pending_reward += r
-            if terminated[e] or truncated[e]:
-                self._end_episode(e, bool(terminated[e]), bool(truncated[e]), infos[e])
-
-    def _end_episode(self, e: int, terminated: bool, truncated: bool, info_e: dict) -> None:
-        """Close env ``e``'s episode: truncation bootstrap; ``done`` on every open
-        transition (full buffers sealed with bootstrap 0); drop the pending
-        reward of slots that never acted; report the result; apply a staged
-        re-assignment; reset model states."""
-        P = self._num_players
-        if truncated and not terminated:
-            self._bootstrap_truncation(e, info_e)
-        for p in range(P):
-            track = self._tracks[e][p]
-            if self._collect_mask[e][p] and track.has_open:
-                track.buffer.mark_done()
-                track.has_open = False
-                if track.buffer.is_full:
-                    self._seal(self._slot_agent_map[e][p], track.buffer, bootstrap_value=0.0)
+                    buf.mark_terminal()
             if track.pending_reward != 0.0:
                 self._dropped_reward_episodes += 1
                 logger.debug(
-                    f"Worker {self.worker_id}: env {e}, slot {p}: dropping reward "
-                    f"{track.pending_reward} of an episode the slot never acted in"
+                    f"Worker {self.worker_id}: env {env}, seat {seat}: dropping reward "
+                    f"{track.pending_reward} of an episode the seat never acted in"
                 )
             track.pending_reward = 0.0
-        self._report_result(e, info_e)
-        self._ep_rewards[e] = 0.0
-        self._ep_lengths[e] = 0
-        self._ep_counter[e] += 1
-        self._apply_pending_assignment(e)
-        for p in range(P):
-            self._tracks[e][p].state = self._initial_state(e, p)
+        self._episodes += 1
+        if self._io.report_result is not None:
+            self._io.report_result(end.result)
 
-    def _bootstrap_truncation(self, e: int, info_e: dict) -> None:
-        """Add ``gamma * V(final_obs)`` to every open transition of env ``e``.
+    def on_lineup_applied(self, env: int, old: Lineup, new: Lineup) -> None:
+        tracks = self._tracks[env]
+        for seat in range(max(len(old.seats), len(new.seats))):
+            assignment = new.seats[seat] if seat < len(new.seats) else None
+            collector = assignment.agent_id if assignment is not None and assignment.collect else None
+            track = tracks.get(seat)
+            if track is not None and track.agent_id != collector:
+                self._pool.park(track.agent_id, track.buffer)
+                del tracks[seat]
+            if collector is not None and seat not in tracks:
+                self._start_collecting(env, seat, collector)
 
-        One batched forward per (agent, network) group, with each slot's current
-        model state, on ``info[p]["terminal_observation"]``; ``gamma`` is the
-        slot agent's (R1-03, R2-09).
-        """
-        groups: dict[tuple[str, str], list[int]] = defaultdict(list)
-        for p in range(self._num_players):
-            if self._collect_mask[e][p] and self._tracks[e][p].has_open:
-                groups[(self._slot_agent_map[e][p], self._slot_network_map[e][p])].append(p)
-        for (aid, net_id), players in groups.items():
-            try:
-                final = np.stack([np.asarray(info_e[p]["terminal_observation"]) for p in players])
-            except (KeyError, TypeError) as exc:
-                raise EnvContractError(
-                    f"worker {self.worker_id}, env {e}: truncated episode without "
-                    f"info['terminal_observation']"
-                ) from exc
-            model = self._resolve_model(aid, net_id)
-            obs_b = torch.from_numpy(np.ascontiguousarray(final, dtype=np.float32))
-            state_b = cat_batch([self._tracks[e][p].state for p in players])
-            with torch.no_grad():
-                out = model.step(obs_b, state_b)
-            v = out.value.float().cpu().numpy()
-            for j, p in enumerate(players):
-                self._tracks[e][p].buffer.add_reward(self._gammas[aid] * float(v[j]))
+    # ------------------------------------------------------------------
+    # Helpers
+    # ------------------------------------------------------------------
 
-    def _seal(self, aid: str, buf: RolloutBuffer, bootstrap_value: float) -> None:
-        chunk = buf.build_chunk(aid, bootstrap_value)
+    def _start_collecting(self, env: int, seat: int, agent_id: str) -> None:
+        if agent_id not in self._models:
+            raise ValueError(f"worker {self.worker_id}: env {env}, seat {seat}: unknown agent {agent_id!r}")
+        self._tracks[env][seat] = _SeatTrack(agent_id=agent_id, buffer=self._pool.acquire(agent_id))
+
+    def _buffered_acts(self, aid: str) -> int:
+        n = self._pool.parked_acts(aid)
+        for tracks in self._tracks:
+            for track in tracks.values():
+                if track.agent_id == aid:
+                    n += track.buffer.num_acts
+        return n
+
+    def _seal(self, aid: str, buf: RolloutBuffer) -> None:
+        chunk = buf.build_chunk(aid)
         buf.reset()
         self._io.send_chunk(chunk)
         self._chunks_sent += 1
-
-    def _report_result(self, e: int, info_e: dict) -> None:
-        """Report env ``e``'s finished episode: one :class:`SeatResult` per seat."""
-        if self._io.report_result is None:
-            return
-        P = self._num_players
-        terminal_infos = {
-            p: (info_e.get(p, {}) or {}).get("terminal_info", {}) for p in range(P)
-        }
-        rewards = self._ep_rewards[e]
-        outcomes = player_outcomes(rewards, terminal_infos, P)
-        seats = []
-        for p in range(P):
-            rank = terminal_infos[p].get("rank")
-            seats.append(SeatResult(
-                seat=p,
-                agent_id=self._slot_agent_map[e][p],
-                network_id=self._slot_network_map[e][p],
-                outcome=float(outcomes[p]),
-                reward=float(rewards[p]),
-                rank=None if rank is None else float(rank),
-            ))
-        self._io.report_result(MatchResult(
-            match_id=f"w{self.worker_id}_e{e}_ep{int(self._ep_counter[e])}",
-            seats=seats,
-            episode_length=int(self._ep_lengths[e]),
-        ))

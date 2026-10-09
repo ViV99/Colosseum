@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 import torch
 
-from colosseum.sp2.core.types import TrajectoryChunk, WeightPayload
+from colosseum.core.types import TrajectoryChunk, WeightPayload
 from game_helpers import chunk_v2_payload
 
 grpc = pytest.importorskip("grpc")
@@ -26,8 +26,8 @@ def _state_dict() -> dict[str, np.ndarray]:
 
 
 def test_weight_store_roundtrip_and_adapters():
-    from colosseum.sp2.distributed import GRPCWeightSink, GRPCWeightSource
-    from colosseum.sp2.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
+    from colosseum.distributed import GRPCWeightSink, GRPCWeightSource
+    from colosseum.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
 
     port = _free_port()
     server = serve_weight_store(port=port)
@@ -52,8 +52,8 @@ def test_weight_store_roundtrip_and_adapters():
 
 
 def test_trajectory_transport_carries_chunk_v2_trees():
-    from colosseum.sp2.distributed import GRPCTrajectorySink
-    from colosseum.sp2.transport.grpc_transport import GRPCTransport, serve_trajectory_receiver
+    from colosseum.distributed import GRPCTrajectorySink
+    from colosseum.transport.grpc_transport import GRPCTransport, serve_trajectory_receiver
 
     port = _free_port()
     chunk_queue: queue.Queue = queue.Queue(maxsize=16)
@@ -75,7 +75,7 @@ def test_trajectory_transport_carries_chunk_v2_trees():
 
 
 def test_servicer_rejects_a_chunk_without_obs():
-    from colosseum.sp2.transport.grpc_transport import GRPCTransport, serve_trajectory_receiver
+    from colosseum.transport.grpc_transport import GRPCTransport, serve_trajectory_receiver
 
     port = _free_port()
     chunk_queue: queue.Queue = queue.Queue(maxsize=8)
@@ -96,8 +96,8 @@ def test_servicer_rejects_a_chunk_without_obs():
 
 
 def test_trajectory_sink_tolerates_a_dead_learner():
-    from colosseum.sp2.distributed import GRPCTrajectorySink
-    from colosseum.sp2.transport.grpc_transport import GRPCTransport
+    from colosseum.distributed import GRPCTrajectorySink
+    from colosseum.transport.grpc_transport import GRPCTransport
 
     transport = GRPCTransport(f"localhost:{_free_port()}")  # nothing listening
     GRPCTrajectorySink(transport, "agent_0").put(chunk_v2_payload(), timeout=0.5)
@@ -105,8 +105,8 @@ def test_trajectory_sink_tolerates_a_dead_learner():
 
 
 def test_trajectory_sink_warns_when_the_learner_rejects_a_chunk(caplog):
-    from colosseum.sp2.distributed import GRPCTrajectorySink
-    from colosseum.sp2.transport.grpc_transport import GRPCTransport, serve_trajectory_receiver
+    from colosseum.distributed import GRPCTrajectorySink
+    from colosseum.transport.grpc_transport import GRPCTransport, serve_trajectory_receiver
 
     port = _free_port()
     chunk_queue: queue.Queue = queue.Queue(maxsize=8)
@@ -115,7 +115,7 @@ def test_trajectory_sink_warns_when_the_learner_rejects_a_chunk(caplog):
     try:
         bad = chunk_v2_payload()
         del bad["obs"]
-        with caplog.at_level("WARNING", logger="colosseum.sp2.distributed"):
+        with caplog.at_level("WARNING", logger="colosseum.distributed"):
             GRPCTrajectorySink(transport, "agent_0").put(bad, timeout=1.0)
         assert any(r.levelname == "WARNING" and "INVALID_ARGUMENT" in r.getMessage() for r in caplog.records)
         assert chunk_queue.empty()
@@ -125,7 +125,7 @@ def test_trajectory_sink_warns_when_the_learner_rejects_a_chunk(caplog):
 
 
 def test_weight_store_rejects_non_array_weights():
-    from colosseum.sp2.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
+    from colosseum.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
 
     port = _free_port()
     server = serve_weight_store(port=port)

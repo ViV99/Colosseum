@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 from gymnasium.spaces import Box, Dict, Discrete, MultiBinary, MultiDiscrete
 
-from colosseum.sp2.envs.spaces import UnitComponent, Units
+from colosseum.envs.spaces import UnitComponent, Units
 
 
 def _move_target(only_if=None):

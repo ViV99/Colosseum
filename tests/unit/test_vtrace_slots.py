@@ -8,8 +8,8 @@ import numpy as np
 import pytest
 import torch
 
-from colosseum.sp2.algorithms.vtrace import VTraceOut, compute_vtrace_slots
-from colosseum.sp2.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
+from colosseum.algorithms.vtrace import VTraceOut, compute_vtrace_slots
+from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
 
 LETTER_KIND = {"A": SLOT_ACT, "T": SLOT_ACT, "B": SLOT_BOOT, "R": SLOT_BOOT, "P": SLOT_PAD}
 

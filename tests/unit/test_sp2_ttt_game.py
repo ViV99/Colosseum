@@ -7,14 +7,14 @@ import pytest
 import torch
 
 from cli_runner import REPO_ROOT
-from colosseum.sp2.core.config import load_config
-from colosseum.sp2.core.registry import build_model, validate_config
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.envs.contract import EpisodeTracker
+from colosseum.core.config import load_config
+from colosseum.core.registry import build_model, validate_config
+from colosseum.core.specs import ActionSpec
+from colosseum.envs.contract import EpisodeTracker
 from examples.tic_tac_toe.game import TicTacToeGame
 from examples.tic_tac_toe.models import TicTacToePolicy
 
-TTT_SP2 = REPO_ROOT / "configs" / "sp2"
+TTT_SP2 = REPO_ROOT / "configs" / "examples"
 
 
 def play(game: TicTacToeGame, cells: list[int]):

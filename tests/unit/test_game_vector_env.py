@@ -5,7 +5,7 @@ import numpy as np
 import pytest
 
 from colosseum.core.errors import EnvContractError
-from colosseum.sp2.envs.vector import VectorEnv
+from colosseum.envs.vector import VectorEnv
 from game_helpers import EliminationFFA, SoloCounterGame
 
 

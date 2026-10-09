@@ -2,8 +2,8 @@
 import numpy as np
 import pytest
 
-from colosseum.sp2.core.specs import ObsSpec
-from colosseum.sp2.envs.game import StepResult
+from colosseum.core.specs import ObsSpec
+from colosseum.envs.game import StepResult
 from game_helpers import (
     TOY_GAMES,
     EliminationFFA,

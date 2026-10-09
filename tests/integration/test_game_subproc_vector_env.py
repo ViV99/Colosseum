@@ -7,8 +7,8 @@ import numpy as np
 import pytest
 
 from colosseum.core.errors import EnvContractError
-from colosseum.sp2.envs.game import StepResult
-from colosseum.sp2.envs.vector import SubprocessVectorEnv, VectorEnv
+from colosseum.envs.game import StepResult
+from colosseum.envs.vector import SubprocessVectorEnv, VectorEnv
 from game_helpers import EliminationFFA, ScriptedGame, SoloCounterGame, UnitsGame
 
 

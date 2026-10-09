@@ -7,9 +7,9 @@ import numpy as np
 import pytest
 import torch
 
+from colosseum.core.types import TrajectoryChunk
 from colosseum.networks.state import state_to_numpy
-from colosseum.sp2.core.types import TrajectoryChunk
-from colosseum.sp2.transport.serialization import (
+from colosseum.transport.serialization import (
     deserialize_chunk,
     deserialize_chunk_payload,
     deserialize_state_dict,
@@ -197,7 +197,7 @@ def test_negative_dimension_cannot_cancel_a_huge_array_out_of_the_cap():
     np.array(["a", "b"]), np.array([b"x"]), np.zeros(2, dtype="V4"), np.array(["2020-01-01"], dtype="datetime64[D]"),
 ])
 def test_weights_payload_rejects_non_numeric_dtypes(value):
-    from colosseum.sp2.transport.serialization import validate_state_dict_payload
+    from colosseum.transport.serialization import validate_state_dict_payload
 
     numeric = {"w": np.zeros(2, np.float32), "flag": np.array([True]), "n": np.arange(2, dtype=np.uint8),
                "c": np.zeros(1, np.complex64)}

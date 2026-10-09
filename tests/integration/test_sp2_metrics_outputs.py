@@ -1,8 +1,8 @@
 """A short SP2 run writes metrics.jsonl with all four kinds, per-layout ratings.json, console progress (T7.1)."""
 from __future__ import annotations
 
-from cli_runner import TTT_SP2_CONFIG, run_train
-from colosseum.sp2.metrics.jsonl import REQUIRED_KEYS
+from cli_runner import TTT_CONFIG, run_train
+from colosseum.metrics.jsonl import REQUIRED_KEYS
 
 # Workers report stats every WORKER_STATS_INTERVAL_SEC (2 s). With masked, turn-based
 # tic-tac-toe (T8.1) TINY's 3000 steps can finish before the first report, so the budget
@@ -11,7 +11,7 @@ BUDGET = 12000
 
 
 def test_metrics_jsonl_ratings_json_and_console(tmp_path):
-    run = run_train(TTT_SP2_CONFIG, tmp_path, name="metrics-run", module="colosseum.sp2",
+    run = run_train(TTT_CONFIG, tmp_path, name="metrics-run",
                     overrides={"training.total_timesteps": str(BUDGET)})
     assert run.returncode == 0, run.stderr[-3000:]
     records = run.records()
@@ -42,16 +42,16 @@ def test_launch_logs_to_wandb_on_per_agent_axes_and_finishes(tmp_path, monkeypat
 
     from fake_wandb import FakeWandb
 
-    from cli_runner import TTT_SP2_CONFIG
-    from colosseum.sp2.core.config import ColosseumConfig, load_config
-    from colosseum.sp2.launcher import Launcher
-    from colosseum.sp2.metrics.jsonl import GLOBAL_KINDS
+    from cli_runner import TTT_CONFIG
+    from colosseum.core.config import ColosseumConfig, load_config
+    from colosseum.launcher import Launcher
+    from colosseum.metrics.jsonl import GLOBAL_KINDS
     from game_helpers import make_test_run_dir
 
     fake = FakeWandb()
     monkeypatch.setitem(sys.modules, "wandb", fake)
 
-    data = load_config(TTT_SP2_CONFIG).model_dump()
+    data = load_config(TTT_CONFIG).model_dump()
     data["training"]["total_timesteps"] = 400
     data["rollout"].update(num_workers=1, envs_per_worker=2, chunk_length=8)
     data["learner"].update(batch_chunks=2, queue_size=16, device="cpu")

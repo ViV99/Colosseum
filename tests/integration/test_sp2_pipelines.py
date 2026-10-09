@@ -10,15 +10,15 @@ import time
 import pytest
 
 from cli_runner import REPO_ROOT
-from colosseum.sp2.coordinator.checkpoint_manager import CheckpointManager
-from colosseum.sp2.core.config import ColosseumConfig, load_config
-from colosseum.sp2.core.types import Lineup, SeatAssignment, TrajectoryChunk
-from colosseum.sp2.launcher import setup_run
+from colosseum.coordinator.checkpoint_manager import CheckpointManager
+from colosseum.core.config import ColosseumConfig, load_config
+from colosseum.core.types import Lineup, SeatAssignment, TrajectoryChunk
+from colosseum.launcher import setup_run
 from game_helpers import make_test_run_dir
 
 
 def example_config(name: str):
-    return REPO_ROOT / "configs" / "sp2" / name
+    return REPO_ROOT / "configs" / "examples" / name
 
 
 def _config(name: str, tmp_path, **sections: dict) -> ColosseumConfig:
@@ -40,7 +40,7 @@ def _stop(proc: mp.Process, stop_event) -> None:
 
 def test_worker_produces_chunks(tmp_path):
     """A spawned worker process sends full-length chunks for its agent."""
-    from colosseum.sp2.launcher import _worker_target
+    from colosseum.launcher import _worker_target
 
     config = _config(
         "tic_tac_toe.yaml", tmp_path,
@@ -74,7 +74,7 @@ def test_worker_produces_chunks(tmp_path):
 
 def test_worker_multi_agent_routing(tmp_path):
     """Chunks are routed to the queue of the agent that occupies the slot."""
-    from colosseum.sp2.launcher import _worker_target
+    from colosseum.launcher import _worker_target
 
     config = _config(
         "tic_tac_toe_multi.yaml", tmp_path,
@@ -117,7 +117,7 @@ def test_worker_multi_agent_routing(tmp_path):
 @pytest.mark.timeout(900)
 def test_full_pipeline(tmp_path):
     """Single-agent self-play training runs to completion and saves checkpoints."""
-    from colosseum.sp2.launcher import Launcher
+    from colosseum.launcher import Launcher
 
     config = _config(
         "tic_tac_toe.yaml", tmp_path,
@@ -133,7 +133,7 @@ def test_full_pipeline(tmp_path):
 @pytest.mark.timeout(900)
 def test_full_pipeline_with_checkpoint_pool(tmp_path):
     """Checkpoints are saved every N train steps, plus a final one, and the FIFO pool is respected."""
-    from colosseum.sp2.launcher import Launcher
+    from colosseum.launcher import Launcher
 
     config = _config(
         "tic_tac_toe.yaml", tmp_path,
@@ -159,7 +159,7 @@ def test_full_pipeline_with_checkpoint_pool(tmp_path):
 @pytest.mark.timeout(900)
 def test_multi_agent_pipeline(tmp_path):
     """Two-agent league training runs to completion."""
-    from colosseum.sp2.launcher import Launcher
+    from colosseum.launcher import Launcher
 
     config = _config(
         "tic_tac_toe_multi.yaml", tmp_path,
@@ -182,7 +182,7 @@ def test_multi_agent_learners_both_train_until_the_budget(tmp_path):
     left the workers blocked on its full chunk queue and the other agent starved.
     Learner metrics are read from the run's ``metrics.jsonl`` (T6.3).
     """
-    from colosseum.sp2.launcher import Launcher
+    from colosseum.launcher import Launcher
 
     config = _config(
         "tic_tac_toe_multi.yaml", tmp_path,
@@ -212,7 +212,7 @@ def test_multi_agent_learners_both_train_until_the_budget(tmp_path):
 @pytest.mark.timeout(900)
 def test_subprocess_vec_env_pipeline(tmp_path):
     """Nested spawn (worker -> env subprocesses) trains to completion."""
-    from colosseum.sp2.launcher import Launcher
+    from colosseum.launcher import Launcher
 
     config = _config(
         "tic_tac_toe.yaml", tmp_path,
@@ -234,7 +234,7 @@ def test_subprocess_vec_env_pipeline(tmp_path):
 @pytest.mark.timeout(900)
 def test_full_pipeline_lstm_core(tmp_path):
     """Recurrent end-to-end run (R1-01): worker chunks with LSTM state train in the learner."""
-    from colosseum.sp2.launcher import Launcher
+    from colosseum.launcher import Launcher
 
     config = _config(
         "tic_tac_toe.yaml", tmp_path,

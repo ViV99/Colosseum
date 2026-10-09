@@ -6,11 +6,11 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from colosseum.envs.game import GameSpec, MultiAgentEnv, StepResult
+from colosseum.networks.base import BaseEncoder, BasePolicy, BaseValue
+from colosseum.networks.composed import ComposedModel
 from colosseum.networks.cores import NoCore
-from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv, StepResult
-from colosseum.sp2.networks.base import BaseEncoder, BasePolicy, BaseValue
-from colosseum.sp2.networks.composed import ComposedModel
-from colosseum.sp2.networks.dist import CategoricalDist
+from colosseum.networks.dist import CategoricalDist
 
 
 class MLPEncoder(BaseEncoder):

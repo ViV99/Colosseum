@@ -10,7 +10,7 @@ import pytest
 import torch
 
 from colosseum.core.ipc import assert_no_tensors
-from colosseum.sp2.core.types import (
+from colosseum.core.types import (
     LATEST_NETWORK_ID,
     SLOT_ACT,
     SLOT_BOOT,

@@ -1,21 +1,30 @@
-"""Core data types that flow through the Colosseum distributed RL system.
+"""Core data types of the SP2 pipeline: chunk v2, lineups, match results, commands, weights.
 
-These dataclasses represent the fundamental units of data exchange between
-workers, learners, the weight store, and the coordinator.
+Everything that crosses a process boundary has a numpy form: ``TrajectoryChunk.to_payload``,
+``WeightPayload`` (numpy ``state_dict``), ``WorkerCommand`` (numpy checkpoints) and the plain
+dataclasses ``Lineup`` / ``MatchResult``.
 """
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
 import torch.nn as nn
 
 from colosseum.core.ipc import numpy_to_tensor, tensor_to_numpy
-from colosseum.networks.state import State, state_from_numpy, state_to_numpy, tree_map
+from colosseum.core.tree import Tree, tree_map, tree_to_numpy, tree_to_torch
+from colosseum.networks.state import State, state_from_numpy, state_to_numpy
+from colosseum.networks.state import tree_map as state_tree_map
+
+# Network id of an agent's current weights, as opposed to a checkpoint id ("ckpt_v<N>").
+LATEST_NETWORK_ID = "latest"
+
+# Values of TrajectoryChunk.kind (int8).
+SLOT_ACT, SLOT_BOOT, SLOT_PAD = 0, 1, 2
 
 
 def state_dict_to_numpy(state_dict: Mapping[str, torch.Tensor]) -> dict[str, np.ndarray]:
@@ -28,235 +37,268 @@ def state_dict_from_numpy(state_dict: Mapping[str, np.ndarray]) -> dict[str, tor
     return {key: numpy_to_tensor(value) for key, value in state_dict.items()}
 
 
+def _map_optional(fn: Callable[[Any], Any], tree: Tree | None) -> Tree | None:
+    return None if tree is None else tree_map(fn, tree)
+
+
 @dataclass
 class TrajectoryChunk:
-    """Fixed-length rollout chunk from a single agent slot in a single env.
+    """``S`` consecutive slots of ONE agent (spec block 4).
 
-    Workers collect observations, actions, rewards, etc. over T consecutive
-    timesteps and package them into chunks that are sent to learners for
-    training.  Episode boundaries are handled within chunks: ``dones[t]``
-    marks the end of an episode, and the next timestep starts a new one.
+    Each slot is one of:
+    - ``SLOT_ACT``: a decision of a seat (observation, optional ``global_state``, mask,
+      action, behavior log-probs, the reward accumulated while it was open, ``terminal``);
+    - ``SLOT_BOOT``: only an observation (and ``global_state``) for the learner's bootstrap
+      value; no action, no loss;
+    - ``SLOT_PAD``: a filler that affects nothing.
 
-    Attributes:
-        agent_id: Identifier of the agent that generated this chunk.
-        observations: Stacked observations of shape ``[T, *obs_shape]``.
-        actions: Actions taken at each step, shape ``[T, *act_shape]``.
-        action_log_probs: Log-probabilities of the chosen actions under the
-            behavior policy, shape ``[T]``.
-        rewards: Scalar rewards received after each action, shape ``[T]``.
-        dones: Episode-termination flags, shape ``[T]`` (transition t is the
-            last of its episode).
-        values: Value estimates from the behavior policy, shape ``[T]``.
-        bootstrap_value: Value estimate after the last transition (scalar),
-            0 when the last transition is terminal.
-        behavior_policy_version: Version counter of the policy that was used
-            to collect this chunk.
-        initial_state: Model state (a ``State`` pytree, see
-            ``colosseum.networks.state``) before the chunk's first transition;
-            every tensor leaf has batch dim 1 (``[1, ...]``). ``None`` for
-            stateless models. The learner concatenates these along dim 0 and
-            unrolls the model from them.
-        action_masks: Optional ``[T, mask_size]`` bool masks the behavior
-            policy acted under.
+    ``reset_after[s]`` resets the model state after slot ``s`` (terminal ACTs, truncation
+    BOOTs and PADs). An ACT never sits in the last slot. Trees (``obs``, ``global_state``,
+    ``actions``, ``action_masks``) have leaves ``[S, ...]`` with their native dtypes.
+    ``behavior_unit_logp`` (``[S, K]``) exists only when the role's action has ``K > 1``
+    deciders. ``initial_state`` is the model state before slot 0 (leaves ``[1, ...]``).
     """
 
     agent_id: str
-    observations: torch.Tensor  # [T, *obs_shape]
-    actions: torch.Tensor  # [T, *act_shape]
-    action_log_probs: torch.Tensor  # [T]
-    rewards: torch.Tensor  # [T]
-    dones: torch.Tensor  # [T] bool
-    values: torch.Tensor  # [T]
-    bootstrap_value: torch.Tensor  # scalar
-    behavior_policy_version: int
-    initial_state: State = None  # leaves [1, ...]; None for stateless models
-    action_masks: torch.Tensor | None = None  # [T, mask_size]
-
-    # ------------------------------------------------------------------
-    # Helpers
-    # ------------------------------------------------------------------
+    policy_version: int
+    initial_state: State
+    obs: Tree
+    global_state: Tree | None
+    actions: Tree
+    action_masks: Tree | None
+    kind: torch.Tensor
+    reward: torch.Tensor
+    terminal: torch.Tensor
+    reset_after: torch.Tensor
+    behavior_logp: torch.Tensor
+    behavior_unit_logp: torch.Tensor | None
 
     @property
-    def chunk_length(self) -> int:
-        """Number of timesteps ``T`` in this chunk."""
-        return self.observations.shape[0]
+    def num_slots(self) -> int:
+        return int(self.kind.shape[0])
 
-    def _apply_to_tensors(self, fn) -> TrajectoryChunk:
-        """Return a copy with *fn* applied to every tensor (including state leaves)."""
+    @property
+    def num_acts(self) -> int:
+        return int((self.kind == SLOT_ACT).sum())
+
+    def _apply(self, fn: Callable[[torch.Tensor], torch.Tensor]) -> TrajectoryChunk:
         return TrajectoryChunk(
             agent_id=self.agent_id,
-            observations=fn(self.observations),
-            actions=fn(self.actions),
-            action_log_probs=fn(self.action_log_probs),
-            rewards=fn(self.rewards),
-            dones=fn(self.dones),
-            values=fn(self.values),
-            bootstrap_value=fn(self.bootstrap_value),
-            behavior_policy_version=self.behavior_policy_version,
-            initial_state=tree_map(fn, self.initial_state),
-            action_masks=fn(self.action_masks) if self.action_masks is not None else None,
+            policy_version=self.policy_version,
+            initial_state=state_tree_map(fn, self.initial_state),
+            obs=tree_map(fn, self.obs),
+            global_state=_map_optional(fn, self.global_state),
+            actions=tree_map(fn, self.actions),
+            action_masks=_map_optional(fn, self.action_masks),
+            kind=fn(self.kind),
+            reward=fn(self.reward),
+            terminal=fn(self.terminal),
+            reset_after=fn(self.reset_after),
+            behavior_logp=fn(self.behavior_logp),
+            behavior_unit_logp=None if self.behavior_unit_logp is None else fn(self.behavior_unit_logp),
         )
 
     def to(self, device: str | torch.device) -> TrajectoryChunk:
-        """Return a copy with all tensors moved to *device*."""
-        return self._apply_to_tensors(lambda t: t.to(device))
+        """Copy with every tensor (state leaves included) on ``device``."""
+        return self._apply(lambda t: t.to(device))
 
     def pin_memory(self) -> TrajectoryChunk:
-        """Pin all tensors to page-locked memory for faster host-to-device copies."""
-        return self._apply_to_tensors(lambda t: t.pin_memory())
+        """Copy with every tensor in page-locked memory."""
+        return self._apply(lambda t: t.pin_memory())
 
     def to_payload(self) -> dict[str, Any]:
-        """Numpy + primitives form for crossing a process boundary (spec block 2)."""
+        """Numpy trees + primitives only, for crossing a process boundary."""
         return {
             "agent_id": str(self.agent_id),
-            "observations": tensor_to_numpy(self.observations),
-            "actions": tensor_to_numpy(self.actions),
-            "action_log_probs": tensor_to_numpy(self.action_log_probs),
-            "rewards": tensor_to_numpy(self.rewards),
-            "dones": tensor_to_numpy(self.dones),
-            "values": tensor_to_numpy(self.values),
-            "bootstrap_value": float(self.bootstrap_value),
-            "behavior_policy_version": int(self.behavior_policy_version),
+            "policy_version": int(self.policy_version),
             "initial_state": state_to_numpy(self.initial_state),
-            "action_masks": None if self.action_masks is None else tensor_to_numpy(self.action_masks),
+            "obs": tree_to_numpy(self.obs),
+            "global_state": None if self.global_state is None else tree_to_numpy(self.global_state),
+            "actions": tree_to_numpy(self.actions),
+            "action_masks": None if self.action_masks is None else tree_to_numpy(self.action_masks),
+            "kind": tensor_to_numpy(self.kind),
+            "reward": tensor_to_numpy(self.reward),
+            "terminal": tensor_to_numpy(self.terminal),
+            "reset_after": tensor_to_numpy(self.reset_after),
+            "behavior_logp": tensor_to_numpy(self.behavior_logp),
+            "behavior_unit_logp": (
+                None if self.behavior_unit_logp is None else tensor_to_numpy(self.behavior_unit_logp)
+            ),
         }
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> TrajectoryChunk:
         """Rebuild a chunk (CPU tensors) from :meth:`to_payload` output."""
-        masks = payload.get("action_masks")
+        gs, masks, unit_logp = payload["global_state"], payload["action_masks"], payload["behavior_unit_logp"]
         return cls(
             agent_id=str(payload["agent_id"]),
-            observations=numpy_to_tensor(payload["observations"]),
-            actions=numpy_to_tensor(payload["actions"]),
-            action_log_probs=numpy_to_tensor(payload["action_log_probs"]),
-            rewards=numpy_to_tensor(payload["rewards"]),
-            dones=numpy_to_tensor(payload["dones"]),
-            values=numpy_to_tensor(payload["values"]),
-            bootstrap_value=torch.tensor(float(payload["bootstrap_value"]), dtype=torch.float32),
-            behavior_policy_version=int(payload["behavior_policy_version"]),
-            initial_state=state_from_numpy(payload.get("initial_state")),
-            action_masks=None if masks is None else numpy_to_tensor(masks),
+            policy_version=int(payload["policy_version"]),
+            initial_state=state_from_numpy(payload["initial_state"]),
+            obs=tree_to_torch(payload["obs"]),
+            global_state=None if gs is None else tree_to_torch(gs),
+            actions=tree_to_torch(payload["actions"]),
+            action_masks=None if masks is None else tree_to_torch(masks),
+            kind=numpy_to_tensor(payload["kind"]),
+            reward=numpy_to_tensor(payload["reward"]),
+            terminal=numpy_to_tensor(payload["terminal"]),
+            reset_after=numpy_to_tensor(payload["reset_after"]),
+            behavior_logp=numpy_to_tensor(payload["behavior_logp"]),
+            behavior_unit_logp=None if unit_logp is None else numpy_to_tensor(unit_logp),
         )
 
 
-# Network id of an agent's current (latest) weights, as opposed to a checkpoint id
-# ("ckpt_v<N>"); used in slot network maps, SeatResult.network_id and the worker's model pool.
-LATEST_NETWORK_ID = "latest"
+_SLOT_RULES = (
+    "a terminal ACT without reset_after",
+    "an open ACT with reset_after",
+    "a PAD without reset_after",
+    "a terminal flag on a non-ACT slot",
+    "an ACT in the last slot",
+    "an open ACT followed by a PAD",
+    "a BOOT that does not follow an open ACT",
+    "a PAD that does not follow the end of an episode",
+    "a BOOT without reset_after before the last slot",
+)
+
+
+def _spell_slots(kind: np.ndarray, terminal: np.ndarray, reset_after: np.ndarray) -> str:
+    """Slot letters as in the SP2 plan: A open ACT, T terminal ACT, B / R BOOT, P PAD, ? unknown."""
+    letters = []
+    for k, term, reset in zip(kind.tolist(), terminal.tolist(), reset_after.tolist(), strict=True):
+        if k == SLOT_ACT:
+            letters.append("T" if term else "A")
+        elif k == SLOT_BOOT:
+            letters.append("R" if reset else "B")
+        else:
+            letters.append("P" if k == SLOT_PAD else "?")
+    return "".join(letters)
+
+
+def validate_slot_structure(chunk: TrajectoryChunk) -> None:
+    """Raise ``ValueError`` (naming the agent) if ``chunk``'s slots break the chunk v2 rules.
+
+    The rules the worker's ``RolloutBuffer`` guarantees and the learner's V-trace relies on:
+    an ACT is never the last slot; an open (non-terminal) ACT is followed by an ACT or a
+    BOOT; a BOOT follows an open ACT; a PAD follows a slot that ends an episode (a terminal
+    ACT or a BOOT with ``reset_after``, possibly after other PADs); a BOOT without
+    ``reset_after`` takes only the last slot. The flags must match the slot kind (APPO
+    resets the recurrent state from ``reset_after``): a terminal ACT and a PAD have
+    ``reset_after``, an open ACT has not, and only ACTs are ``terminal``. The earliest broken
+    slot is reported. A cheap numpy check over ``kind`` / ``terminal`` / ``reset_after``; the
+    slot letters for the message are spelled only on failure.
+    """
+    kind = chunk.kind.cpu().numpy()
+    terminal = chunk.terminal.cpu().numpy().astype(bool)
+    reset_after = chunk.reset_after.cpu().numpy().astype(bool)
+    where = f"agent {chunk.agent_id!r}: malformed chunk v2 (policy_version {chunk.policy_version}"
+    if not (kind.ndim == terminal.ndim == reset_after.ndim == 1
+            and kind.shape == terminal.shape == reset_after.shape):
+        raise ValueError(
+            f"{where}): kind, terminal and reset_after must be 1-D arrays of one length, got shapes "
+            f"{kind.shape}, {terminal.shape}, {reset_after.shape}"
+        )
+    if kind.size == 0:
+        raise ValueError(f"{where}): the chunk has no slots")
+
+    def fail(slot: int, problem: str) -> ValueError:
+        return ValueError(f"{where}, slots {_spell_slots(kind, terminal, reset_after)!r}): slot {slot}: {problem}")
+
+    unknown = np.flatnonzero(~np.isin(kind, (SLOT_ACT, SLOT_BOOT, SLOT_PAD)))
+    if unknown.size:
+        raise fail(int(unknown[0]), f"unknown slot kind {kind[unknown[0]]}")
+
+    act, boot, pad = kind == SLOT_ACT, kind == SLOT_BOOT, kind == SLOT_PAD
+    open_act = act & ~terminal
+    ends_episode = (act & terminal) | (boot & reset_after)
+    prev_open = np.concatenate([[False], open_act[:-1]])
+    prev_pad = np.concatenate([[False], pad[:-1]])
+    prev_ends = np.concatenate([[False], ends_episode[:-1]])
+    next_pad = np.concatenate([pad[1:], [False]])
+    not_last = np.arange(kind.size) < kind.size - 1
+    broken = (
+        act & terminal & ~reset_after,          # a terminal ACT without reset_after
+        open_act & reset_after,                 # an open ACT with reset_after
+        pad & ~reset_after,                     # a PAD without reset_after
+        ~act & terminal,                        # a terminal flag on a non-ACT slot
+        act & ~not_last,                        # an ACT in the last slot
+        open_act & next_pad,                    # an open ACT followed by a PAD
+        boot & ~prev_open,                      # a BOOT that does not follow an open ACT
+        pad & ~prev_pad & ~prev_ends,           # a PAD (first of a run) not after an episode end
+        boot & ~reset_after & not_last,         # a BOOT without reset_after before the last slot
+    )
+    # Earliest broken slot; ties go to the first rule in _SLOT_RULES.
+    found = [(int(np.argmax(mask)), r) for r, mask in enumerate(broken) if mask.any()]
+    if found:
+        slot, rule = min(found)
+        raise fail(slot, _SLOT_RULES[rule])
 
 
 @dataclass
-class PlayerSlot:
-    """Assignment for one player slot in a match.
-
-    The coordinator fills each player slot in a match with either the latest
-    weights of an agent or a specific frozen checkpoint.
-
-    Attributes:
-        agent_id: Which agent occupies this slot.
-        checkpoint_id: Specific checkpoint to load.  ``None`` means "use the
-            latest weights from the weight store" (network id :data:`LATEST_NETWORK_ID`).
-        collect_trajectories: Whether to collect trajectories from this slot
-            and send them to the agent's learner.  Frozen sparring partners
-            typically have this set to ``False``.
-    """
+class SeatAssignment:
+    """Who plays one seat: an agent's latest weights or a checkpoint, and whether it collects."""
 
     agent_id: str
-    checkpoint_id: str | None = None
-    collect_trajectories: bool = True
+    network_id: str = LATEST_NETWORK_ID
+    collect: bool = True
 
 
 @dataclass
-class MatchConfig:
-    """Full specification for a single match to be played by a worker.
+class Lineup:
+    """One match composition: a layout of the game and one assignment per seat of it."""
 
-    Attributes:
-        match_id: Globally unique identifier for this match.
-        env_config: Extra keyword arguments forwarded to the environment
-            constructor (e.g. board size, time limit).
-        player_slots: Ordered list of player-slot assignments.  The length
-            must equal the number of players expected by the environment.
-    """
-
-    match_id: str
-    env_config: dict[str, Any] = field(default_factory=dict)
-    player_slots: list[PlayerSlot] = field(default_factory=list)
-
-    @property
-    def num_players(self) -> int:
-        return len(self.player_slots)
+    layout: str
+    seats: list[SeatAssignment]
 
 
 @dataclass
 class SeatResult:
-    """Outcome of one seat of a finished match.
-
-    Attributes:
-        seat: Seat (player slot) index in the env.
-        agent_id: Base agent that played the seat.
-        network_id: ``"latest"`` or a checkpoint id (``"ckpt_v<N>"``).
-        outcome: In [0, 1] (1 = best), from :mod:`colosseum.core.outcomes`: the
-            env's terminal ``outcome``/``rank`` if every seat has one, else
-            derived from episode rewards.
-        reward: Undiscounted episode return of the seat.
-        rank: The env's terminal ``rank`` for the seat (1 = best), if provided.
-            Kept as a float: ties may be reported as fractional ranks (e.g. 2.5).
-    """
+    """One seat of a finished match. ``reward`` is the undiscounted episode return."""
 
     seat: int
+    role: str
+    team: int
     agent_id: str
     network_id: str
-    outcome: float
     reward: float
-    rank: float | None = None
+    eliminated_step: int | None = None
+
+
+@dataclass
+class TeamResult:
+    """One team of a finished match: rank (1 = best, ties share) and score."""
+
+    team: int
+    rank: float
+    score: float
 
 
 @dataclass
 class MatchResult:
-    """A finished match, one :class:`SeatResult` per seat (no key collisions)."""
+    """A finished match: one SeatResult per occupied seat, one TeamResult per team."""
 
     match_id: str
-    seats: list[SeatResult] = field(default_factory=list)
-    episode_length: int = 0
+    layout: str
+    outcome_kind: Literal["score", "wdl", "rank"]
+    seats: list[SeatResult]
+    teams: list[TeamResult]
+    episode_length: int
 
 
 @dataclass
 class WorkerCommand:
-    """Runtime match-assignment update pushed from the coordinator to a worker.
+    """Runtime update from the coordinator to one worker.
 
-    Lets matchmaking evolve *during* training: the coordinator periodically
-    re-generates slot assignments (e.g. PFSP opponent picks, fresh self-play
-    checkpoints) and ships them to each worker, which applies them per env at
-    its next episode boundary. ``new_checkpoints`` carries the checkpoint
-    weights (numpy, see :func:`state_dict_to_numpy`) the worker does not have
-    yet (deltas only), so historical opponents can enter its model pool
-    without restarting the process.
-
-    Attributes:
-        slot_agent_map: ``[num_envs][num_players]`` -> agent_id.
-        slot_network_map: ``[num_envs][num_players]`` -> ``"latest"`` or a checkpoint id.
-        collect_mask: ``[num_envs][num_players]`` -> whether the slot collects trajectories.
-        new_checkpoints: ``{agent_id: {checkpoint_id: numpy state_dict}}``.
+    ``lineups[e]`` replaces env ``e``'s lineup at its next episode end (``None`` = keep).
+    ``new_checkpoints`` (``{agent_id: {checkpoint_id: numpy state_dict}}``) carries only the
+    checkpoints the worker does not have yet; they are loaded at once.
     """
 
-    slot_agent_map: list[list[str]] = field(default_factory=list)
-    slot_network_map: list[list[str]] = field(default_factory=list)
-    collect_mask: list[list[bool]] = field(default_factory=list)
+    lineups: list[Lineup | None]
     new_checkpoints: dict[str, dict[str, dict[str, np.ndarray]]] = field(default_factory=dict)
 
 
 @dataclass
 class WeightPayload:
-    """Model weights flowing from a learner to workers (numpy, never torch).
-
-    Attributes:
-        agent_id: The agent these weights belong to.
-        policy_version: Monotonically increasing version counter (number of
-            train steps). Workers stamp it on the chunks they collect so the
-            learner can compute V-trace importance weights.
-        state_dict: ``model.state_dict()`` as numpy arrays (see
-            :func:`state_dict_to_numpy`).
-    """
+    """Model weights flowing from a learner to workers (numpy, never torch)."""
 
     agent_id: str
     policy_version: int

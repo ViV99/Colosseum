@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numbers
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -39,13 +39,51 @@ def flatten(prefix: str, value: Any) -> dict[str, float]:
     return out
 
 
+def _episodes_row(ep: dict[str, Any]) -> dict[str, Any]:
+    """An ``episodes`` record without its W/D/L counts (top level and per role), for WandB.
+
+    W/D/L counts stay in ``metrics.jsonl`` only, as in SP1.
+    """
+    row = {k: v for k, v in ep.items() if k not in ("wdl", "by_layout")}
+    row["by_layout"] = {layout: {role: {k: v for k, v in cell.items() if k != "wdl"} for role, cell in roles.items()}
+                        for layout, roles in ep.get("by_layout", {}).items()}
+    return row
+
+
+def wr_vs_past_over_layouts(layouts: Mapping[str, Mapping[str, Any]], agent_id: str) -> float | None:
+    """``wr_vs_past`` of ``agent_id`` over all layouts, weighted by each layout's ``past_games``
+    (counted latest-vs-checkpoint member pairs, see ``RatingBook``)."""
+    total = weight = 0.0
+    for table in layouts.values():
+        value = table.get("wr_vs_past", {}).get(agent_id)
+        games = table.get("past_games", {}).get(agent_id, 0)
+        if value is not None and games:
+            total += value * games
+            weight += games
+    return total / weight if weight else None
+
+
+def wr_arena_over_layouts(layouts: Mapping[str, Mapping[str, Any]], agent_id: str) -> float | None:
+    """Win rate of ``agent_id`` against other agents over all layouts, weighted by ``games``
+    (counted member pairs per opponent, not matches; see ``RatingBook``)."""
+    total = games = 0.0
+    for table in layouts.values():
+        rates = table.get("win_rates", {}).get(agent_id, {})
+        for other, n in table.get("games", {}).get(agent_id, {}).items():
+            if n:
+                total += rates[other] * n
+                games += n
+    return total / games if games else None
+
+
 class MetricsHub:
     """Writes ``train`` records as they arrive (every ``log_interval`` train steps per agent).
 
     Every ``console_interval_sec`` it also writes ``episodes``, ``system`` and ``ratings``
-    records, rewrites ``ratings.json`` and prints one console line per agent.
-    ``initial_env_steps`` / ``initial_train_steps`` are the counters a resumed run continues
-    from (rate baselines, see ``SystemStats``).
+    records (``ratings``: ``{"env_steps", "layouts"}`` with one table set per layout), rewrites
+    ``ratings.json`` with the same content and prints one console line per agent (ratings
+    aggregated over layouts). ``initial_env_steps`` / ``initial_train_steps`` are the counters
+    a resumed run continues from (rate baselines, see ``SystemStats``).
     """
 
     def __init__(self, *, writer: MetricsWriter, ratings_path: str | Path, agent_ids: list[str],
@@ -89,6 +127,7 @@ class MetricsHub:
 
     def maybe_tick(self, *, env_steps: int, ratings: dict, queue_depths: dict[str, int],
                    force: bool = False) -> bool:
+        """``ratings`` is ``RatingBook.snapshot()``: ``{layout: {elo, win_rates, ...}}``."""
         now = self._clock()
         if not force and now - self._last_tick < self._interval:
             return False
@@ -99,28 +138,21 @@ class MetricsHub:
             self._last_returns[agent_id] = ep["return_mean"]
         system = self._system.snapshot(env_steps, queue_depths)
         self._writer.write("system", **system)
-        self._writer.write("ratings", env_steps=int(env_steps), **ratings)
-        write_json_atomic(self._ratings_path, {"env_steps": int(env_steps), **ratings})
+        self._writer.write("ratings", env_steps=int(env_steps), layouts=ratings)
+        write_json_atomic(self._ratings_path, {"env_steps": int(env_steps), "layouts": ratings})
         if self._wandb is not None:
             row = flatten("system", {k: v for k, v in system.items() if k != "env_steps"})
             row.update(flatten("ratings", ratings))
             for agent_id, ep in episodes.items():
-                row.update(flatten(f"episodes/{agent_id}", {k: v for k, v in ep.items() if k != "wdl"}))
+                row.update(flatten(f"episodes/{agent_id}", _episodes_row(ep)))
             self._wandb.log_global(row, int(env_steps))
         self._report_console(int(env_steps), system, ratings)
         return True
 
     def _report_console(self, env_steps: int, system: dict, ratings: dict) -> None:
-        wr_vs_past = ratings.get("wr_vs_past", {})
-        win_rates = ratings.get("win_rates", {})
-        games = ratings.get("games", {})
         lines = []
         for agent_id in self._agent_ids:
             train = self._last_train.get(agent_id, {})
-            n_games = sum(games.get(agent_id, {}).values())
-            wr_arena = None
-            if n_games:
-                wr_arena = sum(win_rates[agent_id][b] * g for b, g in games[agent_id].items()) / n_games
             lines.append(self._console.format_line(
                 agent_id,
                 train_step=int(train.get("train_step", 0)),
@@ -129,8 +161,8 @@ class MetricsHub:
                 loss=train.get("total_loss"),
                 entropy=train.get("entropy"),
                 return_mean=self._last_returns.get(agent_id),
-                wr_vs_past=wr_vs_past.get(agent_id),
-                wr_arena=wr_arena,
+                wr_vs_past=wr_vs_past_over_layouts(ratings, agent_id),
+                wr_arena=wr_arena_over_layouts(ratings, agent_id),
             ))
         self._console.emit(lines)
 

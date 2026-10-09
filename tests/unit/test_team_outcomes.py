@@ -4,8 +4,8 @@ import math
 import pytest
 
 from colosseum.core.errors import EnvContractError
-from colosseum.sp2.core.outcomes import pairwise_rank_score, resolve_outcome
-from colosseum.sp2.envs.game import Outcome
+from colosseum.core.outcomes import pairwise_rank_score, resolve_outcome
+from colosseum.envs.game import Outcome
 
 TEAMS_2V1V1 = [[0, 1], [2], [3]]
 

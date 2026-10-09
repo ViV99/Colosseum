@@ -5,9 +5,9 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.networks.base import BaseEncoder, BasePolicy, BaseValue
-from colosseum.sp2.networks.dist import Distribution, make_distribution
+from colosseum.core.specs import ActionSpec
+from colosseum.networks.base import BaseEncoder, BasePolicy, BaseValue
+from colosseum.networks.dist import Distribution, make_distribution
 
 
 class TicTacToeEncoder(BaseEncoder):

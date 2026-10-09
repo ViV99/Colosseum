@@ -4,9 +4,9 @@ from __future__ import annotations
 import numpy as np
 import torch
 
-from colosseum.sp2.bc.offline_bc import OfflineBCTrainer
-from colosseum.sp2.core.specs import ActionSpec, ObsSpec
-from colosseum.sp2.networks.model import act
+from colosseum.bc.offline_bc import OfflineBCTrainer
+from colosseum.core.specs import ActionSpec, ObsSpec
+from colosseum.networks.model import act
 from game_learning_envs import MaskedChoiceGame, make_mlp_model
 
 

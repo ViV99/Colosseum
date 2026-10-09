@@ -13,17 +13,17 @@ import pytest
 import torch
 import torch.nn as nn
 
-from colosseum.core.errors import ConfigError
-from colosseum.sp2.coordinator import checkpoint_manager as cm_module
-from colosseum.sp2.coordinator.checkpoint_manager import (
+from colosseum.coordinator import checkpoint_manager as cm_module
+from colosseum.coordinator.checkpoint_manager import (
     CheckpointManager,
     check_model_state,
     check_role_signature,
     load_checkpoint_dir,
     resolve_resume,
 )
-from colosseum.sp2.core.config import ColosseumConfig, config_hash
-from colosseum.sp2.learner.learner import apply_resume_state, make_checkpoint_payload, send_checkpoint
+from colosseum.core.config import ColosseumConfig, config_hash
+from colosseum.core.errors import ConfigError
+from colosseum.learner.learner import apply_resume_state, make_checkpoint_payload, send_checkpoint
 from game_helpers import FakeAlgorithm, make_coordinator, make_test_config
 
 
@@ -264,7 +264,7 @@ def test_resolve_resume_checkpoint_dir_run_dir_and_pt(tmp_path):
 
 
 def test_classify_resume_source_reads_only_the_layout(tmp_path):
-    from colosseum.sp2.coordinator.checkpoint_manager import (
+    from colosseum.coordinator.checkpoint_manager import (
         RESUME_CHECKPOINT_DIR,
         RESUME_PT_FILE,
         RESUME_RUN_DIR,

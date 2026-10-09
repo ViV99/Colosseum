@@ -7,9 +7,9 @@ import multiprocessing as mp
 import pytest
 from click.testing import CliRunner
 
+from colosseum.cli import main
 from colosseum.core.errors import ConfigError
-from colosseum.sp2.cli import main
-from colosseum.sp2.networks.model import UnrollOutput
+from colosseum.networks.model import UnrollOutput
 from game_helpers import GameTestModel, make_test_config, write_test_config
 
 
@@ -49,8 +49,8 @@ def test_bc_eval_and_validate_reject_the_config_first(tmp_path):
 
 def test_distributed_roles_reject_the_config_before_serving_or_spawning(tmp_path, monkeypatch,
                                                                         restore_root_logging):
-    from colosseum.sp2 import distributed
-    from colosseum.sp2.transport import grpc_transport
+    from colosseum import distributed
+    from colosseum.transport import grpc_transport
 
     monkeypatch.setattr(grpc_transport, "serve_trajectory_receiver", _fail("serve_trajectory_receiver"))
     with pytest.raises(ConfigError, match="time-major values"):
@@ -65,7 +65,7 @@ def test_distributed_roles_reject_the_config_before_serving_or_spawning(tmp_path
 
 def test_train_rejects_an_invalid_config_without_creating_a_run_dir(tmp_path, monkeypatch, restore_root_logging,
                                                                      restore_global_rng):
-    import colosseum.sp2.launcher as launcher_module
+    import colosseum.launcher as launcher_module
 
     monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *args, **kwargs: None)
     launched = []
@@ -92,7 +92,7 @@ def test_train_rejects_an_invalid_config_without_creating_a_run_dir(tmp_path, mo
 
 def test_train_rejects_a_missing_resume_source_without_creating_a_run_dir(tmp_path, monkeypatch,
                                                                          restore_root_logging):
-    import colosseum.sp2.launcher as launcher_module
+    import colosseum.launcher as launcher_module
 
     monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *args, **kwargs: None)
     monkeypatch.setattr(launcher_module, "Launcher", _fail("Launcher"))
@@ -109,7 +109,7 @@ def test_seed_is_applied_after_overrides(tmp_path, monkeypatch, restore_root_log
 
     import torch
 
-    import colosseum.sp2.launcher as launcher_module
+    import colosseum.launcher as launcher_module
 
     # run_training forces the spawn start method; keep the test free of global side effects.
     monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *args, **kwargs: None)
@@ -144,11 +144,11 @@ def test_cli_validate_malformed_set_value_exits_1(tmp_path):
     (1, 3, 1, 0.0, False),   # single agent owns everything
 ])
 def test_static_ownership_skew_warning(workers, envs, agents, refresh, warns, caplog):
-    from colosseum.sp2.launcher import warn_static_ownership_skew
+    from colosseum.launcher import warn_static_ownership_skew
 
     cfg = make_test_config("turns", agents={f"a{i}": {} for i in range(agents)},
                            rollout={"num_workers": workers, "envs_per_worker": envs,
                                     "match_refresh_interval_sec": refresh})
-    with caplog.at_level(logging.WARNING, logger="colosseum.sp2.launcher"):
+    with caplog.at_level(logging.WARNING, logger="colosseum.launcher"):
         warn_static_ownership_skew(cfg)
     assert any("match_refresh_interval_sec" in r.getMessage() for r in caplog.records) == warns

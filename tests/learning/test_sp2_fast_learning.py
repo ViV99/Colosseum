@@ -8,12 +8,12 @@ import time
 import pytest
 import torch
 
-from colosseum.sp2.algorithms.appo import APPO
-from colosseum.sp2.core.config import AlgorithmConfig
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.core.types import Lineup, SeatAssignment, TrajectoryChunk, WeightPayload
-from colosseum.sp2.networks.model import act
-from colosseum.sp2.worker.rollout_loop import LoopIO, RolloutLoop
+from colosseum.algorithms.appo import APPO
+from colosseum.core.config import AlgorithmConfig
+from colosseum.core.specs import ActionSpec
+from colosseum.core.types import Lineup, SeatAssignment, TrajectoryChunk, WeightPayload
+from colosseum.networks.model import act
+from colosseum.worker.rollout_loop import LoopIO, RolloutLoop
 from game_learning_envs import ContextualBanditGame, ShortChainGame, make_mlp_model
 
 pytestmark = pytest.mark.usefixtures("restore_global_rng")

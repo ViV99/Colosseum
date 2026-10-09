@@ -3,15 +3,15 @@ import numpy as np
 import pytest
 import torch
 
+from colosseum.core.config import ColosseumConfig
 from colosseum.core.errors import ConfigError, EnvContractError
+from colosseum.core.registry import build_model, env_spec, import_class, make_env
+from colosseum.core.specs import ActionSpec, ObsSpec
+from colosseum.core.tree import tree_index, tree_stack, tree_to_torch
+from colosseum.envs.game import GameSpec, RoleSpec, SeatSpec
+from colosseum.networks.composed import ComposedModel
 from colosseum.networks.cores import LSTMCore
-from colosseum.sp2.core.config import ColosseumConfig
-from colosseum.sp2.core.registry import build_model, env_spec, import_class, make_env
-from colosseum.sp2.core.specs import ActionSpec, ObsSpec
-from colosseum.sp2.core.tree import tree_index, tree_stack, tree_to_torch
-from colosseum.sp2.envs.game import GameSpec, RoleSpec, SeatSpec
-from colosseum.sp2.networks.composed import ComposedModel
-from colosseum.sp2.networks.model import PolicyModel, act
+from colosseum.networks.model import PolicyModel, act
 from game_helpers import GlobalStateGame, RandomPolicy, SoloCounterGame, UnitsGame
 
 UNITS_ROLE = UnitsGame(max_units=3).spec.roles["player"]
@@ -105,7 +105,7 @@ def test_critic_encoder_needs_a_global_state():
         build_model(cfg, UNITS_ROLE)
     cfg = _config({"encoder_class": "game_helpers.GenericEncoder", "policy_class": "game_helpers.TreePolicyHead",
                    "value_class": "game_helpers.GenericValue", "critic_encoder_class": "game_helpers.GenericValue"})
-    with pytest.raises(ConfigError, match="must subclass colosseum.sp2.networks.base.BaseCriticEncoder"):
+    with pytest.raises(ConfigError, match="must subclass colosseum.networks.base.BaseCriticEncoder"):
         build_model(cfg, GS_ROLE)
 
 
@@ -124,7 +124,7 @@ def test_kwargs_win_over_injection():
 
 
 def test_model_class_must_be_a_policy_model():
-    with pytest.raises(ConfigError, match="must subclass colosseum.sp2.networks.model.PolicyModel"):
+    with pytest.raises(ConfigError, match="must subclass colosseum.networks.model.PolicyModel"):
         build_model(_config({"model_class": "test_build_model_v2.NotAModel"}), UNITS_ROLE)
     assert issubclass(import_class("game_helpers.RandomPolicy"), PolicyModel)
 
@@ -144,11 +144,11 @@ def test_make_env_and_env_spec():
     assert list(spec.layouts) == ["solo"] and _CountingGame.closed == 1
     with pytest.raises(ConfigError, match="Failed to create env 'game_helpers.UnitsGame': TypeError"):
         make_env(_config(env="game_helpers.UnitsGame", env_kwargs={"bogus": 1}))
-    with pytest.raises(ConfigError, match="must subclass colosseum.sp2.envs.game.MultiAgentEnv"):
+    with pytest.raises(ConfigError, match="must subclass colosseum.envs.game.MultiAgentEnv"):
         make_env(_config(env="collections.OrderedDict"))
     with pytest.raises(EnvContractError, match="team numbers must be exactly"):
         env_spec(_config(env="test_build_model_v2._BadTeams"))
-    with pytest.raises(ConfigError, match="spec must be a colosseum.sp2.envs.game.GameSpec"):
+    with pytest.raises(ConfigError, match="spec must be a colosseum.envs.game.GameSpec"):
         env_spec(_config(env="test_build_model_v2._NoSpec"))
 
 

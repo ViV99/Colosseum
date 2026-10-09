@@ -1,13 +1,13 @@
 """A short SP2 `train` writes the run dir, the resolved config and per-process logs (T7.1)."""
 from __future__ import annotations
 
-from cli_runner import TTT_SP2_CONFIG, run_train
-from colosseum.sp2.coordinator.checkpoint_manager import resolve_resume
-from colosseum.sp2.core.config import load_config
+from cli_runner import TTT_CONFIG, run_train
+from colosseum.coordinator.checkpoint_manager import resolve_resume
+from colosseum.core.config import load_config
 
 
 def test_run_dir_has_resolved_config_and_process_logs(tmp_path):
-    run = run_train(TTT_SP2_CONFIG, tmp_path, name="logs-run", module="colosseum.sp2")
+    run = run_train(TTT_CONFIG, tmp_path, name="logs-run")
     assert run.returncode == 0, run.stderr[-3000:]
     assert f"Run directory: {run.root}" in run.stdout
     cfg = load_config(run.root / "config.resolved.yaml")

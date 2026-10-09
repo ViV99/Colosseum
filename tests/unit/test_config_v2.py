@@ -3,8 +3,7 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
-from colosseum.core.errors import ConfigError
-from colosseum.sp2.core.config import (
+from colosseum.core.config import (
     AlgorithmConfig,
     CheckpointConfig,
     ColosseumConfig,
@@ -16,6 +15,7 @@ from colosseum.sp2.core.config import (
     load_config,
     parse_override_value,
 )
+from colosseum.core.errors import ConfigError
 
 BASE = {
     "env": {"env_class": "my_game.game.MyGame"},
@@ -32,7 +32,7 @@ def _write(tmp_path, data):
 
 def test_defaults():
     cfg = ColosseumConfig.model_validate(BASE)
-    assert cfg.algorithm.algorithm_class == "colosseum.sp2.algorithms.appo.APPO"
+    assert cfg.algorithm.algorithm_class == "colosseum.algorithms.appo.APPO"
     assert (cfg.algorithm.ratio_mode, cfg.algorithm.unit_trace, cfg.algorithm.entropy_reduction) == \
         ("auto", "auto", "auto")
     assert cfg.env.max_idle_steps == 1000 and cfg.env.kwargs == {}

@@ -1,4 +1,4 @@
-"""`python -m colosseum.sp2 train` on toy games: self-play, asymmetric league, FFA layouts,
+"""`python -m colosseum train` on toy games: self-play, asymmetric league, FFA layouts,
 cooperative mixed teams, resume with role signatures (T5.4)."""
 from __future__ import annotations
 
@@ -8,12 +8,10 @@ from pathlib import Path
 from cli_runner import TrainRun, run_train
 from game_helpers import write_test_config
 
-SP2 = "colosseum.sp2"
-
 
 def train(tmp_path: Path, game: str, name: str, overrides: dict[str, str] | None = None, **sections) -> TrainRun:
     config = write_test_config(tmp_path / f"{name}.yaml", game, **sections)
-    return run_train(config, tmp_path, name=name, overrides=overrides, module=SP2)
+    return run_train(config, tmp_path, name=name, overrides=overrides)
 
 
 def metas(run: TrainRun, agent_id: str) -> list[dict]:
@@ -73,13 +71,13 @@ def test_cooperative_game_with_mixed_teammates_fills_the_cross_play_table(tmp_pa
 
 def test_resume_continues_versions_and_checks_the_role_signature(tmp_path):
     config = write_test_config(tmp_path / "turns.yaml", "turns")
-    first = run_train(config, tmp_path, name="first", module=SP2,
+    first = run_train(config, tmp_path, name="first",
                       overrides={"training.total_timesteps": "1500", "checkpoint.interval": "5"})
     assert first.returncode == 0, first.stderr[-3000:]
     final = metas(first, "agent_0")[-1]
     version = final["policy_version"]
 
-    second = run_train(config, tmp_path, name="second", module=SP2,
+    second = run_train(config, tmp_path, name="second",
                        overrides={"training.total_timesteps": "3000", "training.resume_from": str(first.root)})
     assert second.returncode == 0, second.stderr[-3000:]
     assert f"(policy_version {version})" in second.log("main")
@@ -88,7 +86,7 @@ def test_resume_continues_versions_and_checks_the_role_signature(tmp_path):
 
     ckpt = first.root / "checkpoints" / "agent_0" / f"ckpt_v{version}"
     (ckpt / "meta.json").write_text(json.dumps({**final, "role_signature": "another-game"}))
-    third = run_train(config, tmp_path, name="third", module=SP2,
+    third = run_train(config, tmp_path, name="third",
                       overrides={"training.total_timesteps": "3000", "training.resume_from": str(first.root)})
     assert third.returncode == 1
     assert "Config error" in third.stderr and "role signature" in third.stderr and str(ckpt) in third.stderr

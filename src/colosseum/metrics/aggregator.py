@@ -1,36 +1,69 @@
-"""Per-interval aggregation of match results and system throughput."""
+"""Per-interval aggregation of match results (by layout and role) and system throughput."""
 
 from __future__ import annotations
 
 import time
 from collections import defaultdict
 from collections.abc import Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
-from colosseum.core.types import LATEST_NETWORK_ID
+from colosseum.core.types import LATEST_NETWORK_ID, MatchResult, SeatResult
 
 OPPONENT_TYPES = ("latest", "past", "arena")
 # Default cadence of worker stats (``rollout_worker_process(stats_interval_sec=...)``).
 WORKER_STATS_INTERVAL_SEC = 2.0
 
 
-def opponent_type(result, seat) -> str | None:
-    """'arena' (another agent present), 'past' (own checkpoint present), 'latest', or None (solo)."""
-    others = [s for s in result.seats if s is not seat]
-    if not others:
+def opponent_type(result: MatchResult, seat: SeatResult) -> str | None:
+    """Kind of opposition a seat met; teammates are not opponents.
+
+    'arena' (a seat of another team plays another agent), 'past' (one plays a checkpoint of the
+    seat's agent), 'latest' (all play the agent's latest weights), or None (no other team: solo
+    or cooperative layouts).
+    """
+    opponents = [s for s in result.seats if s.team != seat.team]
+    if not opponents:
         return None
-    if any(s.agent_id != seat.agent_id for s in others):
+    if any(s.agent_id != seat.agent_id for s in opponents):
         return "arena"
-    if any(s.network_id != LATEST_NETWORK_ID for s in others):
+    if any(s.network_id != LATEST_NETWORK_ID for s in opponents):
         return "past"
     return "latest"
 
 
+def _wdl_counts() -> dict[str, list[int]]:
+    return {t: [0, 0, 0] for t in OPPONENT_TYPES}
+
+
+@dataclass
+class _RoleCell:
+    """Sums for one (agent, layout, role) cell of ``by_layout``."""
+
+    seats: int = 0
+    returns: float = 0.0
+    lengths: float = 0.0
+    team_scores: float = 0.0
+    eliminated: int = 0
+    wdl: dict[str, list[int]] = field(default_factory=_wdl_counts)
+
+    def summary(self) -> dict[str, Any]:
+        n = self.seats
+        return {"episodes": n, "return_mean": self.returns / n, "length_mean": self.lengths / n,
+                "team_score_mean": self.team_scores / n, "eliminated_frac": self.eliminated / n,
+                "wdl": {t: list(v) for t, v in self.wdl.items()}}
+
+
 class EpisodeAggregator:
     """Per agent, over the seats that play the agent's latest weights:
-    mean return, mean length, W/D/L by opponent type, seat counts."""
+
+    - mean return and episode length, W/D/L by opponent type (win: the seat's team ranks strictly
+      better than every other team; draw: ties the best one), seat counts;
+    - ``by_layout[layout][role]``: episodes (seats), mean return, mean episode length, mean team
+      score, the share of seats eliminated before the episode end, and W/D/L by opponent type.
+    """
 
     def __init__(self) -> None:
         self._reset()
@@ -38,52 +71,68 @@ class EpisodeAggregator:
     def _reset(self) -> None:
         self._returns: dict[str, list[float]] = defaultdict(list)
         self._lengths: dict[str, list[int]] = defaultdict(list)
-        self._wdl: dict[str, dict[str, list[int]]] = defaultdict(
-            lambda: {t: [0, 0, 0] for t in OPPONENT_TYPES})
+        self._wdl: dict[str, dict[str, list[int]]] = defaultdict(_wdl_counts)
         self._seats: dict[str, list[int]] = defaultdict(list)
+        # agent -> layout -> role -> sums
+        self._by_layout: dict[str, dict[str, dict[str, _RoleCell]]] = defaultdict(
+            lambda: defaultdict(lambda: defaultdict(_RoleCell)))
 
-    def add(self, result) -> None:
+    def add(self, result: MatchResult) -> None:
+        ranks = {team.team: team.rank for team in result.teams}
+        scores = {team.team: team.score for team in result.teams}
+        length = int(result.episode_length)
         for seat in result.seats:
             if seat.network_id != LATEST_NETWORK_ID:
                 continue
             agent_id = seat.agent_id
             self._returns[agent_id].append(float(seat.reward))
-            self._lengths[agent_id].append(int(result.episode_length))
+            self._lengths[agent_id].append(length)
             counts = self._seats[agent_id]
             while len(counts) <= seat.seat:
                 counts.append(0)
             counts[seat.seat] += 1
+            cell = self._by_layout[agent_id][result.layout][seat.role]
+            cell.seats += 1
+            cell.returns += float(seat.reward)
+            cell.lengths += length
+            cell.team_scores += float(scores.get(seat.team, 0.0))
+            cell.eliminated += int(seat.eliminated_step is not None)
             kind = opponent_type(result, seat)
             if kind is None:
                 continue
-            best_other = max(s.outcome for s in result.seats if s is not seat)
-            idx = 0 if seat.outcome > best_other else (1 if seat.outcome == best_other else 2)
+            own = ranks[seat.team]
+            best_other = min(rank for team, rank in ranks.items() if team != seat.team)
+            idx = 0 if own < best_other else (1 if own == best_other else 2)
             self._wdl[agent_id][kind][idx] += 1
+            cell.wdl[kind][idx] += 1
 
     def flush(self) -> dict[str, dict[str, Any]]:
         """Stats since the previous flush, per agent; resets the accumulators."""
         out: dict[str, dict[str, Any]] = {}
         for agent_id, returns in self._returns.items():
+            by_layout = {
+                layout: {role: cell.summary() for role, cell in sorted(roles.items())}
+                for layout, roles in sorted(self._by_layout[agent_id].items())
+            }
             out[agent_id] = {
                 "episodes": len(returns),
                 "return_mean": float(np.mean(returns)),
                 "length_mean": float(np.mean(self._lengths[agent_id])),
                 "wdl": {t: list(v) for t, v in self._wdl[agent_id].items()},
                 "seat_counts": list(self._seats[agent_id]),
+                "by_layout": by_layout,
             }
         self._reset()
         return out
 
 
 class SystemStats:
-    """Throughput and queue health between two snapshots.
+    """Throughput and queue health between two snapshots (SP1 behavior, unchanged).
 
     Rate baselines start at ``initial_env_steps`` and ``initial_train_steps[agent]`` (0 for
     agents not listed): the counters a resumed run continues from, so the first snapshot
     of a resumed run measures only progress made since the start, not the resumed totals.
-    Every train step above the baseline counts, including those reported before the first
-    snapshot. Per-worker stats older than ``worker_timeout_sec`` (a dead or stuck worker)
-    are forgotten, so they stop counting toward ``workers_reporting`` and ``parked_buffers``.
+    Per-worker stats older than ``worker_timeout_sec`` (a dead or stuck worker) are forgotten.
     """
 
     def __init__(self, clock: Callable[[], float] = time.monotonic, *, initial_env_steps: int = 0,

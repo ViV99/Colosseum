@@ -6,10 +6,10 @@ import numpy as np
 import pytest
 import torch
 
-from colosseum.sp2.algorithms.appo import APPO
-from colosseum.sp2.core.config import AlgorithmConfig
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.core.types import TrajectoryChunk
+from colosseum.algorithms.appo import APPO
+from colosseum.core.config import AlgorithmConfig
+from colosseum.core.specs import ActionSpec
+from colosseum.core.types import TrajectoryChunk
 from game_helpers import chunk_v2_payload, learner_role, make_test_model
 
 
@@ -47,7 +47,7 @@ def test_vtrace_slots_torch_compile():
     """Compiled slot V-trace gives the same targets as eager."""
     if not _torch_compile_available():
         pytest.skip("torch.compile backend unavailable")
-    from colosseum.sp2.algorithms.vtrace import compute_vtrace_slots
+    from colosseum.algorithms.vtrace import compute_vtrace_slots
 
     S, B = 8, 4
     torch.manual_seed(42)

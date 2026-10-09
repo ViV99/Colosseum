@@ -7,8 +7,8 @@ import random
 
 import pytest
 
-from colosseum.sp2.core.types import SeatAssignment, WeightPayload, WorkerCommand, state_dict_to_numpy
-from colosseum.sp2.worker.rollout_loop import RolloutLoop
+from colosseum.core.types import SeatAssignment, WeightPayload, WorkerCommand, state_dict_to_numpy
+from colosseum.worker.rollout_loop import RolloutLoop
 from game_harness import Collected, GameFactory, kinds, lineup, make_loop, run_steps, slot_steps
 from game_helpers import Tick, TickGame, make_test_model
 

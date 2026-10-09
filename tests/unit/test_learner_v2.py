@@ -10,10 +10,10 @@ import numpy as np
 import pytest
 import torch
 
+from colosseum.core.config import LearnerConfig
 from colosseum.core.ipc import SharedCounter, assert_no_tensors
-from colosseum.sp2.core.config import LearnerConfig
-from colosseum.sp2.core.types import TrajectoryChunk, WeightPayload
-from colosseum.sp2.learner.learner import (
+from colosseum.core.types import TrajectoryChunk, WeightPayload
+from colosseum.learner.learner import (
     FINAL_CHECKPOINT_TIMEOUT_SEC,
     _weight_flush_timeout,
     collect_batch,

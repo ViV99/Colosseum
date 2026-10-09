@@ -1,8 +1,13 @@
-"""PolicyModel: the stateful actor-critic protocol used by workers, learners and eval.
+"""``PolicyModel``: the model protocol of workers (``step``), learners (``unroll``) and eval (SP2 block 3).
 
-A model maps ``(obs, state)`` to an action distribution, a value and the next
-state. ``state`` is an opaque pytree (see :mod:`colosseum.networks.state`);
-stateless models (MLP, CNN) use ``None``.
+- ``step(obs, state, action_mask)`` -> ``PolicyStep(dist, state)``: the policy path only. Workers
+  and eval never compute values.
+- ``unroll(obs, state0, reset_after, action_mask, global_state, with_value)`` ->
+  ``UnrollOutput(dist, value)``: the learner path over chunk slots ``[S, B, ...]``, time-major
+  flattened ``[S*B]`` (index ``s*B + b``). ``reset_after[s, b]`` resets the state AFTER slot s.
+  ``with_value=False`` (BC, kickstart teacher) returns ``value=None`` and needs no global state.
+- Contract: ``unroll`` gives the same policy distributions as consecutive ``step`` calls with
+  the same resets.
 """
 
 from __future__ import annotations
@@ -14,94 +19,54 @@ import torch
 import torch.nn as nn
 from torch import Tensor
 
-from colosseum.networks.distributions import Distribution
+from colosseum.core.tree import Tree, tree_get
+from colosseum.networks.dist import Distribution
 from colosseum.networks.normalization import NormalizeObs
 from colosseum.networks.state import State, batch_size_of, tree_leaves, where_done
 
 
-class StepOutput(NamedTuple):
-    dist: Distribution  # batch [B]
-    value: Tensor  # [B]
+class PolicyStep(NamedTuple):
+    dist: Distribution             # batch [B]
     state: State
 
 
 class UnrollOutput(NamedTuple):
-    dist: Distribution  # batch [T*B], time-major flatten (index t*B + b)
-    value: Tensor  # [T*B], time-major flatten
+    dist: Distribution             # batch [S*B], time-major (index s*B + b)
+    value: Tensor | None           # [S*B]; None when with_value=False
 
 
 class ActOutput(NamedTuple):
-    actions: Tensor  # [B, *action_shape] (flat action layout from ActionSpec)
-    log_probs: Tensor  # [B]
-    values: Tensor  # [B]
+    actions: Tree                  # torch, batch [B]
+    log_probs: Tensor              # [B]
+    unit_log_probs: Tensor         # [B, K]
     state: State
 
 
 class PolicyModel(nn.Module, ABC):
-    """Actor-critic with an optional recurrent/memory state."""
+    """Actor-critic with an optional recurrent/memory state (an opaque pytree, batch first)."""
 
     def initial_state(self, batch_size: int, device: str | torch.device = "cpu") -> State:
         """State at the start of an episode. Stateless models return None."""
         return None
 
     @abstractmethod
-    def step(self, obs: Tensor, state: State, action_mask: Tensor | None = None) -> StepOutput:
-        """One timestep for a batch: obs ``[B, *obs_shape]`` -> (dist [B], value [B], next state).
+    def step(self, obs: Tree, state: State, action_mask: Tree | None = None) -> PolicyStep:
+        """One decision for a batch: obs leaves ``[B, ...]``; the mask (if any) is applied to the dist."""
 
-        ``action_mask`` (``[B, mask_size]`` bool) must be applied to the returned dist.
-        """
+    @abstractmethod
+    def unroll(self, obs: Tree, state0: State, reset_after: Tensor, action_mask: Tree | None = None,
+               global_state: Tree | None = None, with_value: bool = True) -> UnrollOutput:
+        """Slots ``[S, B, ...]``; ``reset_after [S, B]`` bool; masks ``[S, B, ...]``."""
 
-    def unroll(
-        self,
-        obs: Tensor,
-        state0: State,
-        dones: Tensor,
-        action_mask: Tensor | None = None,
-    ) -> UnrollOutput:
-        """Process sequences: obs ``[T, B, ...]``, dones ``[T, B]`` (``dones[t]``: the
-        episode ended AFTER step t, so the state is reset before step t+1),
-        mask ``[T, B, A]`` or None. Returns time-major flattened ``[T*B]`` outputs.
-
-        Default: a Python loop over :meth:`step` with :meth:`reset_state` after
-        every step, which is correct for any model. Stateless models are
-        evaluated in one batched ``step`` (equivalent, faster). Distributions
-        are concatenated with ``Distribution.cat``.
-
-        Raises ``ValueError`` for an empty sequence (``T == 0``) and for a
-        stateful model called with ``state0=None``.
-        """
-        T, B = obs.shape[0], obs.shape[1]
-        self._check_unroll_args(T, state0)
-        if state0 is None:
-            flat_mask = None if action_mask is None else action_mask.reshape(T * B, *action_mask.shape[2:])
-            out = self.step(obs.reshape(T * B, *obs.shape[2:]), None, flat_mask)
-            return UnrollOutput(dist=out.dist, value=out.value)
-
-        dists: list[Distribution] = []
-        values: list[Tensor] = []
-        state = state0
-        for t in range(T):
-            out = self.step(obs[t], state, None if action_mask is None else action_mask[t])
-            dists.append(out.dist)
-            values.append(out.value)
-            state = self.reset_state(out.state, dones[t])
-        return UnrollOutput(dist=type(dists[0]).cat(dists), value=torch.cat(values, dim=0))
-
-    def _check_unroll_args(self, num_steps: int, state0: State) -> None:
-        """Clear errors for inputs ``unroll`` cannot handle."""
-        if num_steps < 1:
-            raise ValueError(f"unroll needs a sequence with T >= 1 steps, got T={num_steps}")
+    def _check_unroll_args(self, num_slots: int, state0: State) -> None:
+        if num_slots < 1:
+            raise ValueError(f"unroll needs at least one slot, got S={num_slots}")
         if state0 is None and self.is_stateful:
-            raise ValueError(
-                f"unroll: state0 is None but {type(self).__name__} is stateful; "
-                f"pass initial_state(B) or the stored state of the sequence start"
-            )
+            raise ValueError(f"unroll: state0 is None but {type(self).__name__} is stateful; pass "
+                             f"initial_state(B) or the stored state of the sequence start")
 
     def reset_state(self, state: State, done: Tensor) -> State:
-        """Replace the rows of ``state`` where ``done`` ([B] bool) with initial-state rows.
-
-        A state without tensor leaves (``None``, empty containers) is returned unchanged.
-        """
+        """Replace the rows of ``state`` where ``done`` ([B] bool) with initial-state rows."""
         batch = batch_size_of(state)
         if batch is None:
             return state
@@ -109,18 +74,17 @@ class PolicyModel(nn.Module, ABC):
         return where_done(done, self.initial_state(batch, device), state)
 
     @torch.no_grad()
-    def update_normalizers(self, obs: Tensor) -> None:
-        """Update running observation statistics from fresh training data.
+    def update_normalizers(self, obs: Tree, global_state: Tree | None = None) -> None:
+        """Update every ``NormalizeObs`` submodule from the leaf at its path of its source tree.
 
-        The algorithm calls this exactly once per train step, before any loss
-        forward, with all new observations of the step (``[N, *obs_shape]``).
-        Default: ``update(obs)`` on every ``NormalizeObs`` submodule (a no-op when
-        there are none). Override when a normalizer sees something other than the
-        raw observation.
+        Called once per train step with all fresh observations (leaves ``[N, ...]``). A
+        global-state normalizer is skipped when ``global_state`` is None.
         """
         for module in self.modules():
             if isinstance(module, NormalizeObs):
-                module.update(obs)
+                source = obs if module.source == "obs" else global_state
+                if source is not None:
+                    module.update(tree_get(source, module.path))
 
     @property
     def is_stateful(self) -> bool:
@@ -128,15 +92,11 @@ class PolicyModel(nn.Module, ABC):
 
 
 @torch.no_grad()
-def act(
-    model: PolicyModel,
-    obs: Tensor,
-    state: State,
-    action_mask: Tensor | None = None,
-    deterministic: bool = False,
-) -> ActOutput:
+def act(model: PolicyModel, obs: Tree, state: State, action_mask: Tree | None = None,
+        deterministic: bool = False) -> ActOutput:
     """Inference helper: step the model, then sample (or take the mode) and score the action."""
     out = model.step(obs, state, action_mask)
     actions = out.dist.mode() if deterministic else out.dist.sample()
-    log_probs = out.dist.log_prob(actions)
-    return ActOutput(actions=actions, log_probs=log_probs, values=out.value, state=out.state)
+    unit_log_probs = out.dist.unit_log_prob(actions)
+    return ActOutput(actions=actions, log_probs=out.dist.log_prob(actions), unit_log_probs=unit_log_probs,
+                     state=out.state)

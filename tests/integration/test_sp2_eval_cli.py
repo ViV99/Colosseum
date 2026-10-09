@@ -1,4 +1,4 @@
-"""`python -m colosseum.sp2 eval`: .pt and checkpoint-dir agents, roles and signatures, layouts, JSON (T6.1)."""
+"""`python -m colosseum eval`: .pt and checkpoint-dir agents, roles and signatures, layouts, JSON (T6.1)."""
 from __future__ import annotations
 
 import json
@@ -9,11 +9,11 @@ import pytest
 import torch
 from click.testing import CliRunner
 
-from colosseum.sp2.cli import main
-from colosseum.sp2.coordinator.checkpoint_manager import CheckpointManager
-from colosseum.sp2.core.registry import build_model, env_spec
-from colosseum.sp2.core.roles import role_signature
-from colosseum.sp2.eval import load_eval_model
+from colosseum.cli import main
+from colosseum.coordinator.checkpoint_manager import CheckpointManager
+from colosseum.core.registry import build_model, env_spec
+from colosseum.core.roles import role_signature
+from colosseum.eval import load_eval_model
 from game_helpers import agent_role_of, make_test_config, write_test_config
 
 WIDE = {"model_class": "game_helpers.GameTestModel", "kwargs": {"core": "none", "hidden": 32}}
@@ -163,7 +163,7 @@ def test_asymmetric_agents_are_evaluated_in_their_roles(tmp_path):
 
 
 def test_output_dir_must_exist_before_loading(tmp_path, monkeypatch):
-    import colosseum.sp2.eval as eval_module
+    import colosseum.eval as eval_module
 
     cfg_path, _cfg, pt_path, _ckpt = _setup(tmp_path)
 
@@ -204,7 +204,7 @@ def test_every_role_of_a_checkpoint_must_keep_its_spaces(tmp_path):
     from gymnasium.spaces import Discrete
 
     from colosseum.core.errors import ConfigError
-    from colosseum.sp2.envs.game import GameSpec, RoleSpec, SeatSpec
+    from colosseum.envs.game import GameSpec, RoleSpec, SeatSpec
 
     cfg = make_test_config("turns")
     _roles, role = agent_role_of(cfg, "agent_0")
@@ -226,7 +226,7 @@ def test_every_role_of_a_checkpoint_must_keep_its_spaces(tmp_path):
 
 
 def test_each_distinct_architecture_is_validated_once(tmp_path, monkeypatch):
-    import colosseum.sp2.eval as eval_module
+    import colosseum.eval as eval_module
 
     cfg_path, cfg, pt_path, ckpt_dir = _setup(tmp_path)
     checked = []

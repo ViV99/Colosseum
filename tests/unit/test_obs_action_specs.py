@@ -4,8 +4,8 @@ import pytest
 from gymnasium.spaces import Box, Dict, Discrete, MultiBinary, MultiDiscrete, Tuple
 
 from colosseum.core.errors import EnvContractError
-from colosseum.sp2.core.specs import ActionSpec, LeafSpec, ObsSpec
-from colosseum.sp2.envs.spaces import Units
+from colosseum.core.specs import ActionSpec, LeafSpec, ObsSpec
+from colosseum.envs.spaces import Units
 
 OBS = Dict([
     ("grid", Box(0, 255, (3, 3), dtype=np.uint8)),

@@ -13,10 +13,10 @@ from typing import Any, NamedTuple
 
 import torch
 
-from colosseum.sp2.algorithms.appo import APPO
-from colosseum.sp2.core.config import AlgorithmConfig
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.core.types import (
+from colosseum.algorithms.appo import APPO
+from colosseum.core.config import AlgorithmConfig
+from colosseum.core.specs import ActionSpec
+from colosseum.core.types import (
     SLOT_ACT,
     SLOT_BOOT,
     SLOT_PAD,
@@ -27,7 +27,7 @@ from colosseum.sp2.core.types import (
     WeightPayload,
     WorkerCommand,
 )
-from colosseum.sp2.worker.rollout_loop import LoopIO, RolloutLoop
+from colosseum.worker.rollout_loop import LoopIO, RolloutLoop
 from game_helpers import TickGame
 
 KIND_LETTER = {SLOT_ACT: "A", SLOT_BOOT: "B", SLOT_PAD: "P"}

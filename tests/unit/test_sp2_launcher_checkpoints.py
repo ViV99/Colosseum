@@ -12,14 +12,14 @@ from pathlib import Path
 import numpy as np
 import pytest
 
+from colosseum.coordinator.checkpoint_manager import CheckpointManager
+from colosseum.core.config import config_hash
 from colosseum.core.errors import ConfigError
-from colosseum.sp2.coordinator.checkpoint_manager import CheckpointManager
-from colosseum.sp2.core.config import config_hash
-from colosseum.sp2.core.registry import build_model
-from colosseum.sp2.core.roles import role_signature
-from colosseum.sp2.core.types import LATEST_NETWORK_ID, Lineup, SeatAssignment
-from colosseum.sp2.launcher import Launcher, _resolve_lineups, setup_run
-from colosseum.sp2.learner.learner import make_checkpoint_payload, send_checkpoint
+from colosseum.core.registry import build_model
+from colosseum.core.roles import role_signature
+from colosseum.core.types import LATEST_NETWORK_ID, Lineup, SeatAssignment
+from colosseum.launcher import Launcher, _resolve_lineups, setup_run
+from colosseum.learner.learner import make_checkpoint_payload, send_checkpoint
 from game_helpers import FakeAlgorithm, agent_role_of, make_coordinator, make_test_config, make_test_run_dir
 
 
@@ -167,8 +167,8 @@ def test_resume_rejects_a_checkpoint_of_another_role(tmp_path):
 
 def test_worker_main_passes_env_max_idle_steps_and_lineups_to_the_rollout_worker(tmp_path, monkeypatch):
     """R14: ``env.max_idle_steps`` reaches ``rollout_worker_process`` (with roles and lineups)."""
-    import colosseum.sp2.worker.rollout_worker as rollout_worker
-    from colosseum.sp2.launcher import _worker_main
+    import colosseum.worker.rollout_worker as rollout_worker
+    from colosseum.launcher import _worker_main
 
     recorded: dict = {}
     monkeypatch.setattr(rollout_worker, "rollout_worker_process", lambda **kwargs: recorded.update(kwargs))

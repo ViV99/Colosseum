@@ -1,6 +1,6 @@
 """Serialization for the gRPC transport: numpy payloads <-> bytes.
 
-SP1 wire format (replaced in SP5):
+Wire format (SP1, unchanged in SP2; replaced in SP5):
     8-byte little-endian length N | N bytes of JSON skeleton | np.savez archive
 The skeleton mirrors the payload structure; every numpy array is replaced by
 ``{"__nd__": i}`` (index into the archive). Dicts, lists, tuples and
@@ -37,7 +37,7 @@ import numpy as np
 import torch
 
 from colosseum.core.ipc import is_namedtuple
-from colosseum.core.types import TrajectoryChunk
+from colosseum.core.types import TrajectoryChunk, validate_slot_structure
 
 _HEADER = struct.Struct("<Q")
 _KEY_TYPES = (str, int, float, bool, type(None))  # dict keys allowed in a payload
@@ -280,39 +280,60 @@ def serialize_chunk_payload(payload: dict[str, Any], compress: bool = True) -> t
     return pack_payload(payload, compress)
 
 
-_CHUNK_STEP_ARRAYS = ("observations", "actions", "action_log_probs", "rewards", "dones", "values")
+_CHUNK_FLAT = ("kind", "reward", "terminal", "reset_after", "behavior_logp")
+_CHUNK_TREES = ("obs", "actions")
+_CHUNK_OPTIONAL_TREES = ("global_state", "action_masks")
+
+
+def _tree_arrays(tree: Any, name: str) -> list[np.ndarray]:
+    """Leaves of a numpy payload tree (dicts with str keys); ValueError on anything else."""
+    if isinstance(tree, np.ndarray):
+        return [tree]
+    if isinstance(tree, dict) and tree and all(isinstance(k, str) for k in tree):
+        return [leaf for value in tree.values() for leaf in _tree_arrays(value, name)]
+    raise ValueError(f"chunk payload field {name!r} must be a numpy array or a dict tree of them, "
+                     f"got {type(tree).__name__}")
 
 
 def validate_chunk_payload(payload: Any) -> None:
-    """Raise ValueError unless ``payload`` is a well-formed chunk payload.
+    """Raise ValueError unless ``payload`` is a well-formed chunk v2 payload.
 
-    Checks the fields, their types and the common time dimension ``T``, then
-    builds the chunk once (which checks ``initial_state`` node types).
+    Checks the fields, their types and the common slot dimension ``S`` of every flat array and
+    tree leaf, then builds the chunk once (which checks ``initial_state`` node types) and
+    checks its slot structure (``validate_slot_structure``), so a hostile or broken chunk is
+    refused here instead of stopping the learner.
     """
     if not isinstance(payload, dict):
         raise ValueError(f"chunk payload must be a dict, got {type(payload).__name__}")
-    for name in _CHUNK_STEP_ARRAYS:
-        if not isinstance(payload.get(name), np.ndarray):
-            raise ValueError(f"chunk payload field {name!r} must be a numpy array, "
-                             f"got {type(payload.get(name)).__name__}")
-        if payload[name].ndim == 0:
-            raise ValueError(f"chunk payload field {name!r} must have a time dimension")
-    T = payload["observations"].shape[0]
-    masks = payload.get("action_masks")
-    if masks is not None and not isinstance(masks, np.ndarray):
-        raise ValueError(f"chunk payload action_masks must be a numpy array or None, got {type(masks).__name__}")
-    for name in (*_CHUNK_STEP_ARRAYS, "action_masks"):
+    if not isinstance(payload.get("agent_id"), str) or type(payload.get("policy_version")) is not int:
+        raise ValueError("chunk payload needs a str agent_id and an int policy_version")
+    for name in _CHUNK_FLAT:
         value = payload.get(name)
-        if value is not None and (value.ndim == 0 or value.shape[0] != T):
-            raise ValueError(f"chunk payload field {name!r} has shape {value.shape}, expected T={T} first")
-    if isinstance(payload.get("bootstrap_value"), bool) or not isinstance(payload.get("bootstrap_value"), int | float):
-        raise ValueError("chunk payload bootstrap_value must be a number")
-    if type(payload.get("behavior_policy_version")) is not int or not isinstance(payload.get("agent_id"), str):
-        raise ValueError("chunk payload needs an int behavior_policy_version and a str agent_id")
+        if not isinstance(value, np.ndarray) or value.ndim != 1:
+            raise ValueError(f"chunk payload field {name!r} must be a 1-D numpy array [S]")
+    num_slots = payload["kind"].shape[0]
+    for name in _CHUNK_FLAT:
+        if payload[name].shape[0] != num_slots:
+            raise ValueError(f"chunk payload field {name!r} has shape {payload[name].shape}, expected [S={num_slots}]")
+    trees = [(name, payload.get(name)) for name in _CHUNK_TREES]
+    trees += [(name, payload.get(name)) for name in _CHUNK_OPTIONAL_TREES if payload.get(name) is not None]
+    unit_logp = payload.get("behavior_unit_logp")
+    if unit_logp is not None:
+        if not isinstance(unit_logp, np.ndarray) or unit_logp.ndim != 2:
+            raise ValueError("chunk payload field 'behavior_unit_logp' must be None or a numpy array [S, K]")
+        trees.append(("behavior_unit_logp", unit_logp))
+    for name, tree in trees:
+        if tree is None:
+            raise ValueError(f"chunk payload field {name!r} is missing")
+        for leaf in _tree_arrays(tree, name):
+            if leaf.ndim == 0 or leaf.shape[0] != num_slots:
+                raise ValueError(f"chunk payload field {name!r} has a leaf of shape {leaf.shape}, "
+                                 f"expected S={num_slots} first")
     try:
-        TrajectoryChunk.from_payload(payload)
+        chunk = TrajectoryChunk.from_payload(payload)
     except (KeyError, TypeError, ValueError) as e:
         raise ValueError(f"malformed chunk payload: {type(e).__name__}: {e}") from e
+    validate_slot_structure(chunk)
 
 
 def deserialize_chunk_payload(
@@ -330,12 +351,12 @@ def serialize_chunk(chunk: TrajectoryChunk, compress: bool = True) -> tuple[byte
 
 def deserialize_chunk(
     agent_id: str,
-    behavior_policy_version: int,
+    policy_version: int,
     data: bytes,
     compressed: bool,
 ) -> TrajectoryChunk:
     """Deserialize bytes from :func:`serialize_chunk` into a TrajectoryChunk."""
     payload = deserialize_chunk_payload(data, compressed)
     payload["agent_id"] = agent_id
-    payload["behavior_policy_version"] = int(behavior_policy_version)
+    payload["policy_version"] = int(policy_version)
     return TrajectoryChunk.from_payload(payload)

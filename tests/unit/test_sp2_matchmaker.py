@@ -8,11 +8,11 @@ import gymnasium
 import numpy as np
 import pytest
 
+from colosseum.coordinator.matchmaker import LineupMatchmaker, permute_seats, validate_matchmaking
+from colosseum.core.config import MatchmakingConfig
 from colosseum.core.errors import ConfigError
-from colosseum.sp2.coordinator.matchmaker import LineupMatchmaker, permute_seats, validate_matchmaking
-from colosseum.sp2.core.config import MatchmakingConfig
-from colosseum.sp2.core.types import LATEST_NETWORK_ID, SeatAssignment
-from colosseum.sp2.envs.game import GameSpec, RoleSpec, SeatSpec
+from colosseum.core.types import LATEST_NETWORK_ID, SeatAssignment
+from colosseum.envs.game import GameSpec, RoleSpec, SeatSpec
 
 OBS = gymnasium.spaces.Box(0.0, 1.0, (2,), np.float32)
 ACT = gymnasium.spaces.Discrete(3)

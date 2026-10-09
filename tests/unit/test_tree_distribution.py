@@ -5,8 +5,8 @@ import pytest
 import torch
 from gymnasium.spaces import Box, Dict, Discrete, MultiDiscrete
 
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.networks.dist import CategoricalDist, TreeDist, make_distribution
+from colosseum.core.specs import ActionSpec
+from colosseum.networks.dist import CategoricalDist, TreeDist, make_distribution
 
 SPEC = ActionSpec.from_space(Dict([("move", Discrete(3)), ("aim", Box(-1.0, 1.0, (2,))),
                                    ("build", MultiDiscrete([2, 2]))]))

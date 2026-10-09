@@ -3,7 +3,7 @@ import numpy as np
 import pytest
 import torch
 
-from colosseum.sp2.core.tree import (
+from colosseum.core.tree import (
     tree_assign,
     tree_get,
     tree_index,

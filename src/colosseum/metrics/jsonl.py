@@ -1,4 +1,8 @@
-"""metrics.jsonl: the source of truth for training metrics (WandB is only a viewer)."""
+"""metrics.jsonl: the source of truth for training metrics (WandB is only a viewer).
+
+SP2 record shapes: ``episodes`` records carry ``by_layout`` (per layout and role) and ``ratings``
+records carry ``layouts`` (``RatingBook.snapshot()``: one table set per layout).
+"""
 
 from __future__ import annotations
 
@@ -21,8 +25,8 @@ METRIC_KINDS = ("train", *GLOBAL_KINDS)
 REQUIRED_KEYS: dict[str, set[str]] = {
     "train": {"ts", "kind", "agent", "train_step"},
     "episodes": {"ts", "kind", "agent", "env_steps", "episodes", "return_mean", "length_mean", "wdl",
-                 "seat_counts"},
-    "ratings": {"ts", "kind", "env_steps", "elo", "win_rates", "games", "wr_vs_past"},
+                 "seat_counts", "by_layout"},
+    "ratings": {"ts", "kind", "env_steps", "layouts"},
     "system": {"ts", "kind", "env_steps", "env_steps_per_sec", "train_steps_per_sec", "queue_depths",
                "parked_buffers", "workers_reporting"},
 }

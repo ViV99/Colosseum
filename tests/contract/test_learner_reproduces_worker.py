@@ -16,15 +16,15 @@ import pytest
 import torch
 import torch.nn as nn
 
+from colosseum.algorithms.appo import APPO
+from colosseum.algorithms.vtrace import compute_vtrace_slots
+from colosseum.core.config import AlgorithmConfig
+from colosseum.core.specs import ActionSpec
+from colosseum.core.tree import tree_map, tree_stack
+from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD, WeightPayload
+from colosseum.envs.spaces import Units
+from colosseum.networks.model import PolicyModel
 from colosseum.networks.state import cat_batch, tree_leaves
-from colosseum.sp2.algorithms.appo import APPO
-from colosseum.sp2.algorithms.vtrace import compute_vtrace_slots
-from colosseum.sp2.core.config import AlgorithmConfig
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.core.tree import tree_map, tree_stack
-from colosseum.sp2.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD, WeightPayload
-from colosseum.sp2.envs.spaces import Units
-from colosseum.sp2.networks.model import PolicyModel
 from game_harness import (
     Collected,
     GameFactory,

@@ -1,14 +1,14 @@
-"""`python -m colosseum.sp2 bc --agent A` (T6.3)."""
+"""`python -m colosseum bc --agent A` (T6.3)."""
 from __future__ import annotations
 
 import pytest
 import torch
 from click.testing import CliRunner
 
-from colosseum.sp2.cli import main
-from colosseum.sp2.core.registry import build_model
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.core.tree import tree_map, tree_stack
+from colosseum.cli import main
+from colosseum.core.registry import build_model
+from colosseum.core.specs import ActionSpec
+from colosseum.core.tree import tree_map, tree_stack
 from game_helpers import agent_role_of, make_test_config, write_test_config
 
 
@@ -155,7 +155,7 @@ def test_bad_data_is_a_one_line_config_error(make_data, message, tmp_path):
 
 def test_a_data_file_that_cannot_be_opened_is_a_one_line_config_error(tmp_path, monkeypatch):
     """SP1 residual: PermissionError / OSError from torch.load used to print a traceback."""
-    import colosseum.sp2.bc.offline_bc as bc_module
+    import colosseum.bc.offline_bc as bc_module
 
     cfg_path = write_test_config(tmp_path / "cfg.yaml", "turns")
     data = tmp_path / "data.pt"

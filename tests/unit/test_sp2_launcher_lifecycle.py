@@ -16,10 +16,10 @@ import yaml
 from click.testing import CliRunner
 from fake_wandb import FakeWandb
 
-import colosseum.sp2.launcher as launcher_module
-from colosseum.sp2.cli import main
-from colosseum.sp2.core.config import ColosseumConfig
-from colosseum.sp2.launcher import Launcher
+import colosseum.launcher as launcher_module
+from colosseum.cli import main
+from colosseum.core.config import ColosseumConfig
+from colosseum.launcher import Launcher
 from game_helpers import make_coordinator, make_test_config, make_test_run_dir
 
 TTT = "examples.tic_tac_toe"
@@ -76,7 +76,7 @@ def fake_process_class(started: list, fail_on_worker: bool = True):
 
 @pytest.fixture
 def count_validations(monkeypatch):
-    import colosseum.sp2.core.registry as registry
+    import colosseum.core.registry as registry
 
     calls: list[str] = []
     real = registry.validate_config
@@ -126,7 +126,7 @@ def test_failed_start_stops_started_children_and_closes_metrics(tmp_path, monkey
     launcher = Launcher(cfg, run)
     sigint_before, sigterm_before = signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
 
-    with caplog.at_level(logging.ERROR, logger="colosseum.sp2.launcher"), pytest.raises(_Stop):
+    with caplog.at_level(logging.ERROR, logger="colosseum.launcher"), pytest.raises(_Stop):
         launcher.launch()
 
     assert [p.name for p in started] == ["learner-alpha", "learner-beta"]
@@ -151,7 +151,7 @@ def test_stop_requested_by_the_caller_is_a_clean_exit(tmp_path, monkeypatch, cap
     timer = threading.Timer(0.5, launcher._stop_event.set)
     timer.start()
     try:
-        with caplog.at_level(logging.INFO, logger="colosseum.sp2.launcher"):
+        with caplog.at_level(logging.INFO, logger="colosseum.launcher"):
             assert launcher.launch() == 0
     finally:
         timer.cancel()
@@ -188,7 +188,7 @@ def test_failed_start_error_is_not_hidden_by_a_failing_teardown(tmp_path, monkey
         raise OSError("disk full")
 
     monkeypatch.setattr(launcher, "_drain_all_checkpoints", failing_drain)
-    with caplog.at_level(logging.ERROR, logger="colosseum.sp2.launcher"), pytest.raises(_Stop) as excinfo:
+    with caplog.at_level(logging.ERROR, logger="colosseum.launcher"), pytest.raises(_Stop) as excinfo:
         launcher.launch()
     assert "Shutdown afterwards also failed: OSError('disk full')" in getattr(excinfo.value, "__notes__", [])
     assert "Shutdown after _Stop failed too" in caplog.text and "disk full" in caplog.text
@@ -295,7 +295,7 @@ def test_nonzero_child_exit_fails_a_run_that_reached_its_budget(tmp_path, monkey
         "worker-1": (_ignore_stop, ()),
     })
     start = time.monotonic()
-    with caplog.at_level(logging.INFO, logger="colosseum.sp2.launcher"):
+    with caplog.at_level(logging.INFO, logger="colosseum.launcher"):
         killed = launcher._shutdown()
         code = launcher._exit_code_after_shutdown(0, killed)
     # The main process waits SHUTDOWN_GRACE_SEC (patched here), then terminates and kills.
@@ -310,7 +310,7 @@ def test_nonzero_child_exit_fails_a_run_that_reached_its_budget(tmp_path, monkey
 def test_signal_exit_code_stays_when_a_child_exits_nonzero(tmp_path, caplog):
     launcher = _launcher_with(tmp_path, {"worker-0": (_exit_after_stop, ("stop", 2))})
     killed = launcher._shutdown()
-    with caplog.at_level(logging.WARNING, logger="colosseum.sp2.launcher"):
+    with caplog.at_level(logging.WARNING, logger="colosseum.launcher"):
         assert launcher._exit_code_after_shutdown(130, killed) == 130
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert "worker-0 died (exit 2)" in caplog.text
@@ -318,7 +318,7 @@ def test_signal_exit_code_stays_when_a_child_exits_nonzero(tmp_path, caplog):
 
 def test_clean_children_keep_exit_code_zero(tmp_path, caplog):
     launcher = _launcher_with(tmp_path, {"learner-a": (_exit_after_stop, ("stop", 0))})
-    with caplog.at_level(logging.INFO, logger="colosseum.sp2.launcher"):
+    with caplog.at_level(logging.INFO, logger="colosseum.launcher"):
         assert launcher._exit_code_after_shutdown(0, launcher._shutdown()) == 0
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
 
@@ -479,7 +479,7 @@ def test_main_puts_cwd_first_on_sys_path(tmp_path, monkeypatch):
 @pytest.mark.parametrize(("worker_exit", "expected"), [(0, 0), (3, 1)])
 def test_run_workers_returns_an_exit_code(worker_exit, expected, tmp_path, monkeypatch, restore_root_logging,
                                           capsys):
-    import colosseum.sp2.distributed as distributed
+    import colosseum.distributed as distributed
 
     class ExitedProcess:
         exitcode = worker_exit
@@ -504,7 +504,7 @@ def test_run_workers_returns_an_exit_code(worker_exit, expected, tmp_path, monke
     path.write_text(yaml.safe_dump(data))
     assert distributed.run_distributed_workers(str(path), "localhost:1", {"agent_0": "localhost:2"}) == expected
     # The entry point logs to stderr (its own handlers replace pytest's capture handler).
-    assert ("[ERROR] workers-main colosseum.sp2.distributed: worker-0 died (exit 3)" in capsys.readouterr().err) == (
+    assert ("[ERROR] workers-main colosseum.distributed: worker-0 died (exit 3)" in capsys.readouterr().err) == (
         worker_exit == 3)
 
 
@@ -516,8 +516,8 @@ def test_run_workers_returns_an_exit_code(worker_exit, expected, tmp_path, monke
 @pytest.fixture
 def fake_learner_role(tmp_path, monkeypatch):
     """run_distributed_learner without gRPC: returns the config path."""
-    import colosseum.sp2.transport.grpc_transport as grpc_transport
-    import colosseum.sp2.weight_store.grpc_store as grpc_store
+    import colosseum.transport.grpc_transport as grpc_transport
+    import colosseum.weight_store.grpc_store as grpc_store
 
     class FakeServer:
         def stop(self, grace):
@@ -541,8 +541,8 @@ def fake_learner_role(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
 def test_run_learner_returns_128_plus_signum(sig, fake_learner_role, monkeypatch, restore_root_logging):
-    import colosseum.sp2.distributed as distributed
-    import colosseum.sp2.learner.learner as learner_module
+    import colosseum.distributed as distributed
+    import colosseum.learner.learner as learner_module
 
     def fake_learner_process(*, stop_event, **kwargs):
         os.kill(os.getpid(), sig)
@@ -556,7 +556,7 @@ def test_run_learner_returns_128_plus_signum(sig, fake_learner_role, monkeypatch
 
 def test_run_learner_setup_failure_leaves_signal_handlers_untouched(fake_learner_role, monkeypatch,
                                                                      restore_root_logging, restore_global_rng):
-    import colosseum.sp2.distributed as distributed
+    import colosseum.distributed as distributed
 
     def failing_seed(seed):
         raise RuntimeError("seeding failed")
@@ -573,10 +573,10 @@ def _raise_keyboard_interrupt(*args, **kwargs):
 
 
 @pytest.mark.parametrize(("args", "target"), [
-    (["train"], "colosseum.sp2.launcher.run_training"),
-    (["run-learner", "--weight-store", "localhost:1"], "colosseum.sp2.distributed.run_distributed_learner"),
+    (["train"], "colosseum.launcher.run_training"),
+    (["run-learner", "--weight-store", "localhost:1"], "colosseum.distributed.run_distributed_learner"),
     (["run-workers", "--weight-store", "localhost:1", "-l", "agent_0=localhost:2"],
-     "colosseum.sp2.distributed.run_distributed_workers"),
+     "colosseum.distributed.run_distributed_workers"),
 ], ids=lambda a: a[0] if isinstance(a, list) else None)
 def test_ctrl_c_before_the_run_handles_signals_exits_130(args, target, tmp_path, monkeypatch):
     monkeypatch.setattr(target, _raise_keyboard_interrupt)
@@ -589,10 +589,10 @@ def test_ctrl_c_before_the_run_handles_signals_exits_130(args, target, tmp_path,
 
 
 @pytest.mark.parametrize(("args", "target"), [
-    (["train"], "colosseum.sp2.launcher.run_training"),
-    (["run-learner", "--weight-store", "localhost:1"], "colosseum.sp2.distributed.run_distributed_learner"),
+    (["train"], "colosseum.launcher.run_training"),
+    (["run-learner", "--weight-store", "localhost:1"], "colosseum.distributed.run_distributed_learner"),
     (["run-workers", "--weight-store", "localhost:1", "-l", "agent_0=localhost:2"],
-     "colosseum.sp2.distributed.run_distributed_workers"),
+     "colosseum.distributed.run_distributed_workers"),
 ], ids=lambda a: a[0] if isinstance(a, list) else None)
 def test_cli_exits_with_the_run_exit_code(args, target, tmp_path, monkeypatch):
     monkeypatch.setattr(target, lambda *a, **k: 143)
@@ -609,8 +609,8 @@ def test_cli_exits_with_the_run_exit_code(args, target, tmp_path, monkeypatch):
 def test_launcher_closes_metrics_file_when_final_drain_fails(tmp_path):
     import queue
 
-    from colosseum.sp2.metrics.hub import MetricsHub
-    from colosseum.sp2.metrics.jsonl import MetricsWriter
+    from colosseum.metrics.hub import MetricsHub
+    from colosseum.metrics.jsonl import MetricsWriter
 
     config = make_test_config("turns")
     run = make_test_run_dir(config, tmp_path)
@@ -639,10 +639,10 @@ def test_launcher_closes_metrics_file_when_final_drain_fails(tmp_path):
 def test_launcher_finishes_wandb_when_final_metrics_fail(monkeypatch, tmp_path):
     import queue
 
+    from colosseum.core.config import MetricsConfig
+    from colosseum.metrics.hub import MetricsHub
+    from colosseum.metrics.jsonl import MetricsWriter
     from colosseum.metrics.wandb_logger import WandBLogger
-    from colosseum.sp2.core.config import MetricsConfig
-    from colosseum.sp2.metrics.hub import MetricsHub
-    from colosseum.sp2.metrics.jsonl import MetricsWriter
 
     fake = FakeWandb()
     monkeypatch.setitem(sys.modules, "wandb", fake)

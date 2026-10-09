@@ -10,8 +10,8 @@ import pytest
 import torch
 
 from colosseum.core.ipc import SharedCounter
-from colosseum.sp2.core.types import Lineup, SeatAssignment, TrajectoryChunk, WorkerCommand
-from colosseum.sp2.worker.rollout_worker import _drain_commands, rollout_worker_process
+from colosseum.core.types import Lineup, SeatAssignment, TrajectoryChunk, WorkerCommand
+from colosseum.worker.rollout_worker import _drain_commands, rollout_worker_process
 from game_helpers import NumpyOnlyQueue, Tick, TickGame, make_test_model
 
 SCRIPT = [Tick(acting={0}), Tick(acting={0}, rewards={0: 1.0}), Tick(over=True, rewards={0: 1.0})]

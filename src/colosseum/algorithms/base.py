@@ -36,7 +36,7 @@ class BaseAlgorithm(ABC):
     """Base class for RL algorithms.
 
     On-policy algorithms (APPO, PPO) train directly on incoming trajectory
-    chunks. Off-policy algorithms (R2D2, DQN) add chunks to a replay buffer
+    chunks (chunk v2: act / boot / pad slots). Off-policy algorithms (R2D2, DQN) add chunks to a replay buffer
     and sample from it for training.
 
     Subclasses must implement: compute_loss, train_step, model, policy_version.

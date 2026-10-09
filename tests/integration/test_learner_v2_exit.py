@@ -13,8 +13,8 @@ import multiprocessing as mp
 import threading
 import time
 
-from colosseum.sp2.core.config import LearnerConfig
-from colosseum.sp2.learner.learner import learner_process
+from colosseum.core.config import LearnerConfig
+from colosseum.learner.learner import learner_process
 from game_helpers import chunk_v2_payload, learner_appo
 
 BIG_NUM_ACTIONS = 8192      # policy head 16 x 8192 floats: ~0.5 MB per weight payload

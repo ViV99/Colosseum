@@ -4,8 +4,8 @@ import pytest
 from gymnasium.spaces import Box, Discrete
 
 from colosseum.core.errors import EnvContractError
-from colosseum.sp2.envs.contract import EpisodeTracker, SeatPhase
-from colosseum.sp2.envs.game import GameSpec, Outcome, StepResult
+from colosseum.envs.contract import EpisodeTracker, SeatPhase
+from colosseum.envs.game import GameSpec, Outcome, StepResult
 from game_helpers import (
     TOY_GAMES,
     EliminationFFA,

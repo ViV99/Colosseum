@@ -3,19 +3,15 @@
 from __future__ import annotations
 
 import logging
-import queue
 import subprocess
 import sys
 
 import pytest
 from fake_wandb import FakeWandb
 
-from colosseum.core.config import RESERVED_AGENT_IDS, MetricsConfig, load_config
-from colosseum.launcher import Launcher
-from colosseum.metrics.hub import MetricsHub
-from colosseum.metrics.jsonl import GLOBAL_KINDS, METRIC_KINDS, MetricsWriter
+from colosseum.core.config import RESERVED_AGENT_IDS, MetricsConfig
+from colosseum.metrics.jsonl import GLOBAL_KINDS, METRIC_KINDS
 from colosseum.metrics.wandb_logger import WandBLogger
-from helpers import example_config, make_test_run_dir
 
 LOGGER = "colosseum.metrics.wandb_logger"
 
@@ -155,27 +151,3 @@ def test_package_imports_without_wandb_installed():
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr
-
-
-def test_launcher_finishes_wandb_when_final_metrics_fail(monkeypatch, tmp_path):
-    fake = FakeWandb()
-    monkeypatch.setitem(sys.modules, "wandb", fake)
-    config = load_config(example_config("tic_tac_toe.yaml"))
-    run = make_test_run_dir(config, tmp_path)
-    launcher = Launcher(config, run)
-    launcher._wandb = WandBLogger(MetricsConfig(use_wandb=True))
-    launcher._metrics_writer = MetricsWriter(run.metrics_path)
-    launcher._hub = MetricsHub(writer=launcher._metrics_writer, ratings_path=run.ratings_path,
-                               agent_ids=["agent_0"], total_timesteps=10, log_interval=1,
-                               console_interval_sec=10.0, wandb_logger=launcher._wandb)
-
-    class FailingCoordinator:
-        def ratings_snapshot(self):
-            raise RuntimeError("boom")
-
-    launcher._coordinator = FailingCoordinator()
-    launcher._results_queue, launcher._metrics_queue = queue.Queue(), queue.Queue()
-    with pytest.raises(RuntimeError, match="boom"):
-        launcher._finish_metrics()
-    assert launcher._metrics_writer.closed
-    assert fake.finished

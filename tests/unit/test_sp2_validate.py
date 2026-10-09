@@ -1,4 +1,4 @@
-"""validate_config (spec block 9) and `python -m colosseum.sp2 validate` (T6.2)."""
+"""validate_config (spec block 9) and `python -m colosseum validate` (T6.2)."""
 from __future__ import annotations
 
 import gymnasium
@@ -8,12 +8,12 @@ import torch
 import yaml
 from click.testing import CliRunner
 
+from colosseum.cli import main
 from colosseum.core.errors import ConfigError, EnvContractError
-from colosseum.sp2.cli import main
-from colosseum.sp2.core.registry import validate_config
-from colosseum.sp2.core.validation import random_legal_action
-from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv, RoleSpec, StepResult
-from colosseum.sp2.networks.model import UnrollOutput
+from colosseum.core.registry import validate_config
+from colosseum.core.validation import random_legal_action
+from colosseum.envs.game import GameSpec, MultiAgentEnv, RoleSpec, StepResult
+from colosseum.networks.model import UnrollOutput
 from game_helpers import CORE_KINDS, GameTestModel, make_test_config
 
 BOX = gymnasium.spaces.Box(0.0, 1.0, (3,), np.float32)
@@ -84,7 +84,7 @@ def solo_config(**sections):
             "networks": {"model_class": "game_helpers.GameTestModel"}}
     for key, value in sections.items():
         data[key] = {**data.get(key, {}), **value}
-    from colosseum.sp2.core.config import ColosseumConfig
+    from colosseum.core.config import ColosseumConfig
 
     return ColosseumConfig.model_validate(data)
 

@@ -7,11 +7,11 @@ import logging
 import numpy as np
 import pytest
 
+from colosseum.core.types import MatchResult, SeatResult, TeamResult
+from colosseum.metrics.aggregator import EpisodeAggregator, SystemStats, opponent_type
 from colosseum.metrics.console import ConsoleReporter
-from colosseum.sp2.core.types import MatchResult, SeatResult, TeamResult
-from colosseum.sp2.metrics.aggregator import EpisodeAggregator, SystemStats, opponent_type
-from colosseum.sp2.metrics.hub import MetricsHub, flatten, wr_arena_over_layouts, wr_vs_past_over_layouts
-from colosseum.sp2.metrics.jsonl import METRIC_KINDS, REQUIRED_KEYS, MetricsWriter, write_json_atomic
+from colosseum.metrics.hub import MetricsHub, flatten, wr_arena_over_layouts, wr_vs_past_over_layouts
+from colosseum.metrics.jsonl import METRIC_KINDS, REQUIRED_KEYS, MetricsWriter, write_json_atomic
 
 
 def seat(i, team, agent, network="latest", reward=0.0, role="player", eliminated=None) -> SeatResult:

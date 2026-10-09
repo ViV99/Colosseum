@@ -8,9 +8,9 @@ import gymnasium
 import numpy as np
 import pytest
 
-from colosseum.sp2.core.types import MatchResult, SeatResult, TeamResult
-from colosseum.sp2.envs.game import GameSpec, RoleSpec, SeatSpec
-from colosseum.sp2.eval import normal_interval, summarize, wilson_interval
+from colosseum.core.types import MatchResult, SeatResult, TeamResult
+from colosseum.envs.game import GameSpec, RoleSpec, SeatSpec
+from colosseum.eval import normal_interval, summarize, wilson_interval
 
 OBS = gymnasium.spaces.Box(0.0, 1.0, (2,), np.float32)
 ACT = gymnasium.spaces.Discrete(3)

@@ -7,8 +7,8 @@ import gymnasium
 import numpy as np
 import pytest
 
-from colosseum.sp2.envs.game import GameSpec, RoleSpec, SeatSpec
-from colosseum.sp2.eval import default_layouts, schedule_lineups
+from colosseum.envs.game import GameSpec, RoleSpec, SeatSpec
+from colosseum.eval import default_layouts, schedule_lineups
 
 OBS = gymnasium.spaces.Box(0.0, 1.0, (2,), np.float32)
 ACT = gymnasium.spaces.Discrete(3)

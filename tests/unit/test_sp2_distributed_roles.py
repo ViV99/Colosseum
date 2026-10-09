@@ -10,8 +10,8 @@ from collections import Counter
 
 import pytest
 
+from colosseum.core.config import load_config
 from colosseum.core.errors import ConfigError
-from colosseum.sp2.core.config import load_config
 from game_helpers import make_test_config, write_test_config
 
 
@@ -40,14 +40,14 @@ class _ExitedProcess:
     ("", "workers-host"),
 ])
 def test_workers_role_includes_the_sanitized_hostname(monkeypatch, host, role):
-    import colosseum.sp2.distributed as distributed
+    import colosseum.distributed as distributed
 
     monkeypatch.setattr(distributed.socket, "gethostname", lambda: host)
     assert distributed.workers_role() == role
 
 
 def test_distributed_lineups_follow_layout_weights_and_rotate_agents():
-    from colosseum.sp2.distributed import distributed_lineups, distributed_setup
+    from colosseum.distributed import distributed_lineups, distributed_setup
 
     cfg = make_test_config("ffa", agents={"a": {}, "b": {}}, matchmaking={"layouts": {"2p": 0.25, "4p": 0.75}})
     setup = distributed_setup(cfg, ["a", "b"])
@@ -61,7 +61,7 @@ def test_distributed_lineups_follow_layout_weights_and_rotate_agents():
 
 
 def test_asymmetric_agents_are_refused_with_a_pointer_to_sp5(tmp_path, monkeypatch, restore_root_logging):
-    import colosseum.sp2.distributed as distributed
+    import colosseum.distributed as distributed
 
     path = write_test_config(tmp_path / "asym.yaml", "asymmetric")
     overrides = {"run.dir": str(tmp_path / "runs")}
@@ -74,7 +74,7 @@ def test_asymmetric_agents_are_refused_with_a_pointer_to_sp5(tmp_path, monkeypat
 
 
 def test_unknown_agents_are_refused_before_a_run_dir_exists(tmp_path, restore_root_logging):
-    import colosseum.sp2.distributed as distributed
+    import colosseum.distributed as distributed
 
     path = write_test_config(tmp_path / "cfg.yaml", "turns")
     overrides = {"run.dir": str(tmp_path / "runs")}
@@ -84,7 +84,7 @@ def test_unknown_agents_are_refused_before_a_run_dir_exists(tmp_path, restore_ro
 
 
 def test_workers_entry_point_records_the_base_run_name(tmp_path, monkeypatch, restore_root_logging):
-    import colosseum.sp2.distributed as distributed
+    import colosseum.distributed as distributed
 
     monkeypatch.setattr(mp, "set_start_method", lambda *args, **kwargs: None)
     monkeypatch.setattr(distributed.mp, "Process", _ExitedProcess)
@@ -101,7 +101,7 @@ def test_workers_entry_point_records_the_base_run_name(tmp_path, monkeypatch, re
 @pytest.mark.parametrize(("worker_exit", "expected"), [(0, 0), (3, 1)])
 def test_run_workers_returns_an_exit_code(worker_exit, expected, tmp_path, monkeypatch, restore_root_logging,
                                           capsys):
-    import colosseum.sp2.distributed as distributed
+    import colosseum.distributed as distributed
 
     class Exited(_ExitedProcess):
         exitcode = worker_exit
@@ -117,8 +117,8 @@ def test_run_workers_returns_an_exit_code(worker_exit, expected, tmp_path, monke
 def fake_learner_role(tmp_path, monkeypatch):
     """run_distributed_learner without gRPC servers: returns the config path."""
     pytest.importorskip("grpc")  # the patched modules import grpc (an optional extra)
-    import colosseum.sp2.transport.grpc_transport as grpc_transport
-    import colosseum.sp2.weight_store.grpc_store as grpc_store
+    import colosseum.transport.grpc_transport as grpc_transport
+    import colosseum.weight_store.grpc_store as grpc_store
 
     class FakeServer:
         def stop(self, grace):
@@ -138,8 +138,8 @@ def fake_learner_role(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("sig", [signal.SIGTERM, signal.SIGINT], ids=["SIGTERM", "SIGINT"])
 def test_run_learner_returns_128_plus_signum(sig, fake_learner_role, monkeypatch, restore_root_logging):
-    import colosseum.sp2.distributed as distributed
-    import colosseum.sp2.learner.learner as learner_module
+    import colosseum.distributed as distributed
+    import colosseum.learner.learner as learner_module
 
     def fake_learner_process(*, stop_event, **kwargs):
         os.kill(os.getpid(), sig)
@@ -153,7 +153,7 @@ def test_run_learner_returns_128_plus_signum(sig, fake_learner_role, monkeypatch
 
 def test_run_learner_setup_failure_leaves_signal_handlers_untouched(fake_learner_role, monkeypatch,
                                                                      restore_root_logging, restore_global_rng):
-    import colosseum.sp2.distributed as distributed
+    import colosseum.distributed as distributed
 
     def failing_seed(seed):
         raise RuntimeError("seeding failed")
@@ -167,7 +167,7 @@ def test_run_learner_setup_failure_leaves_signal_handlers_untouched(fake_learner
 
 def test_agent_rotation_continues_across_the_workers_of_a_machine(tmp_path, monkeypatch, restore_root_logging):
     """One env per worker and two agents: worker 0 plays agent a, worker 1 agent b."""
-    import colosseum.sp2.distributed as distributed
+    import colosseum.distributed as distributed
 
     started: list[dict] = []
 

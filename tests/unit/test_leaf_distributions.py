@@ -4,7 +4,7 @@ import math
 import pytest
 import torch
 
-from colosseum.sp2.networks.dist import CategoricalDist, DiagGaussianDist, MultiCategoricalDist
+from colosseum.networks.dist import CategoricalDist, DiagGaussianDist, MultiCategoricalDist
 
 LOG2, LOG3, LOG4 = math.log(2), math.log(3), math.log(4)
 

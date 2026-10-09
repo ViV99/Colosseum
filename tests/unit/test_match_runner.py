@@ -11,13 +11,13 @@ import pytest
 import torch
 
 from colosseum.core.errors import EnvContractError
+from colosseum.core.types import Lineup, SeatAssignment
+from colosseum.envs.game import GameSpec, Outcome, StepResult
+from colosseum.envs.spaces import Units
+from colosseum.envs.vector import VectorEnv
+from colosseum.networks.model import PolicyModel
 from colosseum.networks.state import tree_leaves
-from colosseum.sp2.core.types import Lineup, SeatAssignment
-from colosseum.sp2.envs.game import GameSpec, Outcome, StepResult
-from colosseum.sp2.envs.spaces import Units
-from colosseum.sp2.envs.vector import VectorEnv
-from colosseum.sp2.networks.model import PolicyModel
-from colosseum.sp2.worker.match_runner import MatchRunner
+from colosseum.worker.match_runner import MatchRunner
 from game_helpers import (
     SCRIPT_GS_SPACE,
     SCRIPT_OBS_SPACE,
@@ -247,7 +247,7 @@ def test_missing_network_falls_back_to_latest_collecting_with_one_warning(caplog
     model = make_test_model(_role(2))
     script = [Tick(acting={0, 1}), Tick(over=True)]
     lineup = Lineup("2p", [SeatAssignment("a"), SeatAssignment("a", "ckpt_v9", collect=False)])
-    with caplog.at_level(logging.WARNING, logger="colosseum.sp2.worker.match_runner"):
+    with caplog.at_level(logging.WARNING, logger="colosseum.worker.match_runner"):
         runner, _, _ = _runner(script, 2, [lineup, lineup], {("a", "latest"): model}, num_envs=2)
     assert runner.lineup(0).seats[1] == SeatAssignment("a", "latest", True)
     assert runner.lineup(1).seats[1] == SeatAssignment("a", "latest", True)

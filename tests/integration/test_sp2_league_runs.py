@@ -9,10 +9,8 @@ from pathlib import Path
 
 import pytest
 
-from cli_runner import TINY_SP2, TTT_SP2_CONFIG, TTT_SP2_MULTI_CONFIG, TrainRun, run_train, training_process, wait_for
-from colosseum.sp2.core.config import load_config
-
-SP2 = "colosseum.sp2"
+from cli_runner import TINY, TTT_CONFIG, TTT_MULTI_CONFIG, TrainRun, run_train, training_process, wait_for
+from colosseum.core.config import load_config
 
 
 def checkpoint_versions(run: TrainRun, agent_id: str) -> list[int]:
@@ -49,7 +47,7 @@ def max_system_env_steps(root: Path) -> int:
 
 
 def test_two_agent_self_play_reaches_budget_and_both_learners_train(tmp_path):
-    run = run_train(TTT_SP2_MULTI_CONFIG, tmp_path, name="sp2", module=SP2, overrides={
+    run = run_train(TTT_MULTI_CONFIG, tmp_path, name="sp2", overrides={
         "matchmaking.mode": "self_play",
         "training.total_timesteps": "6000",
         "rollout.num_workers": "2",
@@ -73,7 +71,7 @@ def test_two_agent_self_play_reaches_budget_and_both_learners_train(tmp_path):
 
 
 def test_three_agent_league_all_pairs_meet_and_seats_balanced(tmp_path):
-    run = run_train(TTT_SP2_MULTI_CONFIG, tmp_path, name="league3", module=SP2, overrides={
+    run = run_train(TTT_MULTI_CONFIG, tmp_path, name="league3", overrides={
         "matchmaking.mode": "league",
         "matchmaking.self_play_ratio": "0.0",
         "agents.agent_gamma": "{}",
@@ -122,7 +120,7 @@ def test_resume_continues_versions_env_steps_and_lr(tmp_path):
     common = {"algorithm.lr_schedule": "linear", "checkpoint.interval": "10",
               "training.total_timesteps": str(budget)}
 
-    with training_process(TTT_SP2_CONFIG, tmp_path, name="first", overrides=common, module=SP2) as (proc, root):
+    with training_process(TTT_CONFIG, tmp_path, name="first", overrides=common) as (proc, root):
         assert wait_for(lambda: max_system_env_steps(root) >= interrupt_at or proc.poll() is not None, 180), \
             (tmp_path / "first.stderr").read_text()[-3000:]
         assert proc.poll() is None, (tmp_path / "first.stderr").read_text()[-3000:]
@@ -138,7 +136,7 @@ def test_resume_continues_versions_env_steps_and_lr(tmp_path):
     first_train = [r for r in first.records("train") if r["agent"] == "agent_0"]
     first_lr, last_lr = lr_of(first_train[0]), lr_of(first_train[-1])
 
-    second = run_train(TTT_SP2_CONFIG, tmp_path, name="second", module=SP2, overrides={
+    second = run_train(TTT_CONFIG, tmp_path, name="second", overrides={
         **common, "training.resume_from": str(first.root)})
     assert second.returncode == 0, second.stderr[-3000:]
     assert f"(policy_version {first_final})" in second.log("main")
@@ -158,7 +156,7 @@ def test_resume_continues_versions_env_steps_and_lr(tmp_path):
     # rate * console_interval_sec <= rate * dt == env_steps - resumed_env_steps.
     first_system = second.records("system")[0]
     assert first_system["env_steps"] >= resumed_env_steps, (resumed_env_steps, first_system)
-    interval = float(TINY_SP2["metrics.console_interval_sec"])
+    interval = float(TINY["metrics.console_interval_sec"])
     new_steps = first_system["env_steps"] - resumed_env_steps
     assert first_system["env_steps_per_sec"] * interval <= new_steps + 1e-6, (resumed_env_steps, first_system)
 

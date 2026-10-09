@@ -6,8 +6,8 @@ import time
 import numpy as np
 
 from colosseum.core.ipc import drain_latest, put_latest
-from colosseum.sp2.core.types import WeightPayload
-from colosseum.sp2.learner.learner import _push_weights
+from colosseum.core.types import WeightPayload
+from colosseum.learner.learner import _push_weights
 from game_helpers import learner_role, make_test_model
 
 

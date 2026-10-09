@@ -95,7 +95,7 @@ def test_load_samples_reads_metrics_jsonl(tmp_path):
     writer.write("train", agent="other", train_step=1, chunks_received=8.0)
     writer.write("system", env_steps=512, env_steps_per_sec=0.0, train_steps_per_sec={},
                  queue_depths={"agent_0": 30}, parked_buffers=0, workers_reporting=1)
-    writer.write("ratings", env_steps=512, elo={}, win_rates={}, games={}, wr_vs_past={})
+    writer.write("ratings", env_steps=512, layouts={"2p": {"elo": {}, "win_rates": {}}})
     writer.close()
     train, system = bench.load_samples(tmp_path / "metrics.jsonl")
     assert [s[1:] for s in train] == [(1, 8)]
@@ -103,10 +103,18 @@ def test_load_samples_reads_metrics_jsonl(tmp_path):
     assert all(isinstance(s[0], float) for s in train + system)
 
 
+def test_workload_summary_names_the_layout():
+    workload = bench.workload_summary(15.0, 60.0)
+    assert set(workload) == {"env", "layout", "envs_per_worker", "chunk_length", "batch_chunks", "queue_size",
+                             "warmup_s", "duration_s"}
+    assert workload["layout"] == "2p" and workload["queue_size"] == bench.QUEUE_SIZE
+
+
 def test_benchmark_config_builds_and_validates(tmp_path):
     """Guard: the pinned benchmark config follows the current config schema."""
     from colosseum.core.registry import validate_config
 
     cfg = bench._make_config(1, str(tmp_path))
-    assert cfg.networks.core is None
+    assert cfg.networks.core is None and cfg.matchmaking.layouts == {"2p": 1.0}
+    assert cfg.env.env_class == "examples.tic_tac_toe.game.TicTacToeGame"
     validate_config(cfg)

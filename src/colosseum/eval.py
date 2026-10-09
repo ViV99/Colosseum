@@ -1,48 +1,39 @@
-"""Evaluation: inference-only matches between agents and checkpoints.
+"""Evaluation: inference-only matches on ``MatchRunner`` (spec block 8).
 
 Engine
 ------
-``schedule_lineups`` turns agent names into a list of matches (one seat -> agent
-lineup per match). ``play_matches`` plays them on a ``VectorEnv`` with batched
-``act()`` inference per agent and one model ``State`` per (env, seat):
+``play_lineups`` plays explicit ``Lineup``s with explicit ``PolicyModel`` instances on the same
+``MatchRunner`` core as training: seat lifecycle, masks, per-seat model states, results by team.
+``Lineup.seats[*].agent_id`` is a key of ``models``; ``network_id`` is ignored (every seat uses
+``models[agent_id]``). Every lineup is played once, to completion. Envs left without a scheduled
+lineup keep playing their last one until the rest finish; those extra episodes are discarded,
+so short episodes are not favoured. The in-process API is what the learning tests and the
+future ``colosseum tournament`` (SP4) use.
 
-- the state starts at ``initial_state(1)`` at every episode start;
-- it advances only when that seat acts (``info[p]["active"]``, default True);
-  non-acting seats send the all-zeros action and keep their state;
-- masks follow the worker's rules (``core/seat_info.py``): an acting seat whose
-  action mask allows nothing raises ``EnvContractError``.
+Schedules (CLI, ``schedule_lineups``)
+-------------------------------------
+- Two or more teams, two or more agents: for every pair (a, b) and match m, team i gets the core
+  ``(a, b)[(i + m) % 2]``; a seat whose role the core does not play goes to the other agent of the
+  pair, so an asymmetric pair (hunter and prey) is never rotated. Pairs that cannot fill every
+  seat, or that leave one of the two out, are not scheduled for the layout.
+- Two or more teams, one agent: every team is that agent.
+- One team (solo, cooperative): each agent alone (homogeneous team), then, with two or more
+  agents and a team of two or more seats, every mixed composition (cross-play), rotating its
+  seat orders over the matches.
 
-These are the same semantics as training rollouts, so stateful models (LSTM,
-GRU, attention) are evaluated as the policy they were trained as.
-
-Seat rotation: for a pair (a, b), match m gives seat s to ``(a, b)[(s + m) % 2]``.
-With an even number of matches per pair each agent plays every seat equally
-often. Every scheduled match is played to completion; extra episodes that idle
-envs play while others finish are discarded, so short episodes are not favoured.
-
-Statistics
-----------
-Pairwise (two or more agents in an N-player game, N >= 2). From agent a's side a
-match is a win when a's mean seat outcome (``core.outcomes``) beats b's, a draw
-when equal. Each pair reports:
-
-- W/D/L and the win rate W/n with a 95% Wilson score interval;
-- the score (W + D/2)/n with a 95% Wilson interval computed on the score as if it
-  were a Bernoulli proportion (a draw counts as half a win). Wilson's null variance
-  p(1 - p) is the largest variance any outcome in [0, 1] with mean p can have, so
-  this interval is at least as wide as a Wilson-type interval that uses the true
-  win/draw/loss variance; without draws it is exactly the Bernoulli Wilson
-  interval. Like every Wilson interval it is asymptotic, not exact.
-  Paired/rating-based selection (Bradley-Terry with bootstrap) is SP4;
-- a per-seat breakdown keyed by the seats agent a occupied (e.g. "0", or "0,2");
-- mean returns and mean episode length.
-
-The reversed row (b vs a) is derived from the same counts, so the two rows never
-contradict each other.
-
-Solo (one agent, or a 1-player env): per agent, the mean episode return and the
-mean outcome with 95% normal-approximation intervals ``mean +- 1.96 * sd / sqrt(n)``,
-plus a per-seat breakdown when the env has several seats.
+Statistics (``summarize``), per layout, by the layout's outcome kind
+--------------------------------------------------------------------
+- ``wdl``: per pair, W/D/L from team ranks, win rate and score (draw = half) with 95% Wilson
+  intervals (SP1), mean returns and length, and a per-side breakdown keyed by the team index of
+  agent a. The reversed row is derived from the same counts. One agent: per-seat W/D/L and mean
+  return. Lineups with a team mixing both agents are counted as ``unattributed``.
+- ``rank``: per agent, mean team rank with a 95% normal interval and the share of first places;
+  a pairwise "who ranked higher" table (``higher[a][b]``: score of a over b, draw = half).
+  Teams mixing agents are left out (the match is counted as ``unattributed``). One agent in
+  every seat (SP1 solo mode): ``solo`` per seat (mean rank, share of first places, mean return).
+- ``score``: per team composition (sorted agent ids joined by ``+``), mean team score with a 95%
+  normal interval; homogeneous compositions are the per-agent results, the rest is cross-play.
+- every kind: mean seat return per role and agent (``by_role``).
 """
 
 from __future__ import annotations
@@ -53,7 +44,7 @@ import json
 import logging
 import math
 from collections import defaultdict, deque
-from collections.abc import Callable, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -63,16 +54,17 @@ import torch
 from pydantic import ValidationError
 
 from colosseum.coordinator.checkpoint_manager import check_model_state, load_checkpoint_dir, read_weights_file
+from colosseum.coordinator.ratings import composition_key
 from colosseum.core.config import ColosseumConfig, NetworkConfig
 from colosseum.core.errors import ConfigError
-from colosseum.core.outcomes import player_outcomes
-from colosseum.core.registry import build_model, validate_config
-from colosseum.core.seat_info import acting_flags, check_masks, extract_masks
-from colosseum.core.types import state_dict_from_numpy
-from colosseum.envs.base_env import BaseEnv
-from colosseum.envs.vec_env import VectorEnv
-from colosseum.networks.model import PolicyModel, act
-from colosseum.networks.state import State, cat_batch, slice_batch
+from colosseum.core.outcomes import pairwise_rank_score
+from colosseum.core.roles import agent_role_spec, resolve_agent_roles, role_signature
+from colosseum.core.types import LATEST_NETWORK_ID, Lineup, MatchResult, SeatAssignment, state_dict_from_numpy
+from colosseum.core.validation import _check_model
+from colosseum.envs.game import GameSpec, MultiAgentEnv
+from colosseum.envs.vector import VectorEnv
+from colosseum.networks.model import PolicyModel
+from colosseum.worker.match_runner import EpisodeEnd, MatchRunner
 
 logger = logging.getLogger(__name__)
 
@@ -81,96 +73,155 @@ SCORE_CI_METHOD = "wilson-on-score (draw = half win; conservative approximation)
 
 
 # ---------------------------------------------------------------------------
+# Schedules
+# ---------------------------------------------------------------------------
+
+
+def _eval_seat(agent_id: str) -> SeatAssignment:
+    return SeatAssignment(agent_id=agent_id, network_id=LATEST_NETWORK_ID, collect=False)
+
+
+def _pair_lineup(spec: GameSpec, layout: str, pair: tuple[str, str], m: int,
+                 players: Mapping[str, Sequence[str]]) -> Lineup | None:
+    seat_specs = spec.layouts[layout]
+    seats: list[SeatAssignment | None] = [None] * len(seat_specs)
+    for team, members in enumerate(spec.teams(layout)):
+        core = pair[(team + m) % 2]
+        other = pair[1 - (team + m) % 2]
+        for s in members:
+            role = seat_specs[s].role
+            if role in players[core]:
+                seats[s] = _eval_seat(core)
+            elif role in players[other]:
+                seats[s] = _eval_seat(other)
+            else:
+                return None
+    names = {seat.agent_id for seat in seats}  # type: ignore[union-attr]
+    if names != set(pair):
+        return None
+    return Lineup(layout=layout, seats=seats)  # type: ignore[arg-type]
+
+
+def _homogeneous(spec: GameSpec, layout: str, name: str, roles: Sequence[str]) -> Lineup | None:
+    if any(seat.role not in roles for seat in spec.layouts[layout]):
+        return None
+    return Lineup(layout=layout, seats=[_eval_seat(name) for _ in spec.layouts[layout]])
+
+
+def _cross_play_orders(spec: GameSpec, layout: str, composition: tuple[str, ...],
+                       players: Mapping[str, Sequence[str]]) -> list[tuple[str, ...]]:
+    roles = [seat.role for seat in spec.layouts[layout]]
+    orders = sorted({order for order in itertools.permutations(composition)
+                     if all(role in players[name] for name, role in zip(order, roles, strict=True))})
+    return orders
+
+
+def schedule_lineups(spec: GameSpec, layout: str, players: Mapping[str, Sequence[str]],
+                     num_matches: int) -> list[Lineup]:
+    """Lineups of one layout for ``players`` (name -> roles) by the CLI rules (module docstring).
+
+    ``num_matches`` is per pair (two or more teams), per agent (one agent, or one team) and per
+    mixed composition (cross-play). Returns ``[]`` when the players cannot fill the layout.
+    """
+    if layout not in spec.layouts:
+        raise ValueError(f"schedule_lineups: unknown layout {layout!r}")
+    if num_matches < 1:
+        raise ValueError(f"schedule_lineups: num_matches must be >= 1, got {num_matches}")
+    names = list(players)
+    if not names:
+        raise ValueError("schedule_lineups: no players")
+    lineups: list[Lineup] = []
+    if spec.num_teams(layout) >= 2 and len(names) >= 2:
+        for pair in itertools.combinations(names, 2):
+            pair_lineups = [_pair_lineup(spec, layout, pair, m, players) for m in range(num_matches)]
+            if all(lineup is not None for lineup in pair_lineups):
+                lineups.extend(pair_lineups)  # type: ignore[arg-type]
+        return lineups
+    for name in names:
+        lineup = _homogeneous(spec, layout, name, players[name])
+        if lineup is not None:
+            lineups.extend(Lineup(layout, list(lineup.seats)) for _ in range(num_matches))
+    size = spec.layout_size(layout)
+    if spec.num_teams(layout) == 1 and len(names) >= 2 and size >= 2:
+        for composition in itertools.combinations_with_replacement(names, size):
+            if len(set(composition)) < 2:
+                continue
+            orders = _cross_play_orders(spec, layout, composition, players)
+            for m in range(num_matches if orders else 0):
+                lineups.append(Lineup(layout, [_eval_seat(name) for name in orders[m % len(orders)]]))
+    return lineups
+
+
+# ---------------------------------------------------------------------------
 # Engine
 # ---------------------------------------------------------------------------
 
 
-def _eval_where(e: int, p: int) -> str:
-    """Error-message context for eval env ``e``, seat ``p``."""
-    return f"eval: env {e} seat {p}"
+class _FixedModels:
+    """``ModelPool`` that serves ``models[agent_id]`` for any network id."""
+
+    def __init__(self, models: Mapping[str, PolicyModel]) -> None:
+        self._models = models
+
+    def get(self, agent_id: str, network_id: str) -> PolicyModel | None:
+        return self._models.get(agent_id)
 
 
-@dataclass(frozen=True)
-class MatchRecord:
-    """One finished match: agent name, outcome in [0, 1] and return per seat."""
+class _Collector:
+    """``MatchObserver`` that keeps the result of every scheduled lineup and feeds the next one."""
 
-    lineup: tuple[str, ...]
-    outcomes: tuple[float, ...]
-    returns: tuple[float, ...]
-    length: int
+    def __init__(self, pending: deque[Lineup], scheduled: list[bool]) -> None:
+        self.runner: MatchRunner | None = None
+        self.results: list[MatchResult] = []
+        self._pending = pending
+        self._scheduled = scheduled
 
+    def on_act(self, env, seat, record) -> None:
+        pass
 
-def schedule_lineups(
-    agent_names: Sequence[str], num_players: int, num_matches: int,
-) -> list[tuple[str, ...]]:
-    """Seat -> agent lineups for an evaluation.
+    def on_rewards(self, env, rewards) -> None:
+        pass
 
-    - One agent, or a 1-player env (solo): ``num_matches`` lineups per agent with
-      the agent in every seat.
-    - Otherwise (pairwise): for every pair (a, b) in ``itertools.combinations``
-      order, ``num_matches`` lineups where match m gives seat s to
-      ``(a, b)[(s + m) % 2]``. With even ``num_matches`` every agent plays every
-      seat equally often.
-    """
-    names = list(agent_names)
-    if not names:
-        raise ValueError("schedule_lineups: no agents")
-    if len(set(names)) != len(names):
-        raise ValueError(f"schedule_lineups: duplicate agent names in {names}")
-    if num_players < 1:
-        raise ValueError(f"schedule_lineups: num_players must be >= 1, got {num_players}")
-    if num_matches < 1:
-        raise ValueError(f"schedule_lineups: num_matches must be >= 1, got {num_matches}")
-    if len(names) == 1 or num_players == 1:
-        return [tuple([name] * num_players) for name in names for _ in range(num_matches)]
-    if num_matches % 2:
-        logger.warning(
-            "eval: num_matches=%d is odd, so seats are balanced only up to one match per pair",
-            num_matches,
-        )
-    lineups: list[tuple[str, ...]] = []
-    for a, b in itertools.combinations(names, 2):
-        pair = (a, b)
-        for m in range(num_matches):
-            lineups.append(tuple(pair[(s + m) % 2] for s in range(num_players)))
-    return lineups
+    def on_terminated(self, env, seats) -> None:
+        pass
+
+    def on_lineup_applied(self, env, old, new) -> None:
+        pass
+
+    def on_episode_end(self, env: int, end: EpisodeEnd) -> None:
+        if self._scheduled[env]:
+            self.results.append(end.result)
+        if self._pending:
+            self.runner.set_next_lineup(env, self._pending.popleft())  # applied at this episode end
+            self._scheduled[env] = True
+        else:
+            self._scheduled[env] = False
 
 
-def play_matches(
-    models: dict[str, PolicyModel],
-    env_fn: Callable[[], BaseEnv],
-    lineups: Sequence[tuple[str, ...]],
+def play_lineups(
+    *,
+    env_fn: Callable[[], MultiAgentEnv],
+    models: Mapping[str, PolicyModel],
+    lineups: Sequence[Lineup],
     num_envs: int = 8,
-    deterministic: bool = False,
     seed: int | None = None,
-) -> list[MatchRecord]:
-    """Play every lineup once, to completion; one record per lineup, in completion order.
+    deterministic: bool = False,
+    max_idle_steps: int = 1000,
+) -> list[MatchResult]:
+    """Play every lineup once, to completion; one ``MatchResult`` per lineup, in completion order.
 
-    Each (env, seat) has its own model State: ``initial_state(1)`` at episode
-    start, advanced only when the seat acts (``info[p]["active"]``, default True),
-    reset at episode end. Non-acting seats send the zero action. Masks follow the
-    worker's rules (``core/seat_info.py``): an acting seat without a legal action
-    raises :class:`~colosseum.core.errors.EnvContractError`. Envs left without a
-    scheduled match keep playing their last lineup until the rest finish; those
-    extra episodes are discarded, so short episodes are not favoured.
-
-    ``seed`` seeds the env resets and a forked torch RNG, so the caller's global
-    RNG is untouched. Models run in eval mode; their train/eval flags are
-    restored on return, also after an exception.
+    ``seed`` seeds the episode resets and a forked torch RNG, so the caller's global RNG is
+    untouched. Models run in eval mode; their train/eval flags are restored on return.
     """
-    lineups = [tuple(lu) for lu in lineups]
+    lineups = list(lineups)
     if not lineups:
         return []
-    unknown = sorted({name for lu in lineups for name in lu} - set(models))
+    unknown = sorted({seat.agent_id for lineup in lineups for seat in lineup.seats} - set(models))
     if unknown:
-        raise ValueError(f"play_matches: lineups use unknown agents {unknown}")
+        raise ValueError(f"play_lineups: lineups use unknown agents {unknown}")
     if num_envs < 1:
-        raise ValueError(f"play_matches: num_envs must be >= 1, got {num_envs}")
-    # A seed must not leak into the caller: sample from a forked torch RNG. Only
-    # the CPU generator is forked (``devices=[]``): eval feeds CPU tensors built
-    # from numpy, so models run and sample on the CPU.
+        raise ValueError(f"play_lineups: num_envs must be >= 1, got {num_envs}")
     rng = torch.random.fork_rng(devices=[]) if seed is not None else contextlib.nullcontext()
-    # Restore every submodule's own flag (a caller may mix train/eval submodules).
     was_training = [(m, m.training) for model in models.values() for m in model.modules()]
     try:
         with rng:
@@ -178,91 +229,27 @@ def play_matches(
                 torch.manual_seed(seed)
             for model in models.values():
                 model.eval()
-            vec_env = VectorEnv(env_fn, min(num_envs, len(lineups)))
+            n = min(num_envs, len(lineups))
+            pending = deque(lineups[n:])
+            collector = _Collector(pending, [True] * n)
+            vec_env = VectorEnv(env_fn, n)
             try:
-                return _play(vec_env, models, lineups, deterministic, seed)
-            finally:
+                runner = MatchRunner(vec_env=vec_env, lineups=lineups[:n], models=_FixedModels(models),
+                                     observer=collector, seed=seed, max_idle_steps=max_idle_steps,
+                                     deterministic=deterministic, context="eval, ", match_id_prefix="eval")
+            except BaseException:
                 vec_env.close()
+                raise
+            collector.runner = runner
+            try:
+                while len(collector.results) < len(lineups):
+                    runner.step()
+            finally:
+                runner.close()
+            return collector.results
     finally:
         for module, training in was_training:
             module.training = training
-
-
-def _play(
-    vec_env: VectorEnv,
-    models: dict[str, PolicyModel],
-    lineups: list[tuple[str, ...]],
-    deterministic: bool,
-    seed: int | None,
-) -> list[MatchRecord]:
-    n_envs, n_players, spec = vec_env.num_envs, vec_env.num_players, vec_env.action_spec
-    bad = [lu for lu in lineups if len(lu) != n_players]
-    if bad:
-        raise ValueError(f"play_matches: lineup {bad[0]} does not have {n_players} seats")
-
-    pending = deque(lineups)
-    playing: list[tuple[str, ...]] = [pending.popleft() for _ in range(n_envs)]
-    counted = [True] * n_envs   # False once an env has no scheduled match left
-    states: list[list[State]] = [
-        [models[playing[e][p]].initial_state(1) for p in range(n_players)]
-        for e in range(n_envs)
-    ]
-    returns = np.zeros((n_envs, n_players), dtype=np.float64)
-    lengths = np.zeros(n_envs, dtype=np.int64)
-    records: list[MatchRecord] = []
-
-    obs, infos = vec_env.reset_all(seed=seed)
-    while len(records) < len(lineups):
-        acting = acting_flags(infos, n_envs, n_players)
-        masks = extract_masks(infos, n_envs, n_players, spec)
-        if masks is not None:
-            check_masks(masks, acting, spec, _eval_where)
-            masks = masks.reshape(n_envs, n_players, -1)
-
-        actions = np.zeros((n_envs, n_players, *spec.action_shape), dtype=spec.numpy_dtype)
-        groups: dict[str, list[tuple[int, int]]] = defaultdict(list)
-        for e in range(n_envs):
-            for p in range(n_players):
-                if acting[e, p]:
-                    groups[playing[e][p]].append((e, p))
-        for name, seats in groups.items():
-            ei = [e for e, _ in seats]
-            pi = [p for _, p in seats]
-            obs_b = torch.from_numpy(np.ascontiguousarray(obs[ei, pi], dtype=np.float32))
-            mask_b = None if masks is None else torch.from_numpy(np.ascontiguousarray(masks[ei, pi]))
-            state_b = cat_batch([states[e][p] for e, p in seats])
-            with torch.no_grad():
-                out = act(models[name], obs_b, state_b, mask_b, deterministic=deterministic)
-            actions[ei, pi] = out.actions.cpu().numpy().astype(spec.numpy_dtype, copy=False)
-            for k, (e, p) in enumerate(seats):
-                states[e][p] = None if out.state is None else slice_batch(out.state, k)
-
-        obs, rewards, terminated, truncated, infos = vec_env.step(actions)
-        returns += rewards
-        lengths += 1
-
-        for e in range(n_envs):
-            if not (terminated[e] or truncated[e]):
-                continue
-            if counted[e]:
-                terminal_infos = {
-                    p: (infos[e].get(p, {}) or {}).get("terminal_info", {}) for p in range(n_players)
-                }
-                outcomes = player_outcomes(returns[e].tolist(), terminal_infos, n_players)
-                records.append(MatchRecord(
-                    lineup=playing[e],
-                    outcomes=tuple(float(x) for x in outcomes),
-                    returns=tuple(float(x) for x in returns[e]),
-                    length=int(lengths[e]),
-                ))
-            if pending:
-                playing[e] = pending.popleft()
-            else:
-                counted[e] = False   # keep the env busy with its last lineup; results ignored
-            states[e] = [models[playing[e][p]].initial_state(1) for p in range(n_players)]
-            returns[e] = 0.0
-            lengths[e] = 0
-    return records
 
 
 # ---------------------------------------------------------------------------
@@ -271,27 +258,18 @@ def _play(
 
 
 def wilson_interval(successes: float, n: int, z: float = Z_95) -> tuple[float, float]:
-    """Wilson score interval for a proportion ``successes / n``.
-
-    ``successes`` may be fractional (score with draws as half wins). The result
-    always contains the point estimate; ``n == 0`` gives ``(0.0, 1.0)``.
-    """
+    """Wilson score interval for ``successes / n`` (fractional successes allowed); n=0 -> (0, 1)."""
     if n <= 0:
         return 0.0, 1.0
     p = successes / n
     denom = 1.0 + z * z / n
     center = (p + z * z / (2.0 * n)) / denom
     half = z * math.sqrt(max(0.0, p * (1.0 - p)) / n + z * z / (4.0 * n * n)) / denom
-    low = min(max(0.0, center - half), p)
-    high = max(min(1.0, center + half), p)
-    return low, high
+    return min(max(0.0, center - half), p), max(min(1.0, center + half), p)
 
 
 def normal_interval(values: Sequence[float], z: float = Z_95) -> tuple[float, float, float]:
-    """``(mean, low, high)`` with ``mean +- z * sd / sqrt(n)`` (sd with ddof=1).
-
-    Fewer than two values give a zero-width interval; no values give zeros.
-    """
+    """``(mean, low, high)`` with ``mean +- z * sd / sqrt(n)`` (ddof=1); n < 2 -> zero width."""
     x = np.asarray(list(values), dtype=np.float64)
     if x.size == 0:
         return 0.0, 0.0, 0.0
@@ -302,333 +280,411 @@ def normal_interval(values: Sequence[float], z: float = Z_95) -> tuple[float, fl
     return mean, mean - half, mean + half
 
 
-def _seat_key(seats: Sequence[int]) -> str:
-    return ",".join(str(s) for s in seats)
+def _team_agents(result: MatchResult) -> dict[int, set[str]]:
+    teams: dict[int, set[str]] = defaultdict(set)
+    for seat in result.seats:
+        teams[seat.team].add(seat.agent_id)
+    return teams
+
+
+def _team_return(result: MatchResult, team: int) -> float:
+    return float(np.mean([seat.reward for seat in result.seats if seat.team == team]))
 
 
 @dataclass
 class PairStats:
-    """Counts for one unordered pair, from ``agent_a``'s side."""
+    """WDL counts of one unordered pair, from ``agent_a``'s side; ``per_side`` is keyed by a's team."""
 
     agent_a: str
     agent_b: str
-    num_players: int
     wins: int = 0
     draws: int = 0
     losses: int = 0
     return_a: float = 0.0
     return_b: float = 0.0
     total_length: int = 0
-    per_seat: dict[tuple[int, ...], list[int]] = field(default_factory=dict)  # a's seats -> [W, D, L]
+    per_side: dict[int, list[int]] = field(default_factory=dict)
 
     @property
     def n(self) -> int:
         return self.wins + self.draws + self.losses
 
-    def add(self, record: MatchRecord) -> None:
-        seats_a = tuple(s for s, name in enumerate(record.lineup) if name == self.agent_a)
-        seats_b = tuple(s for s, name in enumerate(record.lineup) if name == self.agent_b)
-        if not seats_a or not seats_b or len(seats_a) + len(seats_b) != len(record.lineup):
-            raise ValueError(
-                f"PairStats({self.agent_a}, {self.agent_b}): record lineup {record.lineup} "
-                f"is not a lineup of this pair"
-            )
-        score_a = float(np.mean([record.outcomes[s] for s in seats_a]))
-        score_b = float(np.mean([record.outcomes[s] for s in seats_b]))
-        cell = self.per_seat.setdefault(seats_a, [0, 0, 0])
-        if score_a > score_b:
+    def add(self, result: MatchResult, team_a: int, team_b: int) -> None:
+        ranks = {team.team: team.rank for team in result.teams}
+        score = pairwise_rank_score(ranks[team_a], ranks[team_b])
+        cell = self.per_side.setdefault(team_a, [0, 0, 0])
+        idx = 0 if score == 1.0 else (1 if score == 0.5 else 2)
+        cell[idx] += 1
+        if idx == 0:
             self.wins += 1
-            cell[0] += 1
-        elif score_a < score_b:
-            self.losses += 1
-            cell[2] += 1
-        else:
+        elif idx == 1:
             self.draws += 1
-            cell[1] += 1
-        self.return_a += float(np.mean([record.returns[s] for s in seats_a]))
-        self.return_b += float(np.mean([record.returns[s] for s in seats_b]))
-        self.total_length += record.length
+        else:
+            self.losses += 1
+        self.return_a += _team_return(result, team_a)
+        self.return_b += _team_return(result, team_b)
+        self.total_length += result.episode_length
 
     def reversed(self) -> PairStats:
-        """The same counts seen from ``agent_b``'s side."""
-        def complement(seats: tuple[int, ...]) -> tuple[int, ...]:
-            return tuple(s for s in range(self.num_players) if s not in seats)
-
         return PairStats(
-            agent_a=self.agent_b, agent_b=self.agent_a, num_players=self.num_players,
-            wins=self.losses, draws=self.draws, losses=self.wins,
+            agent_a=self.agent_b, agent_b=self.agent_a, wins=self.losses, draws=self.draws, losses=self.wins,
             return_a=self.return_b, return_b=self.return_a, total_length=self.total_length,
-            per_seat={complement(k): [v[2], v[1], v[0]] for k, v in self.per_seat.items()},
+            per_side={1 - side: [v[2], v[1], v[0]] for side, v in self.per_side.items()},
         )
 
     def to_row(self) -> dict[str, Any]:
         n = self.n
         points = self.wins + 0.5 * self.draws
-        per_seat = {}
-        for seats, (w, d, losses) in sorted(self.per_seat.items()):
+        per_side = {}
+        for side, (w, d, losses) in sorted(self.per_side.items()):
             m = w + d + losses
-            per_seat[_seat_key(seats)] = {
-                "n": m, "wins": w, "draws": d, "losses": losses,
-                "score": (w + 0.5 * d) / m if m else 0.0,
-            }
+            per_side[str(side)] = {"n": m, "wins": w, "draws": d, "losses": losses,
+                                   "score": (w + 0.5 * d) / m if m else 0.0}
         return {
-            "agent_a": self.agent_a,
-            "agent_b": self.agent_b,
-            "n": n,
-            "wins": self.wins,
-            "draws": self.draws,
-            "losses": self.losses,
-            "win_rate": self.wins / n if n else 0.0,
-            "win_rate_ci": list(wilson_interval(self.wins, n)),
-            "score": points / n if n else 0.0,
-            "score_ci": list(wilson_interval(points, n)),
-            "mean_return_a": self.return_a / n if n else 0.0,
-            "mean_return_b": self.return_b / n if n else 0.0,
+            "agent_a": self.agent_a, "agent_b": self.agent_b, "n": n,
+            "wins": self.wins, "draws": self.draws, "losses": self.losses,
+            "win_rate": self.wins / n if n else 0.0, "win_rate_ci": list(wilson_interval(self.wins, n)),
+            "score": points / n if n else 0.0, "score_ci": list(wilson_interval(points, n)),
+            "mean_return_a": self.return_a / n if n else 0.0, "mean_return_b": self.return_b / n if n else 0.0,
             "mean_episode_length": self.total_length / n if n else 0.0,
-            "per_seat": per_seat,
+            "per_side": per_side,
         }
 
 
-@dataclass
-class SoloStats:
-    """Per-agent episode statistics for solo evaluation."""
-
-    agent: str
-    num_players: int
-    returns: list[float] = field(default_factory=list)    # per match: mean over seats
-    outcomes: list[float] = field(default_factory=list)
-    lengths: list[int] = field(default_factory=list)
-    seat_returns: dict[int, list[float]] = field(default_factory=lambda: defaultdict(list))
-    seat_outcomes: dict[int, list[float]] = field(default_factory=lambda: defaultdict(list))
-
-    def add(self, record: MatchRecord) -> None:
-        if set(record.lineup) != {self.agent}:
-            raise ValueError(f"SoloStats({self.agent}): unexpected lineup {record.lineup}")
-        self.returns.append(float(np.mean(record.returns)))
-        self.outcomes.append(float(np.mean(record.outcomes)))
-        self.lengths.append(record.length)
-        for seat in range(len(record.lineup)):
-            self.seat_returns[seat].append(record.returns[seat])
-            self.seat_outcomes[seat].append(record.outcomes[seat])
-
-    def to_row(self) -> dict[str, Any]:
-        mean_ret, ret_lo, ret_hi = normal_interval(self.returns)
-        mean_out, out_lo, out_hi = normal_interval(self.outcomes)
-        per_seat = {
-            str(seat): {
-                "n": len(self.seat_returns[seat]),
-                "mean_return": float(np.mean(self.seat_returns[seat])),
-                "mean_outcome": float(np.mean(self.seat_outcomes[seat])),
-            }
-            for seat in sorted(self.seat_returns)
-        }
-        return {
-            "agent": self.agent,
-            "n": len(self.returns),
-            "mean_return": mean_ret,
-            "return_ci": [ret_lo, ret_hi],
-            "mean_outcome": mean_out,
-            "outcome_ci": [out_lo, out_hi],
-            "mean_episode_length": float(np.mean(self.lengths)) if self.lengths else 0.0,
-            "per_seat": per_seat,
-        }
+def _by_role(results: Sequence[MatchResult]) -> dict[str, dict[str, dict[str, float]]]:
+    acc: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    for result in results:
+        for seat in result.seats:
+            acc[seat.role][seat.agent_id].append(float(seat.reward))
+    return {role: {agent: {"n": len(v), "mean_return": float(np.mean(v))} for agent, v in sorted(agents.items())}
+            for role, agents in sorted(acc.items())}
 
 
-def _normal_ci_text(bounds: list[float], n: int) -> str:
-    """Table text of a normal interval; n < 2 has none (the JSON keeps the zero-width one)."""
-    return f"[{bounds[0]:.3f}, {bounds[1]:.3f}]" if n >= 2 else "[n/a]"
+def _summarize_wdl(results: Sequence[MatchResult]) -> dict[str, Any]:
+    pairs: dict[tuple[str, str], PairStats] = {}
+    solo: dict[str, dict[int, list[float]]] = defaultdict(lambda: defaultdict(list))
+    solo_wdl: dict[str, dict[int, list[int]]] = defaultdict(lambda: defaultdict(lambda: [0, 0, 0]))
+    unattributed = 0
+    for result in results:
+        teams = _team_agents(result)
+        names = sorted(set().union(*teams.values()))
+        if len(names) == 1:
+            ranks = {team.team: team.rank for team in result.teams}
+            for seat in result.seats:
+                solo[names[0]][seat.seat].append(float(seat.reward))
+                other = min(rank for team, rank in ranks.items() if team != seat.team)
+                own = ranks[seat.team]
+                solo_wdl[names[0]][seat.seat][0 if own < other else (1 if own == other else 2)] += 1
+            continue
+        if len(names) != 2 or any(len(agents) != 1 for agents in teams.values()):
+            unattributed += 1
+            continue
+        a, b = names
+        team_a = next(t for t, agents in teams.items() if agents == {a})
+        team_b = next(t for t, agents in teams.items() if agents == {b})
+        pairs.setdefault((a, b), PairStats(a, b)).add(result, team_a, team_b)
+    rows = []
+    for pair in pairs.values():
+        rows.append(pair.to_row())
+        rows.append(pair.reversed().to_row())
+    solo_rows = []
+    for name, seats in solo.items():
+        all_returns = [r for v in seats.values() for r in v]
+        mean, low, high = normal_interval(all_returns)
+        solo_rows.append({
+            "agent": name, "n": len(all_returns), "mean_return": mean, "return_ci": [low, high],
+            "per_seat": {str(s): {"n": len(v), "mean_return": float(np.mean(v)),
+                                  "wins": solo_wdl[name][s][0], "draws": solo_wdl[name][s][1],
+                                  "losses": solo_wdl[name][s][2]}
+                         for s, v in sorted(seats.items())},
+        })
+    return {"pairs": rows, "solo": solo_rows, "unattributed": unattributed, "score_ci_method": SCORE_CI_METHOD}
+
+
+def _summarize_rank(results: Sequence[MatchResult]) -> dict[str, Any]:
+    ranks: dict[str, list[float]] = defaultdict(list)
+    higher: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    solo: dict[str, dict[int, list[tuple[float, float]]]] = defaultdict(lambda: defaultdict(list))
+    unattributed = 0
+    for result in results:
+        teams = _team_agents(result)
+        team_rank = {team.team: team.rank for team in result.teams}
+        names = set().union(*teams.values())
+        if len(names) == 1:  # SP1 solo mode: one agent in every seat
+            (name,) = names
+            for seat in result.seats:
+                solo[name][seat.seat].append((team_rank[seat.team], float(seat.reward)))
+            continue
+        if any(len(agents) != 1 for agents in teams.values()):
+            unattributed += 1
+        homogeneous = {t: next(iter(agents)) for t, agents in teams.items() if len(agents) == 1}
+        for team, agent in homogeneous.items():
+            ranks[agent].append(team_rank[team])
+        for ta, tb in itertools.combinations(sorted(homogeneous), 2):
+            a, b = homogeneous[ta], homogeneous[tb]
+            if a == b:
+                continue
+            score = pairwise_rank_score(team_rank[ta], team_rank[tb])
+            higher[a][b].append(score)
+            higher[b][a].append(1.0 - score)
+    agents = {}
+    for agent, values in sorted(ranks.items()):
+        mean, low, high = normal_interval(values)
+        agents[agent] = {"n": len(values), "mean_rank": mean, "rank_ci": [low, high],
+                         "first_place_rate": float(np.mean([v == 1.0 for v in values]))}
+    table = {a: {b: {"n": len(v), "rate": float(np.mean(v))} for b, v in sorted(row.items())}
+             for a, row in sorted(higher.items())}
+    solo_rows = []
+    for name, seats in sorted(solo.items()):
+        all_returns = [ret for cells in seats.values() for _rank, ret in cells]
+        mean, low, high = normal_interval(all_returns)
+        solo_rows.append({
+            "agent": name, "n": len(all_returns), "mean_return": mean, "return_ci": [low, high],
+            "per_seat": {str(s): {"n": len(cells), "mean_rank": float(np.mean([r for r, _ in cells])),
+                                  "first_place_rate": float(np.mean([r == 1.0 for r, _ in cells])),
+                                  "mean_return": float(np.mean([ret for _, ret in cells]))}
+                         for s, cells in sorted(seats.items())},
+        })
+    return {"agents": agents, "higher": table, "solo": solo_rows, "unattributed": unattributed}
+
+
+def _summarize_score(results: Sequence[MatchResult]) -> dict[str, Any]:
+    scores: dict[str, list[float]] = defaultdict(list)
+    for result in results:
+        scores[composition_key(seat.agent_id for seat in result.seats)].append(float(result.teams[0].score))
+    compositions = {}
+    for key, values in sorted(scores.items()):
+        mean, low, high = normal_interval(values)
+        compositions[key] = {"n": len(values), "mean_score": mean, "score_ci": [low, high],
+                             "homogeneous": len(set(key.split("+"))) == 1}
+    return {"compositions": compositions}
 
 
 @dataclass
 class EvalReport:
-    """Result of an evaluation; ``to_dict()`` is the JSON schema written by ``--output``."""
+    """Result of an evaluation; ``to_dict()`` is the JSON written by ``--output``."""
 
     agents: list[str]
-    num_players: int
     num_matches: int
     deterministic: bool
-    pairs: list[PairStats] = field(default_factory=list)
-    solo: list[SoloStats] = field(default_factory=list)
-
-    @property
-    def mode(self) -> str:
-        return "solo" if self.solo else "pairwise"
-
-    def rows(self) -> list[dict[str, Any]]:
-        """Both directions of every pair, derived from one set of counts."""
-        out: list[dict[str, Any]] = []
-        for pair in self.pairs:
-            out.append(pair.to_row())
-            out.append(pair.reversed().to_row())
-        return out
+    layouts: dict[str, dict[str, Any]] = field(default_factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
-        return {
-            "mode": self.mode,
-            "agents": list(self.agents),
-            "num_players": self.num_players,
-            "num_matches_per_pair": self.num_matches,
-            "deterministic": self.deterministic,
-            "ci_level": 0.95,
-            "score_ci_method": SCORE_CI_METHOD,
-            "pairs": self.rows(),
-            "solo": [s.to_row() for s in self.solo],
-        }
+        return {"agents": list(self.agents), "num_matches": self.num_matches, "deterministic": self.deterministic,
+                "ci_level": 0.95, "layouts": self.layouts}
 
     def write_json(self, path: str | Path) -> None:
         Path(path).write_text(json.dumps(self.to_dict(), indent=2) + "\n")
 
-    def summary(self) -> str:
+    def text(self) -> str:
         lines: list[str] = []
-        if self.mode == "solo":
-            header = (f"{'agent':<16} {'n':>6}  {'mean_return [95% CI]':<30} "
-                      f"{'mean_outcome [95% CI]':<30} {'mean_len':>8}")
-            lines += [header, "-" * len(header)]
-            for s in self.solo:
-                r = s.to_row()
-                lines.append(
-                    f"{r['agent']:<16} {r['n']:>6}  "
-                    f"{r['mean_return']:>9.3f} {_normal_ci_text(r['return_ci'], r['n'])}  "
-                    f"{r['mean_outcome']:>6.3f} {_normal_ci_text(r['outcome_ci'], r['n'])}  "
-                    f"{r['mean_episode_length']:>8.1f}"
-                )
-            return "\n".join(lines)
-        header = (f"{'agent_a':<16} {'agent_b':<16} {'n':>6} {'W':>6} {'D':>6} {'L':>6}  "
-                  f"{'win_rate [95% CI]':<24} {'score [95% CI]':<24}")
-        lines += [header, "-" * len(header)]
-        for r in self.rows():
-            lines.append(
-                f"{r['agent_a']:<16} {r['agent_b']:<16} {r['n']:>6} {r['wins']:>6} "
-                f"{r['draws']:>6} {r['losses']:>6}  "
-                f"{r['win_rate']:.3f} [{r['win_rate_ci'][0]:.3f}, {r['win_rate_ci'][1]:.3f}]   "
-                f"{r['score']:.3f} [{r['score_ci'][0]:.3f}, {r['score_ci'][1]:.3f}]"
-            )
-            for seats, cell in r["per_seat"].items():
-                lines.append(
-                    f"{'':<16}   seats {seats:<8} n={cell['n']:<5} W={cell['wins']:<5} "
-                    f"D={cell['draws']:<5} L={cell['losses']:<5} score={cell['score']:.3f}"
-                )
-        lines.append(f"(score CI: {SCORE_CI_METHOD})")
+        for layout, report in self.layouts.items():
+            lines.append(f"== layout {layout} ({report['outcome_kind']}, {report['n']} matches)")
+            if report["outcome_kind"] == "wdl":
+                for r in report["pairs"]:
+                    lines.append(
+                        f"{r['agent_a']:<16} vs {r['agent_b']:<16} n={r['n']:<5} W={r['wins']:<5} "
+                        f"D={r['draws']:<5} L={r['losses']:<5} "
+                        f"win_rate {r['win_rate']:.3f} [{r['win_rate_ci'][0]:.3f}, {r['win_rate_ci'][1]:.3f}]  "
+                        f"score {r['score']:.3f} [{r['score_ci'][0]:.3f}, {r['score_ci'][1]:.3f}]")
+                    for side, cell in r["per_side"].items():
+                        lines.append(f"{'':<20}as team {side}: n={cell['n']} W={cell['wins']} "
+                                     f"D={cell['draws']} L={cell['losses']} score={cell['score']:.3f}")
+                for r in report["solo"]:
+                    lines.append(f"{r['agent']:<16} alone: n={r['n']} mean_return {r['mean_return']:.3f} "
+                                 f"[{r['return_ci'][0]:.3f}, {r['return_ci'][1]:.3f}]")
+                if report["unattributed"]:
+                    lines.append(f"({report['unattributed']} matches with mixed teams not attributed to a pair)")
+            elif report["outcome_kind"] == "rank":
+                for agent, r in report["agents"].items():
+                    lines.append(f"{agent:<16} n={r['n']:<5} mean_rank {r['mean_rank']:.3f} "
+                                 f"[{r['rank_ci'][0]:.3f}, {r['rank_ci'][1]:.3f}]  "
+                                 f"first places {r['first_place_rate']:.3f}")
+                for a, row in report["higher"].items():
+                    for b, cell in row.items():
+                        lines.append(f"{'':<4}{a} above {b}: {cell['rate']:.3f} (n={cell['n']})")
+                for r in report["solo"]:
+                    lines.append(f"{r['agent']:<16} alone: n={r['n']} mean_return {r['mean_return']:.3f} "
+                                 f"[{r['return_ci'][0]:.3f}, {r['return_ci'][1]:.3f}]")
+                    for seat, cell in r["per_seat"].items():
+                        lines.append(f"{'':<20}seat {seat}: n={cell['n']} mean_rank {cell['mean_rank']:.3f} "
+                                     f"first places {cell['first_place_rate']:.3f} "
+                                     f"mean_return {cell['mean_return']:.3f}")
+                if report["unattributed"]:
+                    lines.append(f"({report['unattributed']} matches with mixed teams: only their "
+                                 f"single-agent teams are counted)")
+            else:
+                for key, r in report["compositions"].items():
+                    lines.append(f"{key:<24} n={r['n']:<5} mean_score {r['mean_score']:.3f} "
+                                 f"[{r['score_ci'][0]:.3f}, {r['score_ci'][1]:.3f}]"
+                                 f"{'' if r['homogeneous'] else '  (cross-play)'}")
+            for role, agents in report["by_role"].items():
+                for agent, cell in agents.items():
+                    lines.append(f"{'':<4}role {role}: {agent} mean_return {cell['mean_return']:.3f} (n={cell['n']})")
         return "\n".join(lines)
 
 
-def summarize(
-    records: Sequence[MatchRecord],
-    agent_names: Sequence[str],
-    num_players: int,
-    num_matches: int,
-    deterministic: bool = False,
-) -> EvalReport:
-    """Aggregate match records into an :class:`EvalReport`."""
-    names = list(agent_names)
-    report = EvalReport(agents=names, num_players=num_players,
-                        num_matches=num_matches, deterministic=deterministic)
-    if len(names) == 1 or num_players == 1:
-        solo = {name: SoloStats(name, num_players) for name in names}
-        for record in records:
-            solo[record.lineup[0]].add(record)
-        report.solo = [solo[name] for name in names]
-        return report
-    pairs = {(a, b): PairStats(a, b, num_players) for a, b in itertools.combinations(names, 2)}
-    for record in records:
-        present = sorted(set(record.lineup), key=names.index)
-        if len(present) != 2:
-            raise ValueError(f"summarize: lineup {record.lineup} is not a pair lineup")
-        pairs[(present[0], present[1])].add(record)
-    report.pairs = list(pairs.values())
+def summarize(spec: GameSpec, results: Sequence[MatchResult], *, agents: Sequence[str] = (),
+              num_matches: int = 0, deterministic: bool = False) -> EvalReport:
+    """Aggregate match results into an :class:`EvalReport`, one section per layout."""
+    by_layout: dict[str, list[MatchResult]] = defaultdict(list)
+    for result in results:
+        by_layout[result.layout].append(result)
+    names = list(agents) or sorted({seat.agent_id for r in results for seat in r.seats})
+    report = EvalReport(agents=names, num_matches=num_matches, deterministic=deterministic)
+    unknown = sorted(set(by_layout) - set(spec.layouts))
+    if unknown:
+        raise ValueError(f"summarize: results of layouts {unknown} that the game does not have")
+    for layout in (name for name in spec.layouts if name in by_layout):  # sections in the game's layout order
+        layout_results = by_layout[layout]
+        kind = spec.outcome_kind(layout)
+        section: dict[str, Any] = {"outcome_kind": kind, "n": len(layout_results)}
+        if kind == "wdl":
+            section.update(_summarize_wdl(layout_results))
+        elif kind == "rank":
+            section.update(_summarize_rank(layout_results))
+        else:
+            section.update(_summarize_score(layout_results))
+        section["by_role"] = _by_role(layout_results)
+        report.layouts[layout] = section
     return report
 
 
-def evaluate(
-    models: dict[str, PolicyModel],
-    env_fn: Callable[[], BaseEnv],
-    num_matches: int = 100,
-    num_envs: int = 8,
-    deterministic: bool = False,
-    seed: int | None = None,
-) -> EvalReport:
-    """Schedule, play and summarize an evaluation.
-
-    ``num_matches`` is per pair (pairwise) or per agent (solo).
-    """
-    names = list(models)
-    probe = env_fn()
-    try:
-        num_players = probe.num_players
-    finally:
-        probe.close()
-    lineups = schedule_lineups(names, num_players, num_matches)
-    records = play_matches(models, env_fn, lineups, num_envs=num_envs,
-                           deterministic=deterministic, seed=seed)
-    return summarize(records, names, num_players, num_matches, deterministic)
-
-
 # ---------------------------------------------------------------------------
-# Loading agents
+# Loading agents and the CLI-level evaluation
 # ---------------------------------------------------------------------------
 
 
-def load_eval_model(
-    path: str | Path, config: ColosseumConfig, *, validated: set[str] | None = None,
-) -> PolicyModel:
-    """Build a model and load its weights for evaluation.
+def _agent_model_config(config: ColosseumConfig, name: str) -> ColosseumConfig:
+    """``config.get_agent_config(name)`` for a configured agent, else the global sections."""
+    if name in config.get_trainable_agent_ids():
+        return config.get_agent_config(name)
+    return config.model_copy(update={"agents": {}})
 
-    ``path`` is either
-    - a checkpoint directory ``<run>/checkpoints/<agent>/ckpt_v<N>/`` (read with
-      ``load_checkpoint_dir``: strictly validated, never modified). If its
-      ``meta.json`` has a ``networks`` section (the launcher writes it), the model
-      is built from it, so agents with different architectures can be compared.
-      Otherwise the model is built from ``config.networks``;
-    - a ``.pt`` file with a plain ``state_dict`` (e.g. ``colosseum bc`` output),
-      built from ``config.networks``.
 
-    ``config.networks`` is assumed validated by the caller (the CLI runs
-    ``validate_config(config)`` first). A checkpoint architecture that differs from
-    it is checked with ``validate_config`` against ``config.env``; ``validated``
-    (JSON dumps of architectures already checked against this ``config.env``,
-    updated in place) lets a caller loading several agents check each distinct
-    architecture once.
+def _pt_roles(config: ColosseumConfig, spec: GameSpec, name: str, path: Path) -> list[str]:
+    if name in config.get_trainable_agent_ids():
+        return resolve_agent_roles(config, spec)[name]
+    roles = list(spec.roles)
+    signatures = {role_signature(spec.roles[r]) for r in roles}
+    if len(signatures) > 1:
+        raise ConfigError(
+            f"{path}: agent {name!r}: a .pt file without a matching agents.{name} entry plays every role of "
+            f"the game, but the roles {roles} have different spaces; name the agent after a configured "
+            f"agent (agents.<id>.roles) or use a checkpoint dir"
+        )
+    return roles
 
-    A malformed checkpoint, invalid ``networks``, an unreadable ``.pt`` or weights
-    that do not fit the built model raise ConfigError; a path that is neither a
-    directory nor a ``.pt`` file raises FileNotFoundError.
+
+def _architecture_key(model_config: ColosseumConfig, roles: Sequence[str]) -> str:
+    return json.dumps([model_config.networks.model_dump(mode="json", by_alias=True), list(roles)], sort_keys=True)
+
+
+def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
+                    spec: GameSpec | None = None, validated: set[str] | None = None) -> tuple[PolicyModel, list[str]]:
+    """Build and load one evaluation agent; returns ``(model in eval mode, roles)``.
+
+    - A checkpoint dir (read with ``load_checkpoint_dir``: strict, never modified): roles and
+      ``role_signature`` from its ``meta.json`` (required; the signature must match the game's
+      spaces for those roles), architecture from its ``networks`` (else the agent's config).
+    - A ``.pt`` state_dict: architecture and roles of ``agents.<name>`` when configured, else the
+      global ``networks`` with every role of the game (which must share one signature).
+
+    The built architecture is checked like ``validate_config`` checks an agent's model (``step``
+    and ``unroll`` on the role's spaces), once per distinct (networks, roles): keys already in
+    ``validated`` are skipped and new ones are added (``None``: always check).
+
+    Problems raise ConfigError naming the path; a path that is neither a dir nor a ``.pt`` file
+    raises FileNotFoundError.
     """
+    from colosseum.core.registry import build_model, env_spec
+
+    spec = spec if spec is not None else env_spec(config)
     p = Path(path)
-    model_config = config
+    model_config = _agent_model_config(config, name)
+    source = f"{p}: networks"
     if p.is_dir():
+        source = f"Checkpoint {p}: networks of the config"
         loaded = load_checkpoint_dir(p)
+        roles, signature = loaded["roles"], loaded["role_signature"]
+        if roles is None or signature is None:
+            raise ConfigError(f"Checkpoint {p}: meta.json has no roles/role_signature (not an SP2 checkpoint)")
+        unknown = sorted(set(roles) - set(spec.roles))
+        if unknown:
+            raise ConfigError(f"Checkpoint {p}: roles {unknown} are not roles of the game {sorted(spec.roles)}")
+        for role in roles:  # every role: one network serves them all
+            expected = role_signature(spec.roles[role])
+            if signature != expected:
+                raise ConfigError(
+                    f"Checkpoint {p}: role signature {signature!r} does not match the game's spaces for role "
+                    f"{role!r} ({expected!r}); it was trained on a different game or game version"
+                )
         networks = loaded["meta"].get("networks")
         if networks is not None:
             try:
-                net_cfg = NetworkConfig.model_validate(networks)
+                model_config = model_config.model_copy(update={"networks": NetworkConfig.model_validate(networks)})
             except ValidationError as e:
                 raise ConfigError(f"Checkpoint {p}: invalid meta.json networks:\n{e}") from e
-            if net_cfg != config.networks:
-                model_config = config.model_copy(update={"networks": net_cfg})
-                _validate_architecture(model_config, p, validated)
+            source = f"Checkpoint {p}: meta.json networks"
         model_state = loaded["model_state"]
     elif p.is_file() and p.suffix == ".pt":
+        roles = _pt_roles(config, spec, name, p)
         try:
             model_state = read_weights_file(p)
         except ValueError as e:
             raise ConfigError(f"{p}: {e}") from e
     else:
         raise FileNotFoundError(f"{p}: expected a checkpoint directory or a .pt file")
-    model = build_model(model_config)
+    try:
+        model = build_model(model_config, agent_role_spec(spec, roles))
+    except ConfigError as e:
+        raise ConfigError(f"{p}: {e}") from e
+    except Exception as e:  # noqa: BLE001 - a checkpoint's networks are user data: any constructor failure
+        raise ConfigError(f"{p}: cannot build the agent's model ({type(e).__name__}: {e})") from e
+    role = agent_role_spec(spec, roles)
+    key = _architecture_key(model_config, roles)
+    if validated is None or key not in validated:
+        try:
+            _check_model(model, role, None, f"agent {name!r}")
+        except ConfigError as e:
+            raise ConfigError(f"{source}: {e}") from e
+        if validated is not None:
+            validated.add(key)
     check_model_state(model, model_state, str(p))
     model.load_state_dict(state_dict_from_numpy(model_state))
     model.eval()
-    return model
+    return model, list(roles)
 
 
-def _validate_architecture(model_config: ColosseumConfig, source: Path, validated: set[str] | None) -> None:
-    """``validate_config`` once per distinct ``networks`` (keyed in ``validated``)."""
-    key = model_config.networks.model_dump_json()
-    if validated is not None and key in validated:
-        return
-    try:
-        validate_config(model_config)
-    except ConfigError as e:
-        raise ConfigError(f"Checkpoint {source}: meta.json networks: {e}") from e
-    if validated is not None:
-        validated.add(key)
+def default_layouts(spec: GameSpec, players: Mapping[str, Sequence[str]]) -> list[str]:
+    """Every layout of the game for which ``schedule_lineups`` has at least one lineup."""
+    return [name for name in spec.layouts if schedule_lineups(spec, name, players, 1)]
+
+
+def evaluate(config: ColosseumConfig, agents: Mapping[str, str], *, layouts: Sequence[str] | None,
+             num_matches: int, seed: int | None = None, deterministic: bool = False,
+             num_envs: int = 8) -> EvalReport:
+    """Load ``agents`` (name -> checkpoint dir or ``.pt``), schedule, play and summarize."""
+    from colosseum.core.registry import env_spec, make_env
+
+    spec = env_spec(config)
+    models: dict[str, PolicyModel] = {}
+    players: dict[str, list[str]] = {}
+    validated: set[str] = set()  # each distinct architecture is checked once
+    for name, path in agents.items():
+        models[name], players[name] = load_eval_model(config, name, path, spec=spec, validated=validated)
+    chosen = list(dict.fromkeys(layouts)) if layouts else default_layouts(spec, players)
+    unknown = sorted(set(chosen) - set(spec.layouts))
+    if unknown:
+        raise ConfigError(f"--layout {unknown}: not layouts of the game {sorted(spec.layouts)}")
+    lineups: list[Lineup] = []
+    for layout in chosen:
+        layout_lineups = schedule_lineups(spec, layout, players, num_matches)
+        if not layout_lineups:
+            raise ConfigError(f"layout {layout!r}: the agents {sorted(players)} cannot fill its seats")
+        lineups.extend(layout_lineups)
+    if not lineups:
+        raise ConfigError(f"no layout of the game can be filled by the agents {sorted(players)}")
+    results = play_lineups(env_fn=lambda: make_env(config), models=models, lineups=lineups, num_envs=num_envs,
+                           seed=seed, deterministic=deterministic, max_idle_steps=config.env.max_idle_steps)
+    return summarize(spec, results, agents=list(agents), num_matches=num_matches, deterministic=deterministic)

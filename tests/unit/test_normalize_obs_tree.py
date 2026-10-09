@@ -2,7 +2,7 @@
 import pytest
 import torch
 
-from colosseum.sp2.networks.normalization import NormalizeObs
+from colosseum.networks.normalization import NormalizeObs
 
 
 def test_uint8_input_is_normalized_to_float():

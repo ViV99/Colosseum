@@ -6,7 +6,7 @@ from collections import Counter
 import pytest
 import torch
 
-from colosseum.sp2.eval import play_lineups, schedule_lineups, summarize
+from colosseum.eval import play_lineups, schedule_lineups, summarize
 from game_helpers import EliminationFFA, TurnTakingGame, make_test_model
 
 pytestmark = pytest.mark.usefixtures("restore_global_rng")

@@ -37,8 +37,8 @@ def _port_open(port: int) -> bool:
 @pytest.mark.timeout(600)
 def test_distributed_grpc_pipeline(tmp_path, restore_root_logging):
     """The learner trains on chunk v2 from gRPC workers, publishes weights and saves signed checkpoints."""
-    from colosseum.sp2.distributed import run_distributed_learner, run_distributed_workers, workers_role
-    from colosseum.sp2.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
+    from colosseum.distributed import run_distributed_learner, run_distributed_workers, workers_role
+    from colosseum.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
 
     ws_port, traj_port = _free_port(), _free_port()
     ws_addr, learner_addr = f"localhost:{ws_port}", f"localhost:{traj_port}"

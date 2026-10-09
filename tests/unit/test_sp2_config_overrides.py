@@ -11,15 +11,15 @@ import yaml
 from click.testing import CliRunner
 from pydantic import BaseModel
 
-import colosseum.sp2.core.config as config_module
-from colosseum.core.errors import ConfigError
-from colosseum.sp2.core.config import (
+import colosseum.core.config as config_module
+from colosseum.core.config import (
     ColosseumConfig,
     apply_overrides,
     deep_merge,
     load_config,
     parse_override_value,
 )
+from colosseum.core.errors import ConfigError
 
 TTT = "examples.tic_tac_toe"  # the SP2 example: game.py, models.py
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -194,7 +194,7 @@ def test_load_config_applies_overrides_before_validation(tmp_path):
 
 
 def test_cli_validate_reports_typo_with_exit_1(tmp_path, monkeypatch):
-    from colosseum.sp2.cli import main
+    from colosseum.cli import main
 
     monkeypatch.chdir(REPO_ROOT)
     bad = write_yaml(tmp_path, base_data(rollout={"num_worker": 3}))

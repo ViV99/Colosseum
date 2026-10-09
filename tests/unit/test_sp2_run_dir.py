@@ -8,9 +8,9 @@ import pytest
 import yaml
 from pydantic import ValidationError
 
+from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.errors import ConfigError
-from colosseum.sp2.core.config import ColosseumConfig, load_config
-from colosseum.sp2.core.run_dir import RunDir
+from colosseum.core.run_dir import RunDir
 from colosseum.utils.logging import ENV_LOG_DIR, ENV_PROCESS_NAME, setup_process_logging
 from colosseum.utils.process import run_child
 
@@ -73,7 +73,7 @@ def test_run_dir_rechecks_a_name_assigned_after_validation(tmp_path):
 def test_auto_name_claims_the_next_free_suffix(tmp_path, monkeypatch):
     from datetime import datetime
 
-    import colosseum.sp2.core.run_dir as run_dir_module
+    import colosseum.core.run_dir as run_dir_module
 
     class FrozenClock:
         @staticmethod
@@ -196,7 +196,7 @@ def test_role_dir_records_the_base_run_name(tmp_path, role):
 def test_auto_suffix_goes_before_the_role(tmp_path, monkeypatch):
     from datetime import datetime
 
-    import colosseum.sp2.core.run_dir as run_dir_module
+    import colosseum.core.run_dir as run_dir_module
 
     class FrozenClock:
         @staticmethod

@@ -7,7 +7,7 @@ import pytest
 import torch
 
 from colosseum.core.ipc import assert_no_tensors, from_numpy_tree, to_numpy_tree
-from colosseum.sp2.core.types import (
+from colosseum.core.types import (
     Lineup,
     SeatAssignment,
     WeightPayload,

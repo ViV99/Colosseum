@@ -2,15 +2,15 @@
 import time
 from pathlib import Path
 
-from colosseum.sp2.core.config import ColosseumConfig, load_config
-from colosseum.sp2.launcher import Launcher
+from colosseum.core.config import ColosseumConfig, load_config
+from colosseum.launcher import Launcher
 from game_helpers import make_test_run_dir
 
 REPO = Path(__file__).resolve().parents[2]
 
 
 def test_launch_stops_at_the_env_step_budget(tmp_path):
-    data = load_config(REPO / "configs/sp2/tic_tac_toe.yaml").model_dump()
+    data = load_config(REPO / "configs/examples/tic_tac_toe.yaml").model_dump()
     data["training"]["total_timesteps"] = 400
     data["rollout"]["num_workers"] = 1
     data["rollout"]["envs_per_worker"] = 2
@@ -33,19 +33,19 @@ def test_a_dead_learner_stops_the_run(tmp_path, caplog):
     Otherwise the workers block on the dead learner's full chunk queue and the
     other agent starves while the budget is never reached.
     """
-    data = load_config(REPO / "configs/sp2/tic_tac_toe_multi.yaml").model_dump()
+    data = load_config(REPO / "configs/examples/tic_tac_toe_multi.yaml").model_dump()
     data["training"]["total_timesteps"] = 10**9
     data["rollout"]["num_workers"] = 1
     data["rollout"]["envs_per_worker"] = 2
     data["learner"]["device"] = "cpu"
     data["metrics"]["use_wandb"] = False
-    broken = dict(data["algorithm"], algorithm_class="colosseum.sp2.algorithms.appo.NoSuchAlgorithm")
+    broken = dict(data["algorithm"], algorithm_class="colosseum.algorithms.appo.NoSuchAlgorithm")
     data["agents"]["agent_beta"]["algorithm"] = broken  # agent_beta's learner dies at startup
     config = ColosseumConfig(**data)
     run = make_test_run_dir(config, tmp_path)
     launcher = Launcher(config, run)
     start = time.monotonic()
-    with caplog.at_level("ERROR", logger="colosseum.sp2.launcher"):
+    with caplog.at_level("ERROR", logger="colosseum.launcher"):
         assert launcher.launch() == 1
     assert time.monotonic() - start < 120
     assert launcher.env_steps_done < 10**9

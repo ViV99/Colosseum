@@ -11,8 +11,8 @@ import numpy as np
 import pytest
 import torch
 
+from colosseum.core.types import SeatAssignment, WorkerCommand
 from colosseum.networks.state import tree_leaves
-from colosseum.sp2.core.types import SeatAssignment, WorkerCommand
 from game_harness import GameFactory, kinds, lineup, make_loop, run_steps, seat_chunks, slot_steps
 from game_helpers import Tick, TickGame, make_test_model
 

@@ -1,5 +1,4 @@
-"""Run ``colosseum train`` (or ``python -m colosseum.sp2 train``) in a subprocess for integration
-and learning tests."""
+"""Run ``colosseum train`` in a subprocess for integration and learning tests."""
 from __future__ import annotations
 
 import json
@@ -17,9 +16,6 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = Path(__file__).resolve().parent
 TTT_CONFIG = REPO_ROOT / "configs" / "examples" / "tic_tac_toe.yaml"
 TTT_MULTI_CONFIG = REPO_ROOT / "configs" / "examples" / "tic_tac_toe_multi.yaml"
-# The SP2 tic-tac-toe configs (moved to configs/examples/ by T7.3).
-TTT_SP2_CONFIG = REPO_ROOT / "configs" / "sp2" / "tic_tac_toe.yaml"
-TTT_SP2_MULTI_CONFIG = REPO_ROOT / "configs" / "sp2" / "tic_tac_toe_multi.yaml"
 
 # Small, fast settings for tic-tac-toe runs (about 10 s with 1 worker on CPU).
 TINY: dict[str, str] = {
@@ -31,16 +27,10 @@ TINY: dict[str, str] = {
     "rollout.match_refresh_interval_sec": "1.0",
     "learner.batch_chunks": "2",
     "learner.queue_size": "16",
-    "self_play.checkpoint_interval": "20",
-    "self_play.pool_size": "5",
-    "metrics.log_interval": "1",
-    "metrics.console_interval_sec": "1.0",
-}
-# The same for the SP2 config schema (``python -m colosseum.sp2``): checkpoint.* replaces self_play.*.
-TINY_SP2: dict[str, str] = {
-    **{k: v for k, v in TINY.items() if not k.startswith("self_play.")},
     "checkpoint.interval": "20",
     "checkpoint.pool_size": "5",
+    "metrics.log_interval": "1",
+    "metrics.console_interval_sec": "1.0",
 }
 
 
@@ -55,9 +45,8 @@ def child_env() -> dict[str, str]:
 
 def train_cmd(config: Path, run_parent: Path, name: str, overrides: dict[str, str] | None = None,
               module: str = "colosseum") -> list[str]:
-    """``python -m <module> train`` with the tiny settings of that module's config schema."""
-    tiny = TINY_SP2 if module == "colosseum.sp2" else TINY
-    sets = {**tiny, **(overrides or {}), "run.dir": str(run_parent), "run.name": name}
+    """``python -m <module> train -c <config>`` with the ``TINY`` settings, then ``overrides``."""
+    sets = {**TINY, **(overrides or {}), "run.dir": str(run_parent), "run.name": name}
     cmd = [sys.executable, "-m", module, "train", "-c", str(config)]
     for key, value in sets.items():
         cmd += ["--set", f"{key}={value}"]

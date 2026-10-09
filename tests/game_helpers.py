@@ -19,22 +19,22 @@ import torch
 import torch.nn as nn
 from gymnasium.spaces import Box, Dict, Discrete, MultiBinary
 
+from colosseum.algorithms.appo import APPO
+from colosseum.core.config import AlgorithmConfig
 from colosseum.core.ipc import assert_no_tensors
+from colosseum.core.specs import ActionSpec, ObsSpec
+from colosseum.core.tree import Tree, tree_get, tree_leaves, tree_map, tree_to_torch
+from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
+from colosseum.envs.contract import EpisodeTracker
+from colosseum.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
+from colosseum.envs.spaces import Units
+from colosseum.networks.base import BaseCriticEncoder, BaseEncoder, BasePolicy, BaseValue, EncoderOutput
+from colosseum.networks.composed import ComposedModel
 from colosseum.networks.cores import Core, GRUCore, LSTMCore, NoCore, WindowAttentionCore
-from colosseum.sp2.algorithms.appo import APPO
-from colosseum.sp2.core.config import AlgorithmConfig
-from colosseum.sp2.core.specs import ActionSpec, ObsSpec
-from colosseum.sp2.core.tree import Tree, tree_get, tree_leaves, tree_map, tree_to_torch
-from colosseum.sp2.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
-from colosseum.sp2.envs.contract import EpisodeTracker
-from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
-from colosseum.sp2.envs.spaces import Units
-from colosseum.sp2.networks.base import BaseCriticEncoder, BaseEncoder, BasePolicy, BaseValue, EncoderOutput
-from colosseum.sp2.networks.composed import ComposedModel
-from colosseum.sp2.networks.dist import Distribution, make_distribution
-from colosseum.sp2.networks.heads import UnitsHead
-from colosseum.sp2.networks.model import PolicyModel, PolicyStep, UnrollOutput
-from colosseum.sp2.worker.buffers import BufferSpec, RolloutBuffer
+from colosseum.networks.dist import Distribution, make_distribution
+from colosseum.networks.heads import UnitsHead
+from colosseum.networks.model import PolicyModel, PolicyStep, UnrollOutput
+from colosseum.worker.buffers import BufferSpec, RolloutBuffer
 
 
 def _vec(*values: float) -> np.ndarray:
@@ -1035,7 +1035,7 @@ def make_test_config(game: str, **sections):
     so spawned children need ``tests/`` on their path (the test process has it; CLI children get
     it through ``cli_runner.child_env``).
     """
-    from colosseum.sp2.core.config import ColosseumConfig, deep_merge
+    from colosseum.core.config import ColosseumConfig, deep_merge
 
     agents = TEST_GAME_AGENTS.get(game)
     data = {
@@ -1073,9 +1073,9 @@ def write_test_config(path, game: str, **sections):
 
 def make_coordinator(config, checkpoint_dir):
     """``Coordinator`` for ``config`` with the env's spec and the resolved agent roles."""
-    from colosseum.sp2.coordinator.coordinator import Coordinator
-    from colosseum.sp2.core.registry import env_spec
-    from colosseum.sp2.core.roles import resolve_agent_roles
+    from colosseum.coordinator.coordinator import Coordinator
+    from colosseum.core.registry import env_spec
+    from colosseum.core.roles import resolve_agent_roles
 
     spec = env_spec(config)
     return Coordinator(config, spec, resolve_agent_roles(config, spec), checkpoint_dir)
@@ -1083,8 +1083,8 @@ def make_coordinator(config, checkpoint_dir):
 
 def agent_role_of(config, agent_id: str):
     """``(roles, RoleSpec)`` of a trainable agent of ``config``."""
-    from colosseum.sp2.core.registry import env_spec
-    from colosseum.sp2.core.roles import agent_role_spec, resolve_agent_roles
+    from colosseum.core.registry import env_spec
+    from colosseum.core.roles import agent_role_spec, resolve_agent_roles
 
     spec = env_spec(config)
     roles = resolve_agent_roles(config, spec)[agent_id]
@@ -1125,7 +1125,7 @@ class FakeAlgorithm:
 
 def make_test_run_dir(config, tmp_path, name: str = "test-run"):
     """Point ``config.run`` at ``tmp_path / "runs"`` and create the run dir (tests never write to cwd)."""
-    from colosseum.sp2.core.run_dir import RunDir
+    from colosseum.core.run_dir import RunDir
 
     config.run.dir = str(tmp_path / "runs")
     config.run.name = name

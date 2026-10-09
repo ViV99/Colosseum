@@ -6,12 +6,12 @@ import numpy as np
 import pytest
 import torch
 
+from colosseum.bc import offline_bc as bc_module
+from colosseum.bc.offline_bc import OfflineBCTrainer, _window_index, per_sample_nll
 from colosseum.core.errors import DataError
-from colosseum.sp2.bc import offline_bc as bc_module
-from colosseum.sp2.bc.offline_bc import OfflineBCTrainer, _window_index, per_sample_nll
-from colosseum.sp2.core.specs import ActionSpec, ObsSpec
-from colosseum.sp2.core.tree import tree_stack
-from colosseum.sp2.envs.game import RoleSpec
+from colosseum.core.specs import ActionSpec, ObsSpec
+from colosseum.core.tree import tree_stack
+from colosseum.envs.game import RoleSpec
 from game_helpers import UnitsGame, make_test_model, sample_legal_action
 
 pytestmark = pytest.mark.usefixtures("restore_global_rng")

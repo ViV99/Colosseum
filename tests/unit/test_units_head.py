@@ -2,10 +2,10 @@
 import torch
 from gymnasium.spaces import Box, Dict, Discrete
 
-from colosseum.sp2.core.specs import ActionSpec
-from colosseum.sp2.envs.spaces import Units
-from colosseum.sp2.networks.dist import UnitsDist
-from colosseum.sp2.networks.heads import UnitsHead, gridnet_to_units
+from colosseum.core.specs import ActionSpec
+from colosseum.envs.spaces import Units
+from colosseum.networks.dist import UnitsDist
+from colosseum.networks.heads import UnitsHead, gridnet_to_units
 
 
 def test_units_head_parameters_per_component():
