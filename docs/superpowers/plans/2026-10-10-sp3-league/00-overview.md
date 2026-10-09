@@ -432,7 +432,41 @@ def validate_config(config: ColosseumConfig) -> ValidationReport
 
 ## Contract amendments
 
-None yet. Amendments found while writing the parts or during the pre-flight scan are appended here as A1, A2, … and copied into the SDD workspace `constraints.md`.
+Reconciled after all three parts were written (each part's `## Contract notes` has the reasons). Binding; they override the contract above where they differ. Pre-flight rulings (P1, P2, …) live in the SDD workspace `constraints.md`.
+
+- **A1** `build_frozen_model(config: ColosseumConfig | None, frozen: FrozenSpec, spec: GameSpec) -> PolicyModel` uses only `frozen` and `spec` (workers have no config). A `.pt` teacher/init gets its `FrozenSpec` from the STUDENT's effective networks and roles (`learner.factory` builds it; `load_frozen(config, <student id>, path, spec)` for `.pt` paths uses the student's networks/roles); checkpoint dirs and frozen agents go through `load_frozen` with architecture from `meta.json`.
+- **A2** `check_bot_action(role, action, mask, where, *, action_spec: ActionSpec | None = None) -> Tree` returns the action cast to the role's dtypes (structure, kind and shape, `space.contains`, `first_illegal_action`).
+- **A3** `FrozenSpec.networks_source: str = ""` (last field) keeps SP2 eval's error prefixes.
+- **A4** `ColosseumConfig.agent_ids()` (every agent, config order, implicit `agent_0` first) and `IMPLICIT_AGENT_ID = "agent_0"`; a scripted/frozen agent named `agent_0` without any trainable agent is a ConfigError.
+- **A5** `CheckpointManager.import_snapshots(src, agent_id, expected_signature: str | None = None)`; carried snapshots obey the strict-resume role-signature rule; ids already present are skipped; `trainer_state.pt` is never copied.
+- **A6** `Coordinator.pfsp`, `Coordinator.player_roles`, `Coordinator.trainable_agents` (read-only properties).
+- **A7** `core.config.LEGACY_OVERRIDE_KEYS: set[str]` — dotted keys `apply_overrides` accepts without the schema walk: `checkpoint.pool_size` (T2.1), `matchmaking.mode|self_play_ratio|latest_prob|pfsp_exponent` (T3.1), `training.kickstart_teacher|kickstart_lambda|kickstart_decay_steps|kickstart_kl` (T4.1).
+- **A8** `TrainableAgent.matchmaking` / `init` / `kickstart` are rejected ("not supported yet") from T1.1 until T3.1 (matchmaking) / T4.1 (init, kickstart) validate them and add them to `_AGENT_SECTIONS`.
+- **A9** `MemberPair.net_a` / `net_b`; `metrics.aggregator.OPPONENT_TYPES` gains `"anchor"`; shared PFSP constants `PFSP_MIN_WEIGHT`, `DEFAULT_HALFLIFE_GAMES`, `PFSP_WEIGHTINGS`, `player_name(PlayerKey) -> "agent@net"` in `league.pfsp`.
+- **A10** `src/colosseum/league/__init__.py` is created by T2.3 (docstring only); from T3.2 it exports `BaseMatchmaker`, `MatchmakerContext`, `MixtureMatchmaker` lazily (PEP 562) to avoid the `core.config` ↔ `league` import cycle.
+- **A11** `eval.evaluate(config, agents: Mapping[str, str | None], ...)` (`None` = a scripted/frozen agent of the config by name) and `cli._parse_agent_spec(spec) -> tuple[str, str | None]` (T1.5).
+- **A12** `RunSetup.player_roles`, `RunSetup.fixed`; `_worker_main(..., fixed_players=None, teachers=None)`; `Launcher._refresh_worker_matches(..., worker_evictions=None)`; `Launcher._import_snapshot_pool(coordinator)` (run-dir resume only, after `_resolve_resume`, before the first lineups).
+- **A13** `core.registry.build_network(networks, role)` and `checkpoint_manager.read_checkpoint_meta(ckpt_dir)`.
+- **A14** Tests that drive a `RolloutLoop` through `game_harness` live in `tests/contract/` (e.g. `test_sp3_fixed_players_wiring.py`, `test_sp3_snapshot_eviction.py`).
+- **A15** `ActRecord.info` is set for EVERY acting seat (`result.infos.get(seat)`), neural seats included (T1.3): the DAgger teacher of a neural student seat needs it.
+- **A16** `tests/game_helpers.py` exports `SP2_CHECKPOINT` (the SP2 fixture checkpoint dir) and `SP2_TTT_TINY` (the SP2-format config it was generated with) (T0.1).
+- **A17** `MatchmakerContext` is a dataclass with the contract's read API plus constructor fields `snapshots_fn`, `pfsp_fn`, `env_steps_fn`; `MatchmakerContext.from_config(config, spec, player_roles, *, rng=None, snapshots_fn=..., pfsp_fn=None, env_steps_fn=...)`; `fixed` property; `anchors_at(owner, env_steps)`; `league.base.load_matchmaker_class(path)`; `league.lineups.playable_layouts(spec, config, roles)`.
+- **A18** Per-agent `matchmaking` merges with `core.config.merge_matchmaking` (`opponents` and `pfsp` per key; a schedule and `anchors` / `layouts` replaced whole), not `deep_merge`.
+- **A19** Anchor-name checks (exists; scripted or frozen) live in `league.mixture.validate_matchmaking`, not in the config model (derived per-agent configs have no `agents`).
+- **A20** `KickstartLoss(teacher: PolicyModel | None, ...)` — `None` = scripted teacher (labels only; `compute` raises); `BaseAlgorithm.teacher_active` property (default False; APPO: scripted teacher with lambda > 0), read by the learner when pushing weights; `WeightPayload.from_model(agent_id, policy_version, model, teacher_active=False)`; train metric `kickstart_label_frac`.
+- **A21** `BufferSpec.teacher: bool = False`; `RolloutBuffer.write_act(..., reward, teacher_action=None)`; chunks of an agent with a scripted teacher always carry `teacher_action` and `has_teacher` (zeros / False where nothing was labelled).
+- **A22** `learner.factory` helpers `agent_ids`, `build_teacher_model`, `build_kickstart`, `check_teacher_compat`, `apply_init`; `bc.kickstart.check_teacher_state_layout` replaces APPO's private `_check_teacher_state_layout` (APPO and `validate` share the rule); `_learner_main(..., spec=None, teacher=None, init_state=None)`; launcher helpers `_build_coordinator(setup)`, `_resolve_init(spec, resume_states)`.
+- **A23** Played opponent shares go into the owner's own `episodes` record as `opponents: {layout: {"teams", "categories": {...}, "anchors": {...}}}` (WandB `episodes/<agent>/opponents/...`), via `metrics.aggregator.opponent_draws(result)`; no new reserved agent ids.
+- **A24** Matchmaker switch: T3.1 keeps `LineupMatchmaker` working (SP2 numbers read back from `opponents` at env step 0); T3.2 switches the coordinator to `MixtureMatchmaker`, builds `PfspStats` with the agents' `pfsp.halflife_games`, deletes `coordinator/matchmaker.py` and `tests/unit/test_sp2_matchmaker.py` after porting its guarantees; T3.3 adds `matchmaker_class`, `on_result`, env-step wiring, metrics and the `validate` printout.
+- **A25** APPO trainer-state key `critic_warmup_done` (absent → 0); `APPO.critic_warming_up`; metric `critic_warmup`; `critic_warmup_steps > 0` with `value_loss_coeff == 0` is a ConfigError in `validate` / ValueError in APPO.
+- **A26** `effective_mix` is the structural mix (snapshots count as available; anchors by positive weight at that step); the runtime draw uses the snapshots that exist.
+- **A27** A scripted teacher instance is reset lazily at the student's first decision of each episode at that seat, with `bot_rng(episode_seed, seat, f"{agent}/teacher")`.
+- **A28** `eval.load_player(config, name, path, *, spec, validated=None, option="-a") -> tuple[PolicyModel | ScriptedPlayer, list[str]]` (extracted by T5.1 from T1.5's `evaluate`) and `eval.play_lineups(..., observer: MatchObserver | None = None)` with the eval-only optional hook `on_episode_discarded(env)`; T5.1 also modifies `src/colosseum/eval.py`.
+- **A29** Additional files: `configs/examples/unit_harvest_league.yaml`, `tests/pipeline_kit.py`, `tests/learning/sp3_bandits.py` (T6.2); `scripts/team_tag_anchors.py` (T6.3); `scripts/pipeline_vs_scratch.py` (T6.4); `docs/benchmarks/` data files (T6.3–T6.6).
+- **A30** `colosseum.record.RECORD_FILE = "record.json"` (T5.1) and `colosseum.bc.offline_bc.bc_data_sources(paths, roles) -> list[Path]` (T5.2).
+- **A31** `colosseum.distributed.check_distributed_scope(config) -> None` and `distributed_checkpoint_manager(config, base_dir) -> CheckpointManager` (T6.1); `distributed_setup` calls the check before `validate_config`.
+- **A32** Shared test/benchmark defaults (`cli_runner.TINY`, `game_helpers.make_test_config`, `bench_throughput._make_config`) use the v3 form after T2.1 (`keep_last`) and T3.1 (no SP2 matchmaking knobs), so an injected default never collides with a config's own keys.
+- **A33** T6.5 depends on T4.5 (and runs after T6.4 only for scheduling); not on T6.1.
 
 ## Cross-part execution notes
 
