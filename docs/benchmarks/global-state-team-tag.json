@@ -1,0 +1,18 @@
+{
+  "with_global_state": {
+    "chunk_length": 32,
+    "obs_bytes_per_chunk": 6784,
+    "global_state_bytes_per_chunk": 4608,
+    "payload_bytes_per_chunk": 12192,
+    "batch_chunks": 8,
+    "train_step_ms_median": 14.117999991867691
+  },
+  "without_global_state": {
+    "chunk_length": 32,
+    "obs_bytes_per_chunk": 6784,
+    "global_state_bytes_per_chunk": 0,
+    "payload_bytes_per_chunk": 7584,
+    "batch_chunks": 8,
+    "train_step_ms_median": 10.91209999867715
+  }
+}
