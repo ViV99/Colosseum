@@ -158,7 +158,8 @@ class AlgorithmConfig(StrictModel):
     unit_trace: Literal["auto", "joint", "geo_mean", "none"] = Field(
         default="auto",
         description="Scalar rho for the V-trace targets: 'joint' = exp(sum of decider log-ratios), 'geo_mean' = "
-                    "exp(mean), 'none' = rho = c = 1. 'auto' = joint without Units, geo_mean with Units.",
+                    "exp(mean), 'none' = rho = c = 1. 'auto' = joint (also with Units: units-experiment "
+                    "ruling, docs/benchmarks.md).",
     )
     entropy_reduction: Literal["auto", "mean_valid", "sum"] = Field(
         default="auto",

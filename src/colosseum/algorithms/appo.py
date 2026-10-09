@@ -6,7 +6,8 @@
 - ``K`` = ``ActionSpec.num_deciders``. Three switches (``AlgorithmConfig``):
   - ``unit_trace`` (``auto | joint | geo_mean | none``): the scalar log-ratio fed to V-trace:
     sum of the per-decider log-ratios, their mean over valid deciders, or 0 with
-    rho = c = 1 (TD(lambda)). ``auto`` = ``geo_mean`` with ``Units``, else ``joint``.
+    rho = c = 1 (TD(lambda)). ``auto`` = ``joint`` (with ``Units`` too: the units-experiment
+    ruling of T8.4, docs/benchmarks.md).
   - ``ratio_mode`` (``auto | joint | per_unit``): ``joint`` = PPO-clip on the joint ratio with
     the advantage multiplied by the clipped scalar rho (SP1); ``per_unit`` = PPO-clip per
     decider on the shared advantage WITHOUT the rho factor, mean over valid deciders, then
@@ -57,7 +58,8 @@ def resolve_modes(config: AlgorithmConfig, action_spec: ActionSpec) -> tuple[Rat
     """Resolve ``auto`` values and the ``K == 1`` collapse into ``(ratio_mode, unit_trace, entropy_reduction)``.
 
     ``K > 1`` (only with ``Units``): explicit values apply; ``auto`` gives ``per_unit`` /
-    ``geo_mean`` / (``mean_valid`` for ``per_unit``, ``sum`` for ``joint``).
+    ``joint`` / (``mean_valid`` for ``per_unit``, ``sum`` for ``joint``). ``unit_trace: auto`` is
+    ``joint`` for every action (T8.4 units-experiment ruling, docs/benchmarks.md).
 
     ``K == 1``: ``("joint", "joint", "sum")`` for every configuration except an explicit
     ``unit_trace: none``, which gives ``("joint", "none", "sum")``. An explicit
@@ -72,8 +74,7 @@ def resolve_modes(config: AlgorithmConfig, action_spec: ActionSpec) -> tuple[Rat
         return "joint", ("none" if config.unit_trace == "none" else "joint"), "sum"
     ratio: RatioMode = config.ratio_mode if config.ratio_mode != "auto" else (
         "per_unit" if action_spec.has_units else "joint")
-    trace: UnitTrace = config.unit_trace if config.unit_trace != "auto" else (
-        "geo_mean" if action_spec.has_units else "joint")
+    trace: UnitTrace = config.unit_trace if config.unit_trace != "auto" else "joint"
     reduction: EntropyReduction = config.entropy_reduction if config.entropy_reduction != "auto" else (
         "sum" if ratio == "joint" else "mean_valid")
     return ratio, trace, reduction

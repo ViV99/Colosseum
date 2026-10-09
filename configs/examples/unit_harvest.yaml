@@ -23,7 +23,7 @@ algorithm:
   learning_rate: 1.0e-3
   lr_schedule: "constant"
   ratio_mode: "auto"        # per_unit (the action has Units)
-  unit_trace: "auto"        # see docs/benchmarks.md, units experiment
+  unit_trace: "auto"        # joint (units-experiment ruling, docs/benchmarks.md)
   entropy_reduction: "auto" # mean over valid deciders with per_unit
 
 rollout:

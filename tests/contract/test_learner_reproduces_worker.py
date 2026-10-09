@@ -282,7 +282,7 @@ def test_per_unit_policy_loss_and_mean_valid_entropy_under_random_unit_masks(cor
     deciders of a slot, then mean over ACT slots" (a slot without a valid decider adds 0)."""
     model, role, chunks = _collect(core, units=True, mask_fn=_random_unit_mask)
     S, B = chunks[0].num_slots, len(chunks)
-    config = AlgorithmConfig(normalize_advantages=normalize)
+    config = AlgorithmConfig(normalize_advantages=normalize, unit_trace="geo_mean")   # explicit: auto = joint (T8.4)
     algo = APPO(model, config, ActionSpec.from_space(role.action_space), device="cpu")
     assert algo.modes == ("per_unit", "geo_mean", "mean_valid")
 
@@ -342,7 +342,7 @@ def test_per_unit_policy_loss_off_policy_under_random_unit_masks(core, normalize
     then mean over ACT slots."""
     model, role, chunks = _collect(core, units=True, mask_fn=_random_unit_mask)
     S, B = chunks[0].num_slots, len(chunks)
-    config = AlgorithmConfig(normalize_advantages=normalize)
+    config = AlgorithmConfig(normalize_advantages=normalize, unit_trace="geo_mean")   # explicit: auto = joint (T8.4)
     eps = config.eps_clip
     algo = APPO(model, config, ActionSpec.from_space(role.action_space), device="cpu")
     assert algo.modes == ("per_unit", "geo_mean", "mean_valid")

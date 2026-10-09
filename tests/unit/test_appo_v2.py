@@ -55,8 +55,10 @@ def test_modes_resolve_auto_and_collapse_for_one_decider():
     units = ActionSpec.from_space(UNITS.action_space)
     single = ActionSpec.from_space(DISCRETE.action_space)
     one_unit = ActionSpec.from_space(UNITS_ONE.action_space)
-    assert resolve_modes(AlgorithmConfig(), units) == ("per_unit", "geo_mean", "mean_valid")
-    assert resolve_modes(AlgorithmConfig(ratio_mode="joint"), units) == ("joint", "geo_mean", "sum")
+    # unit_trace auto with Units = joint: the T8.4 units-experiment ruling (docs/benchmarks.md).
+    assert resolve_modes(AlgorithmConfig(), units) == ("per_unit", "joint", "mean_valid")
+    assert resolve_modes(AlgorithmConfig(ratio_mode="joint"), units) == ("joint", "joint", "sum")
+    assert resolve_modes(AlgorithmConfig(unit_trace="geo_mean"), units) == ("per_unit", "geo_mean", "mean_valid")
     assert resolve_modes(AlgorithmConfig(ratio_mode="joint", entropy_reduction="mean_valid", unit_trace="none"),
                          units) == ("joint", "none", "mean_valid")
     for spec in (single, one_unit):
