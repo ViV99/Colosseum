@@ -24,7 +24,7 @@ colosseum train -c configs/examples/tic_tac_toe.yaml --set run.name=ttt-quicksta
 
 Training prints its run directory and one progress line per agent every 10 seconds (log lines go to stderr; the
 same lines are in `runs/ttt-quickstart/logs/main.log`). On an 8-core CPU the run (2 workers × 16 envs, 600,000 env
-steps) takes about a minute (54–64 s in five measured runs). Afterwards the latest checkpoint, played greedily, wins
+steps) takes about a minute (52–64 s over the six measured runs). Afterwards the latest checkpoint, played greedily, wins
 86–94% of games against a random legal-move player (`tests/learning/test_demo_learning_slow.py` requires >= 80%).
 Re-running with the same `run.name` is refused; pick another name or delete `runs/ttt-quickstart`.
 
