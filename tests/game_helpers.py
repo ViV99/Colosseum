@@ -21,7 +21,7 @@ from gymnasium.spaces import Box, Dict, Discrete, MultiBinary
 from colosseum.core.ipc import assert_no_tensors
 from colosseum.networks.cores import Core, GRUCore, LSTMCore, NoCore, WindowAttentionCore
 from colosseum.sp2.core.specs import ActionSpec, ObsSpec
-from colosseum.sp2.core.tree import Tree, tree_get, tree_leaves, tree_map
+from colosseum.sp2.core.tree import Tree, tree_get, tree_leaves, tree_map, tree_to_torch
 from colosseum.sp2.envs.contract import EpisodeTracker
 from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
 from colosseum.sp2.envs.spaces import Units
@@ -30,6 +30,7 @@ from colosseum.sp2.networks.composed import ComposedModel
 from colosseum.sp2.networks.dist import Distribution, make_distribution
 from colosseum.sp2.networks.heads import UnitsHead
 from colosseum.sp2.networks.model import PolicyModel, PolicyStep, UnrollOutput
+from colosseum.sp2.worker.buffers import BufferSpec, RolloutBuffer
 
 
 def _vec(*values: float) -> np.ndarray:
@@ -809,3 +810,87 @@ class NumpyOnlyQueue(queue.Queue):
 
     def cancel_join_thread(self) -> None:
         pass
+
+
+# ---------------------------------------------------------------------------
+# Part B (T4.2): synthetic chunk v2 from a model
+# ---------------------------------------------------------------------------
+
+
+def _random_leaves(spec: ObsSpec, rng: np.random.Generator):
+    tree = spec.allocate(())
+
+    def fill(leaf):
+        if np.issubdtype(leaf.dtype, np.floating):
+            return rng.normal(0.0, 1.0, leaf.shape).astype(leaf.dtype)
+        if leaf.dtype == np.bool_:
+            return rng.random(leaf.shape) < 0.5
+        return rng.integers(0, 2, leaf.shape).astype(leaf.dtype)
+
+    return tree_map(fill, tree)
+
+
+def _random_unit_masks(mask, rng: np.random.Generator):
+    """Copy of ``mask`` with every Units ``"unit"`` leaf randomized (p = 0.7, unit 0 always on)."""
+    if not isinstance(mask, dict):
+        return mask
+    if set(mask) == {"unit", "action"}:
+        unit = rng.random(mask["unit"].shape) < 0.7
+        unit[..., 0] = True
+        return {"unit": unit, "action": mask["action"].copy()}
+    return {k: _random_unit_masks(v, rng) for k, v in mask.items()}
+
+
+@torch.no_grad()
+def synthetic_chunk(model, role, pattern: str, *, seed: int = 0, agent_id: str = "a",
+                    policy_version: int = 0, logp_noise: float = 0.0, random_units: bool = True):
+    """A TrajectoryChunk whose slots are spelled by ``pattern``, recorded like a worker would.
+
+    Letters: ``A`` open ACT, ``T`` terminal ACT, ``B`` chunk-end BOOT, ``R`` truncation BOOT
+    (``reset_after``), ``P`` PAD. Observations (and ``global_state`` if the role has one) are
+    random; ACT actions are sampled from ``model``'s masked policy, stepped with the model
+    state like on a worker (reset after T and R). ``logp_noise`` adds Gaussian noise to every
+    valid decider's behavior log-prob (and their sum to the joint one) to make the chunk
+    off-policy. With ``random_units`` Units masks get random ``unit`` rows.
+    """
+    rng = np.random.default_rng(seed)
+    torch.manual_seed(seed)
+    obs_spec = ObsSpec.from_space(role.observation_space)
+    action_spec = ActionSpec.from_space(role.action_space)
+    gs_spec = None if role.global_state_space is None else ObsSpec.from_space(role.global_state_space)
+    buf = RolloutBuffer(len(pattern), BufferSpec(obs_spec, action_spec, gs_spec))
+    state = model.initial_state(1)
+    buf.begin(state, policy_version)
+    K = action_spec.num_deciders
+    for letter in pattern:
+        obs = _random_leaves(obs_spec, rng)
+        gs = None if gs_spec is None else _random_leaves(gs_spec, rng)
+        if letter in "AT":
+            mask = action_spec.full_mask(()) if action_spec.has_masks else None
+            if mask is not None and random_units:
+                mask = _random_unit_masks(mask, rng)
+            obs_t = tree_to_torch(tree_map(lambda x: np.asarray(x)[None], obs))
+            mask_t = None if mask is None else tree_to_torch(tree_map(lambda x: np.asarray(x)[None], mask))
+            step = model.step(obs_t, state, mask_t)
+            action_t = step.dist.sample()
+            unit_lp = step.dist.unit_log_prob(action_t)[0].float().numpy()
+            valid = step.dist.unit_valid(action_t)[0].numpy()
+            noise = np.where(valid, rng.normal(0.0, logp_noise, K), 0.0).astype(np.float32)
+            joint = float(step.dist.log_prob(action_t)[0]) + float(noise.sum())
+            action = tree_map(lambda t: t[0].numpy(), action_t)
+            buf.write_act(obs, gs, mask, action, joint, (unit_lp + noise) if K > 1 else None,
+                          float(rng.normal()))
+            state = step.state
+            if letter == "T":
+                buf.mark_terminal()
+                state = model.initial_state(1)
+        elif letter == "B":
+            buf.write_boot(obs, gs, reset_after=False)
+        elif letter == "R":
+            buf.write_boot(obs, gs, reset_after=True)
+            state = model.initial_state(1)
+        elif letter == "P":
+            buf.write_pad()
+        else:
+            raise ValueError(f"unknown slot letter {letter!r} in {pattern!r}")
+    return buf.build_chunk(agent_id)
