@@ -161,6 +161,50 @@ def test_sigint_during_startup_exits_130_not_aborted(tmp_path):
     assert "Interrupted" in stderr or "Received SIGINT" in stderr
 
 
+@pytest.mark.parametrize("builtin", ["exec", "eval"])
+def test_ctrl_c_inside_string_exec_during_startup_still_exits_130(tmp_path, builtin):
+    """A Ctrl-C that lands while a string ``exec``/``eval`` runs (``import torch`` builds
+    hundreds of dataclass methods that way) makes CPython flag the KeyboardInterrupt as
+    unhandled although ``_interrupts`` catches it; under ``python -m`` the process then
+    killed itself with SIGINT (-2) instead of exiting 130 (FIX-2)."""
+    # The Ctrl-C, deterministically: a KeyboardInterrupt raised inside the string's code (an
+    # expression, so eval takes it too) of a command run through the real CLI group.
+    (tmp_path / "ki_in_exec_cli.py").write_text(
+        "from colosseum.cli import main\n\n"
+        "@main.command('startup')\n"
+        "def startup():\n"
+        f"    {builtin}('(_ for _ in ()).throw(KeyboardInterrupt)', {{}})\n\n"
+        "main()\n")
+    env = {"PYTHONPATH": os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))}
+    proc = run_in_session([sys.executable, "-m", "ki_in_exec_cli", "startup"], timeout=60, env=env)
+    assert proc.returncode == 130, proc.stderr[-3000:]
+    assert proc.stderr == "Interrupted\n"
+
+
+def test_ctrl_c_lost_in_a_weakref_callback_during_startup_still_exits_130(tmp_path):
+    """A Ctrl-C raised inside a weakref callback (importlib runs them during imports) cannot
+    propagate; Python used to print "Exception ignored ... KeyboardInterrupt" and carry on.
+    The CLI records it: a command that then finishes still ends with "Interrupted" and 130
+    (``train`` hands it to the run's signal handling instead; unit-tested) (FIX-2)."""
+    (tmp_path / "ki_in_callback_cli.py").write_text(
+        "import weakref\n\n"
+        "from colosseum.cli import main\n\n"
+        "class Target:\n    pass\n\n"
+        "def callback(_ref):\n    raise KeyboardInterrupt\n\n"
+        "@main.command('startup')\n"
+        "def startup():\n"
+        "    target = Target()\n"
+        "    ref = weakref.ref(target, callback)\n"
+        "    del target\n"
+        "    print('finished', ref() is None)\n\n"
+        "main()\n")
+    env = {"PYTHONPATH": os.pathsep.join(filter(None, [str(tmp_path), os.environ.get("PYTHONPATH")]))}
+    proc = run_in_session([sys.executable, "-m", "ki_in_callback_cli", "startup"], timeout=60, env=env)
+    assert proc.stdout == "finished True\n"
+    assert proc.returncode == 130, proc.stderr[-3000:]
+    assert proc.stderr == "Interrupted\n"
+
+
 def test_config_error_exit_1_without_traceback(tmp_path):
     bad = tmp_path / "bad.yaml"
     data = yaml.safe_load(TTT_CONFIG.read_text())

@@ -19,15 +19,39 @@ _STARTUP_MARKER_ENV = "COLOSSEUM_TEST_STARTUP_MARKER"
 def _interrupts() -> Iterator[None]:
     """Ctrl-C before the run installs its own signal handling (imports, config loading,
     validation): one line on stderr and exit code 130, as after a handled SIGINT (click would
-    turn it into "Aborted!" with exit code 1). Wraps every command (``_InterruptibleGroup``)."""
+    turn it into "Aborted!" with exit code 1). Wraps every command (``_InterruptibleGroup``).
+
+    A Ctrl-C that Python could not raise here (it landed in a weakref callback or similar) is
+    recorded instead of printed: the run's signal handling takes it over (``train``), and a
+    command that finishes anyway still ends with "Interrupted" and 130.
+    """
     try:
-        marker = os.environ.get(_STARTUP_MARKER_ENV)
-        if marker:
-            open(marker, "a").close()
-        yield
+        from colosseum.utils.process import catch_lost_interrupts, take_lost_interrupt
+
+        with catch_lost_interrupts():
+            marker = os.environ.get(_STARTUP_MARKER_ENV)
+            if marker:
+                open(marker, "a").close()
+            yield
+        if take_lost_interrupt():
+            raise KeyboardInterrupt
     except KeyboardInterrupt:
+        _forget_unhandled_keyboard_interrupt()
         click.echo("Interrupted", err=True)
         sys.exit(130)
+
+
+def _forget_unhandled_keyboard_interrupt() -> None:
+    """Clear CPython's "KeyboardInterrupt was unhandled" flag for an interrupt we did handle.
+
+    A KeyboardInterrupt that leaves a string ``exec``/``eval`` (``PyRun_String*``) sets that
+    flag even when it is caught further up, and under ``python -m`` the interpreter then ends
+    the process with SIGINT (exit -2) instead of our ``sys.exit(130)``. ``import torch`` builds
+    hundreds of dataclass methods with ``exec(str)``, so a Ctrl-C during startup often lands in
+    one (FIX-2). Every string ``exec`` resets the flag when it starts, so a trivial one that
+    completes clears it.
+    """
+    exec("pass", {})
 
 
 class _InterruptibleGroup(click.Group):

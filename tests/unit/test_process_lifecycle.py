@@ -371,3 +371,80 @@ def test_install_signal_handlers_off_the_main_thread_is_a_noop():
     thread.start()
     thread.join(10)
     assert errors == [] and signal.getsignal(signal.SIGTERM) == before
+
+
+def test_sigint_while_the_watcher_thread_starts_is_recorded_not_raised(monkeypatch):
+    """The handlers are in place before the watcher starts: a Ctrl-C landing in
+    ``Thread.start`` is recorded like any other, never a KeyboardInterrupt that leaves an
+    unstarted watcher for ``restore_signal_handlers`` to join (FIX-2)."""
+    import threading
+
+    real_start = threading.Thread.start
+
+    def start_with_ctrl_c(self):
+        signal.raise_signal(signal.SIGINT)
+        sum(range(10))  # bytecode boundary: the Python-level handler runs here
+        real_start(self)
+
+    stop = mp.get_context("spawn").Event()
+    sup = ProcessSupervisor(stop)
+    before = signal.getsignal(signal.SIGINT)
+    monkeypatch.setattr(threading.Thread, "start", start_with_ctrl_c)
+    try:
+        try:
+            sup.install_signal_handlers()
+        except KeyboardInterrupt:
+            pytest.fail("a Ctrl-C during the watcher start escaped as KeyboardInterrupt")
+        monkeypatch.undo()
+        assert stop.wait(5) and sup.received_signal == signal.SIGINT
+    finally:
+        monkeypatch.undo()
+        sup.restore_signal_handlers()
+    assert signal.getsignal(signal.SIGINT) is before
+
+
+def _lose_a_keyboard_interrupt() -> None:
+    """A KeyboardInterrupt raised where Python cannot propagate it (a weakref callback, as in
+    importlib's module-lock bookkeeping during imports): it is reported as unraisable."""
+    import weakref
+
+    class Target:
+        pass
+
+    def callback(_ref):
+        raise KeyboardInterrupt
+
+    target = Target()
+    ref = weakref.ref(target, callback)
+    del target
+    assert ref() is None
+
+
+def test_interrupt_lost_in_an_unraisable_context_reaches_the_supervisor(capsys):
+    """A Ctrl-C lost during startup (catch_lost_interrupts) is taken over by the run's signal
+    handling once installed: the run stops with SIGINT, nothing is printed (FIX-2)."""
+    with process_module.catch_lost_interrupts():
+        _lose_a_keyboard_interrupt()
+    stop = mp.get_context("spawn").Event()
+    sup = ProcessSupervisor(stop)
+    sup.install_signal_handlers()
+    try:
+        assert stop.wait(5) and sup.received_signal == signal.SIGINT
+    finally:
+        sup.restore_signal_handlers()
+    assert not process_module.take_lost_interrupt()  # consumed by the supervisor
+    assert capsys.readouterr().err == ""
+
+
+def test_catch_lost_interrupts_passes_other_unraisables_on_and_restores_the_hook(monkeypatch):
+    import sys
+
+    seen = []
+    monkeypatch.setattr(sys, "unraisablehook", seen.append)
+    with process_module.catch_lost_interrupts():
+        assert sys.unraisablehook is not seen.append
+        _lose_a_keyboard_interrupt()
+        sys.unraisablehook(type("U", (), {"exc_type": ValueError})())
+    assert sys.unraisablehook == seen.append
+    assert [u.exc_type for u in seen] == [ValueError]
+    assert process_module.take_lost_interrupt() and not process_module.take_lost_interrupt()
