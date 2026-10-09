@@ -277,7 +277,8 @@ within a team.
 **Ratings** are kept per layout. Two or more teams: ELO over team pairs (each pair is one comparison by rank; its
 weight `K / (T - 1)` is split among the counted member pairs of different agents), a fractional win-rate matrix and
 `wr_vs_past` (the latest weights against the agent's own checkpoints, last 500 pairs). One team: mean score with EMA
-and a 95% interval per agent, and with `teammates: mixed` a cross-play table "team composition → mean score".
+and a 95% interval per agent, and (two or more seats) a cross-play table "team composition → mean score" (mixed
+compositions appear with `teammates: mixed`).
 
 **Resume.** `training.resume_from` accepts a checkpoint dir, a previous run dir (each agent takes its latest
 checkpoint there) or a `.pt` state dict (weights only, e.g. from `colosseum bc`). An explicit resume is strict: a
@@ -345,7 +346,7 @@ coordinator, league, ratings, `metrics.jsonl` or WandB; every `run-workers` host
 | | Sub-project | Content |
 |---|---|---|
 | ✔ | SP1 Foundation and stabilization | correct single-machine training, stateful model protocol, run dir, metrics, lifecycle |
-| ✔ | SP2 Game model | `GameSpec` / `MultiAgentEnv`, elimination, teams, roles, layouts, `Units`, Dict observations, bootstrap on the learner, centralized critic (awaiting the owner's acceptance) |
+| ✔ | SP2 Game model | `GameSpec` / `MultiAgentEnv`, elimination, teams, roles, layouts, `Units`, Dict observations, bootstrap on the learner, centralized critic (accepted and merged 2026-10-09) |
 | | SP3 Players, league, warm start | scripted, frozen and external players; PFSP over snapshots; per-agent `init`/kickstart/critic warm-up; top-k snapshot storage |
 | | SP4 Selection and observability | match log, OpenSkill / Bradley–Terry ratings, `colosseum tournament`, dashboard, snapshot ratings |
 | | SP5 Distributed | hub and nodes, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images |
@@ -367,7 +368,7 @@ Known limitations today:
 
 ```bash
 .venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 1248 tests
-.venv/bin/python -m pytest -m slow -v                       # learning tests of every demo game (12–16 min) + torch.compile
+.venv/bin/python -m pytest -m slow -v                       # learning tests of every demo game (11–16 min) + torch.compile
 .venv/bin/python -m pytest -m gpu -v                        # CUDA machine only, see docs/GPU_CHECKS.md
 ```
 

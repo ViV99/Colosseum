@@ -3,11 +3,13 @@
 - Ветка `sp2-game-model`. Начало приёмки: HEAD `b97dfec`. Правки документации во время приёмки: `1311fbb`, `07ae1a5`, `6c6f863`. Отчёт — следующий коммит после `6c6f863`.
 - Дата: 2026-10-09.
 - Машина: WSL2, 8 ядер (`nproc` = 8), 11 ГБ ОЗУ, без GPU. Python 3.12.3, torch 2.14.1+cpu, `.venv`.
-- Шаг 14 (merge) не выполнялся: слияние в `main` ждёт явного одобрения владельца. Сообщение владельцу (шаг 13, вторая половина) отправляет контролёр после финального ревью ветки.
+- **Владелец принял SP2 2026-10-09** («Окей»). Ветка `sp2-game-model` сливается в `main` через `git merge --no-ff` (слияние — следующий коммит после этого отчёта, поэтому один `git revert -m 1 <merge>` откатывает SP2).
+- Четыре вопроса владельцу (раздел «Открытые пункты») явного ответа не получили, поэтому действуют умолчания: team_tag — лучший из двух прогонов; `ratio_mode: auto` = `per_unit`; `unit_trace: auto` = `joint`; GPU-проверки ещё не прогнаны. Все четыре — **открыто, решить на брейншторме SP3**.
+- Записи финального ревью, волны исправлений и задач FIX-1/FIX-2 скопированы из рабочего каталога SDD (он удаляется после слияния) в [`2026-10-09-sp2-review/`](2026-10-09-sp2-review/README.md).
 
 ## Итог
 
-**ВСЕ КРИТЕРИИ ВЫПОЛНЕНЫ (ALL PASS).** Три правки документации во время приёмки (`docs:`), шаг 7 после них перезапущен. После приёмки — финальное ревью ветки и одна волна исправлений (раздел «Финальное ревью ветки»); критерий 3.1 после неё повторён. Владельцу остаются вопросы: проверка team_tag «лучший из двух прогонов», `ratio_mode` при K=128, шумный выбор `unit_trace` (раздел «Открытые пункты»).
+**ВСЕ КРИТЕРИИ ВЫПОЛНЕНЫ (ALL PASS).** Три правки документации во время приёмки (`docs:`), шаг 7 после них перезапущен. После приёмки — финальное ревью ветки и одна волна исправлений (раздел «Финальное ревью ветки»); критерий 3.1 после неё повторён. Владелец принял SP2 2026-10-09. Вопросы владельцу (проверка team_tag «лучший из двух прогонов», `ratio_mode` при K=128, шумный выбор `unit_trace`, GPU-проверки) остались без явного ответа: действуют умолчания, пункты открыты до брейншторма SP3 (раздел «Открытые пункты»).
 
 | § | Критерий | Результат |
 |---|---|---|
@@ -360,11 +362,11 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 
 Задачи контролёра вне плана (после T8.4):
 
-- **FIX-1** (`a4f1ad1`, отчёт `.superpowers/sdd/2026-10-08-sp2-game-model/task-FIX-1-report.md`) — нестабильный `tests/integration/test_sp2_game_runs.py::test_resume_continues_versions_and_checks_the_role_signature`.
+- **FIX-1** (`a4f1ad1`, отчёт [`2026-10-09-sp2-review/task-FIX-1-report.md`](2026-10-09-sp2-review/task-FIX-1-report.md)) — нестабильный `tests/integration/test_sp2_game_runs.py::test_resume_continues_versions_and_checks_the_role_signature`.
   - Причина: первый прогон перебирал бюджет в 1500 шагов (счётчик шагов сбрасывается раз в ~0.5 с, плюс задержка остановки), иногда до ≥ 3000. Продолжение с фиксированным бюджетом 3000 тогда сразу останавливалось без шага обучения.
   - Исправлен только тест: бюджет продолжения = реальные `env_steps` первого прогона + 2000. Добавлена проверка, что счётчик шагов продолжается.
   - Ошибки в продукте нет. Перебор бюджета записан как открытый пункт SP5.
-- **FIX-2** (`b97dfec`, отчёт `task-FIX-2-report.md`) — нестабильный `tests/integration/test_sp2_lifecycle.py::test_sigint_during_startup_exits_130_not_aborted` (exit −2).
+- **FIX-2** (`b97dfec`, отчёт [`2026-10-09-sp2-review/task-FIX-2-report.md`](2026-10-09-sp2-review/task-FIX-2-report.md)) — нестабильный `tests/integration/test_sp2_lifecycle.py::test_sigint_during_startup_exits_130_not_aborted` (exit −2).
   - Причина: CPython 3.12 помечает KeyboardInterrupt, вышедший из строкового `exec` (так `dataclasses` при `import torch` создаёт методы), как «необработанный». Под `python -m` процесс тогда завершается сигналом вместо нашего `sys.exit(130)`.
   - Исправлены ещё два режима:
     - Ctrl-C, потерянный в weakref-callback importlib, игнорировался;
@@ -373,7 +375,7 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 
 Отклонения T8.7 от брифа:
 
-1. Вывод команд и временные файлы — в рабочем каталоге задачи (`/home/viv/.claude/jobs/0db917f9/tmp/t87/`), а не в `/tmp` (указание контролёра). Это касается и `run.dir` распределённого smoke-теста шага 8. Добавлены флаги `-p no:cacheprovider --color=no`.
+1. Вывод команд и временные файлы — в рабочем каталоге задачи (scratch-каталог контролёра, `<scratch>/t87/`), а не в `/tmp` (указание контролёра). Это касается и `run.dir` распределённого smoke-теста шага 8. Добавлены флаги `-p no:cacheprovider --color=no`.
 2. Шаг 2: тесты пунктов T5.1/T3.3/T1.5 лежат в `tests/unit`, а не в `tests/contract`, поэтому они прогнаны отдельной командой (174 passed).
 3. Шаг 4: `grep -n "Ruling: unit_trace"` пуст из-за обратной кавычки в тексте решения; само решение в отчёте есть.
 4. Шаг 7: две правки диапазона времени quickstart (`07ae1a5`, `6c6f863`). Третий прогон шага 7 не делался, обоснование в §3.7.
@@ -392,7 +394,7 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 
 ## Решения контроллера во время SP2 (все записи «Ruling:» из журнала, по порядку)
 
-Каждая запись: что решено — почему — чем грозит, если решение неверно. Сначала решения этапа плана (PR-1..PR-5) и предполётной проверки (P1–P22). Затем все строки «Ruling» журнала контролёра SP2 (`.superpowers/sdd/2026-10-08-sp2-game-model/progress.md`) по порядку, дословно, на английском. Если строка не называет свою задачу, в квадратных скобках добавлен префикс задачи. В конце — решения T8.3–T8.4 из черновика.
+Каждая запись: что решено — почему — чем грозит, если решение неверно. Сначала решения этапа плана (PR-1..PR-5) и предполётной проверки (P1–P22). Затем все 42 строки «Ruling» журнала контролёра SP2 (`progress.md` рабочего каталога SDD; каталог удалён после слияния, поэтому этот раздел — единственная копия) по порядку, дословно, на английском. Если строка не называет свою задачу, в квадратных скобках добавлен префикс задачи. В конце — решения T8.3–T8.4 из черновика.
 
 ### Решения этапа плана (PR-1..PR-5, `00-overview.md` и журнал)
 
@@ -402,7 +404,9 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 - PR-4 — `put_row` оставлен рядом с `tree_assign` (поправка R4) — почему: обе функции уже выполнены и проверены, объединять их не стоит переделки — цена ошибки: небольшой дублирующий хелпер.
 - PR-5 (P21) — файлы `models.py` примеров — самостоятельные шаблоны, повтор маленьких классов Policy/Value между примерами допустим — почему: пользователь копирует одну папку примера — цена ошибки: немного дублирования в `examples/`.
 
-### Решения предполётной проверки (P1–P22, `constraints.md`)
+### Решения предполётной проверки (P1–P22)
+
+Источник — `constraints.md` рабочего каталога SDD (удалён после слияния); этот раздел — их полная копия (пересказ на русском). Поправки контракта R1–R18, на которые они ссылаются, — в `docs/superpowers/plans/2026-10-08-sp2-game-model/00-overview.md`.
 
 - P1 (T4.2) — R9 реализуется точно; тест эквивалентности при одном решающем перебирает только `unit_trace` ∈ {`joint`, `geo_mean`} — почему: явный `none` соблюдается и вне политики даёт другой результат — цена ошибки (оценка контроллера): тест не ловит расхождение `none` при K = 1, которое и так задумано.
 - P2 (T4.2) — R10 и R12 не вписаны в текст задачи, реализуются по `constraints.md` — почему: поправки обязательны и сильнее текста частей — цена ошибки (оценка контроллера): нет; без этого пропали бы диагностики (`log_rho_joint_abs_p95`, тест нулевого лага) и GPU-тесты-преемники.
@@ -467,7 +471,10 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 36. Ruling (T8.4, coded pre-registered rule): unit_trace auto with Units = joint (K=128 per_unit score share vs scripted bot, 2-seed mean: joint 0.206, geo_mean 0.093, none 0.190; K=8 saturated at 0.5) — cost if wrong: run-to-run noise (0.044 vs 0.135 same config) exceeds the rule's 0.05 margin; joint vs none undecided by data; geo_mean consistently worst.
 37. Ruling: T8.6 dropped-reward Important fixed in the docs only (describe the real behaviour: dropped silently at default log level, counted in the worker's dropped_reward_episodes stat); surfacing the counter (warn-once or a metric) parked as a final-review candidate — docs must describe the real state, a code change is outside a docs task — cost if wrong: users keep losing rewards of never-acting seats without a visible signal until the final wave/SP3.
 38. Ruling: T8.7's task review is folded into the final whole-branch review (area C reviewer also checks the acceptance report against its evidence) — the report is the final review's main input anyway; a separate seat would duplicate it — cost if wrong: a report error is caught one stage later (still before the owner sees it).
-39. [Final fix wave] Ruling: `serve-weight-store` — Ctrl-C exits 130 consistently (the CLI-wide "Ctrl-C → 130" rule), whether or not a startup Ctrl-C was lost.
+39. [Финальная волна] Ruling: final fix wave scope = A I-1 + C I-1 + A M-1..M-4 + dropped-reward warn-once & system metric + dup-test removal + FIX-2b minors + B optional if trivial — every item is cheap, reviewer-recommended and closes a ledger-deferred item; rest of the Minors stay parked — cost if wrong: a larger single wave (more re-review surface).
+40. [Финальная волна] Ruling: serve-weight-store Ctrl-C exits 130 consistently (CLI-wide "Ctrl-C → 130" rule; SP1 exited 0 there via its own except) — consistency with the lifecycle exit-code table — cost if wrong: scripts that treat serve-weight-store exit 0 as success on Ctrl-C see 130.
+41. [Повторное ревью волны] Ruling: N-1 parked to SP4 (observability), not a second fix wave — the WARNING is the primary signal and always fires; the counter is diagnostic; one fix wave is the process rule — bookkeeping only: one docs commit (ENV_GUIDE wording made accurate, CLAUDE.md «Parked during SP2» + acceptance report open items/residuals list N-1, eval.py docstring) checked by the controller — cost if wrong: a misleading 0 in the last system record until SP4.
+42. [Слияние] Ruling: keep the SDD workspace until the owner's merge decision (the acceptance report cites final-review-*.md and task reports in it; a requested change would need the ledger) — delete it after the merge — cost if wrong: none (git-ignored scratch).
 
 ### Решения (rulings) T8.3–T8.4 (из черновика)
 
@@ -519,11 +526,11 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 5. **SP5:** с заданным `training.seed` распределённые воркеры на разных машинах получают одинаковые seed сред (решение PR-3).
 6. **SP4:** поле `dropped_reward_episodes` записи `system` суммирует только недавно приславших статистику воркеров (может уменьшаться, может быть 0 в последней записи). Сделать его монотонным счётчиком на весь прогон.
 
-Вопросы владельцу (их задаёт контролёр):
-- Принять проверку team_tag «лучший из двух независимых прогонов» (порог 0.80 прежний) или выбрать другую?
-- `ratio_mode` при K=128: оставить `per_unit` (спека) или проверить `joint` на нескольких сидах и реальной игре?
-- `unit_trace` = `joint`: принять выбор, сделанный на шумных данных (`none` не хуже в пределах разброса)?
-- Прогнать 18 GPU-тестов на машине с CUDA (`docs/GPU_CHECKS.md`).
+Вопросы владельцу. При приёмке (2026-10-09) явного ответа не было; действуют умолчания, все четыре — **открыто, решить на брейншторме SP3**:
+- Проверка team_tag: умолчание — «лучший из двух независимых прогонов» (порог 0.80 прежний). Вопрос: принять или выбрать другую?
+- `ratio_mode` при K=128: умолчание — `auto` = `per_unit` (спека). Вопрос: оставить или проверить `joint` на нескольких сидах и реальной игре?
+- `unit_trace`: умолчание — `auto` = `joint`. Вопрос: принять выбор, сделанный на шумных данных (`none` не хуже в пределах разброса)?
+- GPU: 18 GPU-тестов ещё не прогнаны на машине с CUDA (`docs/GPU_CHECKS.md`).
 
 Кандидаты финального ревью ветки (счётчик `dropped_reward_episodes`, мелочи FIX-2) и пункт «контекст `validate`» исправлены финальной волной; см. раздел «Финальное ревью ветки».
 
@@ -531,7 +538,7 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 
 ## Финальное ревью ветки
 
-Три ревьюера по областям (только чтение, диапазон `7430361..7d55974`), отчёты в журнале контролёра (`final-review-{A,B,C}.md`):
+Три ревьюера по областям (только чтение, диапазон `7430361..7d55974`), отчёты: [`2026-10-09-sp2-review/final-review-A.md`](2026-10-09-sp2-review/final-review-A.md), [`final-review-B.md`](2026-10-09-sp2-review/final-review-B.md), [`final-review-C.md`](2026-10-09-sp2-review/final-review-C.md); отчёт волны — [`final-fix-report.md`](2026-10-09-sp2-review/final-fix-report.md), повторное ревью — [`final-rereview.md`](2026-10-09-sp2-review/final-rereview.md):
 
 | Область | Critical | Important | Minor | Вердикт |
 |---|---|---|---|---|
@@ -557,4 +564,50 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 
 Повторное ревью волны: все 10 пунктов исправлены; найден один новый Minor N-1 — поле `system` `dropped_reward_episodes` может уменьшаться и быть 0 в последней записи при остановке (`SystemStats.snapshot` забывает воркеров, чья статистика старше 6 с). Отложен в SP4 (решение контролёра; волна исправлений одна), в «Открытых пунктах» — пункт 6.
 
-Остаются отложенными (Minor, не блокируют слияние): A M-5..M-11 (NaN-градиенты только при не конечных параметрах, Gaussian в fp16 под AMP, `global_state` без критик-энкодера, `role_signature` без `n`/`nvec`, раннее обнаружение «все выбыли», двойной расчёт `unit_log_prob`, пробел в контрактном тесте с `only_if`/Box в `Units`) и остальные мелочи журнала области A; B Minor 1, 5, 6 (NaN-безопасный backward, проверка ролей в `MatchRunner`, значения слотов от чужого узла — SP5/SP6); C M-2..M-6 (наследие `AgentPool` и мелкие остатки, формулировки «Unused in SP1», распределённый режим молча игнорирует `mode: league`, умолчания `scripts/units_experiment.py`) и прочие мелочи журнала (T0.1, T5.2, T6.1, T6.4). Пункты «Открытые пункты» выше и «Parked during SP2» в CLAUDE.md совпадают.
+Остаются отложенными (Minor, не блокируют слияние): A M-5..M-11 (NaN-градиенты только при не конечных параметрах, Gaussian в fp16 под AMP, `global_state` без критик-энкодера, `role_signature` без `n`/`nvec`, раннее обнаружение «все выбыли», двойной расчёт `unit_log_prob`, пробел в контрактном тесте с `only_if`/Box в `Units`) и остальные мелочи журнала области A; B Minor 1, 5, 6 (NaN-безопасный backward, проверка ролей в `MatchRunner`, значения слотов от чужого узла — SP5/SP6); C M-2..M-6 (наследие `AgentPool` и мелкие остатки, формулировки «Unused in SP1», распределённый режим молча игнорирует `mode: league`, умолчания `scripts/units_experiment.py`) и прочие мелочи журнала (T0.1, T5.2, T6.1, T6.4; все отложенные замечания задач — в приложении в конце отчёта). Пункты «Открытые пункты» выше и «Parked during SP2» в CLAUDE.md совпадают.
+
+---
+
+## Приложение. Отложенные замечания по задачам (из журнала контролёра, дословно)
+
+Все 37 строк журнала контролёра SP2 (`progress.md` рабочего каталога SDD, удалён после слияния), содержащие `minor (deferred`, по порядку и дословно; в квадратных скобках — задача. Это замечания уровня Minor, отложенные ревью задач; они не блокируют слияние.
+
+Финальная волна исправлений (коммиты `a6a2faa..62157a6`) закрыла: контекст `validate` (T6.2, `3f32974`), ключи исхода (T1.4, `52ca7c6`), `ObsSpec` (T1.3, `52ca7c6`), умерший процесс среды (T1.6, `18d1abd`), FIX-2b (`2fb77c3`). Пункт о потерянных наградах никогда не ходившего места — не строка `minor (deferred`, а решение T8.6 (запись 37 журнала решений); его закрыл `c5225e6` (WARNING один раз на воркер и `dropped_reward_episodes` в записи `system`), остаток — N-1 (SP4). Строки с пометкой «deferred→T…» журнал направил в названные задачи; остальные строки остаются открытыми Minor.
+
+1. [T0.1] Task T0.1: minor (deferred): launcher._release_queues — reader.release()/later loop unguarded around release_command_queues (no feeder-hang risk; outside spec item)
+2. [T0.1] Task T0.1: minor (deferred): inline cancel_join_thread blocks in launcher duplicate ipc._cancel_join — tidy in the T5.4 launcher copy
+3. [T0.1] Task T0.1: minor (deferred): test reads private mp.Queue attrs (_closed, _thread)
+4. [T0.1] Task T0.1: minor (deferred): CLAUDE.md residuals list stale — update in T8.6
+5. [T1.1] Task T1.1: minor (deferred): tree_map mismatch error prints keys in different orders; tree_assign may half-write on structure error (doc); tree_to_* docstring "dtypes preserved" vs bf16 upcast; tree_stack mixed-type and leaf-vs-dict error paths untested
+6. [T1.2] Task T1.2: minor (deferred): Units.contains accepts NaN in Box components; only_if non-iterable values -> TypeError, floats truncated; sample() puts 0 for absent units even outside Box bounds; sample() doesn't check mask shapes
+7. [T1.3] Task T1.3: minor (deferred): ObsSpec.check accepts dict/None at scalar leaves, ragged list -> bare ValueError (should be EnvContractError); _fmt/_get duplicate core.tree helpers; "masked group" predicate repeated 4x (plan-mandated); ActionSpec eq ignores Box bounds; small coverage gaps (root Units mask, box group_mask None, box-only Units) — **закрыто финальной волной (`52ca7c6`)**: часть «ObsSpec.check accepts dict/None at scalar leaves, ragged list -> bare ValueError»; остальное в строке открыто.
+8. [T1.4] Task T1.4: minor (deferred): validate accepts non-int team (1.0) then teams() TypeError; resolve_outcome malformed key -> TypeError not EnvContractError (sorted(key=repr)); _checked accepts numeric strings and ranks < 1; teams_of numpy ints / mixed / empty input unclear errors; max_seats bare ValueError on empty layouts; unneeded lazy import in validate; coverage gaps — **закрыто финальной волной (`52ca7c6`)**: часть «resolve_outcome malformed key -> TypeError not EnvContractError»; остальное в строке открыто.
+9. [T1.5] Task T1.5: minor (deferred): on_reset failing after self.layout assignment leaves stale phases (harmless when EnvContractError is fatal); no test pin gaps left
+10. [T1.6] Task T1.6: minor (deferred): SubprocessVectorEnv._round after a dead child leaves replies unread / bare error without child context; only first child error of a round raised; child note lacks env index; startup-failure/spec-mismatch/unpicklable-reply paths untested — **закрыто финальной волной (`18d1abd`)**: часть «SubprocessVectorEnv._round after a dead child leaves replies unread / bare error without child context» (ошибка называет процесс, диапазон сред и код выхода); остальное в строке открыто.
+11. [T1.7] Task T1.7: minor (deferred): env_class description example points to examples.tic_tac_toe.game.TicTacToe (created in T7.2)
+12. [T2.1] Task T2.1: minor (deferred): TreeDist._assemble/_fmt near-copies of specs helpers; DiagGaussian mode() keeps grad while sample() is no_grad, box samples inherit mean dtype (fp16 under autocast); TreeDist.unit_valid calls a part only for device; MultiCategoricalDist.nvec writable; test gaps (nested Dict paths, custom part, _check_part mismatch errors, masked MultiCategorical KL)
+13. [T2.2] Task T2.2: minor (deferred): units first-component error text says "logits" even for a box component; silent clamping of out-of-range values on valid components; wrapper converts TypeError too; per-call gate-table rebuild in _component_valid; cat([]) IndexError and no same-group check
+14. [T2.3] Task T2.3: minor (deferred): NormalizeObs path=() on Dict obs -> AttributeError not naming path; ComposedModel.unroll silently ignores global_state without critic encoder; RandomPolicy.unroll skips _check_unroll_args; coverage gaps (UnitsHead non-units group, NormalizeObs clip, S<1, RandomPolicy box branch)
+15. [T2.4] Task T2.4: minor (deferred): no test for non-Core core class ConfigError; env_spec close-on-error untested and a raising close() would mask the original error; kwargs-win test checks one key only; no test that the value head gets no space injection; test leaks an env
+16. [T3.1] Task T3.1: minor (deferred): payload-keys == 13 field names not pinned by a test; TrajectoryChunk._apply would fail on None tree leaves; _map_optional vs inline None checks
+17. [T3.3] Task T3.3: minor (deferred): reset-with-outcome case missing from CONTRACT_CASES; ActRecord.global_state/final_obs not cast to role dtypes (put_row casts later); MatchRunner __init__ doesn't close vec_env on reset failure
+18. [T3.4] Task T3.4: minor (deferred): RolloutLoop._add_checkpoint silently ignores unknown agents' checkpoints. NOTE for T5.1/T6.1: SeatAssignment.collect defaults True, so checkpoint seats must pass collect=False explicitly (else ValueError).
+19. [T4.1] Task T4.1: minor (deferred): no shape/broadcast guard; docstring doesn't say inputs must be detached (T4.2 calls under no_grad)
+20. [T4.2] Task T4.2: minor (deferred): with unit_trace none, rho/c clip metrics compare against configured bars, not the bars V-trace used (diagnostic only); R9 "once" log is a module-level flag; R12 GPU tests unverified on CUDA (GPU_CHECKS)
+21. [T5.1] Task T5.1: minor (deferred): untested branches (PFSP_MIN_WEIGHT clamp, pfsp_exponent != 1, mixed on opposing teams, _mixed_teammate fallback); unused logger; pfsp_weight docstring
+22. [T5.2] Task T5.2: minor (deferred): `games` counts member pairs not matches (label it in T5.3 consumers); _classify returns untyped tuple; cross_play also records homogeneous teams (a+a baseline)
+23. [T5.3] Task T5.3: minor (deferred): _parse_meta docstring stale; roles/role_signature not validated together; asymmetric rotation test name overclaims; SystemStats docstring shortened; console arena WR weighted by member pairs (documented)
+24. [T5.4] Task T5.4: minor (deferred): 6 blank lines in sp2/launcher.py:133-138; _parse_agent_spec unused until T6.1; SP1 traceability tags dropped in comments. CARRY to T7.1: cover _learner_main kickstart-teacher branch in test_sp2_learner_entry.py; automated sp2 lifecycle coverage (exit codes 130/143, ≤10 s, final ckpts) comes with T7.1 ports.
+25. [T6.2] Task T6.2: minor (deferred, final-wave candidate): validate's own EnvContractError context order "layout, episode step, seat" violates the global format "seat, episode step, layout"; test gaps (global_state/final_obs outside space, tracker violation via validate, env.step failure, non-first layout, Units random action); _seeded reseeds shared space objects; env.close() in finally can mask the error; CLI test doesn't assert single line — **закрыто финальной волной (`3f32974`)**: часть «validate's own EnvContractError context order»; пробелы в тестах и прочее в строке открыто.
+26. [T6.1] Task T6.1: minor (deferred): eval's architecture check uses zero obs (allocate) not an env sample; validated-set key has no game identity; odd --num-matches note checks all layouts; outcomes split by team side not role; _cross_play_orders n! permutations; build_model except Exception hides traceback; SP1 test_eval_stateful equivalence vs manual loop not ported (MatchRunner state tests cover per-seat state)
+27. [T6.3] Task T6.3: minor (deferred): specs.py now imports torch at top level (env-side import cost); bad learner.device / unwritable --output in bc print a traceback (SP1 parity); absent units' discrete values range-checked (strict, documented)
+28. [T6.4] Task T6.4: minor (deferred): distributed_setup duplicates setup_run's spec/roles sequence; per-env worker seeds identical across machines when training.seed set (PR-3 cost); wrong-obs-shape chunk can still fail in the learner forward (SP5)
+29. [T7.2] Task T7.2: minor (deferred): ContextualBanditGame starts from unseeded default_rng (deterministic only via reset seed); TicTacToeValue lacks a docstring; machine-specific timing comment
+30. [T7.1] Task T7.1: minor (deferred→T7.3 where noted): metrics.jsonl ratings record per-layout keys not asserted end to end (→T7.3 one-line add); kickstart test single-role only; ±8% seat bound measured on SP1; 4p seat-balance case can't detect missing shuffle; console-script check restored in T7.3 Step 6 (verify)
+31. [T7.3] Task T7.3: minor (deferred→T8.6): stale comments naming deleted modules (tests/conftest.py:25,47-48 "helpers"/"harness"; core/errors.py:15 "BaseEnv contract"); report miscounts (60 files: 44 overwrite, 16 new)
+32. [T8.1] Task T8.1: minor (deferred): demo constructors don't validate max_steps>=1 / view_radius>=1 / num_resources fit; unit_harvest mirrored-board resources check can't fail; coin_grid seed test only compares reset grid; tron 3.5/3.5 mid-game crash and non-right headings not pinned directly; coin_grid.yaml references T8.3 file before it exists; demo_checks._Pool.get returns None for unknown key; unit_harvest ~1.9k steps/s
+33. [T8.2] Task T8.2: minor (deferred): predator_prey rejection-sampling placement slow at the smallest board with large radius (terminates)
+34. [T8.5] Task T8.5: minor (deferred): Round 2 preset test doesn't assert upgrade features stay 0; tests reach into env._game/_obs internals
+35. [T8.3] Task T8.3: minor (deferred→T8.6/T8.7): report vs acceptance-doc cost numbers differ (0.86→0.43/67% vs 0.8→0.4/64%); test docstring says "one run in seven" (record is 2 of 9)
+36. [FIX-1] Task FIX-1: minor (deferred): comment overstates overshoot frequency; margin tied to tiny config params (queue_size, chunk length, envs) without a note.
+37. [FIX-2b] Task FIX-2b: minor (deferred→final wave): autouse fixture take_lost_interrupt() in test_process_lifecycle.py (process-global record can leak between in-process tests); serve-weight-store exits 0 on Ctrl-C but 130 after a lost startup Ctrl-C (inconsistent); two new integration tests replace PYTHONPATH (drop tests/ dir); optional _thread.interrupt_main() re-delivery instead of exit-130-after-finish. — **закрыто финальной волной (`2fb77c3`)**: autouse-фикстура, `serve-weight-store` → 130, `PYTHONPATH` двух тестов; необязательный вариант `_thread.interrupt_main()` не делался.

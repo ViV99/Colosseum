@@ -158,6 +158,8 @@ T8.1, крестики-нолики ещё с ходами обоих мест �
 
 Оценка — greedy-политика последнего чекпоинта: 100 партий против случайного игрока и 100 против скриптового бота (`scripted_action`); `share_vs_scripted` = свой счёт / (свой + бота). Диагностики — среднее по последней четверти записей `train`. Сырые данные: [`benchmarks/units-experiment.json`](benchmarks/units-experiment.json) (seed 0) и [`benchmarks/units-experiment-seed1.json`](benchmarks/units-experiment-seed1.json) (seed 1, только три строки K=128 `per_unit`, см. ниже).
 
+Повтор с параметрами записанного эксперимента (умолчания скрипта другие: `--steps 400000`, `--parallel 2`): `.venv/bin/python scripts/units_experiment.py --steps 340000 --parallel 1 --json units-experiment.json` (seed 0) и `... --k 128 --ratio-modes per_unit --seeds 1 --json units-experiment-seed1.json` (seed 1).
+
 | k | ratio_mode | unit_trace | seed | win_vs_random | score_vs_random | win_vs_scripted | share_vs_scripted | clip_fraction | clip_fraction_joint | ess | log_rho_abs_p95 | log_rho_joint_abs_mean | c_clip_frac | deciders_valid_mean | env_steps_per_s | wall_s |
 |---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|---|
 | 8 | joint | joint | 0 | 1.00 | 75.0 | 0.00 | 0.500 | 0.023 | 0.118 | 0.963 | 0.102 | 0.082 | 0.516 | 7.7 | 1505 | 229 |
