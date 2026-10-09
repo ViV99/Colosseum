@@ -128,3 +128,35 @@ def test_sections_follow_the_layout_order_of_the_game_and_cross_play_is_marked()
     assert "(cross-play)" in report.text()
     with pytest.raises(ValueError, match="does not have"):
         summarize(GameSpec.symmetric(2, OBS, ACT), [match("coop2", ["a", "a"], {0: 1})])
+
+
+def test_one_agent_in_a_rank_layout_reports_per_seat():
+    results = [match("4p", ["a"] * 4, {0: 1, 1: 2, 2: 3, 3: 4}, rewards=[3, 1, 0, -1]),
+               match("4p", ["a"] * 4, {0: 2, 1: 1, 2: 3, 3: 4}, rewards=[1, 3, 0, -1])]
+    section = summarize(SPEC, results).to_dict()["layouts"]["4p"]
+    assert section["agents"] == {} and section["higher"] == {} and section["unattributed"] == 0
+    (row,) = section["solo"]
+    assert row["agent"] == "a" and row["n"] == 8 and row["mean_return"] == pytest.approx(0.75)
+    assert row["per_seat"]["0"] == {"n": 2, "mean_rank": 1.5, "first_place_rate": 0.5, "mean_return": 2.0}
+    assert row["per_seat"]["3"] == {"n": 2, "mean_rank": 4.0, "first_place_rate": 0.0, "mean_return": -1.0}
+    assert "seat 0: n=2 mean_rank 1.500" in summarize(SPEC, results).text()
+
+
+def test_rank_layout_counts_matches_with_mixed_teams_as_unattributed():
+    spec = GameSpec.teams_of([2, 1, 1], OBS, ACT)
+    result = MatchResult(
+        match_id="m", layout="2v1v1", outcome_kind="rank",
+        seats=[SeatResult(i, "player", t, name, "latest", 0.0) for i, (t, name) in enumerate(
+            [(0, "a"), (0, "b"), (1, "a"), (2, "b")])],
+        teams=[TeamResult(0, 1.0, 0.0), TeamResult(1, 2.0, 0.0), TeamResult(2, 3.0, 0.0)], episode_length=3)
+    section = summarize(spec, [result]).to_dict()["layouts"]["2v1v1"]
+    assert section["unattributed"] == 1 and section["solo"] == []
+    assert section["agents"]["a"]["n"] == 1 and section["higher"]["a"]["b"] == {"n": 1, "rate": 1.0}
+
+
+def test_top_level_json_keys_are_pinned():
+    report = summarize(SPEC, [match("2p", ["a", "b"], {0: 1, 1: 2})], agents=["a", "b"], num_matches=1,
+                       deterministic=True).to_dict()
+    assert list(report) == ["agents", "num_matches", "deterministic", "ci_level", "layouts"]
+    assert (report["agents"], report["num_matches"], report["deterministic"], report["ci_level"]) == (
+        ["a", "b"], 1, True, 0.95)

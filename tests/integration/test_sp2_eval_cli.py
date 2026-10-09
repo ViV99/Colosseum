@@ -5,6 +5,7 @@ import json
 import os
 import time
 
+import pytest
 import torch
 from click.testing import CliRunner
 
@@ -197,3 +198,94 @@ def test_checkpoint_networks_that_cannot_build_a_model_are_a_config_error(tmp_pa
     result = invoke("-c", cfg_path, "-a", f"b={ckpt_dir}", "-n", 1)
     assert result.exit_code == 1 and result.stderr.startswith("Config error:"), result.output
     assert str(ckpt_dir) in result.stderr and "TypeError" in result.stderr
+
+
+def test_every_role_of_a_checkpoint_must_keep_its_spaces(tmp_path):
+    from gymnasium.spaces import Discrete
+
+    from colosseum.core.errors import ConfigError
+    from colosseum.sp2.envs.game import GameSpec, RoleSpec, SeatSpec
+
+    cfg = make_test_config("turns")
+    _roles, role = agent_role_of(cfg, "agent_0")
+    ckpt_id = CheckpointManager(tmp_path / "ck").save(
+        "agent_x", 1, numpy_state(build_model(cfg.get_agent_config("agent_0"), role)),
+        meta_extra={"roles": ["x", "y"], "role_signature": role_signature(role)},
+    )
+    ckpt_dir = tmp_path / "ck" / "agent_x" / ckpt_id
+
+    def game(y_role):
+        return GameSpec(roles={"x": role, "y": y_role}, layouts={"xy": (SeatSpec("x", 0), SeatSpec("y", 1))})
+
+    _model, roles = load_eval_model(cfg, "b", ckpt_dir, spec=game(role))
+    assert roles == ["x", "y"]
+    changed = RoleSpec(role.observation_space, Discrete(5))
+    with pytest.raises(ConfigError, match=r"role 'y'") as info:
+        load_eval_model(cfg, "b", ckpt_dir, spec=game(changed))
+    assert str(ckpt_dir) in str(info.value)
+
+
+def test_each_distinct_architecture_is_validated_once(tmp_path, monkeypatch):
+    import colosseum.sp2.eval as eval_module
+
+    cfg_path, cfg, pt_path, ckpt_dir = _setup(tmp_path)
+    checked = []
+    real_check = eval_module._check_model
+    monkeypatch.setattr(eval_module, "_check_model",
+                        lambda model, role, sample, where: (checked.append(where), real_check(model, role, sample,
+                                                                                              where)))
+    seen: set[str] = set()
+    load_eval_model(cfg, "a", pt_path, validated=seen)
+    load_eval_model(cfg, "b", ckpt_dir, validated=seen)
+    load_eval_model(cfg, "c", ckpt_dir, validated=seen)
+    load_eval_model(cfg, "d", pt_path, validated=seen)
+    assert checked == ["agent 'a'", "agent 'b'"]
+    checked.clear()
+    result = invoke("-c", cfg_path, "-a", f"a={pt_path}", "-a", f"b={ckpt_dir}", "-a", f"c={ckpt_dir}", "-n", 2,
+                    "--num-envs", 2)
+    assert result.exit_code == 0, result.output
+    assert checked == ["agent 'a'", "agent 'b'"]
+
+
+def test_an_architecture_that_builds_but_cannot_step_is_a_config_error(tmp_path, monkeypatch):
+    from colosseum.core.errors import ConfigError
+    from game_helpers import GameTestModel
+
+    _cfg_path, cfg, pt_path, ckpt_dir = _setup(tmp_path)
+
+    def broken_step(self, obs, state, action_mask=None):
+        raise RuntimeError("broken step")
+
+    monkeypatch.setattr(GameTestModel, "step", broken_step)
+    with pytest.raises(ConfigError, match="broken step") as info:
+        load_eval_model(cfg, "b", ckpt_dir)
+    assert str(info.value).startswith(f"Checkpoint {ckpt_dir}: meta.json networks: agent 'b': model.step failed")
+    with pytest.raises(ConfigError, match="broken step") as info:
+        load_eval_model(cfg, "a", pt_path)
+    assert str(info.value).startswith(f"{pt_path}: networks: agent 'a'")
+
+
+def test_checkpoint_without_networks_uses_the_config_networks(tmp_path):
+    cfg_path, cfg, _pt, wide_dir = _setup(tmp_path)
+    roles, role = agent_role_of(cfg, "agent_0")
+    ckpt_id = CheckpointManager(tmp_path / "plain").save(
+        "agent_p", 1, numpy_state(build_model(cfg.get_agent_config("agent_0"), role)),
+        meta_extra={"roles": roles, "role_signature": role_signature(role)},
+    )
+    result = invoke("-c", cfg_path, "-a", f"p={tmp_path / 'plain' / 'agent_p' / ckpt_id}", "-n", 1)
+    assert result.exit_code == 0, result.output
+    meta = json.loads((wide_dir / "meta.json").read_text())
+    (wide_dir / "meta.json").write_text(json.dumps({k: v for k, v in meta.items() if k != "networks"}))
+    result = invoke("-c", cfg_path, "-a", f"w={wide_dir}", "-n", 1)
+    assert result.exit_code == 1 and "do not match" in result.stderr
+
+
+def test_eval_cli_deterministic_flag_and_repeated_layouts(tmp_path):
+    cfg_path, cfg, pt_path, ckpt_dir = _setup(tmp_path)
+    out = tmp_path / "r.json"
+    layout = only_layout(cfg)
+    result = invoke("-c", cfg_path, "-a", f"a={pt_path}", "-a", f"b={ckpt_dir}", "--layout", layout,
+                    "--layout", layout, "-n", 2, "--num-envs", 2, "--deterministic", "-o", out)
+    assert result.exit_code == 0, result.output
+    data = json.loads(out.read_text())
+    assert data["deterministic"] is True and data["layouts"][layout]["n"] == 2  # the layout runs once

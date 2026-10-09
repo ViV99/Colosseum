@@ -29,6 +29,8 @@ Statistics (``summarize``), per layout, by the layout's outcome kind
   return. Lineups with a team mixing both agents are counted as ``unattributed``.
 - ``rank``: per agent, mean team rank with a 95% normal interval and the share of first places;
   a pairwise "who ranked higher" table (``higher[a][b]``: score of a over b, draw = half).
+  Teams mixing agents are left out (the match is counted as ``unattributed``). One agent in
+  every seat (SP1 solo mode): ``solo`` per seat (mean rank, share of first places, mean return).
 - ``score``: per team composition (sorted agent ids joined by ``+``), mean team score with a 95%
   normal interval; homogeneous compositions are the per-agent results, the rest is cross-play.
 - every kind: mean seat return per role and agent (``by_role``).
@@ -58,6 +60,7 @@ from colosseum.sp2.core.config import ColosseumConfig, NetworkConfig
 from colosseum.sp2.core.outcomes import pairwise_rank_score
 from colosseum.sp2.core.roles import agent_role_spec, resolve_agent_roles, role_signature
 from colosseum.sp2.core.types import LATEST_NETWORK_ID, Lineup, MatchResult, SeatAssignment, state_dict_from_numpy
+from colosseum.sp2.core.validation import _check_model
 from colosseum.sp2.envs.game import GameSpec, MultiAgentEnv
 from colosseum.sp2.envs.vector import VectorEnv
 from colosseum.sp2.networks.model import PolicyModel
@@ -401,9 +404,19 @@ def _summarize_wdl(results: Sequence[MatchResult]) -> dict[str, Any]:
 def _summarize_rank(results: Sequence[MatchResult]) -> dict[str, Any]:
     ranks: dict[str, list[float]] = defaultdict(list)
     higher: dict[str, dict[str, list[float]]] = defaultdict(lambda: defaultdict(list))
+    solo: dict[str, dict[int, list[tuple[float, float]]]] = defaultdict(lambda: defaultdict(list))
+    unattributed = 0
     for result in results:
         teams = _team_agents(result)
         team_rank = {team.team: team.rank for team in result.teams}
+        names = set().union(*teams.values())
+        if len(names) == 1:  # SP1 solo mode: one agent in every seat
+            (name,) = names
+            for seat in result.seats:
+                solo[name][seat.seat].append((team_rank[seat.team], float(seat.reward)))
+            continue
+        if any(len(agents) != 1 for agents in teams.values()):
+            unattributed += 1
         homogeneous = {t: next(iter(agents)) for t, agents in teams.items() if len(agents) == 1}
         for team, agent in homogeneous.items():
             ranks[agent].append(team_rank[team])
@@ -421,7 +434,18 @@ def _summarize_rank(results: Sequence[MatchResult]) -> dict[str, Any]:
                          "first_place_rate": float(np.mean([v == 1.0 for v in values]))}
     table = {a: {b: {"n": len(v), "rate": float(np.mean(v))} for b, v in sorted(row.items())}
              for a, row in sorted(higher.items())}
-    return {"agents": agents, "higher": table}
+    solo_rows = []
+    for name, seats in sorted(solo.items()):
+        all_returns = [ret for cells in seats.values() for _rank, ret in cells]
+        mean, low, high = normal_interval(all_returns)
+        solo_rows.append({
+            "agent": name, "n": len(all_returns), "mean_return": mean, "return_ci": [low, high],
+            "per_seat": {str(s): {"n": len(cells), "mean_rank": float(np.mean([r for r, _ in cells])),
+                                  "first_place_rate": float(np.mean([r == 1.0 for r, _ in cells])),
+                                  "mean_return": float(np.mean([ret for _, ret in cells]))}
+                         for s, cells in sorted(seats.items())},
+        })
+    return {"agents": agents, "higher": table, "solo": solo_rows, "unattributed": unattributed}
 
 
 def _summarize_score(results: Sequence[MatchResult]) -> dict[str, Any]:
@@ -479,6 +503,16 @@ class EvalReport:
                 for a, row in report["higher"].items():
                     for b, cell in row.items():
                         lines.append(f"{'':<4}{a} above {b}: {cell['rate']:.3f} (n={cell['n']})")
+                for r in report["solo"]:
+                    lines.append(f"{r['agent']:<16} alone: n={r['n']} mean_return {r['mean_return']:.3f} "
+                                 f"[{r['return_ci'][0]:.3f}, {r['return_ci'][1]:.3f}]")
+                    for seat, cell in r["per_seat"].items():
+                        lines.append(f"{'':<20}seat {seat}: n={cell['n']} mean_rank {cell['mean_rank']:.3f} "
+                                     f"first places {cell['first_place_rate']:.3f} "
+                                     f"mean_return {cell['mean_return']:.3f}")
+                if report["unattributed"]:
+                    lines.append(f"({report['unattributed']} matches with mixed teams: only their "
+                                 f"single-agent teams are counted)")
             else:
                 for key, r in report["compositions"].items():
                     lines.append(f"{key:<24} n={r['n']:<5} mean_score {r['mean_score']:.3f} "
@@ -542,8 +576,12 @@ def _pt_roles(config: ColosseumConfig, spec: GameSpec, name: str, path: Path) ->
     return roles
 
 
+def _architecture_key(model_config: ColosseumConfig, roles: Sequence[str]) -> str:
+    return json.dumps([model_config.networks.model_dump(mode="json", by_alias=True), list(roles)], sort_keys=True)
+
+
 def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
-                    spec: GameSpec | None = None) -> tuple[PolicyModel, list[str]]:
+                    spec: GameSpec | None = None, validated: set[str] | None = None) -> tuple[PolicyModel, list[str]]:
     """Build and load one evaluation agent; returns ``(model in eval mode, roles)``.
 
     - A checkpoint dir (read with ``load_checkpoint_dir``: strict, never modified): roles and
@@ -551,6 +589,10 @@ def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
       spaces for those roles), architecture from its ``networks`` (else the agent's config).
     - A ``.pt`` state_dict: architecture and roles of ``agents.<name>`` when configured, else the
       global ``networks`` with every role of the game (which must share one signature).
+
+    The built architecture is checked like ``validate_config`` checks an agent's model (``step``
+    and ``unroll`` on the role's spaces), once per distinct (networks, roles): keys already in
+    ``validated`` are skipped and new ones are added (``None``: always check).
 
     Problems raise ConfigError naming the path; a path that is neither a dir nor a ``.pt`` file
     raises FileNotFoundError.
@@ -560,7 +602,9 @@ def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
     spec = spec if spec is not None else env_spec(config)
     p = Path(path)
     model_config = _agent_model_config(config, name)
+    source = f"{p}: networks"
     if p.is_dir():
+        source = f"Checkpoint {p}: networks of the config"
         loaded = load_checkpoint_dir(p)
         roles, signature = loaded["roles"], loaded["role_signature"]
         if roles is None or signature is None:
@@ -568,18 +612,20 @@ def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
         unknown = sorted(set(roles) - set(spec.roles))
         if unknown:
             raise ConfigError(f"Checkpoint {p}: roles {unknown} are not roles of the game {sorted(spec.roles)}")
-        expected = role_signature(agent_role_spec(spec, roles))
-        if signature != expected:
-            raise ConfigError(
-                f"Checkpoint {p}: role signature {signature!r} does not match the game's spaces for roles "
-                f"{roles} ({expected!r}); it was trained on a different game or game version"
-            )
+        for role in roles:  # every role: one network serves them all
+            expected = role_signature(spec.roles[role])
+            if signature != expected:
+                raise ConfigError(
+                    f"Checkpoint {p}: role signature {signature!r} does not match the game's spaces for role "
+                    f"{role!r} ({expected!r}); it was trained on a different game or game version"
+                )
         networks = loaded["meta"].get("networks")
         if networks is not None:
             try:
                 model_config = model_config.model_copy(update={"networks": NetworkConfig.model_validate(networks)})
             except ValidationError as e:
                 raise ConfigError(f"Checkpoint {p}: invalid meta.json networks:\n{e}") from e
+            source = f"Checkpoint {p}: meta.json networks"
         model_state = loaded["model_state"]
     elif p.is_file() and p.suffix == ".pt":
         roles = _pt_roles(config, spec, name, p)
@@ -595,6 +641,15 @@ def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
         raise ConfigError(f"{p}: {e}") from e
     except Exception as e:  # noqa: BLE001 - a checkpoint's networks are user data: any constructor failure
         raise ConfigError(f"{p}: cannot build the agent's model ({type(e).__name__}: {e})") from e
+    role = agent_role_spec(spec, roles)
+    key = _architecture_key(model_config, roles)
+    if validated is None or key not in validated:
+        try:
+            _check_model(model, role, None, f"agent {name!r}")
+        except ConfigError as e:
+            raise ConfigError(f"{source}: {e}") from e
+        if validated is not None:
+            validated.add(key)
     check_model_state(model, model_state, str(p))
     model.load_state_dict(state_dict_from_numpy(model_state))
     model.eval()
@@ -615,9 +670,10 @@ def evaluate(config: ColosseumConfig, agents: Mapping[str, str], *, layouts: Seq
     spec = env_spec(config)
     models: dict[str, PolicyModel] = {}
     players: dict[str, list[str]] = {}
+    validated: set[str] = set()  # each distinct architecture is checked once
     for name, path in agents.items():
-        models[name], players[name] = load_eval_model(config, name, path, spec=spec)
-    chosen = list(layouts) if layouts else default_layouts(spec, players)
+        models[name], players[name] = load_eval_model(config, name, path, spec=spec, validated=validated)
+    chosen = list(dict.fromkeys(layouts)) if layouts else default_layouts(spec, players)
     unknown = sorted(set(chosen) - set(spec.layouts))
     if unknown:
         raise ConfigError(f"--layout {unknown}: not layouts of the game {sorted(spec.layouts)}")

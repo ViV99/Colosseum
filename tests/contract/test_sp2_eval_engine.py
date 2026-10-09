@@ -87,3 +87,31 @@ def test_bad_arguments():
     with pytest.raises(ValueError, match="num_envs"):
         play_lineups(env_fn=TurnTakingGame, models=models_for(spec, ["a"]), lineups=lineups, num_envs=0)
     assert play_lineups(env_fn=TurnTakingGame, models={}, lineups=[]) == []
+
+
+def test_one_agent_in_an_ffa_layout_reports_ranks_per_seat():
+    spec = EliminationFFA(max_players=4).spec
+    players = {"a": list(spec.roles)}
+    results = play_lineups(env_fn=lambda: EliminationFFA(max_players=4), models=models_for(spec, players),
+                           lineups=schedule_lineups(spec, "3p", players, 4), num_envs=2, seed=0)
+    section = summarize(spec, results).to_dict()["layouts"]["3p"]
+    assert section["agents"] == {} and section["n"] == 4
+    (row,) = section["solo"]
+    assert set(row["per_seat"]) == {"0", "1", "2"} and all(c["n"] == 4 for c in row["per_seat"].values())
+
+
+def test_deterministic_play_ignores_the_sampling_seed():
+    spec, layout = turn_layout()
+    players = {"a": list(spec.roles), "b": list(spec.roles)}
+    models = models_for(spec, players, seed=3)
+    lineups = schedule_lineups(spec, layout, players, 4)
+
+    def outcomes(seed):
+        results = play_lineups(env_fn=TurnTakingGame, models=models, lineups=lineups, num_envs=2, seed=seed,
+                               deterministic=True)
+        return Counter((seat_agents(r), tuple(s.reward for s in sorted(r.seats, key=lambda s: s.seat)))
+                       for r in results)
+
+    first = outcomes(1)
+    assert first == outcomes(2)
+    assert len(first) == 2  # one outcome per seat order: greedy actions in a deterministic game
