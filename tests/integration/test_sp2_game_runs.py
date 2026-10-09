@@ -75,19 +75,25 @@ def test_resume_continues_versions_and_checks_the_role_signature(tmp_path):
                       overrides={"training.total_timesteps": "1500", "checkpoint.interval": "5"})
     assert first.returncode == 0, first.stderr[-3000:]
     final = metas(first, "agent_0")[-1]
-    version = final["policy_version"]
+    version, done = final["policy_version"], final["env_steps"]
+    # The first run overshoots its budget (workers flush their env steps about every 0.5 s and step
+    # until they see the stop; often by more than 1500 steps here), so the resumed budget counts from
+    # where it really stopped. 2000 more steps cannot pass before the learner trains: while it
+    # consumes nothing, the full trajectory queue stops the worker after about 500 env steps.
+    resumed_budget = str(done + 2000)
 
     second = run_train(config, tmp_path, name="second",
-                       overrides={"training.total_timesteps": "3000", "training.resume_from": str(first.root)})
+                       overrides={"training.total_timesteps": resumed_budget, "training.resume_from": str(first.root)})
     assert second.returncode == 0, second.stderr[-3000:]
     assert f"(policy_version {version})" in second.log("main")
+    assert f"env-step counter continues from {done}" in second.log("main")
     assert train_steps(second, "agent_0")[0] == version + 1
     assert min(m["policy_version"] for m in metas(second, "agent_0")) > version
 
     ckpt = first.root / "checkpoints" / "agent_0" / f"ckpt_v{version}"
     (ckpt / "meta.json").write_text(json.dumps({**final, "role_signature": "another-game"}))
     third = run_train(config, tmp_path, name="third",
-                      overrides={"training.total_timesteps": "3000", "training.resume_from": str(first.root)})
+                      overrides={"training.total_timesteps": resumed_budget, "training.resume_from": str(first.root)})
     assert third.returncode == 1
     assert "Config error" in third.stderr and "role signature" in third.stderr and str(ckpt) in third.stderr
     assert "Traceback" not in third.stderr
