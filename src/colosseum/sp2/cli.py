@@ -194,5 +194,80 @@ def eval_cmd(
         click.echo(f"Result written to {output}")
 
 
+@main.command()
+@click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
+@click.option("--data", "-d", required=True, type=click.Path(exists=True),
+              help="BC data: a .pt file or a directory of .pt files (keys: observations, actions, "
+                   "optional action_masks, dones; trees in the agent's spaces)")
+@click.option("--output", "-o", required=True, type=click.Path(), help="Where to save the trained state_dict (.pt)")
+@click.option("--agent", "-a", "agent", default=None,
+              help="Agent whose networks and roles are trained (default: the config's only trainable agent)")
+@click.option("--epochs", default=10, type=click.IntRange(min=1), show_default=True, help="Number of BC epochs")
+@click.option("--batch-size", default=256, type=click.IntRange(min=1), show_default=True,
+              help="Decisions per gradient step")
+@click.option("--lr", default=1e-3, type=float, show_default=True, help="Adam learning rate")
+@click.option("--seq-len", default=None, type=click.IntRange(min=1),
+              help="Window length for stateful models (default: bc.seq_len from the config, 64)")
+def bc(
+    config: str,
+    data: str,
+    output: str,
+    agent: str | None,
+    epochs: int,
+    batch_size: int,
+    lr: float,
+    seq_len: int | None,
+) -> None:
+    """Train one agent's policy by offline behavioral cloning (loss = -log pi(a|s), masks applied).
+
+    Exit code: 0 done, 1 config or data error, 2 bad command-line arguments, 130 SIGINT.
+    """
+    import logging
+
+    import torch
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    with _config_errors():
+        from colosseum.core.errors import ConfigError
+        from colosseum.sp2.bc.offline_bc import OfflineBCTrainer
+        from colosseum.sp2.core.config import load_config
+        from colosseum.sp2.core.registry import build_model, env_spec, validate_config
+        from colosseum.sp2.core.roles import agent_role_spec, resolve_agent_roles
+        from colosseum.sp2.core.specs import ActionSpec, ObsSpec
+
+        cfg = load_config(config)
+        validate_config(cfg)
+        agent_ids = cfg.get_trainable_agent_ids()
+        if agent is None:
+            if len(agent_ids) != 1:
+                raise ConfigError(f"the config has {len(agent_ids)} trainable agents {agent_ids}; "
+                                  f"choose one with --agent")
+            agent = agent_ids[0]
+        elif agent not in agent_ids:
+            raise ConfigError(f"--agent {agent!r} is not a trainable agent of the config ({agent_ids})")
+        spec = env_spec(cfg)
+        role = agent_role_spec(spec, resolve_agent_roles(cfg, spec)[agent])
+        agent_cfg = cfg.get_agent_config(agent)
+        model = build_model(agent_cfg, role)
+    device = agent_cfg.learner.device
+    if device == "auto":
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+    trainer = OfflineBCTrainer(
+        model, ActionSpec.from_space(role.action_space), ObsSpec.from_space(role.observation_space),
+        lr=lr, device=device, seq_len=seq_len if seq_len is not None else agent_cfg.bc.seq_len,
+    )
+    with _config_errors():  # unreadable or malformed data, actions that do not fit the policy (DataError)
+        trainer.load_data(data)
+        metrics = trainer.train(num_epochs=epochs, batch_size=batch_size)
+
+    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, output)
+    message = f"BC training complete ({agent}): final-epoch NLL={metrics['bc_loss']:.4f}"
+    if "accuracy" in metrics:
+        message += f", accuracy={metrics['accuracy']:.3f}"
+    click.echo(message)
+    click.echo(f"Weights saved to {output}")
+
+
 if __name__ == "__main__":
     main()
