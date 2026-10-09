@@ -95,3 +95,17 @@ def test_random_matches_run_through_the_match_runner():
         assert sorted(t.team for t in r.teams) == list(range(n))
         assert sum(t.rank for t in r.teams) == pytest.approx(n * (n + 1) / 2)   # places are shared, never lost
     assert seen.terminated > 0
+
+
+@pytest.mark.parametrize(("kwargs", "match"), [
+    ({"view_radius": 0}, "view_radius"),
+    ({"size": 5}, "size"),
+    ({"players": (2, 5)}, "players"),
+])
+def test_bad_constructor_arguments_are_rejected(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        TronGame(**kwargs)
+
+
+def test_the_smallest_view_radius_works():
+    assert TronGame(view_radius=1).reset(0, "2p").obs[0].shape == (2, 3, 3)

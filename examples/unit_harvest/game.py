@@ -46,6 +46,12 @@ class UnitHarvestGame(MultiAgentEnv):
             raise ValueError(f"initial_workers must be in [1, max_units], got {initial_workers}")
         if num_resources % 2 or num_resources < 2 or size < 4:
             raise ValueError("num_resources must be even and >= 2, size >= 4")
+        free = (size // 2 - 1) * size     # cells of the left half for resources: 1 <= x < size // 2
+        if num_resources // 2 > free:
+            raise ValueError(f"num_resources={num_resources} does not fit: each half of a size-{size} board "
+                             f"has {free} free cells for num_resources // 2 resources")
+        if max_steps < 1:
+            raise ValueError(f"max_steps must be >= 1, got {max_steps}")
         self.max_units, self.size, self.num_resources = max_units, size, num_resources
         self.initial_workers, self.build_cost, self.max_steps = initial_workers, build_cost, max_steps
         self.deposit_reward = deposit_reward

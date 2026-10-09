@@ -58,3 +58,12 @@ def test_random_matches_run_through_the_match_runner():
     results, _ = random_matches(CoopButtonsGame, min_episodes=8)
     for r in results:
         assert r.layout == "coop2" and r.outcome_kind == "score" and len(r.teams) == 1
+
+
+@pytest.mark.parametrize(("kwargs", "match"), [
+    ({"max_steps": 0}, "max_steps"),
+    ({"size": 2}, "size"),
+])
+def test_bad_constructor_arguments_are_rejected(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        CoopButtonsGame(**kwargs)

@@ -123,3 +123,20 @@ def test_random_matches_run_through_the_match_runner():
         rank = {t.team: t.rank for t in r.teams}
         score = {t.team: t.score for t in r.teams}
         assert (rank[0] < rank[1]) == (score[0] > score[1])
+
+
+@pytest.mark.parametrize(("kwargs", "match"), [
+    ({"size": 4, "num_resources": 10}, "does not fit"),
+    ({"max_steps": 0}, "max_steps"),
+    ({"num_resources": 3}, "even"),
+    ({"initial_workers": 0}, "initial_workers"),
+])
+def test_bad_constructor_arguments_are_rejected(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        UnitHarvestGame(**kwargs)
+
+
+def test_resources_filling_every_free_cell_still_reset():
+    env = UnitHarvestGame(size=4, num_resources=8)          # 4 free cells per half
+    env.reset(0, "2p")
+    assert len({tuple(xy) for xy in env._resources.tolist()}) == 8

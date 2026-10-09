@@ -29,6 +29,8 @@ class CoopButtonsGame(MultiAgentEnv):
     def __init__(self, size: int = 5, max_steps: int = 40, button_reward: float = 0.05) -> None:
         if size < 3:
             raise ValueError(f"size must be >= 3, got {size}")
+        if max_steps < 1:
+            raise ValueError(f"max_steps must be >= 1, got {max_steps}")
         self.size, self.max_steps, self.button_reward = size, max_steps, button_reward
         obs_space = gymnasium.spaces.Box(-1.0, 1.0, (9,), np.float32)
         self.spec = GameSpec.teams_of([2], obs_space, gymnasium.spaces.Discrete(6))

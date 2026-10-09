@@ -32,6 +32,8 @@ class TronGame(MultiAgentEnv):
     def __init__(self, size: int = 10, view_radius: int = 3, players: tuple[int, ...] = (2, 3, 4)) -> None:
         if size < 6 or not set(players) <= {2, 3, 4}:
             raise ValueError("size must be >= 6 and players a subset of {2, 3, 4}")
+        if view_radius < 1:
+            raise ValueError(f"view_radius must be >= 1, got {view_radius}")
         self.size, self.radius = size, view_radius
         side = 2 * view_radius + 1
         obs_space = gymnasium.spaces.Box(0, 1, (2, side, side), np.uint8)

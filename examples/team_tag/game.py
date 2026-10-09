@@ -42,6 +42,10 @@ class TeamTagGame(MultiAgentEnv):
                  with_global_state: bool = True) -> None:
         if size < 5:
             raise ValueError(f"size must be >= 5, got {size}")
+        if view_radius < 1:
+            raise ValueError(f"view_radius must be >= 1, got {view_radius}")
+        if max_steps < 1:
+            raise ValueError(f"max_steps must be >= 1, got {max_steps}")
         self.size, self.radius, self.max_steps, self.tag_reward = size, view_radius, max_steps, tag_reward
         w = 2 * view_radius + 1
         obs_space = gymnasium.spaces.Dict([
@@ -118,22 +122,15 @@ class TeamTagGame(MultiAgentEnv):
         return self._acting_result({})
 
     def step(self, actions: dict) -> StepResult:
-        taggers = []
-        for seat, action in actions.items():
-            a = int(action)
-            if TEAM[seat] == 1:
-                a = int(MIRROR_ACTION[a])
-            if a == TAG:
-                taggers.append(seat)
+        # team 1 acts in its mirrored view: map its actions back to board directions once
+        acts = {seat: int(MIRROR_ACTION[int(a)]) if TEAM[seat] == 1 else int(a) for seat, a in actions.items()}
+        taggers = [seat for seat, a in acts.items() if a == TAG]
         frozen_now = set()
         for seat in taggers:   # resolved against the positions before the moves, all at once
             dist = np.abs(self._pos - self._pos[seat]).max(axis=1)
             for other in np.flatnonzero((TEAM != TEAM[seat]) & self._active & (dist <= 1)):
                 frozen_now.add(int(other))
-        for seat, action in actions.items():
-            a = int(action)
-            if TEAM[seat] == 1:
-                a = int(MIRROR_ACTION[a])
+        for seat, a in acts.items():
             if a != TAG and seat not in frozen_now:
                 self._pos[seat] = np.clip(self._pos[seat] + MOVES[a], 0, self.size - 1)
         for seat in frozen_now:

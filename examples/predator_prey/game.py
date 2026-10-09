@@ -30,8 +30,14 @@ HUNTER, PREY = 0, (1, 2)
 
 class PredatorPreyGame(MultiAgentEnv):
     def __init__(self, size: int = 7, max_steps: int = 30, catch_radius: int = 1) -> None:
-        if size < 4:
-            raise ValueError(f"size must be >= 4, got {size}")
+        # reset() redraws until every prey is farther than catch_radius + 1 from the hunter
+        # (Chebyshev). With the hunter in a corner, the farthest cell is size - 1 away, so a
+        # placement exists iff size - 1 >= catch_radius + 2, i.e. size >= catch_radius + 3.
+        if catch_radius < 0 or size < catch_radius + 3:
+            raise ValueError(f"need catch_radius >= 0 and size >= catch_radius + 3 (so reset can place the prey "
+                             f"out of reach), got size={size}, catch_radius={catch_radius}")
+        if max_steps < 1:
+            raise ValueError(f"max_steps must be >= 1, got {max_steps}")
         self.size, self.max_steps, self.catch_radius = size, max_steps, catch_radius
         box = gymnasium.spaces.Box
         hunter = RoleSpec(box(-1.0, 1.0, (9,), np.float32), gymnasium.spaces.Discrete(5))

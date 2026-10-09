@@ -101,3 +101,18 @@ def test_random_matches_run_through_the_match_runner():
         assert r.layout == "2v2" and r.outcome_kind == "wdl"
         assert sorted((s.seat, s.team) for s in r.seats) == [(0, 0), (1, 0), (2, 1), (3, 1)]
         assert all(s.eliminated_step is None for s in r.seats)       # frozen bots are never eliminated
+
+
+@pytest.mark.parametrize(("kwargs", "match"), [
+    ({"view_radius": 0}, "view_radius"),
+    ({"max_steps": 0}, "max_steps"),
+    ({"size": 4}, "size"),
+])
+def test_bad_constructor_arguments_are_rejected(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        TeamTagGame(**kwargs)
+
+
+def test_the_smallest_view_radius_works():
+    res = TeamTagGame(view_radius=1).reset(0, "2v2")
+    assert all(res.obs[s]["window"].shape == (4, 3, 3) for s in range(4))

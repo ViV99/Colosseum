@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import numpy as np
+import pytest
 
 from demo_checks import check_example_config, random_matches
 from examples.predator_prey.game import PredatorPreyGame, chase_action, flee_action
@@ -88,3 +89,22 @@ def test_random_matches_run_through_the_match_runner():
         assert r.layout == "1v2" and r.outcome_kind == "wdl"
         assert [s.role for s in sorted(r.seats, key=lambda s: s.seat)] == ["hunter", "prey", "prey"]
     assert seen.terminated > 0
+
+
+@pytest.mark.parametrize(("kwargs", "match"), [
+    ({"size": 4, "catch_radius": 2}, "catch_radius"),     # no placement out of reach: reset would never return
+    ({"size": 5, "catch_radius": 3}, "catch_radius"),
+    ({"catch_radius": -1}, "catch_radius"),
+    ({"max_steps": 0}, "max_steps"),
+])
+def test_bad_constructor_arguments_are_rejected(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        PredatorPreyGame(**kwargs)
+
+
+@pytest.mark.parametrize("catch_radius", [0, 1, 2, 3])
+def test_the_smallest_allowed_board_places_the_prey_out_of_reach(catch_radius):
+    env = PredatorPreyGame(size=catch_radius + 3, catch_radius=catch_radius)
+    for seed in range(5):
+        env.reset(seed, "1v2")
+        assert (np.abs(env._pos[1:] - env._pos[0]).max(axis=1) > catch_radius + 1).all()

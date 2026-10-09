@@ -22,6 +22,8 @@ class CoinGridGame(MultiAgentEnv):
     def __init__(self, size: int = 7, num_coins: int = 5, max_steps: int = 50) -> None:
         if size < 3 or not 1 <= num_coins < size * size:
             raise ValueError(f"need size >= 3 and 1 <= num_coins < size*size, got {size}, {num_coins}")
+        if max_steps < 1:
+            raise ValueError(f"max_steps must be >= 1, got {max_steps}")
         self.size, self.num_coins, self.max_steps = size, num_coins, max_steps
         obs_space = gymnasium.spaces.Dict(
             [("grid", gymnasium.spaces.Box(0, 1, (2, size, size), np.uint8)),   # agent, coins

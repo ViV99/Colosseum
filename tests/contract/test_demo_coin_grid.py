@@ -82,3 +82,13 @@ def test_random_matches_run_through_the_match_runner():
     for r in results:
         assert r.outcome_kind == "score" and len(r.teams) == 1 and r.episode_length == 50
         assert r.teams[0].score == pytest.approx(r.seats[0].reward)   # default: mean of the team's returns
+
+
+@pytest.mark.parametrize(("kwargs", "match"), [
+    ({"max_steps": 0}, "max_steps"),
+    ({"size": 2}, "size"),
+    ({"num_coins": 0}, "num_coins"),
+])
+def test_bad_constructor_arguments_are_rejected(kwargs, match):
+    with pytest.raises(ValueError, match=match):
+        CoinGridGame(**kwargs)
