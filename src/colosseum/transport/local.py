@@ -1,6 +1,6 @@
 """Local transport using multiprocessing queues.
 
-Unused in SP1; kept for SP5 (distribution). The single-machine launcher wires its
+Unused since SP1; kept for SP5 (distribution). The single-machine launcher wires its
 ``mp.Queue`` objects directly.
 
 For single-machine mode. Trajectory chunks flow from worker processes
@@ -20,7 +20,7 @@ from colosseum.transport.base import BaseTransport
 class LocalTransport(BaseTransport):
     """Single-machine transport using multiprocessing.Queue.
 
-    Unused in SP1; kept for SP5 (distribution).
+    Unused since SP1; kept for SP5 (distribution).
     """
 
     def __init__(self, queue_size: int = 64) -> None:

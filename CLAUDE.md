@@ -6,11 +6,20 @@ Reusable framework for competitive bot programming competitions (Lux AI, Neural 
 The core problem: competitions are short, no time to rebuild RL infrastructure each time.
 Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, distributed, modular, with dynamic agent and machine management.
 
+Owner priorities (judge every design against them):
+1. Inference / trajectory collection and training run on DIFFERENT machines with different hardware (CPU boxes, GPU boxes); machines and agents can be added or removed dynamically.
+2. Maximal flexibility and simplicity, both for deployment and for configuring training scenarios.
+3. Several warm-start options (offline BC, kickstarting, resume, etc.).
+4. A flexible final stage: an arena where bots with different weights and architectures play, with scripted bots mixed in; convenient selection of the best; monitoring of all metrics and results.
+5. Every game type: solo (score), 1v1 (turn-based and simultaneous), one bot controlling a team of units vs other teams, team vs team with several bots, 1 vs N (FFA or asymmetric roles).
+
 ## Research Documents
 
 - `research/01_distributed_rl_architectures.md` — Distributed RL: GORILA, A3C, IMPALA, Ape-X, R2D2, SEED RL, Podracer, Sample Factory, PureJaxRL, PufferLib, Cleanba, GPU envs, V-trace math
 - `research/02_competitive_rl_framework_research.md` — AlphaStar, OpenAI Five, AlphaZero/MuZero, Cicero, Pluribus, HoK; matchmaking (PFSP, PSRO, PBT, ELO/TrueSkill); BC/DAgger/GAIL/IRL/kickstarting; N-player games; OpenSpiel, PettingZoo, JaxMARL, Mava, EPyMARL; MAPPO/QMIX/MADDPG/HAPPO
 - `research/rl_frameworks_survey.md` — 30+ frameworks: RLlib, SB3, CleanRL, TorchRL, Tianshou, Acme, Sample Factory, EnvPool, JaxMARL, Mava, EPyMARL, MARLlib, PettingZoo, OpenSpiel, Gymnax, Pgx, Brax, PufferLib
+- `research/MULTI_AGENT_RL_RESEARCH.md` — survey of multi-agent / multiplayer RL: landmark systems, self-play methods, MARL paradigms, matchmaking and opponent modeling, BC/imitation for cold start, practical approaches for bot competitions
+- `research/dialogue.txt` (Russian) — the owner's original brief for the project
 - `research/sp2_game_apis.md` (Russian) — game structures of real competitions (Lux AI S1–S3, Orbit Wars, Halite/Kore, Hungry Geese, GRF, Neural MMO, Pommerman, MicroRTS, Generals, CodinGame, Battlecode, …) and existing multi-agent APIs (PettingZoo, RLlib, OpenSpiel, kaggle-environments, Melting Pot, JaxMARL, PufferLib); conclusions that shaped `GameSpec` / `MultiAgentEnv`
 - `research/sp2_per_unit_ppo.md` (Russian) — what practitioners do for many units per bot: joint vs per-unit PPO ratios and clipping, V-trace weights in factorized action spaces, entropy normalization, per-unit vs team value, dead/absent units, GridNet vs entity lists
 
@@ -47,7 +56,7 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
   - AMP (mixed precision) training support
   - This is what Sample Factory, PufferLib use; similar to OpenAI Five's approach
 
-**Tier 2 (next):**
+**Tier 2 (planned; see Roadmap — SP6 "new algorithms"):**
 - **Rainbow DQN / R2D2** — off-policy, discrete actions
   - Prioritized replay buffer (Ape-X style distribution)
   - R2D2 = Rainbow + LSTM for partial observability
@@ -124,7 +133,7 @@ Colosseum provides the full pipeline: BC → RL → Self-Play → PFSP/League, d
 - Lineups via `schedule_lineups` (per layout): for a pair (a, b), match m gives team i as a whole to `(a, b)[(i + m) % 2]` (or to the pair's other agent when that one does not play every role of the team); an orientation the roles forbid is replaced by the other, and a pair is dropped from a layout only when both are impossible; one agent fills every team; one-team layouts play each agent's homogeneous team plus mixed compositions (cross-play); `--num-matches` is per pair (or composition) and layout
 - Reports per layout and role: `wdl` — W/D/L, win rate and score with 95% Wilson intervals, per side; `rank` — mean rank with CI, first-place share, pairwise matrix; `score` — mean score with CI, cross-play table
 - JSON output with `--output`; architecture of each checkpoint rebuilt from its `meta.json` (`.pt` files from `--config`)
-- Command: `colosseum eval -c config.yaml -a A=runs/x/checkpoints/agent_0/ckpt_v100 -a B=runs/x/checkpoints/agent_0/ckpt_v200 --num-matches 1000 --output result.json` (`--num-matches` is per pair; the architecture comes from each checkpoint's `meta.json`)
+- Command: `colosseum eval -c config.yaml -a A=runs/x/checkpoints/agent_0/ckpt_v100 -a B=runs/x/checkpoints/agent_0/ckpt_v200 --num-matches 1000 --output result.json` (`--num-matches` is per pair (or composition) and layout; the architecture comes from each checkpoint's `meta.json`)
 
 ---
 
@@ -270,7 +279,7 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
   - seat lifecycle: empty / live / eliminated; a dead teammate is removed from `acting` but keeps team rewards; steps without decisions bounded by `env.max_idle_steps`;
   - observation, action, mask and `global_state` trees with preserved dtypes (`uint8` reaches the model); bool masks only; entity lists with masks; `Units(max_units, per_unit, only_if)` with `Discrete`/`MultiDiscrete`/`Box`/`Dict` components; deciders (each unit + the non-unit part).
 - **Training loop:** IMPALA-style; one `MatchRunner` core for training (`RolloutLoop`) and eval. Workers infer only the policy; chunk v2 with `act`/`boot`/`pad` slots; the learner computes every value (bootstrap from `boot` slots and `final_obs`) with its current network. Only numpy payloads cross process boundaries. Every learner update uses exactly `learner.batch_chunks` chunks; `training.total_timesteps` is a global env-step budget.
-- **Algorithm:** APPO with V-trace over slots; `ratio_mode` (`joint` / `per_unit`; `auto` = `per_unit` with `Units`), `unit_trace` (`joint` / `geo_mean` / `none`; `auto` = `joint` for every action, decided by the units experiment), `entropy_reduction`; with one decider every mode collapses to `joint`; every loss and metric reduces over `act` slots; per-unit diagnostics (`clip_fraction_joint`, `ess`, `log_rho_abs_p95`, `deciders_valid_mean`, ...). Centralized critic: `networks.critic_encoder_class` over `global_state`, value path only.
+- **Algorithm:** APPO with V-trace over slots; `ratio_mode` (`joint` / `per_unit`; `auto` = `per_unit` with `Units`), `unit_trace` (`joint` / `geo_mean` / `none`; `auto` = `joint` for every action, decided by the units experiment), `entropy_reduction`; with one decider every mode collapses to `joint` (except an explicit `unit_trace: none`, ruling PR-1); every loss and metric reduces over `act` slots; per-unit diagnostics (`clip_fraction_joint`, `ess`, `log_rho_abs_p95`, `deciders_valid_mean`, ...). Centralized critic: `networks.critic_encoder_class` over `global_state`, value path only.
 - **Models:** `PolicyModel` protocol (`step` for the policy path, `unroll` for the learner, `with_value=False` for BC and the kickstart teacher); `ComposedModel(encoder, core, policy, value, critic_encoder)` with `EncoderOutput(latent, aux)` for per-unit features; cores `NoCore`, `LSTMCore`, `GRUCore`, `WindowAttentionCore`; `UnitsHead`, `gridnet_to_units`; `NormalizeObs` on a leaf path. The learner reproduces the worker's joint and per-unit log-probs for all four cores (contract tests).
 - **League:** lineups (layout + seat assignments); owner rotation; layout weights; self-play / arena with PFSP per layout; teams with a core and `teammates: self | mixed`; roles per agent (`agents.<id>.roles`), asymmetric games with one agent per role; seat permutation within equal role compositions. Ratings per layout (`ratings.json` = `{"env_steps", "layouts": {...}}`): team-pair ELO, win-rate matrix, `wr_vs_past`, `ScoreTracker` and cross-play for one-team layouts. FIFO checkpoint pool with roles and role signature in `meta.json`; strict resume.
 - **Eval:** `MatchRunner`-based; CLI lineups per spec block 8; reports for `wdl` (Wilson intervals, per side), `rank` (mean rank, first places, pairwise matrix), `score` (mean, cross-play), by role; in-process `play_lineups` with any `PolicyModel`.
@@ -292,7 +301,7 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
 - Not planned at all (SP2 spec §2): one agent on roles with different spaces; per-unit rewards, values or recurrent state; built-in autoregression between action components (a custom `Distribution` can do it); match series as a framework entity (best-of-N lives inside the env); MCTS controllers and communication channels between bots; canonical perspective and augmentations (the env's job).
 - A PettingZoo adapter (later, if needed).
 - OpenSkill / Bradley–Terry ratings, a tournament command, match log, dashboard (SP4).
-- Off-policy algorithms (R2D2/DQN, replay buffer), SAC, AlphaZero/MuZero.
+- Off-policy algorithms (R2D2/DQN, replay buffer), SAC, AlphaZero/MuZero (SP6 "new algorithms" or later).
 - GPU inference on workers; a vectorized worker path for envs with hundreds of seats (SP6).
 - Shared-memory weight store and trajectory ring buffer; adding or removing agents and machines during a run; gRPC control plane, distributed league and asymmetric games across machines (SP5).
 
@@ -304,7 +313,7 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
 | **SP2 Game model** (done) | `GameSpec` / `MultiAgentEnv`, elimination, teams, roles, layouts, `Units`, Dict observations, bootstrap on the learner, centralized critic, demo games |
 | **SP3 Players, league, warm start** | scripted / frozen / external players (also as BC data recorders and DAgger experts), PFSP over snapshots (including opponent checkpoints in asymmetric games; balanced `x(1-x)` weighting), anti-passivity in self-play (so team_tag can again pass in one run), per-agent warm start (`init`, kickstart teacher per agent, critic warm-up), top-k snapshot storage |
 | **SP4 Selection and observability** (parallel with SP5) | match log, OpenSkill / Bradley–Terry, `colosseum tournament`, dashboard, snapshot ratings |
-| **SP5 Distributed** (parallel with SP4) | hub and nodes, distributed league (including asymmetric games and agents that do not play every role), wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images |
+| **SP5 Distributed** (parallel with SP4) | hub and nodes, distributed league (including asymmetric games and agents that do not play every role), adding / removing agents and machines during a run, shared-memory weight store and trajectory ring buffer, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images |
 | **SP6 Speed and extensions** | vectorized fast path for array envs and hundreds of seats (Neural MMO), cuDNN RNN path, fast transformer unroll, GPU inference on workers, inference server, new algorithms |
 
 ### Open items parked during SP1 and SP2
@@ -328,8 +337,6 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
   - `--set` lists follow YAML 1.1, so `--set x=[1e-4,2]` keeps `1e-4` as a string (write `1.0e-4` in lists);
   - the main process builds a ratings snapshot on every monitor pass (negligible cost);
   - stale parked rollout buffers have no age limit (bounded by agents × envs × seats);
-  - SharedMemory zero-copy weight store (raw `shared_memory` instead of queue payloads);
-  - dynamic add/remove of agents and machines during a run;
   - config inheritance / profiles (`extends: base.yaml`);
   - a PettingZoo adapter (later, if needed; SP2 spec §2).
 - **Parked during SP2** (from the SP2 acceptance report, «Открытые пункты»):
@@ -337,10 +344,10 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
   - `ratio_mode` at K=128 on unit_harvest: `joint` beat `per_unit` by ≈0.09–0.13 `share_vs_scripted` (seed 0; noisy); the spec default (`auto` = `per_unit` with `Units`) stands — open owner question (Next step);
   - `unit_trace` auto with `Units` = `joint` was chosen on noisy data (run-to-run spread exceeds the rule's 0.05 margin; `joint` vs `none` undecided; `geo_mean` consistently worst) — open owner question (Next step);
   - budget overshoot and resume: a local run overshoots `total_timesteps` by about one second of env steps; a resume needs a budget above the checkpoint's `env_steps` to train (optional warning when a resume starts at or past the budget) → SP5 "one budget semantics";
-  - distributed workers get identical per-env seeds across machines when `training.seed` is set (ruling PR-3) → SP5;
+  - distributed workers get identical per-env seeds across machines when `training.seed` is set (a consequence of ruling PR-3: seeds are `training.seed + worker_id` on every machine) → SP5;
   - SP4: `system` `dropped_reward_episodes` sums only recently reporting workers (can decrease, can read 0 in the last record); make it a per-run monotonic counter.
 - **SP2 final-review Minors worth knowing** (full lists: the SP2 report's «Финальное ревью ветки» and appendix, and `docs/superpowers/reports/2026-10-09-sp2-review/`):
-  - SP3: `coordinator/agent_pool.py` keeps unused legacy (`register_frozen` / `register_scripted`, `AgentHandle.elo` / `win_rates`; no caller) — reuse it for SP3 players or delete it; `units_component_valid` is the single action-legality gate and can check scripted bots' actions;
+  - SP3: `coordinator/agent_pool.py` keeps unused legacy (`register_frozen` / `register_scripted`, `AgentHandle.elo` / `win_rates`; no caller) — reuse it for SP3 players or delete it; `units_component_valid` is the single action-legality gate and can check scripted bots' actions; owner rotation (`Coordinator.generate_lineups`, `src/colosseum/coordinator/coordinator.py:98-106`) relies on `AgentPool.list_trainable()` returning the trainable agents in config order (T5.3) — keep that order when frozen or scripted entries join the pool;
   - SP5: with several agents the distributed roles silently ignore `matchmaking.mode: league`, `teammates: mixed` and `shuffle_seats` (warn or `ConfigError`); the learner trusts slot payload values from a peer (finite `behavior_logp`, zero rewards on `boot`/`pad`), and a chunk with a wrong observation shape fails only in the learner forward; `distributed_setup` duplicates `setup_run`'s spec/roles sequence;
   - GPU checks: Gaussian log-prob and entropy run in fp16 under AMP (also inside `Units`); compare per-decider log-ratios with fp32 on a Box-in-`Units` AMP step;
   - SP6: `unit_log_prob` is computed twice per step (`act` and APPO's evaluate), the `Units` gate table is rebuilt per call;
@@ -348,10 +355,15 @@ Commands (run from the repo root after `scripts/setup-dev.sh`; the cwd is put on
 
 ### Next step
 SP3 (players, league, warm start; branch `sp3-<name>`). Like SP1 and SP2, it starts with a brainstorm and a written spec before any plan or code (see Development Workflow); read the SP3 row, «Parked during SP2» and the SP2 rulings first.
+- Design inputs for SP3 (pre-SP1 material: re-check every finding against the current code):
+  - `review/README.md` §6.3 (player model and league: `Trainable` / `Snapshot` / `Scripted` / `External`, where External = a foreign `.pt` + a network description; a policy pool in the worker; a matchmaker over snapshots), §6.4 (ratings and best-agent selection; snapshot storage `keep_last` / `keep_every` / top-k / `pinned`), §6.5 (warm start: per-agent `init`, `critic_warmup_steps`, kickstart from any policy, `colosseum record --bot X`);
+  - `review/code/04_league.md` «Proposed design» (config sketch); `review/research/B_league_rating_warmstart.md` (research behind it);
+  - SP2 spec items handed to SP3: §2 «Вне рамок» (players, PFSP over snapshots incl. opponent checkpoints in asymmetric games, per-agent `init` and critic warm-up, top-k snapshots; BC and kickstart were only ported); block 5 (`MatchRunner` takes the caller's (agent, network) → `PolicyModel` map, so a scripted player can be a `PolicyModel`); block 6 (a kickstart teacher per agent); §8 (only the minimum of league with teams, roles and layouts is in SP2); the team_tag single-run requirement (acceptance report, open item 1).
 - Open owner questions (no explicit answer at the SP2 acceptance, so the defaults stand); decide them at the SP3 brainstorm:
   - team_tag slow test: best of two independent runs (threshold 0.80 unchanged), or another check / an SP3 anti-passivity fix;
   - `ratio_mode: auto` = `per_unit` with `Units` (spec default), or `joint` after a multi-seed check on a real game;
-  - `unit_trace: auto` = `joint` (chosen on noisy data; `none` is within the spread).
+  - `unit_trace: auto` = `joint` (chosen on noisy data; `none` is within the spread);
+  - backward compatibility in SP3: SP2 had none (owner's SP2 instruction); confirm the same for SP3 (SP2 configs and checkpoints may break), or keep SP2 checkpoints resumable / usable as frozen players.
 - GPU checks still pending: the owner has to run `docs/GPU_CHECKS.md` (18 tests) on a CUDA machine.
 
 ## Development Workflow
@@ -360,15 +372,25 @@ SP3 (players, league, warm start; branch `sp3-<name>`). Like SP1 and SP2, it sta
 - **`main` stays stable.** A sub-project branch is merged with `git merge --no-ff` only after the owner explicitly accepts the acceptance report, so one `git revert -m 1 <merge>` undoes it. Push the branch to `origin` regularly while working.
 - **Implementation process (SP1):** one subagent per plan task (TDD, commit), a spec + quality review after every task, fix rounds with scoped re-reviews, then one whole-branch review with a single fix wave, then acceptance against the spec's §3 criteria.
 - **SP2 was executed the same way**, with a pre-flight consistency scan of the plan (rulings P1–P22) and a shadow package `colosseum.sp2` built next to the old code and overlaid onto `colosseum.*` in task T7.3 (the shadow is gone now); an Opus/high implementer and an Opus/high reviewer per task (owner's instruction), three area reviewers for the final whole-branch review, then one fix wave and a scoped re-review.
-- **The SDD workspace** (`.superpowers/sdd/<plan>/`: briefs, ledger `progress.md`, review packages, reports) is git-ignored scratch and is deleted after the merge; anything durable (rulings, deferred items, review records) goes into `docs/` before the merge.
+- **The SDD workspace** (`.superpowers/sdd/<plan>/`: briefs, ledger `progress.md`, review packages, reports) is git-ignored scratch and is deleted after the merge; anything durable (rulings, deferred items, review records) goes into `docs/` before the merge. The loop, the instruction templates, `brief.sh` and the ledger line formats are in `docs/superpowers/process/` (at most 5 fix rounds per task; implementer status `DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT`).
 - **Decisions taken on the owner's behalf** are recorded as rulings ("what — why — cost if wrong"). The SP1 list (58 rulings) is at the end of `docs/superpowers/reports/2026-10-08-sp1-acceptance.md`; the SP2 list (plan-stage PR-1..PR-5, pre-flight P1–P22, the 42 ledger rulings, the T8.3–T8.4 rulings) is at the end of `docs/superpowers/reports/2026-10-09-sp2-acceptance.md`. Check both lists before changing an area SP1/SP2 touched, and revise a ruling explicitly (with the owner) rather than silently undoing it.
 - **Frozen material:** `review/` is the pre-SP1 review snapshot and SP specs/plans are history; never edit them to match new code.
 - **Dev machine and tests:**
   - setup: `scripts/setup-dev.sh` (CPU-only torch from the PyTorch CPU index; `--gpu` for CUDA);
-  - CI suite: `.venv/bin/python -m pytest -m "not gpu and not slow" -q -rw` (must pass with zero warnings), plus `-m slow` for the learning test and `.venv/bin/ruff check .`;
+  - CI suite: `.venv/bin/python -m pytest -m "not gpu and not slow" -q -rw` (must pass with zero warnings) and `.venv/bin/ruff check .`;
+  - slow suite: `.venv/bin/python -m pytest -m slow -v` — 9 tests (the 7 demo-game learning tests in `tests/learning/test_demo_learning_slow.py` and 2 torch.compile checks in `tests/unit/test_sp2_performance.py`), 11–16 min; run it at acceptance and after any change to the training math, the worker or the learner;
   - test conventions: no `__init__.py` under `tests/`; import support modules by bare name (`from game_helpers import ...`, `from cli_runner import ...`); test basenames and support-class names are unique; every file goes under `tmp_path`; integration runs start processes through `tests/cli_runner.py` (process-group cleanup);
   - at most 2 worker processes in tests (the benchmark may use 4); `OMP_NUM_THREADS=1`;
   - any config-schema change also updates `scripts/bench_throughput.py::_make_config` (pinned benchmark workload; guarded by `tests/unit/test_bench_throughput.py`).
+- **Conventions:** commits use conventional prefixes (`feat:`, `fix:`, `test:`, `docs:`, `refactor:`, `chore:`, `perf:`) and **never** carry attribution or `Co-Authored-By` lines, in commits or PRs; push after every task. Language: code, comments, docstrings, log messages, `README.md` and `CLAUDE.md` in English; specs, acceptance reports and the project docs `docs/ENV_GUIDE.md`, `docs/benchmarks.md`, `docs/GPU_CHECKS.md` in Russian (plans so far in English).
+
+## Working with the owner
+
+- The owner writes in Russian; reply in Russian. Docs follow the language rules above.
+- Long reports (acceptance, reviews) go on a private, phone-readable artifact page, with a short Russian summary in chat.
+- Specs are approved section by section in the brainstorm; no code is written before the spec is approved.
+- In autonomous runs ("работай автономно"), keep going without asking. Decide conflicts as rulings ("what — why — cost if wrong") in the ledger and hand over the full list at the end. Stop only for destructive, security-sensitive or outward actions; a merge into `main` always needs the owner's explicit "yes".
+- Delegation: implementation and review subagents run on Opus with high effort (implementers never dispatch subagents); web research and surveys on Sonnet with high effort; the main session orchestrates and makes the key decisions.
 
 ## Tech Stack
 

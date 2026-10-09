@@ -11,5 +11,6 @@ Verbatim copies of the SP2 records that lived only in the git-ignored SDD worksp
 | [`final-rereview.md`](final-rereview.md) | Scoped re-review of the fix wave: all items addressed; new Minor N-1 (parked to SP4). |
 | [`task-FIX-1-report.md`](task-FIX-1-report.md) | FIX-1 (`a4f1ad1`): flaky resume integration test; root cause = first run overshoots its budget. |
 | [`task-FIX-2-report.md`](task-FIX-2-report.md) | FIX-2 (`b97dfec`): flaky SIGINT-during-startup test; CPython 3.12 unhandled-KeyboardInterrupt quirk and two more startup Ctrl-C paths. |
+| [`readiness-review.md`](readiness-review.md) | Fresh-session readiness review of the handoff docs at `70e65ab`: answers a new SP3 session would get from the repo alone, gaps G1–G14 with suggested text, 7 inaccuracies, 32 verified claims, the check that every forwarded ledger minor was closed. Its gaps were fixed in the next docs commit. |
 
 Workspace files these records mention but that were not kept (briefs, `review-*.diff` packages, `progress.md`) are reproducible from git: the diffs are the named commit ranges, and every `Ruling` and deferred-minor line of `progress.md` is copied verbatim into the acceptance report.

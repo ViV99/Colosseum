@@ -4,7 +4,7 @@
 - Дата: 2026-10-09.
 - Машина: WSL2, 8 ядер (`nproc` = 8), 11 ГБ ОЗУ, без GPU. Python 3.12.3, torch 2.14.1+cpu, `.venv`.
 - **Владелец принял SP2 2026-10-09** («Окей»). Ветка `sp2-game-model` сливается в `main` через `git merge --no-ff` (слияние — следующий коммит после этого отчёта, поэтому один `git revert -m 1 <merge>` откатывает SP2).
-- Четыре вопроса владельцу (раздел «Открытые пункты») явного ответа не получили, поэтому действуют умолчания: team_tag — лучший из двух прогонов; `ratio_mode: auto` = `per_unit`; `unit_trace: auto` = `joint`; GPU-проверки ещё не прогнаны. Все четыре — **открыто, решить на брейншторме SP3**.
+- Четыре вопроса владельцу (раздел «Открытые пункты») явного ответа не получили, поэтому действуют умолчания: team_tag — лучший из двух прогонов; `ratio_mode: auto` = `per_unit`; `unit_trace: auto` = `joint`; GPU-проверки ещё не прогнаны. Все четыре — **открыто, решить на брейншторме SP3**. Пятый вопрос добавило ревью готовности: обратная совместимость в SP3 (в SP2 её не было).
 - Записи финального ревью, волны исправлений и задач FIX-1/FIX-2 скопированы из рабочего каталога SDD (он удаляется после слияния) в [`2026-10-09-sp2-review/`](2026-10-09-sp2-review/README.md).
 
 ## Итог
@@ -531,6 +531,7 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 - `ratio_mode` при K=128: умолчание — `auto` = `per_unit` (спека). Вопрос: оставить или проверить `joint` на нескольких сидах и реальной игре?
 - `unit_trace`: умолчание — `auto` = `joint`. Вопрос: принять выбор, сделанный на шумных данных (`none` не хуже в пределах разброса)?
 - GPU: 18 GPU-тестов ещё не прогнаны на машине с CUDA (`docs/GPU_CHECKS.md`).
+- Обратная совместимость в SP3 (добавлено ревью готовности): в SP2 её не было (указание владельца для SP2); подтвердить то же для SP3 (конфиги и чекпоинты SP2 могут сломаться) или сохранить чекпоинты SP2 пригодными для resume / как замороженных игроков.
 
 Кандидаты финального ревью ветки (счётчик `dropped_reward_episodes`, мелочи FIX-2) и пункт «контекст `validate`» исправлены финальной волной; см. раздел «Финальное ревью ветки».
 
@@ -572,7 +573,14 @@ Cross-play `coop_buttons`: перед строкой `[coop_buttons]` тест �
 
 Все 37 строк журнала контролёра SP2 (`progress.md` рабочего каталога SDD, удалён после слияния), содержащие `minor (deferred`, по порядку и дословно; в квадратных скобках — задача. Это замечания уровня Minor, отложенные ревью задач; они не блокируют слияние.
 
-Финальная волна исправлений (коммиты `a6a2faa..62157a6`) закрыла: контекст `validate` (T6.2, `3f32974`), ключи исхода (T1.4, `52ca7c6`), `ObsSpec` (T1.3, `52ca7c6`), умерший процесс среды (T1.6, `18d1abd`), FIX-2b (`2fb77c3`). Пункт о потерянных наградах никогда не ходившего места — не строка `minor (deferred`, а решение T8.6 (запись 37 журнала решений); его закрыл `c5225e6` (WARNING один раз на воркер и `dropped_reward_episodes` в записи `system`), остаток — N-1 (SP4). Строки с пометкой «deferred→T…» журнал направил в названные задачи; остальные строки остаются открытыми Minor.
+Финальная волна исправлений (коммиты `a6a2faa..62157a6`) закрыла: контекст `validate` (T6.2, `3f32974`), ключи исхода (T1.4, `52ca7c6`), `ObsSpec` (T1.3, `52ca7c6`), умерший процесс среды (T1.6, `18d1abd`), FIX-2b (`2fb77c3`). Пункт о потерянных наградах никогда не ходившего места — не строка `minor (deferred`, а решение T8.6 (запись 37 журнала решений); его закрыл `c5225e6` (WARNING один раз на воркер и `dropped_reward_episodes` в записи `system`), остаток — N-1 (SP4). Строки с пометкой «deferred→T…» и перенос из T5.4 закрыты в названных задачах; это проверило ревью готовности перед слиянием ([`2026-10-09-sp2-review/readiness-review.md`](2026-10-09-sp2-review/readiness-review.md), раздел 4):
+- строка 4 (T0.1 → T8.6, устаревший список остатков SP1 в CLAUDE.md): раздела «Residuals from the SP1 final review» больше нет; три пункта закрыты в T0.1 (§3.10), пункт про финальный чекпоинт распределённого лёрнера — в списке SP5 CLAUDE.md;
+- строка 24 (T5.4, перенос в T7.1): ветка kickstart-учителя в `_learner_main` — `tests/unit/test_sp2_learner_entry.py::test_learner_target_builds_and_uses_the_kickstart_teacher`; жизненный цикл — `tests/integration/test_sp2_lifecycle.py`, `tests/unit/test_sp2_launcher_lifecycle.py`;
+- строка 30 (T7.1 → T7.3): ключи рейтингов по вариантам в `metrics.jsonl` — `tests/integration/test_sp2_metrics_outputs.py` (также `test_sp2_game_runs.py`); консольный скрипт — `tests/integration/test_sp2_lifecycle.py::test_readme_quickstart_from_repo_root`;
+- строка 31 (T7.3 → T8.6): комментарии `tests/conftest.py` (`game_helpers`, `cli_runner`, `game_harness`) и `core/errors.py` (контракт `MultiAgentEnv`, `EpisodeTracker`) исправлены в `cbc0d4c`;
+- строка 35 (T8.3 → T8.6/T8.7): докстринг теста team_tag говорит «about 2 of 9 single runs»; в отчёте осталась одна версия цены ошибки (с ~0.8 до ~0.4, ~64 %).
+
+Остальные строки остаются открытыми Minor (например, строка 2: дублирующие блоки `cancel_join_thread` в лаунчере).
 
 1. [T0.1] Task T0.1: minor (deferred): launcher._release_queues — reader.release()/later loop unguarded around release_command_queues (no feeder-hang risk; outside spec item)
 2. [T0.1] Task T0.1: minor (deferred): inline cancel_join_thread blocks in launcher duplicate ipc._cancel_join — tidy in the T5.4 launcher copy

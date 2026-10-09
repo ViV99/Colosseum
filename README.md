@@ -352,6 +352,8 @@ coordinator, league, ratings, `metrics.jsonl` or WandB; every `run-workers` host
 | | SP5 Distributed | hub and nodes, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images |
 | | SP6 Speed and extensions | cuDNN RNN path, fast transformer unroll, GPU inference on workers, inference server, new algorithms |
 
+The table is a summary; the full scope of each sub-project and the parked items are in [`CLAUDE.md`](CLAUDE.md) («Roadmap»), which is authoritative.
+
 Known limitations today:
 - **Players:** only trainable agents; no scripted, frozen or external players in training (SP3). PFSP picks among
   agents' latest weights, not snapshots. Online ELO is a progress indicator, not a selection-grade rating.
