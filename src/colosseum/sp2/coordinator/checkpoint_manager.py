@@ -377,12 +377,13 @@ def check_role_signature(state: dict, expected: str, context: str) -> None:
     if signature is None:
         raise ConfigError(
             f"{context}: checkpoint {state['source']} has no role_signature in its meta.json "
-            f"(written before SP2); SP1 checkpoints cannot be resumed"
+            f"(written before SP2); SP1 checkpoints cannot be resumed: drop training.resume_from to start fresh"
         )
     if signature != expected:
         raise ConfigError(
             f"{context}: checkpoint {state['source']} has role signature {signature!r}, but the agent's "
-            f"roles in this game have {expected!r}: the observation/action/global-state spaces differ"
+            f"roles in this game have {expected!r}: the observation/action/global-state spaces differ; "
+            f"resume from a checkpoint of an agent with the same roles, or drop training.resume_from"
         )
 
 

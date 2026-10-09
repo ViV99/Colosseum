@@ -1121,3 +1121,12 @@ class FakeAlgorithm:
     def load_state_dict(self, state):
         self._opt.load_state_dict(state["optimizer"])
         self._version = int(state["policy_version"])
+
+
+def make_test_run_dir(config, tmp_path, name: str = "test-run"):
+    """Point ``config.run`` at ``tmp_path / "runs"`` and create the run dir (tests never write to cwd)."""
+    from colosseum.sp2.core.run_dir import RunDir
+
+    config.run.dir = str(tmp_path / "runs")
+    config.run.name = name
+    return RunDir.create(config)
