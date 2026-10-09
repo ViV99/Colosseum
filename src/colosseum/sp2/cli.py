@@ -122,5 +122,77 @@ def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
     click.echo("Config is valid.")
 
 
+@main.command("eval")
+@click.option("--config", "-c", required=True, type=click.Path(exists=True),
+              help="Config YAML: its env is used for every match; agents.<name> / networks build .pt agents")
+@click.option("--agent", "-a", "agents", required=True, multiple=True,
+              help="name=path. path is a checkpoint dir (architecture and roles from its meta.json) or a "
+                   ".pt state_dict (architecture and roles of agents.<name>, else the global networks "
+                   "playing every role). Repeatable.")
+@click.option("--layout", "layouts", multiple=True,
+              help="Layout to evaluate (repeatable). Default: every layout the agents can fill.")
+@click.option("--num-matches", "-n", default=100, type=click.IntRange(min=1), show_default=True,
+              help="Matches per agent pair and layout (one agent or one team: per agent; cross-play: per "
+                   "composition). With several agents and a layout of two or more teams an odd count is "
+                   "rounded up, so every agent plays every side equally often.")
+@click.option("--num-envs", default=8, type=click.IntRange(min=1), show_default=True, help="Parallel environments")
+@click.option("--deterministic", is_flag=True, default=False, help="Act greedily (distribution mode)")
+@click.option("--seed", default=None, type=int, help="Seed for env resets and sampling")
+@click.option("--output", "-o", default=None, type=click.Path(dir_okay=False),
+              help="Write the machine-readable result as JSON")
+def eval_cmd(
+    config: str,
+    agents: tuple[str, ...],
+    layouts: tuple[str, ...],
+    num_matches: int,
+    num_envs: int,
+    deterministic: bool,
+    seed: int | None,
+    output: str | None,
+) -> None:
+    """Evaluate agents/checkpoints against each other (no training).
+
+    Exit code: 0 done, 1 config error (also a malformed checkpoint, a role signature or weights
+    that do not fit), 2 bad command-line arguments, 130 SIGINT (Ctrl+C), 143 SIGTERM.
+    """
+    import logging
+    from pathlib import Path
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+
+    if output is not None and not Path(output).parent.is_dir():
+        raise click.BadParameter(f"directory {str(Path(output).parent)!r} does not exist", param_hint="'--output'")
+    with _config_errors():
+        from colosseum.sp2.core.config import load_config
+        from colosseum.sp2.core.registry import env_spec, validate_config
+        from colosseum.sp2.eval import evaluate
+
+        cfg = load_config(config)
+        validate_config(cfg)
+        specs = [_parse_agent_spec(spec) for spec in agents]
+        names = [name for name, _ in specs]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise click.BadParameter(f"duplicate agent names {duplicates}", param_hint="'--agent'")
+        for _name, path in specs:
+            p = Path(path)
+            if not (p.is_dir() or (p.is_file() and p.suffix == ".pt")):
+                raise click.BadParameter(f"{p}: expected a checkpoint directory or a .pt file",
+                                         param_hint="'--agent'")
+        spec = env_spec(cfg)
+        chosen = list(layouts) or list(spec.layouts)
+        competitive = any(spec.num_teams(name) >= 2 for name in chosen if name in spec.layouts)
+        if len(specs) > 1 and competitive and num_matches % 2:
+            click.echo(f"Note: --num-matches {num_matches} is odd; using {num_matches + 1} per pair so every "
+                       f"agent plays every side equally often.", err=True)
+            num_matches += 1
+        report = evaluate(cfg, dict(specs), layouts=list(layouts) or None, num_matches=num_matches, seed=seed,
+                          deterministic=deterministic, num_envs=num_envs)
+    click.echo("\n" + report.text())
+    if output:
+        report.write_json(output)
+        click.echo(f"Result written to {output}")
+
+
 if __name__ == "__main__":
     main()
