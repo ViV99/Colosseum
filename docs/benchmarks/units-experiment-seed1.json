@@ -85,5 +85,31 @@
       "share_vs_scripted": 0.2192059546141829
     }
   ],
-  "recommendation": "geo_mean"
+  "recommendation": null,
+  "recommendation_note": "no recommendation: the rule needs share_vs_scripted of every per_unit trace at K=128 and K=8; missing: K=8 joint, K=8 geo_mean, K=8 none",
+  "separate_runs": [
+    {
+      "note": "a separate 340k-step run of the K=128 per_unit/geo_mean cell with seed 0 (same command as the seed-0 grid, run dir /tmp/colosseum-units-pilot2), made before the grid to check that the evaluation does not saturate; not part of either grid",
+      "k": 128,
+      "ratio_mode": "per_unit",
+      "unit_trace": "geo_mean",
+      "seed": 0,
+      "name": "k128-per_unit-geo_mean-s0",
+      "returncode": 0,
+      "wall_s": 483.2193009000039,
+      "clip_fraction": 0.05515800012785132,
+      "clip_fraction_joint": 0.5610126896959836,
+      "ess": 0.999629262040873,
+      "log_rho_abs_p95": 0.19867243526167558,
+      "log_rho_joint_abs_mean": 0.4044724507410018,
+      "c_clip_frac": 0.41657853028813346,
+      "deciders_valid_mean": 32.95954526057009,
+      "env_steps_per_s": 708.1814841560305,
+      "train_steps": 2451,
+      "win_vs_random": 0.99,
+      "score_vs_random": 288.96,
+      "win_vs_scripted": 0.0,
+      "share_vs_scripted": 0.13477766725549925
+    }
+  ]
 }
