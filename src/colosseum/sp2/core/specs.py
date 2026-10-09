@@ -27,6 +27,7 @@ from typing import Any, Literal
 
 import gymnasium
 import numpy as np
+import torch
 
 from colosseum.core.errors import EnvContractError
 from colosseum.sp2.core.tree import Tree
@@ -173,6 +174,42 @@ class ActionGroup:
 
 def _units_mask_size(units: Units) -> int:
     return sum(c.size for c in units.components if c.kind == "discrete")
+
+
+def split_unit_actions(units: Units, actions: Any) -> dict[str, Any]:
+    """Component name -> values ``[..., U]`` (discrete) / ``[..., U, d]`` (box) of a units action
+    with any leading dims (the env format of :mod:`colosseum.sp2.envs.spaces`)."""
+    if units.per_unit_kind == "dict":
+        return {c.name: actions[c.name] for c in units.components}
+    if units.per_unit_kind == "multi_discrete":
+        return {c.name: actions[..., i] for i, c in enumerate(units.components)}
+    return {"0": actions}
+
+
+def units_component_valid(units: Units, base: dict[str, torch.Tensor],
+                          values: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Validity ``[..., U]`` per component: ``base[c]`` (the unit is present and, for a discrete
+    component, its mask row is non-empty) gated by ``only_if`` in dependency order. The gate of
+    ``child <- (parent, values)`` holds iff the parent is valid and the recorded parent value
+    (``values[parent]``) is in ``values``. The one implementation of the gate rule (``UnitsDist``,
+    ``ActionSpec.first_illegal_action``)."""
+    valid: dict[str, torch.Tensor] = {}
+    pending = list(units.components)
+    while pending:
+        for c in list(pending):
+            rule = units.only_if.get(c.name)
+            if rule is not None and rule[0] not in valid:
+                continue  # parent first
+            ok = base[c.name]
+            if rule is not None:
+                parent, allowed = rule
+                n = next(p.size for p in units.components if p.name == parent)
+                table = torch.zeros(n, dtype=torch.bool, device=ok.device)
+                table[sorted(allowed)] = True
+                ok = ok & valid[parent] & table[values[parent].long().clamp(0, n - 1)]
+            valid[c.name] = ok
+            pending.remove(c)
+    return valid
 
 
 class ActionSpec:
@@ -384,6 +421,66 @@ class ActionSpec:
                     raise EnvContractError(f"{where}: action mask {_fmt(g.path)}{part} has no legal action "
                                            f"for an acting seat")
                 offset += n
+
+    def first_illegal_action(self, actions: Tree, mask: Tree | None) -> tuple[int, str] | None:
+        """The first decision whose recorded action a normalized mask forbids, as ``(index, reason)``,
+        or None. ``actions`` and ``mask`` are torch trees with a leading ``[N]``; discrete values
+        must be in range.
+
+        - discrete / each multi_discrete sub-action: the row must be non-empty (the acting-seat
+          rule of :meth:`check_acting_mask`) and allow the recorded value;
+        - units: every valid discrete component of a present unit (non-empty row, ``only_if`` gate
+          holding for the recorded parent value) must be allowed by its row; invalid ones are free.
+        """
+        if mask is None:
+            return None
+        found: list[tuple[int, str]] = []
+
+        def first(bad: torch.Tensor) -> list[int] | None:
+            """Index of the first True of ``bad`` ([N] or [N, U]; row-major: smallest decision first)."""
+            return [int(x) for x in bad.nonzero()[0]] if bad.any() else None
+
+        for g in self.groups:
+            if g.kind == "box":
+                continue
+            row = self.group_mask(mask, g)
+            a = actions if not self.is_dict else self._get(actions, g.path)
+            w = _fmt(g.path)
+            if g.kind in ("discrete", "multi_discrete"):
+                offset = 0
+                for k, n in enumerate(g.nvec):
+                    seg = row[..., offset:offset + n]
+                    value = (a if g.kind == "discrete" else a[..., k]).long()
+                    part = "" if g.kind == "discrete" else f" (sub-action {k})"
+                    empty = ~seg.any(dim=-1)
+                    legal = seg.gather(-1, value.unsqueeze(-1)).squeeze(-1)
+                    if (at := first(empty)) is not None:
+                        found.append((at[0], f"action mask {w}{part} has no legal action"))
+                    if (at := first(~legal & ~empty)) is not None:
+                        found.append((at[0], f"action {int(value[at[0]])} at {w}{part} is illegal under its "
+                                             f"action mask"))
+                    offset += n
+                continue
+            units = g.units
+            comps = split_unit_actions(units, a)
+            rows: dict[str, torch.Tensor] = {}
+            base: dict[str, torch.Tensor] = {}
+            offset = 0
+            for c in units.components:
+                base[c.name] = row["unit"]
+                if c.kind == "discrete":
+                    rows[c.name] = row["action"][..., offset:offset + c.size]
+                    base[c.name] = row["unit"] & rows[c.name].any(dim=-1)
+                    offset += c.size
+            valid = units_component_valid(units, base, comps)
+            for name, r in rows.items():
+                value = comps[name].long()
+                legal = r.gather(-1, value.unsqueeze(-1)).squeeze(-1)
+                if (at := first(valid[name] & ~legal)) is not None:
+                    i, u = at
+                    found.append((i, f"unit {u} component {name!r}: action {int(value[i, u])} at {w} is illegal "
+                                     f"under its action mask"))
+        return min(found, key=lambda item: item[0]) if found else None
 
     # ---- identity -------------------------------------------------------------
 

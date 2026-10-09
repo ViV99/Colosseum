@@ -108,13 +108,34 @@ def _illegal_actions(tmp_path):
     return path
 
 
+def _empty_mask_row(tmp_path):
+    path = tmp_path / "data.pt"
+    write_data(path, make_test_config("turns"))
+    data = torch.load(path, weights_only=True)
+    data["action_masks"][5] = False
+    torch.save(data, path)
+    return path
+
+
+def _nan_observations(tmp_path):
+    path = tmp_path / "data.pt"
+    write_data(path, make_test_config("turns"))
+    data = torch.load(path, weights_only=True)
+    data["observations"][7, 1] = float("nan")
+    torch.save(data, path)
+    return path
+
+
 @pytest.mark.parametrize(("make_data", "message"), [
     (_garbage, "data.pt"),
     (_missing_actions, "missing BC data keys ['actions']"),
     (_float_actions, "floating point"),
     (_empty_dir, "no .pt files"),
-    (_illegal_actions, "illegal under their action_masks"),
-], ids=["unreadable", "missing-key", "float-actions", "empty-dir", "illegal-actions"])
+    (_illegal_actions, "data.pt: BC decision 0: action"),
+    (_empty_mask_row, "data.pt: BC decision 5: action mask <root> has no legal action"),
+    (_nan_observations, "has NaN/inf values (first at decision 7)"),
+], ids=["unreadable", "missing-key", "float-actions", "empty-dir", "illegal-actions", "empty-mask-row",
+        "nan-observations"])
 def test_bad_data_is_a_one_line_config_error(make_data, message, tmp_path):
     cfg_path = write_test_config(tmp_path / "cfg.yaml", "turns")
     out = tmp_path / "bc.pt"
@@ -140,3 +161,17 @@ def test_a_data_file_that_cannot_be_opened_is_a_one_line_config_error(tmp_path, 
     result = bc("-c", cfg_path, "-d", data, "-o", tmp_path / "bc.pt")
     assert result.exit_code == 1 and result.stderr.startswith("Config error:")
     assert "PermissionError" in result.stderr and len(result.stderr.strip().splitlines()) == 1
+
+
+def test_an_illegal_units_action_is_a_one_line_config_error(tmp_path):
+    cfg_path = write_test_config(tmp_path / "cfg.yaml", "units")
+    path = tmp_path / "units.pt"
+    write_data(path, make_test_config("units"))
+    data = torch.load(path, weights_only=True)
+    move = data["actions"]["units"]["move"][:, 1]                     # unit 1 is present (full masks)
+    row = data["action_masks"]["units"]["action"]
+    row[torch.arange(len(move)), 1, move] = False                      # forbid its recorded move
+    torch.save(data, path)
+    result = bc("-c", cfg_path, "-d", path, "-o", tmp_path / "bc.pt", "--epochs", 1)
+    assert result.exit_code == 1 and result.stderr.startswith("Config error:"), result.output
+    assert "unit 1 component 'move'" in result.stderr and len(result.stderr.strip().splitlines()) == 1

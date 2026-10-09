@@ -18,7 +18,7 @@ from typing import Any
 import torch
 from torch import Tensor
 
-from colosseum.sp2.core.specs import ActionGroup
+from colosseum.sp2.core.specs import ActionGroup, split_unit_actions, units_component_valid
 from colosseum.sp2.envs.spaces import UnitComponent
 from colosseum.sp2.networks.dist.base import Distribution
 from colosseum.sp2.networks.dist.leaf import (
@@ -127,12 +127,7 @@ class UnitsDist(Distribution):
         return self.U
 
     def _split(self, actions: Any) -> dict[str, Tensor]:
-        kind = self.units.per_unit_kind
-        if kind == "dict":
-            return {c.name: actions[c.name] for c in self.units.components}
-        if kind == "multi_discrete":
-            return {c.name: actions[..., i] for i, c in enumerate(self.units.components)}
-        return {"0": actions}
+        return split_unit_actions(self.units, actions)
 
     def _join(self, values: dict[str, Tensor]) -> Any:
         kind = self.units.per_unit_kind
@@ -149,25 +144,9 @@ class UnitsDist(Distribution):
         return self.unit_mask & row.any(dim=-1)
 
     def _component_valid(self, actions: Any) -> dict[str, Tensor]:
-        """``[B, U]`` validity per component for the given actions (``only_if`` in dependency order)."""
-        a = self._split(actions)
-        valid: dict[str, Tensor] = {}
-        pending = list(self.units.components)
-        while pending:
-            for c in list(pending):
-                rule = self.units.only_if.get(c.name)
-                if rule is not None and rule[0] not in valid:
-                    continue  # parent first
-                ok = self._row_ok(c) if c.kind == "discrete" else self.unit_mask
-                if rule is not None:
-                    parent, values = rule
-                    n = next(p.size for p in self.units.components if p.name == parent)
-                    table = torch.zeros(n, dtype=torch.bool, device=ok.device)
-                    table[sorted(values)] = True
-                    ok = ok & valid[parent] & table[a[parent].long().clamp(0, n - 1)]
-                valid[c.name] = ok
-                pending.remove(c)
-        return valid
+        """``[B, U]`` validity per component for the given actions (``units_component_valid``)."""
+        base = {c.name: self._row_ok(c) if c.kind == "discrete" else self.unit_mask for c in self.units.components}
+        return units_component_valid(self.units, base, self._split(actions))
 
     # ---- protocol ----------------------------------------------------------------------
 

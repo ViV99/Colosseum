@@ -140,14 +140,38 @@ def test_units_actions_train_on_the_mean_over_valid_deciders():
 
 
 def test_illegal_units_actions_under_their_masks_are_data_errors():
-    role = UnitsGame().spec.roles["player"]
-    trainer = trainer_for(role)
+    trainer = trainer_for(UnitsGame().spec.roles["player"])
     data = units_decisions(12)
-    data["actions"]["units"]["target"][:, 0] = 3          # unit 0 always exists; unit 3 only at t = 3
-    data["actions"]["units"]["move"][:, 0] = 3            # so the target counts (only_if move == 3)
+    data["actions"]["units"]["move"][:, 0] = 3            # unit 0 always exists; the target counts (move == 3)
+    data["actions"]["units"]["target"][:, 0] = 3          # unit 3 exists only at t = 3 (decision 3, 9)
+    with pytest.raises(DataError, match=r"BC decision 0: unit 0 component 'target': action 3 at units is illegal"):
+        trainer.add_data(**data)
+
+
+def test_a_gated_off_units_component_need_not_be_legal():
+    """``target`` counts only where ``move == 3``: elsewhere its recorded value is free."""
+    trainer = trainer_for(UnitsGame().spec.roles["player"])
+    data = units_decisions(12)
+    data["actions"]["units"]["move"][:, 0] = 0
+    data["actions"]["units"]["target"][:, 0] = 3          # illegal row value, but the gate is off
+    absent = ~data["action_masks"]["units"]["unit"]
+    data["actions"]["units"]["move"][absent] = 3          # absent units: nothing is checked
+    data["actions"]["units"]["target"][absent] = 3
     trainer.add_data(**data)
-    with pytest.raises(DataError, match="illegal under their action_masks"):
-        trainer.train(num_epochs=1, batch_size=12)
+    assert trainer.num_samples == 12
+
+
+def test_first_illegal_action_reports_the_first_bad_decision():
+    spec = ActionSpec.from_space(gymnasium.spaces.Dict({"a": FOUR, "m": gymnasium.spaces.MultiDiscrete([3, 2])}))
+    actions = {"a": torch.zeros(4, dtype=torch.long), "m": torch.zeros(4, 2, dtype=torch.long)}
+    mask = {k: torch.as_tensor(v) for k, v in spec.full_mask((4,)).items()}
+    assert spec.first_illegal_action(actions, mask) is None and spec.first_illegal_action(actions, None) is None
+    mask["m"][2, 3] = False                                           # sub-action 1, value 0 at decision 2
+    mask["a"][3] = False                                              # empty row at decision 3
+    assert spec.first_illegal_action(actions, mask) == (2, "action 0 at m (sub-action 1) is illegal under its "
+                                                           "action mask")
+    mask["a"][1] = False
+    assert spec.first_illegal_action(actions, mask) == (1, "action mask a has no legal action")
 
 
 @pytest.mark.parametrize(("kwargs", "message"), [
@@ -157,10 +181,14 @@ def test_illegal_units_actions_under_their_masks_are_data_errors():
     ({"observations": {"x": np.zeros((8, 3), np.float32)}}, "observations has leaves"),
     ({"observations": np.zeros((8, 4), np.float32)}, "observations leaf"),
     ({"observations": np.array(["a"] * 8)}, "observations"),
+    ({"observations": np.where(np.arange(24).reshape(8, 3) == 7, np.nan, 0.5).astype(np.float32)},
+     "observations leaf <root> has NaN/inf values \\(first at decision 2\\)"),
     ({"action_masks": np.ones((8, 3), dtype=bool)}, "action_masks leaf"),
+    ({"action_masks": np.arange(8)[:, None] != np.ones((1, 4))}, "decision 1: action mask <root> has no"),
+    ({"action_masks": np.arange(32).reshape(8, 4) != 16}, "decision 4: action 0 at <root> is illegal under its"),
     ({"dones": np.zeros(7, dtype=bool)}, "dones"),
 ], ids=["float-actions", "action-shape", "action-range", "obs-structure", "obs-shape", "obs-strings",
-        "mask-shape", "dones"])
+        "obs-nan", "mask-shape", "mask-empty-row", "illegal-action", "dones"])
 def test_data_that_does_not_fit_the_agent_is_a_data_error(kwargs, message):
     trainer = trainer_for(RoleSpec(BOX, FOUR))
     data = {"observations": samples(BOX, 8), "actions": np.zeros(8, np.int64),
@@ -183,13 +211,27 @@ def test_masks_on_a_box_action_space_are_rejected():
         trainer.add_data(samples(BOX, 4), np.zeros((4, 2), np.float32), np.ones((4, 2), dtype=bool))
 
 
-def test_illegal_expert_actions_under_their_masks_fail_loudly():
+def test_box_actions_must_be_finite():
+    box_actions = gymnasium.spaces.Box(-1.0, 1.0, (2,), np.float32)
+    trainer = trainer_for(RoleSpec(BOX, box_actions))
+    actions = np.zeros((4, 2), np.float32)
+    actions[3, 1] = np.inf
+    with pytest.raises(DataError, match="actions leaf <root> has NaN/inf"):
+        trainer.add_data(samples(BOX, 4), actions)
+
+
+def test_illegal_expert_actions_fail_in_add_data_naming_the_file(tmp_path):
     trainer = trainer_for(RoleSpec(BOX, FOUR))
     masks = np.zeros((8, 4), dtype=bool)
     masks[:, 1] = True
-    trainer.add_data(samples(BOX, 8), np.zeros(8, np.int64), masks)
-    with pytest.raises(DataError, match="illegal under their action_masks"):
-        trainer.train(num_epochs=1, batch_size=8)
+    masks[:3, 0] = True
+    path = tmp_path / "expert.pt"
+    torch.save({"observations": torch.as_tensor(samples(BOX, 8)), "actions": torch.zeros(8, dtype=torch.long),
+                "action_masks": torch.as_tensor(masks)}, path)
+    with pytest.raises(DataError, match=r"expert\.pt: BC decision 3: action 0 at <root> is illegal under its "
+                                        r"action mask"):
+        trainer.load_data(path)
+    assert trainer.num_samples == 0  # nothing trained, nothing kept
 
 
 def test_unreadable_files_are_data_errors(tmp_path, monkeypatch):

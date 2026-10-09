@@ -17,8 +17,13 @@ Loss = minus log-prob of the expert action: the joint log-prob when the action h
 (K = 1); with K > 1 (``Units``) the mean of ``unit_log_prob`` over the valid deciders, so a
 decision weighs the same whatever its number of units. Decisions without a valid decider are
 skipped. The model runs without its value path (``step``, or ``unroll(with_value=False)``).
-An expert action that the masks forbid is a :class:`DataError` (masked entries have log-prob
-about ``finfo.min``, so the check uses a threshold, not ``isinf``).
+
+``add_data`` checks the data against the agent's spaces, independent of the model, and raises
+:class:`DataError` (naming the file in ``load_data`` and the first bad decision): tree structure
+and shapes, integer dtypes and ranges of discrete values (also those of absent units), finite
+float leaves, and the legality of every expert action under its ``action_masks``
+(:meth:`ActionSpec.first_illegal_action`: no empty non-units row, the recorded value allowed;
+for units, every valid component of a present unit).
 
 Stateless models train on shuffled decisions. Stateful models (``model.is_stateful``) train
 with ``unroll`` over contiguous windows of ``seq_len`` decisions, from ``initial_state`` and
@@ -50,10 +55,9 @@ logger = logging.getLogger(__name__)
 _REQUIRED_KEYS = {"observations", "actions"}
 _KNOWN_KEYS = _REQUIRED_KEYS | {"action_masks", "dones"}
 _EVAL_BATCH = 4096
-# Masked-out categories sit at ``finfo.min`` logits (``masked_log_softmax``), so the NLL of an
-# illegal action is about 3e38 (finite) or inf when several illegal parts add up. Legal actions
-# stay many orders of magnitude below this threshold.
-_ZERO_PROB_NLL = 1e30
+# Numerical backstop only (legality is checked in ``add_data``): an NLL this large means a
+# (near-)zero probability, e.g. a collapsed std or diverged logits.
+_HUGE_NLL = 1e30
 
 
 def _window_index(n: int, seq_len: int, offset: int = 0) -> torch.Tensor:
@@ -114,6 +118,16 @@ def _check_tree(name: str, data: Any, expected: Any, n: int) -> None:
     for path, shape in want.items():
         if got[path][:1] != (n,) or got[path][1:] != shape[1:]:
             raise DataError(f"BC {name} leaf {_fmt(path)} has shape {got[path]}, expected ({n}, *{shape[1:]})")
+
+
+def _check_finite(name: str, tree: Any) -> None:
+    """Float leaves must be finite (DataError naming the leaf and the first bad decision)."""
+    for path, leaf in zip(tree_paths(tree), tree_leaves(tree), strict=True):
+        if leaf.is_floating_point():
+            bad = ~torch.isfinite(leaf).reshape(leaf.shape[0], -1).all(dim=-1)
+            if bad.any():
+                raise DataError(f"BC {name} leaf {_fmt(path)} has NaN/inf values (first at decision "
+                                f"{int(bad.nonzero()[0, 0])})")
 
 
 def _discrete_ranges(group: ActionGroup) -> list[tuple[tuple[str, ...], int | None, int]]:
@@ -217,6 +231,8 @@ class OfflineBCTrainer:
         _check_tree("observations", obs, self._obs_spec.allocate((1,)), n)
         _check_tree("actions", acts, self._action_spec.allocate_actions((1,)), n)
         _check_action_values(self._action_spec, acts)
+        _check_finite("observations", obs)
+        _check_finite("actions", acts)
         acts = tree_map(lambda x: x.float() if x.is_floating_point() else x.long(), acts)
         masks = None
         if action_masks is not None:
@@ -225,6 +241,11 @@ class OfflineBCTrainer:
                                 "drop 'action_masks' from the data")
             masks = tree_map(lambda x: x.bool(), _as_tree("action_masks", action_masks))
             _check_tree("action_masks", masks, self._action_spec.full_mask((1,)), n)
+            illegal = self._action_spec.first_illegal_action(acts, masks)
+            if illegal is not None:
+                index, reason = illegal
+                raise DataError(f"BC decision {index}: {reason}; expert actions must be legal under their "
+                                f"action_masks (fix the data)")
         if self._masks and (masks is None) != (self._masks[0] is None):
             raise DataError("BC data: either every batch/file has 'action_masks' or none does")
         if dones is None:
@@ -327,8 +348,8 @@ class OfflineBCTrainer:
             self._model.update_normalizers(self._to_device(tree_index(obs, idx)))
         self._normalized_upto = n
 
-    def _weighted_nll(self, dist: Distribution, actions: Any, weights: torch.Tensor,
-                      masked: bool) -> tuple[torch.Tensor, torch.Tensor]:
+    def _weighted_nll(self, dist: Distribution, actions: Any,
+                      weights: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         nll, valid = per_sample_nll(dist, actions, self._num_deciders)
         weights = torch.where(valid, weights, torch.zeros_like(weights))
         active = weights > 0
@@ -338,13 +359,12 @@ class OfflineBCTrainer:
                 f"BC NLL is NaN for {int(nan.sum())} samples: training diverged or the data contains "
                 f"NaN/inf (check observations/actions, lower the learning rate)"
             )
-        zero_prob = (nll > _ZERO_PROB_NLL) & active
-        if zero_prob.any():
-            if masked:
-                raise DataError(f"{int(zero_prob.sum())} BC expert actions have zero probability under the "
-                                f"policy: they are illegal under their action_masks (fix the data)")
-            raise ValueError(f"{int(zero_prob.sum())} BC expert actions have zero probability under the policy "
-                             f"(no action_masks are given: an out-of-support action or an underflowing std)")
+        huge = (nll > _HUGE_NLL) & active
+        if huge.any():
+            raise RuntimeError(
+                f"BC NLL exceeds {_HUGE_NLL:g} for {int(huge.sum())} samples: the policy gives the expert "
+                f"actions (near-)zero probability (a collapsed std or diverged logits; lower the learning rate)"
+            )
         nll = torch.where(active, nll, torch.zeros_like(nll))
         return (nll * weights).sum(), weights.sum()
 
@@ -365,8 +385,7 @@ class OfflineBCTrainer:
             idx = perm[start:start + batch_size]
             dist = self._step_dist(tree_index(obs, idx), None if masks is None else tree_index(masks, idx), len(idx))
             weights = torch.ones(len(idx), device=self._device)
-            loss_sum, weight = self._weighted_nll(dist, self._to_device(tree_index(actions, idx)), weights,
-                                                  masks is not None)
+            loss_sum, weight = self._weighted_nll(dist, self._to_device(tree_index(actions, idx)), weights)
             self._optimize(loss_sum, weight)
             total += float(loss_sum.detach())
             count += float(weight)
@@ -398,8 +417,7 @@ class OfflineBCTrainer:
         for start in range(0, len(windows), per_batch):
             index = windows[order[start:start + per_batch]].t()          # [L, b]
             dist, weights = self._sequence_forward(index, obs, masks, dones)
-            loss_sum, weight = self._weighted_nll(dist, self._window_actions(actions, index), weights,
-                                                  masks is not None)
+            loss_sum, weight = self._weighted_nll(dist, self._window_actions(actions, index), weights)
             self._optimize(loss_sum, weight)
             total += float(loss_sum.detach())
             count += float(weight)
