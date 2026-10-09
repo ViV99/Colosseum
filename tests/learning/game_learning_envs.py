@@ -87,3 +87,64 @@ class MaskedChoiceGame(MultiAgentEnv):
         if self._t >= self.LENGTH:
             return StepResult(acting=set(), obs={}, rewards={0: reward}, episode_over=True)
         return self._turn({0: reward})
+
+
+class ContextualBanditGame(MultiAgentEnv):
+    """Solo, one decision per episode. Observation: one-hot context c in {0, 1}; reward 1 iff action == c."""
+
+    spec = GameSpec.solo(gymnasium.spaces.Box(0.0, 1.0, (2,), np.float32), gymnasium.spaces.Discrete(2))
+
+    def __init__(self) -> None:
+        self._rng = np.random.default_rng()
+        self._context = 0
+
+    def reset(self, seed, layout) -> StepResult:
+        if seed is not None:
+            self._rng = np.random.default_rng(seed)
+        self._context = int(self._rng.integers(2))
+        obs = np.zeros(2, np.float32)
+        obs[self._context] = 1.0
+        return StepResult(acting={0}, obs={0: obs})
+
+    def step(self, actions) -> StepResult:
+        reward = 1.0 if int(actions[0]) == self._context else 0.0
+        return StepResult(acting=set(), obs={}, rewards={0: reward}, episode_over=True)
+
+
+class ShortChainGame(MultiAgentEnv):
+    """Combination lock: states 0..4, start at 0, actions 0/1. The correct action at state i is
+    ``KEY[i]`` and advances to i+1; a wrong action steps back to max(0, i-1). Reaching 4 gives +1
+    and ends the episode by the rules; 20 decisions truncate it (``truncated`` with ``final_obs``).
+
+    The key alternates, so no state-independent bias solves it, and only the last transition is
+    rewarded: solving it needs credit assignment over several decisions (gamma > 0)."""
+
+    KEY = (1, 0, 1, 0)
+    LENGTH = len(KEY) + 1
+    MAX_STEPS = 20
+    spec = GameSpec.solo(gymnasium.spaces.Box(0.0, 1.0, (LENGTH,), np.float32), gymnasium.spaces.Discrete(2))
+
+    def __init__(self) -> None:
+        self._pos = 0
+        self._t = 0
+
+    def _obs(self) -> np.ndarray:
+        obs = np.zeros(self.LENGTH, np.float32)
+        obs[self._pos] = 1.0
+        return obs
+
+    def reset(self, seed, layout) -> StepResult:
+        self._pos, self._t = 0, 0
+        return StepResult(acting={0}, obs={0: self._obs()})
+
+    def step(self, actions) -> StepResult:
+        self._t += 1
+        if int(actions[0]) == self.KEY[self._pos]:
+            self._pos += 1
+        else:
+            self._pos = max(0, self._pos - 1)
+        if self._pos == self.LENGTH - 1:
+            return StepResult(acting=set(), obs={}, rewards={0: 1.0}, episode_over=True)
+        if self._t >= self.MAX_STEPS:
+            return StepResult(acting=set(), obs={}, episode_over=True, truncated=True, final_obs={0: self._obs()})
+        return StepResult(acting={0}, obs={0: self._obs()})

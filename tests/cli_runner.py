@@ -17,6 +17,9 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = Path(__file__).resolve().parent
 TTT_CONFIG = REPO_ROOT / "configs" / "examples" / "tic_tac_toe.yaml"
 TTT_MULTI_CONFIG = REPO_ROOT / "configs" / "examples" / "tic_tac_toe_multi.yaml"
+# The SP2 tic-tac-toe configs (moved to configs/examples/ by T7.3).
+TTT_SP2_CONFIG = REPO_ROOT / "configs" / "sp2" / "tic_tac_toe.yaml"
+TTT_SP2_MULTI_CONFIG = REPO_ROOT / "configs" / "sp2" / "tic_tac_toe_multi.yaml"
 
 # Small, fast settings for tic-tac-toe runs (about 10 s with 1 worker on CPU).
 TINY: dict[str, str] = {
