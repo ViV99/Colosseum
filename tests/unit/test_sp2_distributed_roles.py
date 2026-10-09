@@ -73,6 +73,16 @@ def test_asymmetric_agents_are_refused_with_a_pointer_to_sp5(tmp_path, monkeypat
     assert not (tmp_path / "runs").exists()
 
 
+def test_unknown_agents_are_refused_before_a_run_dir_exists(tmp_path, restore_root_logging):
+    import colosseum.sp2.distributed as distributed
+
+    path = write_test_config(tmp_path / "cfg.yaml", "turns")
+    overrides = {"run.dir": str(tmp_path / "runs")}
+    with pytest.raises(ConfigError, match=r"agents \['ghost'\] are not trainable agents.*agent_0"):
+        distributed.run_distributed_learner(str(path), "ghost", 0, "localhost:1", overrides=overrides)
+    assert not (tmp_path / "runs").exists()
+
+
 def test_workers_entry_point_records_the_base_run_name(tmp_path, monkeypatch, restore_root_logging):
     import colosseum.sp2.distributed as distributed
 
@@ -105,7 +115,8 @@ def test_run_workers_returns_an_exit_code(worker_exit, expected, tmp_path, monke
 
 @pytest.fixture
 def fake_learner_role(tmp_path, monkeypatch):
-    """run_distributed_learner without gRPC: returns the config path."""
+    """run_distributed_learner without gRPC servers: returns the config path."""
+    pytest.importorskip("grpc")  # the patched modules import grpc (an optional extra)
     import colosseum.sp2.transport.grpc_transport as grpc_transport
     import colosseum.sp2.weight_store.grpc_store as grpc_store
 

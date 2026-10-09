@@ -19,7 +19,9 @@ Scope (SP2, spec block 10): self-play on the latest weights, without a coordinat
 where every agent of the run plays every role of the enabled layouts. Each worker env gets a
 fixed lineup: a layout drawn by ``matchmaking.layouts`` and every seat the latest weights of one
 agent (agents in rotation over the envs). Anything else (asymmetric agents, leagues across
-machines) is a ConfigError pointing to SP5.
+machines) is a ConfigError pointing to SP5. Layouts are drawn once per worker env (ruling
+PR-3) from an RNG seeded by ``training.seed + worker_id``, and the agent rotation starts at env 0
+of worker 0, so every worker machine of a run starts with the same layout mix and rotation.
 
 Budget and progress: there is no shared env-step counter across machines. Each
 distributed learner uses progress = consumed_samples / training.total_timesteps
@@ -68,7 +70,8 @@ class GRPCTrajectorySink:
 
     Transient RPC failures (e.g. the learner restarting or shutting down) drop
     the chunk rather than crashing the worker — trajectory data is replaceable,
-    and a worker should survive a learner blip.
+    and a worker should survive a learner blip. A chunk the learner refuses
+    (e.g. ``INVALID_ARGUMENT``) is dropped too, with a WARNING.
     """
 
     def __init__(self, transport, agent_id: str) -> None:
@@ -80,7 +83,11 @@ class GRPCTrajectorySink:
         try:
             self._transport.send_chunk(self._agent_id, chunk)
         except grpc.RpcError as e:
-            logger.debug(f"Dropping chunk for {self._agent_id}: {e.code()}")
+            transient = (grpc.StatusCode.UNAVAILABLE, grpc.StatusCode.DEADLINE_EXCEEDED, grpc.StatusCode.CANCELLED)
+            if e.code() in transient:  # the learner is down or restarting
+                logger.debug(f"Dropping chunk for {self._agent_id}: {e.code()}")
+            else:  # e.g. INVALID_ARGUMENT: the learner refused the chunk itself
+                logger.warning(f"Chunk for {self._agent_id} rejected by the learner: {e.code()}: {e.details()}")
 
     def put(self, chunk, timeout: float | None = None) -> None:  # noqa: ARG002
         self._send(chunk)
@@ -209,12 +216,15 @@ def run_distributed_learner(
     from colosseum.sp2.core.roles import role_signature
     from colosseum.sp2.core.specs import ActionSpec
     from colosseum.sp2.learner.learner import learner_process, resolve_device
-    from colosseum.sp2.transport.grpc_transport import serve_trajectory_receiver
-    from colosseum.sp2.weight_store.grpc_store import GRPCWeightStore
 
     setup_process_logging(None, f"learner-{agent_id}", console_level=logging.INFO)
     config = load_config(config_path, overrides)
     setup = distributed_setup(config, [agent_id])  # before the run dir exists: a bad config leaves nothing
+    # gRPC (an optional extra) is imported only after the scope check: a bad config is a
+    # ConfigError even where grpc is not installed.
+    from colosseum.sp2.transport.grpc_transport import serve_trajectory_receiver
+    from colosseum.sp2.weight_store.grpc_store import GRPCWeightStore
+
     acfg = config.get_agent_config(agent_id)
     role_spec = setup.role_specs[agent_id]
     run_dir = RunDir.create(config, config_path, role=f"learner-{agent_id}")

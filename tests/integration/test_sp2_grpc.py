@@ -104,6 +104,26 @@ def test_trajectory_sink_tolerates_a_dead_learner():
     transport.close()
 
 
+def test_trajectory_sink_warns_when_the_learner_rejects_a_chunk(caplog):
+    from colosseum.sp2.distributed import GRPCTrajectorySink
+    from colosseum.sp2.transport.grpc_transport import GRPCTransport, serve_trajectory_receiver
+
+    port = _free_port()
+    chunk_queue: queue.Queue = queue.Queue(maxsize=8)
+    server = serve_trajectory_receiver(chunk_queue, port=port)
+    transport = GRPCTransport(f"localhost:{port}")
+    try:
+        bad = chunk_v2_payload()
+        del bad["obs"]
+        with caplog.at_level("WARNING", logger="colosseum.sp2.distributed"):
+            GRPCTrajectorySink(transport, "agent_0").put(bad, timeout=1.0)
+        assert any(r.levelname == "WARNING" and "INVALID_ARGUMENT" in r.getMessage() for r in caplog.records)
+        assert chunk_queue.empty()
+    finally:
+        transport.close()
+        server.stop(0)
+
+
 def test_weight_store_rejects_non_array_weights():
     from colosseum.sp2.weight_store.grpc_store import GRPCWeightStore, serve_weight_store
 
