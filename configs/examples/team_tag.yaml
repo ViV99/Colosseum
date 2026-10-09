@@ -19,8 +19,8 @@ networks:
 algorithm:
   gamma: 0.97
   vtrace_lambda: 0.95
-  entropy_coeff: 0.01
-  learning_rate: 1.0e-3
+  entropy_coeff: 0.003     # T8.3 calibration: with 1e-3 / 0.01, 400k steps gave 0.56-0.70 vs a random team
+  learning_rate: 2.0e-3
   lr_schedule: "constant"
 
 rollout:
@@ -36,7 +36,7 @@ learner:
   batch_chunks: 8
 
 training:
-  total_timesteps: 500000
+  total_timesteps: 400000   # global env steps; ~170 s of training on 8 cores (T8.3 calibration)
   seed: null
 
 matchmaking:

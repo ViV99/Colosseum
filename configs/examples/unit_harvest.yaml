@@ -39,7 +39,7 @@ learner:
   batch_chunks: 8
 
 training:
-  total_timesteps: 400000
+  total_timesteps: 260000   # global env steps; ~170 s of training on 8 cores (T8.3 calibration)
   seed: null
 
 matchmaking:

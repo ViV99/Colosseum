@@ -44,9 +44,10 @@ def child_env() -> dict[str, str]:
 
 
 def train_cmd(config: Path, run_parent: Path, name: str, overrides: dict[str, str] | None = None,
-              module: str = "colosseum") -> list[str]:
-    """``python -m <module> train -c <config>`` with the ``TINY`` settings, then ``overrides``."""
-    sets = {**TINY, **(overrides or {}), "run.dir": str(run_parent), "run.name": name}
+              module: str = "colosseum", tiny: bool = True) -> list[str]:
+    """``python -m <module> train -c <config>`` with the ``TINY`` settings (unless ``tiny=False``:
+    the config's own budget and sizes, as in the slow learning tests), then ``overrides``."""
+    sets = {**(TINY if tiny else {}), **(overrides or {}), "run.dir": str(run_parent), "run.name": name}
     cmd = [sys.executable, "-m", module, "train", "-c", str(config)]
     for key, value in sets.items():
         cmd += ["--set", f"{key}={value}"]
@@ -75,10 +76,11 @@ class TrainRun:
 
 
 def run_train(config: Path, tmp_path: Path, name: str = "run", overrides: dict[str, str] | None = None,
-              timeout: float = 240.0, env: dict[str, str] | None = None, module: str = "colosseum") -> TrainRun:
-    """``env`` entries are added to ``child_env()``."""
+              timeout: float = 240.0, env: dict[str, str] | None = None, module: str = "colosseum",
+              tiny: bool = True) -> TrainRun:
+    """``env`` entries are added to ``child_env()``; ``tiny`` as in ``train_cmd``."""
     run_parent = tmp_path / "runs"
-    proc = run_in_session(train_cmd(config, run_parent, name, overrides, module), timeout, env)
+    proc = run_in_session(train_cmd(config, run_parent, name, overrides, module, tiny), timeout, env)
     return TrainRun(proc.returncode, proc.stdout, proc.stderr, run_parent / name)
 
 
