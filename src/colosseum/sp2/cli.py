@@ -105,5 +105,22 @@ def train(config: str, overrides: tuple[str, ...]) -> None:
     sys.exit(code)
 
 
+@main.command("validate")
+@click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set env.max_idle_steps=200)." + _SET_HELP_YAML)
+def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
+    """Validate a config: GameSpec, roles, matchmaking, env steps under the contract, every agent's model."""
+    with _config_errors():
+        from colosseum.sp2.core.config import load_config
+        from colosseum.sp2.core.registry import validate_config
+
+        cfg = load_config(config, _parse_overrides(overrides) or None)
+        validate_config(cfg)
+        for aid in cfg.get_trainable_agent_ids():
+            click.echo(f"  OK: agent '{aid}'")
+    click.echo("Config is valid.")
+
+
 if __name__ == "__main__":
     main()

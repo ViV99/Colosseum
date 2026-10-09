@@ -98,20 +98,11 @@ class RunSetup:
 
 
 def validate_run_config(config: ColosseumConfig) -> None:
-    """Fail fast (ConfigError / EnvContractError) before any process starts.
-
-    The GameSpec, the agents' roles, the matchmaking checks and one model per agent
-    (T6.2 replaces this body with ``registry.validate_config``).
-    """
-    from colosseum.sp2.coordinator.matchmaker import validate_matchmaking
+    """Fail fast (ConfigError / EnvContractError) before any process starts: ``registry.validate_config``
+    (looked up at call time, so tests can count or replace it)."""
     from colosseum.sp2.core import registry
-    from colosseum.sp2.core.roles import agent_role_spec, resolve_agent_roles
 
-    spec = registry.env_spec(config)
-    agent_roles = resolve_agent_roles(config, spec)
-    validate_matchmaking(spec, agent_roles, config.matchmaking)
-    for aid, roles in agent_roles.items():
-        registry.build_model(config.get_agent_config(aid), agent_role_spec(spec, roles))
+    registry.validate_config(config)
 
 
 def setup_run(config: ColosseumConfig, validate: bool = True) -> RunSetup:

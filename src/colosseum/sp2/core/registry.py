@@ -148,3 +148,13 @@ def build_model(agent_config: ColosseumConfig, role: RoleSpec) -> PolicyModel:
     value_cls = import_class(net.value_class)
     value = value_cls(**_with_in_dim(value_cls, kwargs, core.output_dim + critic_dim))
     return ComposedModel(encoder, core, policy, value, critic)
+
+
+def validate_config(config: ColosseumConfig) -> None:
+    """Every check that can run before a run starts (spec block 9); see ``colosseum.sp2.core.validation``.
+
+    Callers use this name (``registry.validate_config``), so tests can monkeypatch it here.
+    """
+    from colosseum.sp2.core.validation import validate_config as _validate_config
+
+    _validate_config(config)
