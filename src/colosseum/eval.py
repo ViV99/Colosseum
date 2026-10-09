@@ -28,10 +28,12 @@ Statistics (``summarize``), per layout, by the layout's outcome kind
 - ``wdl``: per pair, W/D/L from team ranks, win rate and score (draw = half) with 95% Wilson
   intervals (SP1), mean returns and length, and a per-side breakdown keyed by the team index of
   agent a. The reversed row is derived from the same counts. One agent: per-seat W/D/L and mean
-  return. Lineups with a team mixing both agents are counted as ``unattributed``.
+  return. A lineup with a team mixing both agents is counted as ``unattributed``; ``schedule_lineups``
+  no longer produces such lineups, only explicit ``play_lineups`` lineups can.
 - ``rank``: per agent, mean team rank with a 95% normal interval and the share of first places;
   a pairwise "who ranked higher" table (``higher[a][b]``: score of a over b, draw = half).
-  Teams mixing agents are left out (the match is counted as ``unattributed``). One agent in
+  Teams mixing agents (only possible in explicit ``play_lineups`` lineups; ``schedule_lineups``
+  does not produce them) are left out (the match is counted as ``unattributed``). One agent in
   every seat (SP1 solo mode): ``solo`` per seat (mean rank, share of first places, mean return).
 - ``score``: per team composition (sorted agent ids joined by ``+``), mean team score with a 95%
   normal interval; homogeneous compositions are the per-agent results, the rest is cross-play.
