@@ -34,7 +34,8 @@ DIAGNOSTICS = {
     "log_rho_abs_mean", "log_rho_abs_p95", "log_rho_joint_abs_mean", "log_rho_joint_abs_p95", "ess",
     "deciders_valid_mean", "deciders_valid_max", "boot_frac", "pad_frac", "explained_variance",
 }
-STATE_KEYS = {"optimizer", "progress", "scaler", "kickstart", "policy_version", "consumed_samples"}
+STATE_KEYS = {"optimizer", "progress", "scaler", "kickstart", "policy_version", "consumed_samples",
+              "critic_warmup_done"}
 
 
 def _patterns() -> list[str]:

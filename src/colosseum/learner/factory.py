@@ -158,6 +158,9 @@ def build_algorithm(agent_config: ColosseumConfig, role_spec: RoleSpec, spec: Ga
         kwargs["kickstart"] = kickstart
         logger.info(f"Kickstart from {teacher.source} (lambda {teacher.lambda_}, decay over {teacher.decay_steps} "
                     f"train steps, {teacher.kind} teacher)")
+    warmup = agent_config.init.critic_warmup_steps
+    if warmup > 0:
+        kwargs["critic_warmup_steps"] = warmup
     return algo_cls(model, agent_config.algorithm, ActionSpec.from_space(role_spec.action_space), **kwargs)
 
 

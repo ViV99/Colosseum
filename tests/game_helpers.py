@@ -1027,6 +1027,9 @@ class GameTestModel(PolicyModel):
     def update_normalizers(self, obs, global_state=None):
         self.inner.update_normalizers(obs, global_state)
 
+    def value_parameters(self):
+        return self.inner.value_parameters()
+
     @property
     def is_stateful(self) -> bool:
         return self.inner.is_stateful

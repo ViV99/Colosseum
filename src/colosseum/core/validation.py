@@ -457,6 +457,32 @@ def _check_matchmaker_class(config: ColosseumConfig, spec: GameSpec, player_role
                 raise ConfigError(f"matchmaking.matchmaker_class {path!r}: {e}") from e
 
 
+def _check_critic_warmup(where: str, agent_config: ColosseumConfig, model: Any) -> None:
+    """``init.critic_warmup_steps > 0`` needs a value loss, ``PolicyModel.value_parameters()`` and an algorithm
+    class that takes ``critic_warmup_steps``."""
+    import inspect
+
+    from colosseum.core.registry import import_class
+
+    steps = agent_config.init.critic_warmup_steps
+    if steps <= 0:
+        return
+    if not agent_config.algorithm.value_loss_coeff > 0:
+        raise ConfigError(f"{where}: init.critic_warmup_steps={steps} trains only the value loss; "
+                          f"algorithm.value_loss_coeff must be > 0")
+    try:
+        params = list(model.value_parameters())
+    except NotImplementedError as e:
+        raise ConfigError(f"{where}: init.critic_warmup_steps={steps}: {e}") from e
+    if not params:
+        raise ConfigError(f"{where}: init.critic_warmup_steps={steps}: value_parameters() returned no parameters")
+    path = agent_config.algorithm.algorithm_class
+    if "critic_warmup_steps" not in inspect.signature(import_class(path)).parameters:
+        raise ConfigError(f"{where}: init.critic_warmup_steps={steps}, but algorithm.algorithm_class {path!r} takes "
+                          f"no critic_warmup_steps argument; use colosseum.algorithms.appo.APPO (or a subclass that "
+                          f"accepts it) or set critic_warmup_steps: 0")
+
+
 def validate_config(config: ColosseumConfig) -> ValidationReport:
     """Check a whole config before any process starts (spec block 9; SP3 spec block 1).
 
@@ -470,6 +496,7 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
       final observations;
     - every agent's model: ``step`` on its role's observations and ``unroll`` on a synthetic chunk
       with BOOT/PAD slots, resets and ``global_state``;
+    - the critic warm-up's requirements (``init.critic_warmup_steps``);
     - every agent's kickstart teacher (``learner.factory.resolve_teacher``) and its weights;
     - every agent's ``init`` source (strict / partial report in ``ValidationReport.lines``), except for
       agents ``training.resume_from`` restores (``learner.factory.resume_source_of``), which ignore it;
@@ -516,6 +543,7 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
             raise ConfigError(f"{where}: failed to build the model from networks: {type(e).__name__}: {e}") from e
         sample = next((samples[r] for r in agent_roles[aid] if r in samples), None)
         _check_model(model, role_specs[aid], sample, where)
+        _check_critic_warmup(where, acfg, model)
     _check_kickstart_teachers(config, spec, agent_configs)
     for aid, acfg in agent_configs.items():
         resumed = resume_source_of(config, aid)
