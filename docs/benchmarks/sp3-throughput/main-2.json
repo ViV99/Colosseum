@@ -1,0 +1,48 @@
+{
+  "machine": {
+    "platform": "Linux-4.19.128-microsoft-standard-x86_64-with-glibc2.39",
+    "cpu_count": 8,
+    "python": "3.12.3",
+    "torch": "2.14.1+cpu",
+    "torch_threads_default": 8
+  },
+  "workload": {
+    "env": "tic_tac_toe",
+    "layout": "2p",
+    "envs_per_worker": 8,
+    "chunk_length": 32,
+    "batch_chunks": 8,
+    "queue_size": 32,
+    "warmup_s": 15.0,
+    "duration_s": 60.0
+  },
+  "results": [
+    {
+      "updates_per_s": 19.412563184153644,
+      "env_steps_per_s": 4821.5618892454395,
+      "chunks_per_update": 8.0,
+      "queue_depth_mean": 1.1454545454545455,
+      "bound": "worker",
+      "train_steps": 1158,
+      "workers": 1
+    },
+    {
+      "updates_per_s": 38.7937803267042,
+      "env_steps_per_s": 9599.839519743186,
+      "chunks_per_update": 8.0,
+      "queue_depth_mean": 5.111111111111111,
+      "bound": "worker",
+      "train_steps": 2318,
+      "workers": 2
+    },
+    {
+      "updates_per_s": 58.58226476175488,
+      "env_steps_per_s": 14481.06996580086,
+      "chunks_per_update": 8.0,
+      "queue_depth_mean": 29.425925925925927,
+      "bound": "learner",
+      "train_steps": 3489,
+      "workers": 4
+    }
+  ]
+}

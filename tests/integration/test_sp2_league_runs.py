@@ -48,7 +48,7 @@ def max_system_env_steps(root: Path) -> int:
 
 def test_two_agent_self_play_reaches_budget_and_both_learners_train(tmp_path):
     run = run_train(TTT_MULTI_CONFIG, tmp_path, name="sp2", overrides={
-        "matchmaking.mode": "self_play",
+        "matchmaking.opponents": "{latest: 0.8, snapshots: 0.2, rivals: 0.0, anchors: 0.0}",
         "training.total_timesteps": "6000",
         "rollout.num_workers": "2",
     })
@@ -72,8 +72,6 @@ def test_two_agent_self_play_reaches_budget_and_both_learners_train(tmp_path):
 
 def test_three_agent_league_all_pairs_meet_and_seats_balanced(tmp_path):
     run = run_train(TTT_MULTI_CONFIG, tmp_path, name="league3", overrides={
-        "matchmaking.mode": "league",
-        "matchmaking.self_play_ratio": "0.0",
         "agents.agent_gamma": "{}",
         # Masked tic-tac-toe has no illegal-move forfeits, so episodes run ~7.6 moves (T8.1);
         # 20000 steps keep the ~2000 seats per agent that the bound below was measured on.

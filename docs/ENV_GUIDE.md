@@ -17,6 +17,7 @@
 | Кооператив | `examples/coop_buttons` | `coop_buttons.yaml` | одна команда, исход `score`, `teammates: mixed`, cross-play |
 | Соревновательная игра «как на соревновании» | `examples/space_miners` | `space_miners.yaml` | `Units` с `Box`-компонентом, маски внутри юнитов, сущности, Box2D |
 | Дерево действий | `examples/composite_action` | `chase.yaml` | `Dict(direction=Discrete, speed=Box)` |
+| Скриптовые боты (SP3) | `examples/unit_harvest/bots.py`, `examples/tic_tac_toe/bots.py` | `unit_harvest_league.yaml` | `ScriptedBot` как якорь и учитель; что среда отдаёт ботам через `infos` — раздел 10, лига — `docs/LEAGUE_GUIDE.md` |
 
 ## 1. Минимальная среда
 
@@ -362,3 +363,16 @@ colosseum train -c configs/examples/<game>.yaml --set training.total_timesteps=2
 проверки пространств (`space.contains`): `validate, seat 2, episode step 7, layout 4p`.
 Исключение из `reset`/`step` самой среды `validate` показывает одной строкой `Config error: ...` с
 вариантом и шагом.
+
+## 10. `infos` для скриптовых ботов
+
+Скриптовый бот (`colosseum.players.ScriptedBot`, `docs/LEAGUE_GUIDE.md`) получает в `act(obs, mask, info)` наблюдение и маску своего места и `info = StepResult.infos.get(seat)` последнего шага (`None`, если среда ничего не положила). Через `infos` среда отдаёт боту «сырое» состояние, которое нейросети не нужно: координаты, ссылки на объекты движка, словари.
+
+```python
+return StepResult(acting={0, 1}, obs=..., action_masks=..., rewards=...,
+                  infos={s: {"enemy_base": self._bases[1 - s].copy()} for s in (0, 1)})
+```
+
+- Ключ — номер места, значение — что угодно (обычно `dict`). Фреймворк его не проверяет и не копирует; в чанки и BC-данные он не попадает. Читают его только места со скриптовыми ботами (игроки и учителя DAgger), в обучении, `eval` и `record` одинаково.
+- `rollout.vec_env: sync`: объект передаётся по ссылке, цены нет. Не меняйте его после `step`: бот может держать ссылку.
+- `rollout.vec_env: subprocess`: `StepResult` целиком пиклится из процесса среды в воркер на каждом шаге — вместе с `infos`, даже если ботов в партии нет. Цена — размер `infos`: крупные объекты (вся карта, история) на каждом шаге заметно замедляют воркер. Кладите туда только нужное ботам и компактно (numpy-массивы вместо списков словарей) или включайте их флагом среды в `env.kwargs`, который ставится только в конфигах с ботами.

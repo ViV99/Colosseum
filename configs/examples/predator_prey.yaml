@@ -1,6 +1,6 @@
 # Predator and prey: 1 hunter vs 2 prey. The roles have different observation and action spaces,
-# so each role has its own agent (agents.<id>.roles). With mode self_play the owner's opponents
-# come from the other agent, because the owner cannot play the other role.
+# so each role has its own agent (agents.<id>.roles). The owner cannot play the other role, so its
+# opponents are the other agent: `latest` = its latest weights, `snapshots` = its stored snapshots.
 run:
   name: null
   dir: "runs"
@@ -40,8 +40,9 @@ training:
   seed: null
 
 matchmaking:
-  mode: self_play
-  latest_prob: 0.8
+  # SP2 form: mode self_play, latest_prob 0.8 (translated exactly; see docs/LEAGUE_GUIDE.md)
+  opponents: {latest: 0.8, snapshots: 0.2, rivals: 0.0, anchors: 0.0}
+  pfsp: {weighting: hard, exponent: 1.0}
 
 agents:
   hunter: {roles: [hunter]}

@@ -48,8 +48,9 @@ training:
   seed: null
 
 matchmaking:
-  mode: self_play
-  latest_prob: 0.8
+  # SP2 form: mode self_play, latest_prob 0.8 (translated exactly; see docs/LEAGUE_GUIDE.md)
+  opponents: {latest: 0.8, snapshots: 0.2, rivals: 0.0, anchors: 0.0}
+  pfsp: {weighting: hard, exponent: 1.0}
   shuffle_seats: true
 
 checkpoint:

@@ -39,10 +39,11 @@ training:
   seed: null
 
 matchmaking:
-  mode: self_play
+  # SP2 form: mode self_play, latest_prob 0.8 (translated exactly; see docs/LEAGUE_GUIDE.md)
+  opponents: {latest: 0.8, snapshots: 0.2, rivals: 0.0, anchors: 0.0}
+  pfsp: {weighting: hard, exponent: 1.0}
   teammates: mixed
   teammate_self_prob: 0.5
-  latest_prob: 0.8
 
 agents:
   coop_a: {}

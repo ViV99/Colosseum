@@ -149,7 +149,7 @@ def _make_config(num_workers: int, run_parent: str):
             "seed": 0,
         },
         matchmaking={
-            "opponents": {"latest": 0.5, "snapshots": 0.5, "rivals": 0.0, "anchors": 0.0},
+            "opponents": {"latest": 1.0, "snapshots": 0.0, "rivals": 0.0, "anchors": 0.0},  # SP2 workload: latest only
             "anchors": [],
             "pfsp": {"weighting": "hard", "exponent": 1.0, "halflife_games": 200.0},
             "layouts": {LAYOUT: 1.0},

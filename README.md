@@ -4,10 +4,13 @@ A reusable training framework for competitive bot-programming competitions (Lux 
 behavioural cloning → RL → self-play → league, built on an IMPALA-style asynchronous actor–learner (APPO with V-trace)
 in PyTorch, without Ray.
 
-> **Status (SP2 of 6).** Single-machine training is the supported mode for every game structure: solo, 1v1 with
+> **Status (SP3 of 6).** Single-machine training is the supported mode for every game structure: solo, 1v1 with
 > turn-based or simultaneous moves, one bot controlling many units, team vs team, free-for-all with elimination and
 > 2–4 players in one run, asymmetric roles, and cooperative games. Each structure has a demo game that is trained
-> end-to-end in the test suite. Read [Status and limitations](#status-and-limitations) before relying on anything else.
+> end-to-end in the test suite. SP3 adds scripted and frozen players, a configurable league (latest weights, PFSP
+> over stored snapshots, other agents, scripted/frozen anchors; shares, schedules, per-agent overrides, a custom
+> matchmaker), snapshot retention, per-agent warm start (`init`, critic warm-up, kickstart from a neural or scripted
+> teacher) and `colosseum record`. Read [Status and limitations](#status-and-limitations) before relying on anything else.
 
 ## Quick start
 
@@ -55,6 +58,28 @@ colosseum train -c configs/examples/tic_tac_toe_multi.yaml --set run.name=ttt-le
 
 `runs/` and `eval.json` are git-ignored.
 
+### Competition pipeline: bot → BC → league
+
+The game's scripted bot plays itself, its decisions become BC data, the BC weights start RL with a critic warm-up,
+the bot itself keeps teaching (DAgger kickstart) and plays as an anchor:
+
+```bash
+colosseum record -c configs/examples/unit_harvest_league.yaml --player greedy --num-matches 300 \
+  --output data/greedy --seed 0
+colosseum bc -c configs/examples/unit_harvest_league.yaml --agent main --data data/greedy --output bc.pt --epochs 5
+colosseum train -c configs/examples/unit_harvest_league.yaml --set run.name=harvest-league \
+  --set agents.main.init.from=bc.pt --set agents.main.init.critic_warmup_steps=30 \
+  --set agents.main.kickstart.teacher=greedy
+NEW=$(ls -d runs/harvest-league/checkpoints/main/ckpt_v* | sort -V | tail -1)
+colosseum eval -c configs/examples/unit_harvest_league.yaml -a trained=$NEW -a greedy -a random -a bc=bc.pt \
+  --num-matches 100 --deterministic
+```
+
+On an 8-core CPU recording takes about 17 s, BC about 17 s and training about 126 s (wall clock with process
+start-up; measured once, 2026-10-10). The trained agent beats `random` in 100% of games and scores 0.50 against
+`greedy` (win = 1, draw = 0.5; on this game a good policy mostly draws with the bot: all 100 games were draws). Recipes for leagues, anchors, asymmetric games and custom matchmakers:
+[`docs/LEAGUE_GUIDE.md`](docs/LEAGUE_GUIDE.md) (Russian). `data/` and `bc.pt` are yours to delete.
+
 ## Demo games
 
 | Game | Config | Structure | Contract features |
@@ -62,19 +87,23 @@ colosseum train -c configs/examples/tic_tac_toe_multi.yaml --set run.name=ttt-le
 | `coin_grid` | `coin_grid.yaml` | solo | Dict observation with a `uint8` grid, masks, step-limit truncation |
 | `tic_tac_toe` | `tic_tac_toe.yaml` (also `_attention`, `_multi`) | 1v1 turn-based | one acting seat, masks, rewards to the waiting seat |
 | `unit_harvest` | `unit_harvest.yaml` | one bot, many units, simultaneous | `Units`, units born and killed, entity lists with masks |
-| `team_tag` | `team_tag.yaml` | 2v2 | local window per bot, `global_state` for a centralized critic, tagged (frozen-in-game) teammates keep team rewards |
+| `unit_harvest` league | `unit_harvest_league.yaml` | the same game, SP3 pipeline | agent `main`, scripted anchors `greedy` (`examples/unit_harvest/bots.py`) and `random` |
+| `team_tag` | `team_tag.yaml` | 2v2 | local window per bot, `global_state` for a centralized critic, tagged (frozen-in-game) teammates keep team rewards; a `RandomBot` anchor (`anchors` 0.2) |
 | `tron` | `tron.yaml` | FFA 2p/3p/4p | elimination (`terminated`), ranks by elimination order, several layouts in one run |
 | `predator_prey` | `predator_prey.yaml` | 1 vs 2 | roles with different spaces, one agent per role |
 | `coop_buttons` | `coop_buttons.yaml` | cooperative | one team, `score` outcome, mixed teammates, cross-play table |
 | `space_miners` | `space_miners.yaml` | 1v1 (Box2D) | units with a continuous and a discrete component, entity list; reference only |
 | `composite_action` | `chase.yaml` | 1v1 | tree action `Dict(direction=Discrete, speed=Box)`; reference only |
 
-The slow learning tests train each of the first seven and check it against random players: coin_grid scores at least
-twice the random score; tic-tac-toe, unit_harvest and team_tag win at least 80% (team_tag: the better of two
-independent runs, because about 2 of 9 single runs settle into a passive draw-seeking policy); tron wins 80% of 2p
-games and takes first place in at least half of 4p games against three random cycles; each predator_prey role beats a
-random opponent at least 70%; both coop_buttons agents' homogeneous teams reach `max(5 × random, 0.6 × scripted)`
-of the measured baselines. Numbers per seed are in `docs/superpowers/reports/2026-10-09-sp2-acceptance.md`.
+The slow learning tests train each of the seven games from `coin_grid` to `coop_buttons` and check it against random
+players: coin_grid scores at least twice the random score; tic-tac-toe, unit_harvest and team_tag win at least 80%
+(team_tag in a single run since SP3: its `RandomBot` anchor keeps self-play from settling into the passive
+draw-seeking policy that about 2 of 9 SP2 runs found); tron wins 80% of 2p games and takes first place in at least
+half of 4p games against three random cycles; each predator_prey role beats a random opponent at least 70%; both
+coop_buttons agents' homogeneous teams reach `max(5 × random, 0.6 × scripted)` of the measured baselines. A further
+slow test runs the whole pipeline above on `unit_harvest_league.yaml` (win against `random` ≥ 0.95, score against
+`greedy` ≥ 0.40 and against the BC network ≥ 0.45). Numbers per seed are in
+`docs/superpowers/reports/2026-10-09-sp2-acceptance.md` and `docs/benchmarks.md`.
 
 ## Writing your own game
 
@@ -189,9 +218,9 @@ The run directory is `<run.dir>/<run.name>` (`run.dir` defaults to `runs`, relat
 
 | kind | content |
 |---|---|
-| `train` | APPO metrics of one agent every `metrics.log_interval` train steps: `total_loss`, `policy_loss`, `value_loss`, `entropy`, `approx_kl`, `clip_fraction` (per decider) and `clip_fraction_joint`, `rho_mean`, `rho_clip_frac`, `c_clip_frac`, `ess`, `log_rho_abs_mean/p95`, `log_rho_joint_abs_mean/p95`, `deciders_valid_mean/max`, `boot_frac`, `pad_frac`, `explained_variance`, `grad_norm`, `lr`, `policy_version`, `kickstart_loss` / `kickstart_lambda` (with a teacher) |
-| `episodes` | per agent since the previous record: `episodes`, `return_mean`, `length_mean`, `wdl` (W/D/L against `latest`, `past` and `arena` opponents), `seat_counts`, and `by_layout.<layout>.<role>` with episodes, returns, lengths, `team_score_mean`, `eliminated_frac` and W/D/L by opponent type |
-| `ratings` | `layouts`: per layout `outcome_kind`, `elo`, `win_rates`, `games`, `wr_vs_past`, `past_games`, `scores`, `cross_play`, `role_win_rates` |
+| `train` | APPO metrics of one agent every `metrics.log_interval` train steps: `total_loss`, `policy_loss`, `value_loss`, `entropy`, `approx_kl`, `clip_fraction` (per decider) and `clip_fraction_joint`, `rho_mean`, `rho_clip_frac`, `c_clip_frac`, `ess`, `log_rho_abs_mean/p95`, `log_rho_joint_abs_mean/p95`, `deciders_valid_mean/max`, `boot_frac`, `pad_frac`, `explained_variance`, `grad_norm`, `lr`, `policy_version`, `critic_warmup` (1 during the critic warm-up), `kickstart_loss` / `kickstart_lambda` (with a teacher), `kickstart_label_frac` (scripted teacher: share of ACT slots with a DAgger label) |
+| `episodes` | per agent since the previous record: `episodes`, `return_mean`, `length_mean`, `wdl` (W/D/L against `latest`, `past`, `arena` and `anchor` opponents), `seat_counts`, `by_layout.<layout>.<role>` with episodes, returns, lengths, `team_score_mean`, `eliminated_frac` and W/D/L by opponent type, and `opponents.<layout>` (the agent as data owner: `teams`, the played share of each opponent category `latest` / `snapshots` / `rivals` / `anchors` / `fallback`, and of each anchor) |
+| `ratings` | `layouts`: per layout `outcome_kind`, `elo`, `win_rates`, `games`, `wr_vs_past`, `past_games`, `scores`, `cross_play`, `role_win_rates` (scripted and frozen agents are entities of their own), and `pfsp` (the owner's latest against each player: EMA score and games) |
 | `system` | `env_steps`, `env_steps_per_sec`, `train_steps_per_sec` per agent, learner `queue_depths`, `parked_buffers`, `dropped_reward_episodes` (seat-episodes whose rewards were dropped because the seat never acted, summed over the latest counts of the workers that reported in the last few seconds, so it can drop when a worker stalls and read 0 at shutdown; the reliable signal is the WARNING logged on a worker's first drop, see ENV_GUIDE), `workers_reporting` |
 
 `meta.json` of a checkpoint holds `agent_id`, `checkpoint_id`, `policy_version`, `env_steps`, `final`, `config_hash`,
@@ -247,70 +276,78 @@ Inside a list, YAML 1.1 rules apply: `--set x=[1e-4,2]` keeps `1e-4` as a string
 | `algorithm` | `name` (`appo`), `algorithm_class` (`colosseum.algorithms.appo.APPO`), `gamma` 0.99, `vtrace_lambda` 1.0, `vtrace_rho_bar` 1.0, `vtrace_c_bar` 1.0, `eps_clip` 0.2, `value_loss_coeff` 0.5, `entropy_coeff` 0.01, `max_grad_norm` 0.5, `num_epochs` 1, `minibatch_chunks` 0 (all chunks), `learning_rate` 3e-4, `lr_schedule` (`linear`; also `constant`, `cosine`), `normalize_advantages` (true), `use_amp` (false), `amp_dtype` (`float16` / `bfloat16`), `use_torch_compile` (false), `ratio_mode` (`auto` = `per_unit` with `Units`, else `joint`), `unit_trace` (`auto` = `joint` with or without `Units`, the units-experiment ruling in `docs/benchmarks.md`; also `geo_mean`, `none`), `entropy_reduction` (`auto` = `sum` for `joint`, `mean_valid` for `per_unit`); with one decider every mode is `joint` (an explicit `unit_trace: none` is kept) |
 | `rollout` | `chunk_length` 256 (>= 2), `num_workers` 4, `envs_per_worker` 8, `torch_threads` 1, `weight_sync_interval_sec` 5, `vec_env` (`sync` / `subprocess`), `subproc_workers` (null), `match_refresh_interval_sec` 30 |
 | `learner` | `device` (`auto`), `batch_chunks` 16 (every update uses exactly this many chunks), `queue_size` 64, `weight_push_interval` 5, `torch_threads` (null = auto), `pin_memory` (false) |
-| `training` | `total_timesteps` 10,000,000 (global env steps), `seed`, `resume_from`, `kickstart_teacher`, `kickstart_lambda` 1.0, `kickstart_decay_steps` 50000, `kickstart_kl` (`forward` / `reverse`) |
-| `matchmaking` | `mode` (`self_play` / `league`), `layouts` (`{layout: weight}`; empty = every layout equally), `self_play_ratio` 0.5, `pfsp_exponent` 1.0, `latest_prob` 0.5, `teammates` (`self` / `mixed`), `teammate_self_prob` 0.5, `shuffle_seats` (true) |
-| `checkpoint` | `interval` 1000 (train steps), `pool_size` 20 (FIFO per agent), `save_optimizer` (true) |
+| `training` | `total_timesteps` 10,000,000 (global env steps), `seed`, `resume_from` (SP2's `kickstart_*` keys are translated into `kickstart` with one warning) |
+| `matchmaking` | `opponents` (`latest` 0.7, `snapshots` 0.2, `rivals` 0, `anchors` 0.1; each a number or a schedule `{env_step: share}`), `anchors` (null = every scripted and frozen agent; a list of names or `{name: weight-or-schedule}`), `pfsp` (`weighting` `hard` / `balanced` / `uniform`, `exponent` 2.0, `halflife_games` 200), `layouts` (`{layout: weight}`; empty = every layout equally), `teammates` (`self` / `mixed`), `teammate_self_prob` 0.5, `shuffle_seats` (true), `matchmaker_class` (null; a `colosseum.league.BaseMatchmaker` subclass). SP2's `mode`, `self_play_ratio`, `latest_prob`, `pfsp_exponent` are translated with one warning |
+| `checkpoint` | `interval` 1000 (train steps), `keep_last` 20, `keep_every` 10 (every N-th snapshot kept for good; 0 = off), `save_optimizer` (true); the final snapshot is never deleted; SP2's `pool_size` = `keep_last` |
+| `init` | `from` (null; `.pt`, checkpoint dir, run dir or a frozen agent's name), `strict` (true; false loads tensors with matching names and shapes), `critic_warmup_steps` 0 (train steps that update only the value path) |
+| `kickstart` | `teacher` (null; a frozen or scripted agent's name, a `.pt` or a checkpoint dir), `lambda` 1.0, `decay_steps` 50000 (train steps after the warm-up), `kl` (`forward` / `reverse`, neural teachers) |
 | `metrics` | `log_interval` 10 (train steps), `console_interval_sec` 10, `use_wandb` (false), `wandb_project` (`colosseum`), `wandb_entity` |
 | `bc` | `seq_len` 64 (sequence length for stateful models in `colosseum bc`) |
 | `transport` | `grpc_max_message_mb` 64 (distributed mode); `mode` and `grpc_port` are unused until SP5 |
-| `agents` | `{agent_id: {roles: [...], networks: {...}, algorithm: {...}, learner: {...}}}`: roles and partial overrides, deep-merged onto the global sections |
+| `agents` | `{agent_id: {kind: trainable (default) / scripted / frozen, ...}}`: trainable — `roles`, partial overrides `networks`, `algorithm`, `learner`, `matchmaking`, `init`, `kickstart` (deep-merged onto the global sections); scripted — `class`, `kwargs`, `roles`; frozen — `path` (plus `networks` and `roles` for a `.pt`) |
 
-**Agents and roles.** Without an `agents` section there is one agent, `agent_0`, playing every role (then all roles
-must have the same spaces). With it, every key is a trainable agent with its own learner. `roles` lists the roles an
-agent plays (omitted = every role); the roles of one agent must have the same observation, action and `global_state`
-spaces. An agent id may contain letters, digits, `_` and `-` (not starting with `-`), no `.`, and cannot be
-`ratings`, `system`, `episodes` or `train`.
+**Agents, players and roles.** Every key of `agents` is an agent: `trainable` (the default kind) has its own learner;
+`scripted` is a `colosseum.players.ScriptedBot` subclass (`colosseum.players.RandomBot` is built in); `frozen` plays
+fixed weights from a checkpoint dir or a `.pt`. Without any trainable agent the config gets an implicit `agent_0` with
+the global settings. `roles` lists the roles an agent plays (omitted = every role; a trainable or frozen agent's roles
+must share their spaces). Only seats with a trainable agent's latest weights collect data. An agent id may contain
+letters, digits, `_` and `-` (not starting with `-`), no `.`, and cannot be `ratings`, `system`, `episodes` or `train`.
 
-**Matchmaking.** Every env has an owner: the trainable agents take turns by env index. For each match the matchmaker
-picks a layout (`matchmaking.layouts`, only layouts with a seat for the owner's roles), a match type once per match
-(self-play with probability `self_play_ratio`, else arena; `mode: self_play` means always self-play), and the owner's
-team. The owner's team gets the owner's latest weights as its core. Every other team gets a core: in self-play, if
-the owner plays a role of that team, the owner's latest weights (probability `latest_prob`) or one of its
-checkpoints; otherwise (arena, or roles the owner does not play) another trainable agent that plays a role of the
-team, picked by PFSP, `(1 - win_rate)^pfsp_exponent`, on that layout. The core takes one seat; `teammates: self`
-gives it the team's other seats it can play; `mixed` gives each such seat to the core with probability
-`teammate_self_prob`, else to another trainable agent's latest weights or a checkpoint of the core. A seat of a role
-the core does not play goes to the latest weights of an agent that plays it. All seats with latest weights collect
-data; checkpoint seats do not. `shuffle_seats` permutes teams with the same role composition and same-role seats
-within a team.
+**Matchmaking.** Every env has an owner: the trainable agents take turns by env index. For each match the built-in
+matchmaker picks a layout (`layouts`, only layouts with a seat for the owner's roles), the owner's team (its latest
+weights on one seat of its role), and for every other team independently a core category by the `opponents` shares:
+the owner's latest weights (or, in an asymmetric game, the latest weights of an agent that plays that team), a stored
+snapshot of an agent that plays the team (PFSP), another trainable agent's latest weights (`rivals`, PFSP) or an anchor
+(by weight). Shares of categories that are empty right now go to the others. The team's other seats follow
+`teammates`. `docs/LEAGUE_GUIDE.md` has the full rules and recipes; `colosseum validate` prints each agent's effective
+mix.
 
 **Ratings** are kept per layout. Two or more teams: ELO over team pairs (each pair is one comparison by rank; its
 weight `K / (T - 1)` is split among the counted member pairs of different agents), a fractional win-rate matrix and
 `wr_vs_past` (the latest weights against the agent's own checkpoints, last 500 pairs). One team: mean score with EMA
 and a 95% interval per agent, and (two or more seats) a cross-play table "team composition → mean score" (mixed
-compositions appear with `teammates: mixed`).
+compositions appear with `teammates: mixed`). Scripted and frozen agents are entities of their own in the ELO and
+win-rate tables; snapshots count for their agent. `ratings.json` also holds the PFSP table per layout, and
+`metrics.jsonl` the shares of played episodes per opponent category and anchor.
 
 **Resume.** `training.resume_from` accepts a checkpoint dir, a previous run dir (each agent takes its latest
 checkpoint there) or a `.pt` state dict (weights only, e.g. from `colosseum bc`). An explicit resume is strict: a
 missing or malformed `meta.json`, or a role signature that does not match the agent's roles, is a config error naming
-the path.
+the path. A resume from a run dir also carries the stored snapshots over into the new run (hard links, else
+copies), so the opponent pool survives the resume; `training.resume_from` takes precedence over `init`.
 
-## Behavioural cloning and kickstarting
+## Recording, behavioural cloning and warm start
 
 ```bash
-colosseum bc -c my_game/config.yaml --agent agent_0 --data path/to/demos/ --output bc.pt --epochs 20
-colosseum train -c my_game/config.yaml --set training.resume_from=bc.pt
+colosseum record -c cfg.yaml --player <scripted|frozen agent | name=path> [--against <player> ...] [--layout L ...] \
+  --num-matches N --output data/x [--num-envs E] [--seed S] [--deterministic]
+colosseum bc -c cfg.yaml --agent main --data data/x [--data more.pt ...] --output bc.pt --epochs 20
 ```
 
-Other `bc` options: `--batch-size` (256), `--lr` (1e-3), `--seq-len` (default `bc.seq_len`). BC data: `.pt` files
-with the trees `observations`, `actions` and optional `action_masks` and `dones`. The network and roles come from the
-`--agent` (default: the only agent). The loss is `-log_prob` of the recorded action (the mean over valid deciders for
-actions with units); masks are applied, and an expert action the mask forbids is a data error; stateful models train
-on sequences of `--seq-len` steps that reset at `dones`.
+`record` plays the player on the eval engine and writes its decisions per role (`<output>/<role>/part-NNNNN.pt`,
+every seat-episode contiguous) plus `record.json`. Without `--against` the player takes every seat; with it, each
+opponent forms a pair with the player as in `eval`, and only the player's seats are recorded. `bc` reads `.pt` files,
+directories of them and `record` output directories (the folders of the agent's roles), `--data` repeatable; other
+options: `--batch-size` (256), `--lr` (1e-3), `--seq-len` (default `bc.seq_len`). The loss is `-log_prob` of the
+recorded action (the mean over valid deciders for actions with units); masks are applied, and an expert action the
+mask forbids is a data error.
 
-Kickstarting adds `lambda * KL(teacher‖student)` per decider to the RL loss, decaying linearly over
-`kickstart_decay_steps`: `--set training.kickstart_teacher=bc.pt`. There is one global teacher: its spaces must match
-every agent's roles.
+Warm start is per agent (`init`, `kickstart`; global sections are the defaults): `init.from` loads weights only
+(strict, or partial with `strict: false`), `critic_warmup_steps` first trains the value path alone while the workers
+keep the initial policy bit for bit, and `kickstart` adds `lambda * KL(teacher‖student)` per decider (a neural teacher
+of any architecture) or `lambda * -log pi(teacher's action)` (a scripted teacher, DAgger labels written by the
+workers), decaying linearly over `decay_steps` after the warm-up. `training.resume_from` takes precedence over `init`.
 
 ## Evaluation
 
 ```bash
-colosseum eval -c cfg.yaml -a A=<ckpt-dir|.pt> [-a B=...] [--layout L ...] --num-matches N [--num-envs E] [--output r.json] [--deterministic] [--seed S]
+colosseum eval -c cfg.yaml -a A=<ckpt-dir|.pt> [-a <scripted or frozen agent>] ... [--layout L ...] --num-matches N [--num-envs E] [--output r.json] [--deterministic] [--seed S]
 ```
 
 Matches run on the same engine as training (`MatchRunner`): per-seat model state, acting seats and masks. An agent's
 architecture and roles come from its checkpoint's `meta.json`; a `.pt` is built from the config agent of the same
 name, or from the global `networks` with every role. By default every layout the agents can fill is played.
+A bare name (`-a greedy`) plays a scripted or frozen agent of the config; a trainable agent needs `name=path`.
 - Two or more teams, two or more agents: for every pair (a, b) match m gives team i to `(a, b)[(i + m) % 2]` where
   the roles allow; teams are filled homogeneously; when only one orientation of the pair can fill the layout
   (hunter and prey, or an agent that plays only some roles), every match uses it; `--num-matches` is per pair and
@@ -324,7 +361,8 @@ mean score with a 95% interval per team composition (the cross-play table); with
 Mean returns are also broken down by role. `--output` writes JSON.
 
 The in-process API `colosseum.eval.play_lineups(env_fn=..., models=..., lineups=...)` plays any `PolicyModel`
-instances in explicit lineups (the learning tests use it with a random legal-move player).
+instances and scripted players (`colosseum.worker.match_runner.ScriptedPlayer`) in explicit lineups (the learning
+tests use it with `RandomBot`).
 
 ## Distributed mode (limited)
 
@@ -340,6 +378,9 @@ coordinator, league, ratings, `metrics.jsonl` or WandB; every `run-workers` host
 `total_timesteps / num_workers` per worker, and the learner's progress is `consumed_samples / total_timesteps`
 (decisions, not env steps); with `training.seed` set, worker machines start with identical per-env seeds;
 `run-learner` cannot resume; no fault tolerance or authentication; `deployment/` (Docker, Kubernetes) is untested.
+SP3 features are local only: scripted and frozen agents, `init`, critic warm-up, a custom matchmaker, per-agent
+`matchmaking` or `kickstart` are refused with a config error pointing to SP5, and any opponent mix is reduced to latest
+weights with one warning.
 
 ## Status and limitations
 
@@ -347,16 +388,17 @@ coordinator, league, ratings, `metrics.jsonl` or WandB; every `run-workers` host
 |---|---|---|
 | ✔ | SP1 Foundation and stabilization | correct single-machine training, stateful model protocol, run dir, metrics, lifecycle |
 | ✔ | SP2 Game model | `GameSpec` / `MultiAgentEnv`, elimination, teams, roles, layouts, `Units`, Dict observations, bootstrap on the learner, centralized critic (accepted and merged 2026-10-09) |
-| | SP3 Players, league, warm start | scripted, frozen and external players; PFSP over snapshots; per-agent `init`/kickstart/critic warm-up; top-k snapshot storage |
-| | SP4 Selection and observability | match log, OpenSkill / Bradley–Terry ratings, `colosseum tournament`, dashboard, snapshot ratings |
-| | SP5 Distributed | hub and nodes, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images |
+| ✔ | SP3 Players, league, warm start | scripted and frozen players, opponent mixes with PFSP over snapshots and anchors, snapshot retention, per-agent init / critic warm-up / kickstart (neural or DAgger), `colosseum record` (implemented on `sp3-league`; acceptance report in docs/superpowers/reports) |
+| | SP4 Selection and observability | match log, OpenSkill / Bradley–Terry ratings, `colosseum tournament`, dashboard, snapshot ratings, top-k snapshot storage |
+| | SP5 Distributed | hub and nodes, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images, distributed league, scripted/frozen players and SP3 warm start across machines |
 | | SP6 Speed and extensions | cuDNN RNN path, fast transformer unroll, GPU inference on workers, inference server, new algorithms |
 
 The table is a summary; the full scope of each sub-project and the parked items are in [`CLAUDE.md`](CLAUDE.md) («Roadmap»), which is authoritative.
 
 Known limitations today:
-- **Players:** only trainable agents; no scripted, frozen or external players in training (SP3). PFSP picks among
-  agents' latest weights, not snapshots. Online ELO is a progress indicator, not a selection-grade rating.
+- **Players:** external players are frozen agents (`.pt` or checkpoint dir); no top-k snapshot storage or snapshot
+  ratings yet (SP4); online ELO is a progress indicator, not a selection-grade rating; scripted bots run one Python
+  call per seat (no batched bot API).
 - **Game model:** one agent cannot play roles with different spaces; no per-unit rewards or values; no built-in
   autoregression between action components; no PettingZoo adapter.
 - **Speed:** the worker handles observation trees in Python per seat (hundreds of seats per env, as in Neural MMO,
@@ -369,9 +411,10 @@ Known limitations today:
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 1248 tests
-.venv/bin/python -m pytest -m slow -v                       # learning tests of every demo game (11–16 min) + torch.compile
-.venv/bin/python -m pytest -m gpu -v                        # CUDA machine only, see docs/GPU_CHECKS.md
+.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 1662 tests
+.venv/bin/python -m pytest -m slow -v                       # 10 tests, about 15 min: the 7 demo-game learning tests,
+                                                            # the unit_harvest pipeline test, 2 torch.compile checks
+.venv/bin/python -m pytest -m gpu -v                        # 22 tests, CUDA machine only, see docs/GPU_CHECKS.md
 ```
 
 Layout:
@@ -387,21 +430,25 @@ Tests write only under pytest's `tmp_path`. Throughput and the units experiment 
 
 ```
 src/colosseum/
-  cli.py launcher.py distributed.py eval.py
+  cli.py launcher.py distributed.py eval.py record.py
   core/         config, types (chunk v2, lineups, results), tree, specs (ObsSpec, ActionSpec, masks), roles,
                 registry, validation, outcomes, errors, ipc, run_dir, threads
   envs/         game (GameSpec, MultiAgentEnv, StepResult), spaces (Units), contract (EpisodeTracker), vector
   networks/     model (PolicyModel, act), composed, base, heads (UnitsHead), dist/, cores, state, normalization
   algorithms/   appo, vtrace, base
   worker/       match_runner (MatchRunner), rollout_loop (RolloutLoop), buffers, rollout_worker
-  learner/      learner process
-  coordinator/  coordinator, matchmaker (lineups), ratings (per layout), checkpoint_manager, agent_pool
+  learner/      learner process, factory (algorithm, init, kickstart teacher per agent)
+  coordinator/  coordinator, ratings (per layout), checkpoint_manager (keep_last / keep_every, run-dir import)
+  players/      scripted bots (ScriptedBot, RandomBot), fixed-player registry (scripted / frozen agents)
+  league/       matchmaker interface (BaseMatchmaker, MatchmakerContext), mixture matchmaker, PFSP, schedules,
+                lineup checks
   metrics/      jsonl, aggregator, console, hub, wandb_logger
   transport/ weight_store/ bc/ utils/
 examples/       coin_grid, tic_tac_toe, unit_harvest, team_tag, tron, predator_prey, coop_buttons,
                 space_miners (Box2D), composite_action (chase)
 configs/examples/
-scripts/        setup-dev.sh, bench_throughput.py, units_experiment.py, measure_global_state.py
-docs/           ENV_GUIDE.md, benchmarks.md, GPU_CHECKS.md
+scripts/        setup-dev.sh, bench_throughput.py, units_experiment.py, measure_global_state.py,
+                team_tag_anchors.py, pipeline_vs_scratch.py
+docs/           ENV_GUIDE.md, LEAGUE_GUIDE.md, benchmarks.md, GPU_CHECKS.md
 deployment/     Dockerfiles, docker-compose, k8s (untested)
 ```

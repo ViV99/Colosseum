@@ -1,4 +1,4 @@
-# Two trainable agents in a league: every match is an arena match (self_play_ratio 0.0).
+# Two trainable agents in a league: every opposing team is the other agent's latest weights (opponents.rivals 1.0).
 run:
   name: null
   dir: "runs"
@@ -38,10 +38,9 @@ training:
   total_timesteps: 300000
 
 matchmaking:
-  mode: league
-  self_play_ratio: 0.0
-  latest_prob: 0.8
-  pfsp_exponent: 1.0
+  # SP2 form: mode league, self_play_ratio 0.0, latest_prob 0.8, pfsp_exponent 1.0 (translated exactly; see docs/LEAGUE_GUIDE.md)
+  opponents: {latest: 0.0, snapshots: 0.0, rivals: 1.0, anchors: 0.0}
+  pfsp: {weighting: hard, exponent: 1.0}
   shuffle_seats: true
 
 checkpoint:
