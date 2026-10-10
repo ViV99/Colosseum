@@ -774,7 +774,7 @@ class TickGame(MultiAgentEnv):
 
 
 class DictModelPool:
-    """ModelPool over a plain ``{(agent_id, network_id): model}`` dict."""
+    """PlayerPool over a plain ``{(agent_id, network_id): model}`` dict."""
 
     def __init__(self, models: Mapping[tuple[str, str], Any]) -> None:
         self.models = dict(models)

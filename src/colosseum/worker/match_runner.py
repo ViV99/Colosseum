@@ -77,7 +77,7 @@ from colosseum.worker.buffers import put_row
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ActRecord", "EpisodeEnd", "MatchObserver", "MatchRunner", "ModelPool", "PlayerPool", "ScriptedPlayer"]
+__all__ = ["ActRecord", "EpisodeEnd", "MatchObserver", "MatchRunner", "PlayerPool", "ScriptedPlayer"]
 
 
 @dataclass(frozen=True)
@@ -89,9 +89,6 @@ class ScriptedPlayer:
 
 class PlayerPool(Protocol):
     def get(self, agent_id: str, network_id: str) -> PolicyModel | ScriptedPlayer | None: ...
-
-
-ModelPool = PlayerPool  # SP2 name
 
 
 @dataclass

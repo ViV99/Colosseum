@@ -798,10 +798,6 @@ class TrainableAgent(_AgentEntry):
         return value
 
 
-# SP2 name of the per-agent override model.
-AgentOverride = TrainableAgent
-
-
 class ScriptedAgent(_AgentEntry):
     """A rule-based bot (``kind: scripted``): a ``colosseum.players.ScriptedBot`` subclass built with ``kwargs``."""
 

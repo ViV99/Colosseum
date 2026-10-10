@@ -5,7 +5,6 @@ import pytest
 import yaml
 
 from colosseum.core.config import (
-    AgentOverride,
     ColosseumConfig,
     FrozenAgent,
     ScriptedAgent,
@@ -47,7 +46,7 @@ def test_entries_default_to_trainable_and_keep_their_kind():
     assert cfg.get_trainable_agent_ids() == ["main", "beta"]
     assert cfg.fixed_agent_ids() == ["greedy", "prev", "bc_net"]
     assert [cfg.agent_kind(a) for a in cfg.agent_ids()] == ["trainable", "trainable", "scripted", "frozen", "frozen"]
-    assert cfg.agent_entry("main") == TrainableAgent() and AgentOverride is TrainableAgent
+    assert cfg.agent_entry("main") == TrainableAgent()
     greedy = cfg.agent_entry("greedy")
     assert isinstance(greedy, ScriptedAgent)
     assert greedy.class_path == "my_game.bots.Greedy" and greedy.kwargs == {"aggr": 0.7} and greedy.roles is None
