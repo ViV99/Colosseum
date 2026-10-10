@@ -660,7 +660,7 @@ def load_player(config: ColosseumConfig, name: str, path: str | None, *, spec: G
         if entry.kind == "scripted":
             bot = BotSpec(entry.class_path, dict(entry.kwargs))
             make_bot(bot, spec)                    # a bad class or kwargs fail here, as a ConfigError
-            roles = list(resolve_player_roles(config, spec)[name])
+            roles = list(resolve_player_roles(config, spec, [name])[name])   # other fixed agents are not read
             return ScriptedPlayer(functools.partial(make_bot, bot, spec)), roles
         path = entry.path
         p = Path(path)

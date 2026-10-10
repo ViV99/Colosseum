@@ -43,7 +43,8 @@ from colosseum.worker.match_runner import ActRecord, EpisodeEnd
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DECISIONS_PER_FILE", "RECORD_FILE", "RECORD_FORMAT", "RecordObserver", "RoleWriter", "record"]
+__all__ = ["DECISIONS_PER_FILE", "RECORD_FILE", "RECORD_FORMAT", "RecordObserver", "RoleWriter", "parse_player",
+           "record"]
 
 RECORD_FILE = "record.json"
 RECORD_FORMAT = 1
@@ -144,7 +145,7 @@ class RecordObserver:
             del self._buffers[key]
 
 
-def _parse_player(text: str) -> tuple[str, str | None]:
+def parse_player(text: str) -> tuple[str, str | None]:
     """``name`` (a scripted or frozen agent of the config) or ``name=path``."""
     name, sep, path = text.partition("=")
     if not name or (sep and not path):
@@ -204,8 +205,8 @@ def record(config: ColosseumConfig, player: str, against: Sequence[str], *, layo
     out = Path(output)
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise ConfigError(f"--output {out}: exists and is not empty; choose a new directory")
-    p_name, p_path = _parse_player(player)
-    opponents = [_parse_player(text) for text in against]
+    p_name, p_path = parse_player(player)
+    opponents = [parse_player(text) for text in against]
     names = [p_name] + [name for name, _ in opponents]
     reused = sorted({name for name in names if names.count(name) > 1})
     if reused:

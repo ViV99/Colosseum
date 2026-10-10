@@ -7,9 +7,9 @@ can monkeypatch it there).
 from __future__ import annotations
 
 import json
-from collections.abc import Sequence
+from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 import numpy as np
 import torch
@@ -33,6 +33,7 @@ from colosseum.networks.dist import Distribution
 
 VALIDATE_STEPS = 8  # random legal steps per enabled layout
 VALIDATE_LINEUPS = 16  # lineups drawn per trainable agent from a custom matchmaker
+VALIDATION_SCOPES = ("train", "play")
 
 # Synthetic chunk of the model check, time-major [S=4, B=2], spelled like the chunk v2 tests
 # (A open ACT, T terminal ACT, R truncation BOOT, B chunk-end BOOT, P PAD):
@@ -523,8 +524,36 @@ def _check_critic_warmup(where: str, agent_config: ColosseumConfig, model: Any) 
                           f"accepts it) or set critic_warmup_steps: 0")
 
 
-def validate_config(config: ColosseumConfig) -> ValidationReport:
+def _check_warm_start(config: ColosseumConfig, spec: GameSpec, agent_configs: dict[str, ColosseumConfig],
+                      role_specs: dict[str, RoleSpec], samples: dict[str, tuple | None],
+                      report: ValidationReport) -> None:
+    """Kickstart teachers and ``init`` sources of the trainable agents (the "train" scope only)."""
+    from colosseum.learner.factory import resolve_init, resume_source_of
+
+    _check_kickstart_teachers(config, spec, agent_configs, role_specs, samples)
+    for aid, acfg in agent_configs.items():
+        resumed = resume_source_of(config, aid)
+        if resumed is not None:   # spec block 6: an agent restored by resume_from ignores init
+            if acfg.init.from_ is not None:
+                report.lines.append(f"agent {aid!r}: resumes from {resumed}; init.from ignored")
+            continue
+        init = resolve_init(config, aid, spec)
+        if init is not None:
+            report.lines.extend(init.report)
+    if config.training.resume_from:
+        report.lines.append("training.resume_from is set: agents restored from it ignore init")
+
+
+def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] = "train",
+                    players: Collection[str] | None = None) -> ValidationReport:
     """Check a whole config before any process starts (spec block 9; SP3 spec block 1).
+
+    ``scope="train"`` (``train``, ``validate``, the distributed roles) runs every check below. ``scope="play"``
+    (``record``, ``bc``, ``eval``: commands that play or clone but never train) checks only what they use, so
+    one config can name the BC output before it exists (spec blocks 1 and 6): it skips the matchmaking checks
+    (they need every anchor's roles, i.e. every frozen agent's file), the warm start of trainable agents
+    (``init``, kickstart teachers, critic warm-up) and every scripted / frozen agent not named in ``players``
+    (the fixed agents the command seats; ``None`` = none). ``players`` is only for the "play" scope.
 
     - the env's ``GameSpec`` (``env_spec``; unsupported role spaces are a ConfigError), the
       agents' roles (``resolve_agent_roles``), the matchmaking checks per agent
@@ -551,20 +580,26 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
     """
     from colosseum.core.roles import agent_role_spec, resolve_agent_roles
     from colosseum.league.mixture import describe_mix, validate_matchmaking
-    from colosseum.learner.factory import resolve_init, resume_source_of
     from colosseum.players.registry import load_fixed_players, resolve_player_roles
 
+    if scope not in VALIDATION_SCOPES:
+        raise ValueError(f"validate_config: scope must be one of {VALIDATION_SCOPES}, got {scope!r}")
+    if scope == "train" and players is not None:
+        raise ValueError("validate_config: players selects fixed agents of the 'play' scope only")
+    train = scope == "train"
+    selected = None if train else list(players or ())
     report = ValidationReport()
     spec = _game_spec(config)
     agent_roles = resolve_agent_roles(config, spec)
-    player_roles = resolve_player_roles(config, spec)
-    validate_matchmaking(spec, player_roles, config)
-    _check_matchmaker_class(config, spec, player_roles)
-    if config.matchmaking.matchmaker_class is not None:
-        report.lines.append(f"matchmaker: {config.matchmaking.matchmaker_class} (custom; the mix below is the "
-                            f"configured matchmaking section, which it may ignore)")
-    report.lines.extend(describe_mix(config, spec))
-    fixed = load_fixed_players(config, spec)   # roles, classes, paths and role signatures of fixed agents
+    if train:
+        player_roles = resolve_player_roles(config, spec)
+        validate_matchmaking(spec, player_roles, config)
+        _check_matchmaker_class(config, spec, player_roles)
+        if config.matchmaking.matchmaker_class is not None:
+            report.lines.append(f"matchmaker: {config.matchmaking.matchmaker_class} (custom; the mix below is the "
+                                f"configured matchmaking section, which it may ignore)")
+        report.lines.extend(describe_mix(config, spec))
+    fixed = load_fixed_players(config, spec, selected)   # roles, classes, paths and role signatures of fixed agents
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_roles}
     role_specs = {aid: agent_role_spec(spec, roles) for aid, roles in agent_roles.items()}
     for aid, acfg in agent_configs.items():
@@ -587,19 +622,10 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
         sample = next((samples[r] for r in agent_roles[aid] if r in samples), None)
         agent_samples[aid] = sample
         _check_model(model, role_specs[aid], sample, where)
-        _check_critic_warmup(where, acfg, model)
-    _check_kickstart_teachers(config, spec, agent_configs, role_specs, agent_samples)
-    for aid, acfg in agent_configs.items():
-        resumed = resume_source_of(config, aid)
-        if resumed is not None:   # spec block 6: an agent restored by resume_from ignores init
-            if acfg.init.from_ is not None:
-                report.lines.append(f"agent {aid!r}: resumes from {resumed}; init.from ignored")
-            continue
-        init = resolve_init(config, aid, spec)
-        if init is not None:
-            report.lines.extend(init.report)
-    if config.training.resume_from:
-        report.lines.append("training.resume_from is set: agents restored from it ignore init")
+        if train:
+            _check_critic_warmup(where, acfg, model)
+    if train:
+        _check_warm_start(config, spec, agent_configs, role_specs, agent_samples, report)
     _check_frozen_players(config, spec, fixed, samples, report)
     _check_scripted_players(config, spec, fixed, layouts, report)
     return report

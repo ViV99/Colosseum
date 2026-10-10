@@ -61,21 +61,34 @@ colosseum train -c configs/examples/tic_tac_toe_multi.yaml --set run.name=ttt-le
 ### Competition pipeline: bot → BC → league
 
 The game's scripted bot plays itself, its decisions become BC data, the BC weights start RL with a critic warm-up,
-the bot itself keeps teaching (DAgger kickstart) and plays as an anchor:
+the bot itself keeps teaching (DAgger kickstart) and plays as an anchor. One config serves every step: copy
+`configs/examples/unit_harvest_league.yaml` to `harvest.yaml` and name the BC output in it before it exists:
 
-```bash
-colosseum record -c configs/examples/unit_harvest_league.yaml --player greedy --num-matches 300 \
-  --output data/greedy --seed 0
-colosseum bc -c configs/examples/unit_harvest_league.yaml --agent main --data data/greedy --output bc.pt --epochs 5
-colosseum train -c configs/examples/unit_harvest_league.yaml --set run.name=harvest-league \
-  --set agents.main.init.from=bc.pt --set agents.main.init.critic_warmup_steps=30 \
-  --set agents.main.kickstart.teacher=greedy
-NEW=$(ls -d runs/harvest-league/checkpoints/main/ckpt_v* | sort -V | tail -1)
-colosseum eval -c configs/examples/unit_harvest_league.yaml -a trained=$NEW -a greedy -a random -a bc=bc.pt \
-  --num-matches 100 --deterministic
+```yaml
+agents:
+  main:
+    init: {from: bc_net, critic_warmup_steps: 30}   # start RL from the BC weights
+    kickstart: {teacher: greedy}                     # the bot keeps teaching (DAgger labels)
+  bc_net: {kind: frozen, path: bc.pt}                # written by step 2
+  # greedy and random as in the example
 ```
 
-On an 8-core CPU recording takes about 17 s, BC about 17 s and training about 126 s (wall clock with process start-up;
+```bash
+colosseum record -c harvest.yaml --player greedy --num-matches 300 --output data/greedy --seed 0
+colosseum bc -c harvest.yaml --agent main --data data/greedy --output bc.pt --epochs 5 --seed 0
+colosseum train -c harvest.yaml --set run.name=harvest-league
+NEW=$(ls -d runs/harvest-league/checkpoints/main/ckpt_v* | sort -V | tail -1)
+colosseum eval -c harvest.yaml -a trained=$NEW -a greedy -a random -a bc_net --num-matches 100 --deterministic
+```
+
+`record`, `bc` and `eval` check only what they use (the env, the trainable agents' models, the scripted / frozen
+agents they seat), so `bc_net` and `init.from` may point at a `bc.pt` that does not exist yet; `validate` and `train`
+check everything. The example config itself can be used unchanged as well, with the warm start given on the
+command line: `colosseum train -c configs/examples/unit_harvest_league.yaml --set agents.main.init.from=bc.pt
+--set agents.main.init.critic_warmup_steps=30 --set agents.main.kickstart.teacher=greedy` (`record`, `bc` and
+`eval` take `--set` too).
+
+On an 8-core CPU recording takes about 17 s, BC about 9 s and training about 126 s (wall clock with process start-up;
 measured once, 2026-10-10). The trained agent beats `random` in 100% of games and scores 0.50 against `greedy` (win 1,
 draw 0.5; on this game a good policy mostly draws with the bot: all 100 games were draws). Recipes for leagues,
 anchors, asymmetric games and custom matchmakers: [`docs/LEAGUE_GUIDE.md`](docs/LEAGUE_GUIDE.md) (Russian). `data/`
@@ -321,15 +334,18 @@ copies), so the opponent pool survives the resume; `training.resume_from` takes 
 
 ```bash
 colosseum record -c cfg.yaml --player <scripted|frozen agent | name=path> [--against <player> ...] [--layout L ...] \
-  --num-matches N --output data/x [--num-envs E] [--seed S] [--deterministic]
-colosseum bc -c cfg.yaml --agent main --data data/x [--data more.pt ...] --output bc.pt --epochs 20
+  --num-matches N --output data/x [--num-envs E] [--seed S] [--deterministic] [--set k=v ...]
+colosseum bc -c cfg.yaml --agent main --data data/x [--data more.pt ...] --output bc.pt --epochs 20 [--seed S] \
+  [--set k=v ...]
 ```
 
 `record` plays the player on the eval engine and writes its decisions per role (`<output>/<role>/part-NNNNN.pt`,
 every seat-episode contiguous) plus `record.json`. Without `--against` the player takes every seat; with it, each
 opponent forms a pair with the player as in `eval`, and only the player's seats are recorded. `bc` reads `.pt` files,
 directories of them and `record` output directories (the folders of the agent's roles), `--data` repeatable; other
-options: `--batch-size` (256), `--lr` (1e-3), `--seq-len` (default `bc.seq_len`). The loss is `-log_prob` of the
+options: `--batch-size` (256), `--lr` (1e-3), `--seq-len` (default `bc.seq_len`), `--seed` (initial weights and
+minibatch order). Both commands, like `eval`, check only what they use, so the config may already name the BC output
+(`init.from`, a frozen agent with `path: bc.pt`) before it exists. The loss is `-log_prob` of the
 recorded action (the mean over valid deciders for actions with units); masks are applied, and an expert action the
 mask forbids is a data error.
 
@@ -345,7 +361,7 @@ scripted teacher, DAgger labels written by the workers), decaying linearly over 
 ## Evaluation
 
 ```bash
-colosseum eval -c cfg.yaml -a A=<ckpt-dir|.pt> [-a <scripted or frozen agent>] ... [--layout L ...] --num-matches N [--num-envs E] [--output r.json] [--deterministic] [--seed S]
+colosseum eval -c cfg.yaml -a A=<ckpt-dir|.pt> [-a <scripted or frozen agent>] ... [--layout L ...] --num-matches N [--num-envs E] [--output r.json] [--deterministic] [--seed S] [--set k=v ...]
 ```
 
 Matches run on the same engine as training (`MatchRunner`): per-seat model state, acting seats and masks. An agent's

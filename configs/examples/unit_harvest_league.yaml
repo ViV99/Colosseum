@@ -1,8 +1,12 @@
 # Unit harvest league (SP3): the trainable agent `main` plays its latest weights, PFSP snapshots and two
-# scripted anchors, the game's bot `greedy` and `random`. The competition pipeline (README, docs/LEAGUE_GUIDE.md):
+# scripted anchors, the game's bot `greedy` and `random`. The competition pipeline (README, docs/LEAGUE_GUIDE.md
+# section 8) runs from one config that names the BC output in advance (`bc_net: {kind: frozen, path: bc.pt}`,
+# `main.init.from: bc_net`, `main.kickstart.teacher: greedy`); with this file unchanged, give the warm start with
+# --set instead:
 #   colosseum record -c configs/examples/unit_harvest_league.yaml --player greedy --num-matches 300 \
 #     --output data/greedy --seed 0
-#   colosseum bc -c configs/examples/unit_harvest_league.yaml --agent main --data data/greedy --output bc.pt --epochs 5
+#   colosseum bc -c configs/examples/unit_harvest_league.yaml --agent main --data data/greedy --output bc.pt \
+#     --epochs 5 --seed 0
 #   colosseum train -c configs/examples/unit_harvest_league.yaml --set run.name=harvest-league \
 #     --set agents.main.init.from=bc.pt --set agents.main.init.critic_warmup_steps=30 \
 #     --set agents.main.kickstart.teacher=greedy

@@ -9,6 +9,7 @@ weights (frozen agents, ``eval -a``, and later kickstart teachers and ``init``).
 
 from __future__ import annotations
 
+from collections.abc import Collection
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -143,8 +144,19 @@ def _checkpoint_roles(spec: GameSpec, path: Path, meta: dict) -> list[str]:
     return list(roles)
 
 
-def resolve_player_roles(config: ColosseumConfig, spec: GameSpec) -> dict[str, list[str]]:
-    """``{agent_id: roles}`` for EVERY agent in config order (``ColosseumConfig.agent_ids``).
+def _fixed_selected(config: ColosseumConfig, players: Collection[str] | None) -> list[str]:
+    """The fixed agents to resolve or load: every one (``players`` None), else those named in ``players``."""
+    if players is None:
+        return config.fixed_agent_ids()
+    names = set(players)
+    return [agent_id for agent_id in config.fixed_agent_ids() if agent_id in names]
+
+
+def resolve_player_roles(config: ColosseumConfig, spec: GameSpec,
+                         players: Collection[str] | None = None) -> dict[str, list[str]]:
+    """``{agent_id: roles}`` for EVERY agent in config order (``ColosseumConfig.agent_ids``); with ``players``,
+    for every trainable agent and only the scripted / frozen agents named there (other names are ignored), so
+    a frozen agent whose file does not exist yet is not read (``validate_config``'s "play" scope).
 
     Trainable: ``core.roles.resolve_agent_roles``. Scripted: ``roles`` or every role of the game (their
     spaces may differ). Frozen: a checkpoint dir's ``meta.json`` roles (checked against the game; the entry
@@ -152,9 +164,12 @@ def resolve_player_roles(config: ColosseumConfig, spec: GameSpec) -> dict[str, l
     of spaces. ConfigError with a hint otherwise.
     """
     trainable = resolve_agent_roles(config, spec)
+    fixed = set(_fixed_selected(config, players))
     out: dict[str, list[str]] = {}
     for agent_id in config.agent_ids():
         entry = config.agent_entry(agent_id)
+        if entry.kind != "trainable" and agent_id not in fixed:
+            continue
         if entry.kind == "trainable":
             out[agent_id] = list(trainable[agent_id])
         elif entry.kind == "scripted":
@@ -242,16 +257,19 @@ def build_frozen_model(config: ColosseumConfig | None, frozen: FrozenSpec, spec:
     return model
 
 
-def load_fixed_players(config: ColosseumConfig, spec: GameSpec) -> FixedPlayers:
-    """Every scripted and frozen agent of ``config`` (main process; before any child starts).
+def load_fixed_players(config: ColosseumConfig, spec: GameSpec,
+                       players: Collection[str] | None = None) -> FixedPlayers:
+    """Every scripted and frozen agent of ``config`` (main process; before any child starts); with ``players``,
+    only the fixed agents named there (``resolve_player_roles``).
 
     Scripted bots are imported and constructed once (a bad class or kwargs fail here); frozen weights are
     read with ``load_frozen`` (roles and signatures checked). Models are built where they run.
     """
-    roles = resolve_player_roles(config, spec)
+    selected = _fixed_selected(config, players)
+    roles = resolve_player_roles(config, spec, selected)
     bots: dict[str, BotSpec] = {}
     frozen: dict[str, FrozenSpec] = {}
-    for agent_id in config.fixed_agent_ids():
+    for agent_id in selected:
         entry = config.agent_entry(agent_id)
         if entry.kind == "scripted":
             bot = BotSpec(entry.class_path, dict(entry.kwargs))
@@ -259,4 +277,4 @@ def load_fixed_players(config: ColosseumConfig, spec: GameSpec) -> FixedPlayers:
             bots[agent_id] = bot
         else:
             frozen[agent_id] = load_frozen(config, agent_id, entry.path, spec)
-    return FixedPlayers(bots=bots, frozen=frozen, roles={a: tuple(roles[a]) for a in config.fixed_agent_ids()})
+    return FixedPlayers(bots=bots, frozen=frozen, roles={a: tuple(roles[a]) for a in selected})

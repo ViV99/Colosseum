@@ -170,6 +170,8 @@ def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
 @click.option("--seed", default=None, type=int, help="Seed for env resets and sampling")
 @click.option("--output", "-o", default=None, type=click.Path(dir_okay=False),
               help="Write the machine-readable result as JSON")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set env.max_idle_steps=200)." + _SET_HELP_YAML)
 def eval_cmd(
     config: str,
     agents: tuple[str, ...],
@@ -179,8 +181,12 @@ def eval_cmd(
     deterministic: bool,
     seed: int | None,
     output: str | None,
+    overrides: tuple[str, ...],
 ) -> None:
     """Evaluate agents/checkpoints against each other (no training).
+
+    The config is checked for what eval uses: the env, the trainable agents' models and the scripted /
+    frozen agents named with -a (warm-start sources and other fixed agents are not read).
 
     Exit code: 0 done, 1 config error (also a malformed checkpoint, a role signature or weights
     that do not fit), 2 bad command-line arguments, 130 SIGINT (Ctrl+C), 143 SIGTERM.
@@ -197,9 +203,9 @@ def eval_cmd(
         from colosseum.core.registry import env_spec, validate_config
         from colosseum.eval import evaluate
 
-        cfg = load_config(config)
-        validate_config(cfg)
+        cfg = load_config(config, _parse_overrides(overrides) or None)
         specs = [_parse_agent_spec(spec) for spec in agents]
+        validate_config(cfg, scope="play", players=[name for name, path in specs if path is None])
         names = [name for name, _ in specs]
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
@@ -250,9 +256,14 @@ def eval_cmd(
 @click.option("--seed", default=None, type=int, help="Seed for env resets, bots and sampling")
 @click.option("--deterministic", is_flag=True, default=False,
               help="Neural players act greedily (scripted bots are unaffected)")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set env.max_idle_steps=200)." + _SET_HELP_YAML)
 def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tuple[str, ...], num_matches: int,
-               output: str, num_envs: int, seed: int | None, deterministic: bool) -> None:
+               output: str, num_envs: int, seed: int | None, deterministic: bool, overrides: tuple[str, ...]) -> None:
     """Record a player's decisions as behavioural-cloning data (read by 'colosseum bc --data <output>').
+
+    The config is checked for what record uses: the env, the trainable agents' models and the scripted /
+    frozen agents named by --player / --against (warm-start sources and other fixed agents are not read).
 
     Exit code: 0 done, 1 config error (unknown player, a layout the player cannot fill without
     --against, a non-empty output directory) or a scripted player's illegal action, 2 bad
@@ -265,10 +276,11 @@ def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tupl
         from colosseum.core.config import load_config
         from colosseum.core.registry import validate_config
         from colosseum.eval import EvalReport
-        from colosseum.record import RECORD_FILE, record
+        from colosseum.record import RECORD_FILE, parse_player, record
 
-        cfg = load_config(config)
-        validate_config(cfg)
+        cfg = load_config(config, _parse_overrides(overrides) or None)
+        named = [parse_player(text) for text in (player, *against)]
+        validate_config(cfg, scope="play", players=[name for name, path in named if path is None])
         content = record(cfg, player, list(against), layouts=list(layouts) or None, num_matches=num_matches,
                          output=output, num_envs=num_envs, seed=seed, deterministic=deterministic)
     summary = content["summary"]
@@ -298,6 +310,10 @@ def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tupl
 @click.option("--lr", default=1e-3, type=float, show_default=True, help="Adam learning rate")
 @click.option("--seq-len", default=None, type=click.IntRange(min=1),
               help="Window length for stateful models (default: bc.seq_len from the config, 64)")
+@click.option("--seed", default=None, type=int,
+              help="Seed for the model's initial weights and the minibatch order (torch and numpy)")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set bc.seq_len=32)." + _SET_HELP_YAML)
 def bc(
     config: str,
     data: tuple[str, ...],
@@ -307,8 +323,14 @@ def bc(
     batch_size: int,
     lr: float,
     seq_len: int | None,
+    seed: int | None,
+    overrides: tuple[str, ...],
 ) -> None:
     """Train one agent's policy by offline behavioral cloning (loss = -log pi(a|s), masks applied).
+
+    The config is checked for what bc uses: the env and the trainable agents' models (warm-start sources and
+    scripted / frozen agents are not read), so the config may already name the output (init.from, a frozen
+    agent with path: <output>).
 
     Exit code: 0 done, 1 config or data error, 2 bad command-line arguments, 130 SIGINT.
     """
@@ -326,8 +348,8 @@ def bc(
         from colosseum.core.roles import agent_role_spec, resolve_agent_roles
         from colosseum.core.specs import ActionSpec, ObsSpec
 
-        cfg = load_config(config)
-        validate_config(cfg)
+        cfg = load_config(config, _parse_overrides(overrides) or None)
+        validate_config(cfg, scope="play")
         agent_ids = cfg.get_trainable_agent_ids()
         if agent is None:
             if len(agent_ids) != 1:
@@ -340,6 +362,11 @@ def bc(
         roles = resolve_agent_roles(cfg, spec)[agent]
         role = agent_role_spec(spec, roles)
         agent_cfg = cfg.get_agent_config(agent)
+        if seed is not None:              # initial weights, window offsets and minibatch order
+            import numpy as np
+
+            torch.manual_seed(seed)
+            np.random.seed(seed)
         model = build_model(agent_cfg, role)
     device = agent_cfg.learner.device
     if device == "auto":

@@ -129,19 +129,33 @@ agents:
 
 ## 8. Конвейер: `record` → `bc` → `init` → kickstart
 
-```bash
-# 1. Бот играет сам с собой; все его решения — данные BC (папка на роль + record.json)
-colosseum record -c configs/examples/unit_harvest_league.yaml --player greedy --num-matches 300 --output data/greedy --seed 0
-# 2. BC-сеть агента main
-colosseum bc -c configs/examples/unit_harvest_league.yaml --agent main --data data/greedy --output bc.pt --epochs 5
-# 3. RL с BC-весов: прогрев критика, kickstart от бота (DAgger), лига с якорями
-colosseum train -c configs/examples/unit_harvest_league.yaml --set run.name=harvest-league \
-  --set agents.main.init.from=bc.pt --set agents.main.init.critic_warmup_steps=30 \
-  --set agents.main.kickstart.teacher=greedy
+Весь конвейер идёт по одному конфигу. Скопируйте `configs/examples/unit_harvest_league.yaml` в `harvest.yaml` и заранее назовите в нём выход BC — файла ещё нет:
+
+```yaml
+agents:
+  main:
+    init: {from: bc_net, critic_warmup_steps: 30}   # RL стартует с BC-весов
+    kickstart: {teacher: greedy}                     # бот продолжает учить (DAgger)
+  bc_net: {kind: frozen, path: bc.pt}                # появится на шаге 2
+  # greedy и random — как в примере
 ```
 
+```bash
+# 1. Бот играет сам с собой; все его решения — данные BC (папка на роль + record.json)
+colosseum record -c harvest.yaml --player greedy --num-matches 300 --output data/greedy --seed 0
+# 2. BC-сеть агента main
+colosseum bc -c harvest.yaml --agent main --data data/greedy --output bc.pt --epochs 5 --seed 0
+# 3. RL с BC-весов: прогрев критика, kickstart от бота (DAgger), лига с якорями
+colosseum train -c harvest.yaml --set run.name=harvest-league
+# 4. Оценка: обученный агент против бота, random и BC-сети
+NEW=$(ls -d runs/harvest-league/checkpoints/main/ckpt_v* | sort -V | tail -1)
+colosseum eval -c harvest.yaml -a trained=$NEW -a greedy -a random -a bc_net --num-matches 100 --deterministic
+```
+
+`record`, `bc` и `eval` проверяют только то, чем пользуются: среду, модели обучаемых агентов и scripted / frozen агентов, которых сажают за стол (`--player`, `--against`, `-a <имя>`). Источники `init`, учителя kickstart и остальные frozen-агенты им не нужны, поэтому `bc_net` и `init.from` могут указывать на ещё не созданный `bc.pt`. `validate` и `train` проверяют всё. Пример можно использовать и без правок, задав тёплый старт в командной строке: `colosseum train -c configs/examples/unit_harvest_league.yaml --set agents.main.init.from=bc.pt --set agents.main.init.critic_warmup_steps=30 --set agents.main.kickstart.teacher=greedy`; `--set` принимают и `record`, `bc`, `eval`.
+
 - **`record`.** `--player` / `--against` — имя scripted или frozen агента либо `name=path` (папка чекпоинта или `.pt`). Без `--against` игрок занимает все места, и записываются все места. Варианты, которые игрок не может заполнить один (не играет какую-то их роль), без `--layout` пропускаются с одной INFO-строкой в логе; ошибка конфига с подсказкой «добавьте `--against`» — только если не осталось ни одного варианта или такой вариант задан явно через `--layout`. С `--against` каждый соперник даёт пару с игроком (ротация как в `eval`, `--num-matches` на пару и вариант), записываются только места игрока. Эпизод места лежит в файле непрерывно, `dones` корректны; `record.json` описывает запись и содержит сводку исходов.
-- **`bc`.** `--data` можно повторять; для папки с `record.json` берутся подпапки ролей агента.
+- **`bc`.** `--data` можно повторять; для папки с `record.json` берутся подпапки ролей агента. `--seed` фиксирует начальные веса и порядок минибатчей.
 - **`init`** (секция агента или глобальная): `from` — `.pt`, папка чекпоинта, папка запуска (последний чекпоинт агента с тем же id) или имя frozen-агента; грузятся только веса (версия политики 0, новый оптимизатор). `strict: false` грузит тензоры с совпавшими именем и формой и перечисляет остальные в логе и в выводе `validate`. При `training.resume_from` resume важнее: восстановленный агент игнорирует `init` (запись в лог).
 - **Прогрев критика** `critic_warmup_steps: N`: первые N шагов обучения обновляется только value-путь (value-голова и `critic_encoder`), лоссы политики, энтропии и kickstart выключены, статистика нормализаторов наблюдений заморожена — политика лёрнера побитово остаётся BC-политикой, пока критик догоняет; нормализатор глобального состояния критика (путь value) продолжает учиться, чтобы входы критика не «прыгнули» в конце прогрева. Воркеры, как и в SP2, играют своей случайной инициализацией до первой синхронизации весов (первые секунды; V-trace это учитывает), после неё — BC-политикой.
 - **Kickstart** (`kickstart: {teacher, lambda, decay_steps, kl}`): `teacher` — имя frozen или scripted агента либо путь (`.pt` или папка чекпоинта). Нейросетевой учитель — KL по решающим (`kl: forward | reverse`); голый путь к `.pt` строится с архитектурой ученика (как в SP2), а frozen-агент (для `.pt` — с его `networks`) и папка чекпоинта приносят свою архитектуру; рекуррентный учитель — только с той же раскладкой состояния, что у ученика. Скриптовый учитель — DAgger: на каждом ходе собирающего места воркер спрашивает бота, его действие идёт в чанк, лёрнер добавляет `λ · mean(−log π(a_учителя))`. λ затухает линейно за `decay_steps` шагов обучения, начиная после прогрева. Имя обучаемого агента учителем быть не может: нужный снимок подключается как frozen-агент с `path`.

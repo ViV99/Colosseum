@@ -7,11 +7,13 @@ unit_harvest test (``tests/learning/test_sp3_pipeline_slow.py``) and
 ``cli_runner.run_in_session`` (default) or in-process through click's ``CliRunner``
 (``in_process=True``); ``train`` always runs in a subprocess (it starts processes).
 
-The pipeline config is an example config with these agents (``pipeline_config``):
-- ``main``: the trainable agent (``init`` and ``kickstart`` are added for the train step);
+The pipeline config is ONE config for every step (spec blocks 1 and 6): an example config with these agents
+(``pipeline_config``):
+- ``main``: the trainable agent, with ``init`` and ``kickstart`` (warm start) already naming the BC output;
 - ``PipelineGame.bot``: the game's scripted bot (recorded, an anchor, possibly the DAgger teacher);
 - ``random``: ``colosseum.players.RandomBot``;
-- ``bc_net``: the frozen BC weights, once they exist.
+- ``bc_net``: the frozen BC weights (``path: <workdir>/bc.pt``, written by the bc step).
+``record``, ``bc`` and ``eval`` validate only what they use, so the config works before ``bc.pt`` exists.
 SP2 matchmaking knobs are dropped and ``pool_size`` becomes ``keep_last``, so old and new knobs
 never meet (that would be a ConfigError).
 """
@@ -152,9 +154,10 @@ def record(config: Path, player: str, out: Path, *, num_matches: int, seed: int,
     return json.loads((Path(out) / "record.json").read_text())
 
 
-def bc(config: Path, data: Path, out: Path, *, epochs: int, agent: str = MAIN, in_process: bool = False) -> Path:
-    _ok(cli(["bc", "-c", config, "--agent", agent, "--data", data, "--output", out, "--epochs", epochs],
-            in_process=in_process), "bc")
+def bc(config: Path, data: Path, out: Path, *, epochs: int, seed: int, agent: str = MAIN,
+       in_process: bool = False) -> Path:
+    _ok(cli(["bc", "-c", config, "--agent", agent, "--data", data, "--output", out, "--epochs", epochs,
+             "--seed", seed], in_process=in_process), "bc")
     return Path(out)
 
 
@@ -163,7 +166,6 @@ def train(config: Path, workdir: Path, name: str, sets: Mapping[str, Any], *, ti
     run = run_train(config, workdir, name, dict(sets), timeout=timeout, tiny=False)
     assert run.returncode == 0, run.stderr[-3000:]
     return run
-
 
 
 def evaluate(config: Path, checkpoint: Path, opponents: Sequence[str], out: Path, *, layout: str, num_matches: int,
@@ -192,28 +194,28 @@ class PipelineRun:
 def run_pipeline(game: PipelineGame, workdir: Path, *, seed: int, settings: PipelineSettings, warm_start: bool = True,
                  bc_path: Path | None = None, name: str = "pipeline", in_process: bool = False) -> PipelineRun:
     """record -> bc (both skipped when ``bc_path`` is given) -> train -> eval against the bot, RandomBot
-    and the frozen BC net. ``warm_start=False`` trains in the same league without ``init`` and
-    kickstart (the "pipeline vs scratch" comparison)."""
+    and the frozen BC net, all from one config written before ``bc.pt`` exists. ``warm_start=False`` trains
+    in the same league without ``init`` and kickstart (the "pipeline vs scratch" comparison)."""
     workdir = Path(workdir)
     seconds: dict[str, float] = {}
     record_json = None
-    if bc_path is None:
-        record_cfg = write_config(workdir / "record.yaml", pipeline_config(game))
-        start = time.monotonic()
-        record_json = record(record_cfg, game.bot, workdir / "data", num_matches=settings.record_matches, seed=seed,
-                             in_process=in_process)
-        seconds["record"] = time.monotonic() - start
-        start = time.monotonic()
-        bc_path = bc(record_cfg, workdir / "data", workdir / "bc.pt", epochs=settings.bc_epochs, in_process=in_process)
-        seconds["bc"] = time.monotonic() - start
+    target = Path(bc_path) if bc_path is not None else workdir / "bc.pt"
     init = kickstart = None
     if warm_start:
-        init = {"from": BC_NET if settings.init_from == BC_NET else str(bc_path),
+        init = {"from": BC_NET if settings.init_from == BC_NET else str(target),
                 "critic_warmup_steps": settings.critic_warmup_steps}
         kickstart = {"teacher": settings.kickstart_teacher, "lambda": settings.kickstart_lambda,
                      "decay_steps": settings.kickstart_decay_steps}
     train_cfg = write_config(workdir / f"{name}.yaml",
-                             pipeline_config(game, bc_path=bc_path, init=init, kickstart=kickstart))
+                             pipeline_config(game, bc_path=target, init=init, kickstart=kickstart))
+    if bc_path is None:
+        start = time.monotonic()
+        record_json = record(train_cfg, game.bot, workdir / "data", num_matches=settings.record_matches, seed=seed,
+                             in_process=in_process)
+        seconds["record"] = time.monotonic() - start
+        start = time.monotonic()
+        bc_path = bc(train_cfg, workdir / "data", target, epochs=settings.bc_epochs, seed=seed, in_process=in_process)
+        seconds["bc"] = time.monotonic() - start
     start = time.monotonic()
     run = train(train_cfg, workdir, name, {"training.seed": seed, **settings.train_sets})
     seconds["train"] = time.monotonic() - start

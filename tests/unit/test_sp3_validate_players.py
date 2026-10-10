@@ -108,3 +108,23 @@ def test_cli_validate_lists_every_agent_with_its_kind(tmp_path):
     for line in ("OK: agent 'agent_0' (trainable)", "OK: agent 'rnd' (scripted)", "OK: agent 'old' (frozen)",
                  "agent 'rnd' (scripted colosseum.players.RandomBot)", "Config is valid."):
         assert line in result.output, result.output
+
+
+def test_the_play_scope_reads_only_the_named_fixed_agents_and_skips_warm_start(tmp_path):
+    missing = tmp_path / "bc.pt"
+    cfg = make_test_config("turns", agents={
+        "agent_0": {"init": {"from": str(missing)}, "kickstart": {"teacher": "bc_net"}},
+        "rnd": scripted_agent(), "bad": scripted_agent("no_such_module.Bot"), "bc_net": frozen_agent(missing)})
+    with pytest.raises(ConfigError):
+        validate_config(cfg)
+    report = validate_config(cfg, scope="play", players=["rnd", "agent_0", "unknown"])
+    assert any(line.startswith("agent 'rnd' (scripted") for line in report.lines)
+    assert not any("bc_net" in line or "'bad'" in line for line in report.lines)
+    with pytest.raises(ConfigError, match="no_such_module"):
+        validate_config(cfg, scope="play", players=["bad"])
+    with pytest.raises(ConfigError, match="bc_net"):
+        validate_config(cfg, scope="play", players=["bc_net"])
+    with pytest.raises(ValueError, match="play"):
+        validate_config(cfg, players=["rnd"])
+    with pytest.raises(ValueError, match="scope"):
+        validate_config(cfg, scope="fast")

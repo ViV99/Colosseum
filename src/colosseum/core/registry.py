@@ -10,11 +10,13 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from colosseum.core.errors import ConfigError
 
 if TYPE_CHECKING:
+    from collections.abc import Collection
+
     from colosseum.core.config import ColosseumConfig, NetworkConfig
     from colosseum.core.validation import ValidationReport
     from colosseum.envs.game import GameSpec, MultiAgentEnv, RoleSpec
@@ -155,10 +157,13 @@ def build_network(net: NetworkConfig, role: RoleSpec) -> PolicyModel:
     return ComposedModel(encoder, core, policy, value, critic)
 
 
-def validate_config(config: ColosseumConfig) -> ValidationReport:
+def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] = "train",
+                    players: Collection[str] | None = None) -> ValidationReport:
     """Every check that can run before a run starts; see ``colosseum.core.validation``. Returns the report
-    ``colosseum validate`` prints. Callers use this name (``registry.validate_config``), so tests can
+    ``colosseum validate`` prints. ``scope`` / ``players``: the full "train" check (``train``, ``validate``,
+    distributed roles) or the "play" check of ``record`` / ``bc`` / ``eval`` (``players``: the scripted /
+    frozen agents the command seats). Callers use this name (``registry.validate_config``), so tests can
     monkeypatch it here."""
     from colosseum.core.validation import validate_config as _validate_config
 
-    return _validate_config(config)
+    return _validate_config(config, scope=scope, players=players)

@@ -112,3 +112,18 @@ def test_a_record_split_into_several_part_files_loads_whole(tmp_path):
     for source in bc_data_sources([out], ["player"]):
         trainer.load_data(source)
     assert trainer.num_samples == 60
+
+
+def test_bc_seed_makes_the_weights_reproducible(tmp_path):
+    cfg = make_test_config("turns", agents={"bot": RANDOM_BOT})
+    cfg_path = write_test_config(tmp_path / "cfg.yaml", "turns", agents={"bot": RANDOM_BOT})
+    record(cfg, "bot", [], layouts=None, num_matches=10, output=tmp_path / "rec", num_envs=4, seed=0)
+    weights = {}
+    for name, seed in (("a", 3), ("b", 3), ("c", 4)):
+        out = tmp_path / f"{name}.pt"
+        result = bc("-c", cfg_path, "-d", tmp_path / "rec", "-o", out, "--epochs", 2, "--batch-size", 8,
+                    "--seed", seed)
+        assert result.exit_code == 0, result.output
+        weights[name] = torch.load(out, weights_only=True)
+    assert all(torch.equal(weights["a"][k], weights["b"][k]) for k in weights["a"])
+    assert any(not torch.equal(weights["a"][k], weights["c"][k]) for k in weights["a"])
