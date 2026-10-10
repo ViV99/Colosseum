@@ -302,15 +302,55 @@ def _check_model(model: Any, role: RoleSpec, sample: tuple | None, where: str) -
                               f"teacher run the policy path only)")
 
 
-def _check_kickstart_teachers(config: ColosseumConfig, spec: GameSpec,
-                              agent_configs: dict[str, ColosseumConfig]) -> None:
-    """Every trainable agent's kickstart teacher resolves, and a neural one builds with its weights."""
-    from colosseum.learner.factory import build_teacher_model, resolve_teacher
+def _check_kickstart_teachers(config: ColosseumConfig, spec: GameSpec, agent_configs: dict[str, ColosseumConfig],
+                              role_specs: dict[str, RoleSpec], samples: dict[str, tuple | None]) -> None:
+    """Every trainable agent's kickstart teacher resolves (roles included); a neural one builds with its
+    weights, can be unrolled on the student's chunks (state-layout rule), and the KL between teacher and
+    student is finite on a synthetic batch of the role's observations."""
+    from colosseum.learner.factory import build_teacher_model, check_teacher_compat, resolve_teacher
 
     for aid, acfg in agent_configs.items():
         teacher = resolve_teacher(config, aid, spec)
-        if teacher is not None and teacher.kind == "neural":
-            build_teacher_model(acfg, teacher, spec)
+        if teacher is None or teacher.kind != "neural":
+            continue
+        where = f"agent {aid!r}: kickstart teacher {teacher.source}"
+        teacher_model = build_teacher_model(acfg, teacher, spec)
+        student = build_model(acfg, role_specs[aid])
+        check_teacher_compat(student, teacher_model, where)
+        _check_teacher_kl(student, teacher_model, role_specs[aid], samples.get(aid), where, teacher.kl)
+
+
+def _check_teacher_kl(student: Any, teacher: Any, role: RoleSpec, sample: tuple | None, where: str,
+                      direction: str) -> None:
+    """The kickstart KL of ``teacher`` vs ``student`` on a synthetic [S=2, B=2] batch of the role's observations."""
+    from colosseum.bc.kickstart import KickstartLoss
+
+    obs_spec = ObsSpec.from_space(role.observation_space)
+    action_spec = ActionSpec.from_space(role.action_space)
+    obs1 = _as_spec(obs_spec, sample[0]) if sample is not None else obs_spec.allocate(())
+    mask1 = None
+    if action_spec.has_masks:
+        mask1 = sample[1] if sample is not None and sample[1] is not None else action_spec.full_mask(())
+    s, b = 2, 2
+
+    def seq(value: Any) -> Any:
+        return None if value is None else tree_to_torch(tree_stack([tree_stack([value] * b)] * s))
+
+    obs_seq, mask_seq = seq(obs1), seq(mask1)
+    reset_after = torch.zeros(s, b, dtype=torch.bool)
+    student.eval()
+    try:
+        with torch.no_grad():
+            state0 = student.initial_state(b)
+            student_dist = student.unroll(obs_seq, state0, reset_after, mask_seq, with_value=False).dist
+            loss = KickstartLoss(teacher, initial_lambda=1.0, direction=direction).compute(
+                student_dist=student_dist, obs=obs_seq, reset_after=reset_after, state0=state0, action_mask=mask_seq,
+                actions=student_dist.sample(), is_act=torch.ones(s, b, dtype=torch.bool), reduction="sum")
+    except Exception as e:  # noqa: BLE001 - any failure means an incompatible teacher
+        raise ConfigError(f"{where}: the kickstart KL between teacher and student failed ({type(e).__name__}: {e}); "
+                          f"the teacher's action distribution must match the student's") from e
+    if not torch.isfinite(loss):
+        raise ConfigError(f"{where}: the kickstart KL between teacher and student is not finite on a synthetic batch")
 
 
 def _check_frozen_players(config: ColosseumConfig, spec: GameSpec, fixed: Any, samples: dict[str, tuple],
@@ -497,7 +537,9 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
     - every agent's model: ``step`` on its role's observations and ``unroll`` on a synthetic chunk
       with BOOT/PAD slots, resets and ``global_state``;
     - the critic warm-up's requirements (``init.critic_warmup_steps``);
-    - every agent's kickstart teacher (``learner.factory.resolve_teacher``) and its weights;
+    - every agent's kickstart teacher (``learner.factory.resolve_teacher``): its roles, its weights, the
+      state-layout rule (``learner.factory.check_teacher_compat``) and a finite teacher/student KL on a
+      synthetic batch;
     - every agent's ``init`` source (strict / partial report in ``ValidationReport.lines``), except for
       agents ``training.resume_from`` restores (``learner.factory.resume_source_of``), which ignore it;
     - every frozen agent: weights, role signature and its architecture (once per architecture); every
@@ -533,6 +575,7 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
             )
     layouts = _all_enabled_layouts(config, spec)
     samples = _exercise_env(config, spec, layouts)
+    agent_samples: dict[str, tuple | None] = {}
     for aid, acfg in agent_configs.items():
         where = f"agent {aid!r}"
         try:
@@ -542,9 +585,10 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
         except Exception as e:
             raise ConfigError(f"{where}: failed to build the model from networks: {type(e).__name__}: {e}") from e
         sample = next((samples[r] for r in agent_roles[aid] if r in samples), None)
+        agent_samples[aid] = sample
         _check_model(model, role_specs[aid], sample, where)
         _check_critic_warmup(where, acfg, model)
-    _check_kickstart_teachers(config, spec, agent_configs)
+    _check_kickstart_teachers(config, spec, agent_configs, role_specs, agent_samples)
     for aid, acfg in agent_configs.items():
         resumed = resume_source_of(config, aid)
         if resumed is not None:   # spec block 6: an agent restored by resume_from ignores init

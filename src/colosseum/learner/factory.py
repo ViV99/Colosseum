@@ -80,7 +80,8 @@ def resolve_teacher(config: ColosseumConfig, agent_id: str, spec: GameSpec) -> T
 
     ``teacher`` is the name of a frozen agent (its own architecture), a ``.pt`` path (the student's
     architecture, SP2) or a checkpoint dir (architecture and roles from its ``meta.json``). The name
-    of a trainable agent is a ConfigError with a hint. Main process only (it reads weight files).
+    of a trainable agent is a ConfigError with a hint; so is a teacher that does not play every role of
+    its student. Main process only (it reads weight files).
     """
     ks = config.get_agent_config(agent_id).kickstart
     if ks.teacher is None:
@@ -109,6 +110,13 @@ def resolve_teacher(config: ColosseumConfig, agent_id: str, spec: GameSpec) -> T
             raise ConfigError(f"{where} is neither an agent of the config ({agent_ids(config)}) nor an existing .pt "
                               f"file or checkpoint dir")
         source = ref
+    from colosseum.players.registry import resolve_player_roles
+
+    student_roles = resolve_player_roles(config, spec)[agent_id]
+    missing = [r for r in student_roles if r not in frozen.roles]
+    if missing:
+        raise ConfigError(f"{where}: the teacher plays roles {list(frozen.roles)}; a teacher must play every role of "
+                          f"its student ({list(student_roles)}), missing {missing}")
     return TeacherSpec(kind="neural", source=source, lambda_=float(ks.lambda_), decay_steps=int(ks.decay_steps),
                        kl=ks.kl, frozen=frozen)
 
@@ -122,6 +130,16 @@ def build_teacher_model(agent_config: ColosseumConfig, teacher: TeacherSpec, spe
         return build_frozen_model(agent_config, teacher.frozen, spec)
     except ConfigError as e:
         raise ConfigError(f"kickstart teacher {teacher.source}: {e}") from e
+
+
+def check_teacher_compat(student: PolicyModel, teacher: PolicyModel, where: str) -> None:
+    """ConfigError unless ``teacher`` can be unrolled on ``student``'s chunks (``check_teacher_state_layout``)."""
+    from colosseum.bc.kickstart import check_teacher_state_layout
+
+    try:
+        check_teacher_state_layout(student, teacher)
+    except ValueError as e:
+        raise ConfigError(f"{where}: {e}") from e
 
 
 def build_kickstart(agent_config: ColosseumConfig, teacher: TeacherSpec | None, spec: GameSpec | None,

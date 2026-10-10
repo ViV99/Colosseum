@@ -12,9 +12,10 @@ student, with the chunks' action masks, ``reset_after`` flags and initial states
 computed per decider (``Distribution.unit_kl``, 0 where a decider is invalid), reduced over
 deciders per ``reduction`` (``"sum"`` or ``"mean_valid"``) and averaged over ACT slots only.
 
-In SP2 the teacher stays global and is built from the student's networks config, so both
-share one state layout and the chunk's ``initial_state`` (recorded by the student's behavior
-policy) is the teacher's ``state0``: exact when teacher == student, an approximation after.
+Teachers are per agent (SP3) and may have any architecture. A stateless teacher is unrolled with
+``state0=None``; a recurrent teacher must share the student's state layout
+(``check_teacher_state_layout``) and gets the chunk's ``initial_state`` (recorded by the student's
+behavior policy): exact when teacher == student, an approximation after.
 """
 
 from __future__ import annotations
@@ -27,9 +28,27 @@ from torch import Tensor
 from colosseum.core.tree import Tree
 from colosseum.networks.dist import Distribution
 from colosseum.networks.model import PolicyModel
-from colosseum.networks.state import State
+from colosseum.networks.state import State, tree_leaves
 
 KLDirection = Literal["forward", "reverse"]
+
+
+def check_teacher_state_layout(student: PolicyModel, teacher: PolicyModel) -> None:
+    """ValueError unless ``teacher`` can be unrolled on ``student``'s chunks.
+
+    A stateless teacher works with any student (it is unrolled with ``state0=None``). A recurrent teacher
+    reuses the chunks' initial states, which the student's behavior policy recorded, so it needs the
+    student's exact state layout (exact while teacher == student, an approximation afterwards).
+    """
+    teacher_shapes = [tuple(t.shape) for t in tree_leaves(teacher.initial_state(1))]
+    if not teacher_shapes:
+        return
+    student_shapes = [tuple(t.shape) for t in tree_leaves(student.initial_state(1))]
+    if student_shapes != teacher_shapes:
+        raise ValueError(
+            "a recurrent kickstart teacher must share the student's state layout (student state leaves "
+            f"{student_shapes}, teacher {teacher_shapes}); use a stateless teacher or one with the student's core"
+        )
 
 
 class KickstartLoss:
@@ -48,6 +67,7 @@ class KickstartLoss:
         self._teacher.eval()
         for p in self._teacher.parameters():
             p.requires_grad_(False)
+        self._teacher_stateful = bool(teacher.is_stateful)
         self._initial_lambda = float(initial_lambda)
         self._decay_steps = max(1, int(decay_steps))
         self._direction: KLDirection = direction
@@ -104,7 +124,8 @@ class KickstartLoss:
                 from the algorithm's main ``unroll``.
             obs: observation tree, leaves ``[S, B, ...]``.
             reset_after: ``[S, B]`` bool; the state is reset after slot s.
-            state0: the teacher's initial state (leaves ``[B, ...]``).
+            state0: the student's chunk initial state (leaves ``[B, ...]``); passed to a recurrent
+                teacher only.
             action_mask: mask tree, leaves ``[S, B, ...]``, or None.
             actions: the recorded actions, leaves ``[S*B, ...]`` (they gate ``only_if`` children).
             is_act: ``[S, B]`` bool; only ACT slots contribute.
@@ -114,7 +135,9 @@ class KickstartLoss:
         if lam <= 0:
             return torch.zeros((), device=reset_after.device)
         with torch.no_grad():
-            teacher_dist = self._teacher.unroll(obs, state0, reset_after.bool(), action_mask, with_value=False).dist
+            teacher_state0 = state0 if self._teacher_stateful else None   # a stateless teacher needs no state
+            teacher_dist = self._teacher.unroll(obs, teacher_state0, reset_after.bool(), action_mask,
+                                                with_value=False).dist
         if self._direction == "forward":
             kl = teacher_dist.unit_kl(student_dist, actions)
         else:

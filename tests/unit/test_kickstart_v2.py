@@ -114,9 +114,11 @@ def test_appo_adds_kickstart_with_the_entropy_reduction_and_checks_the_state_lay
     chunks = [synthetic_chunk(student, UNITS, "AATP", seed=s) for s in range(2)]
     metrics = algo.train_step(chunks)
     assert metrics["kickstart_loss"] > 0 and metrics["kickstart_lambda"] == pytest.approx(0.5)
-    with pytest.raises(ValueError, match="state layout"):
+    with pytest.raises(ValueError, match="state layout"):          # a recurrent teacher needs the student's layout
         APPO(make_test_model(UNITS, core="lstm"), AlgorithmConfig(), spec,
-             kickstart=KickstartLoss(make_test_model(UNITS, core="none")))
+             kickstart=KickstartLoss(make_test_model(UNITS, core="gru")))
+    APPO(make_test_model(UNITS, core="lstm"), AlgorithmConfig(), spec,   # a stateless teacher: allowed (SP3)
+         kickstart=KickstartLoss(make_test_model(UNITS, core="none")))
 
 
 @pytest.mark.gpu

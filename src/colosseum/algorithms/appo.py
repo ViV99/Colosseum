@@ -39,13 +39,13 @@ from torch import Tensor
 
 from colosseum.algorithms.base import BaseAlgorithm, deep_cpu_copy
 from colosseum.algorithms.vtrace import compute_vtrace_slots
-from colosseum.bc.kickstart import KickstartLoss
+from colosseum.bc.kickstart import KickstartLoss, check_teacher_state_layout
 from colosseum.core.config import AlgorithmConfig, LRSchedule
 from colosseum.core.specs import ActionSpec
 from colosseum.core.tree import tree_map, tree_stack
 from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD, TrajectoryChunk
 from colosseum.networks.model import PolicyModel, UnrollOutput
-from colosseum.networks.state import cat_batch, slice_batch, state_to, tree_leaves
+from colosseum.networks.state import cat_batch, slice_batch, state_to
 
 logger = logging.getLogger(__name__)
 
@@ -82,18 +82,6 @@ def resolve_modes(config: AlgorithmConfig, action_spec: ActionSpec) -> tuple[Rat
     reduction: EntropyReduction = config.entropy_reduction if config.entropy_reduction != "auto" else (
         "sum" if ratio == "joint" else "mean_valid")
     return ratio, trace, reduction
-
-
-def _check_teacher_state_layout(student: PolicyModel, teacher: PolicyModel) -> None:
-    """The teacher reuses the student's chunk initial states, so the layouts must match."""
-    student_shapes = [tuple(t.shape) for t in tree_leaves(student.initial_state(1))]
-    teacher_shapes = [tuple(t.shape) for t in tree_leaves(teacher.initial_state(1))]
-    if student_shapes != teacher_shapes:
-        raise ValueError(
-            "kickstart teacher must share the student's state layout "
-            f"(student state leaves {student_shapes}, teacher {teacher_shapes}); "
-            "build the teacher from the student's networks config"
-        )
 
 
 # Layout of every key ``APPO._prepare_batch`` produces (``_select_chunks`` rejects others).
@@ -149,7 +137,7 @@ class APPO(BaseAlgorithm):
     ):
         self._model = model.to(device)
         if kickstart is not None:
-            _check_teacher_state_layout(self._model, kickstart.teacher)
+            check_teacher_state_layout(self._model, kickstart.teacher)
             kickstart.to(device)
         self._config = config
         self._action_spec = action_spec
