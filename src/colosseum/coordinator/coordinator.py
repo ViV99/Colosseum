@@ -1,8 +1,8 @@
 """Coordinator: matchmaking, checkpoint storage and ratings of a training run.
 
 Manages:
-- the agent pool (trainable agents) and their roles;
-- owner rotation over the trainable agents and one ``Lineup`` per env (``LineupMatchmaker``);
+- the players (trainable, scripted, frozen agents) and their roles; owner rotation over the trainable agents
+  in config order and one ``Lineup`` per env (``LineupMatchmaker`` until T3.2);
 - checkpoint storage (learner checkpoint payloads -> ``CheckpointManager``; ``meta.json`` gets the
   agent's roles and their role signature);
 - match results and per-layout ratings (``RatingBook``).
@@ -13,10 +13,9 @@ from __future__ import annotations
 import logging
 import random
 from collections import deque
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
-from colosseum.coordinator.agent_pool import AgentPool
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.coordinator.matchmaker import LineupMatchmaker
 from colosseum.coordinator.ratings import RatingBook
@@ -32,20 +31,23 @@ logger = logging.getLogger(__name__)
 class Coordinator:
     """Central coordinator of a single-machine training run."""
 
-    def __init__(self, config: ColosseumConfig, spec: GameSpec, agent_roles: Mapping[str, Sequence[str]],
-                 checkpoint_dir: str | Path) -> None:
+    def __init__(self, config: ColosseumConfig, spec: GameSpec, player_roles: Mapping[str, Sequence[str]],
+                 checkpoint_dir: str | Path, env_steps: Callable[[], int] = lambda: 0) -> None:
+        """``player_roles``: roles of EVERY agent (``players.registry.resolve_player_roles``); ``env_steps``:
+        the run's global env-step counter (share schedules, SP3 block 5)."""
         self._config = config
         self._spec = spec
         trainable = config.get_trainable_agent_ids()
-        missing = [a for a in trainable if a not in agent_roles]
+        players = config.agent_ids()   # config order (implicit agent_0 first)
+        missing = [a for a in players if a not in player_roles]
         if missing:
             raise ConfigError(f"Coordinator: no roles resolved for agents {missing}")
-        self._agent_roles = {a: list(agent_roles[a]) for a in trainable}
+        self._trainable = list(trainable)
+        self._player_roles = {a: list(player_roles[a]) for a in players}
+        self._agent_roles = {a: list(player_roles[a]) for a in trainable}
+        self._env_steps = env_steps
         # One RNG for matchmaking and seat permutations: runs with the same seed get the same schedule.
         self._rng = random.Random(config.training.seed)
-        self._agent_pool = AgentPool()
-        for agent_id in trainable:
-            self._agent_pool.register_trainable(agent_id)
         self._checkpoint_manager = CheckpointManager(base_dir=checkpoint_dir, pool_size=config.checkpoint.pool_size)
         self._ratings = RatingBook(spec, trainable)
         self._role_signatures = {a: role_signature(agent_role_spec(spec, roles))
@@ -58,8 +60,14 @@ class Coordinator:
         )
 
     @property
-    def agent_pool(self) -> AgentPool:
-        return self._agent_pool
+    def player_roles(self) -> dict[str, list[str]]:
+        """Roles of every agent (trainable, scripted, frozen) in config order."""
+        return {a: list(r) for a, r in self._player_roles.items()}
+
+    @property
+    def trainable_agents(self) -> list[str]:
+        """Trainable agent ids in config order (the owner rotation order)."""
+        return list(self._trainable)
 
     @property
     def checkpoint_manager(self) -> CheckpointManager:
@@ -99,7 +107,7 @@ class Coordinator:
         """One lineup per env. Env ``e`` of this batch has global index ``g = env_offset + e``;
         its owner is ``agents[(g + refresh_round) % n_trainable]`` (SP1 rotation), so every
         trainable agent owns envs, and ownership rotates between refreshes."""
-        agents = [a.agent_id for a in self._agent_pool.list_trainable()]
+        agents = self._trainable
         if not agents:
             raise ValueError("Coordinator has no trainable agents")
         return [self._matchmaker.lineup_for(agents[(env_offset + e + self._refresh_round) % len(agents)])

@@ -1081,13 +1081,13 @@ def write_test_config(path, game: str, **sections):
 
 
 def make_coordinator(config, checkpoint_dir):
-    """``Coordinator`` for ``config`` with the env's spec and the resolved agent roles."""
+    """``Coordinator`` for ``config`` with the env's spec and the roles of every player."""
     from colosseum.coordinator.coordinator import Coordinator
     from colosseum.core.registry import env_spec
-    from colosseum.core.roles import resolve_agent_roles
+    from colosseum.players.registry import resolve_player_roles
 
     spec = env_spec(config)
-    return Coordinator(config, spec, resolve_agent_roles(config, spec), checkpoint_dir)
+    return Coordinator(config, spec, resolve_player_roles(config, spec), checkpoint_dir)
 
 
 def agent_role_of(config, agent_id: str):

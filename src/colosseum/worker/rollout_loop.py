@@ -3,9 +3,10 @@
 All I/O goes through :class:`LoopIO` callbacks, so the loop runs unchanged in a worker
 process (``rollout_worker_process``) and in-process in tests.
 
-``RolloutLoop`` is the :class:`MatchRunner`'s model pool (each agent's latest model plus
-frozen checkpoints) and its observer. As observer it writes the slots of every collecting
-seat (slot rules of spec block 4):
+``RolloutLoop`` is the :class:`MatchRunner`'s player pool (each trainable agent's latest model and
+loaded snapshots, plus the fixed players: scripted bots and frozen models of ``FixedPlayers``, served
+under ``FIXED_NETWORK_ID``) and its observer. Fixed players never collect. As observer it writes the
+slots of every collecting seat (slot rules of spec block 4):
 
 - **The seat acts.** With an open ACT and exactly one free slot: a BOOT with the current
   observation and ``global_state``, the chunk is sealed, and the new ACT goes into the same
@@ -28,6 +29,7 @@ seat (slot rules of spec block 4):
 
 from __future__ import annotations
 
+import functools
 import logging
 import random
 import time
@@ -42,6 +44,7 @@ import torch
 from colosseum.core.roles import agent_role_spec
 from colosseum.core.specs import ActionSpec, ObsSpec
 from colosseum.core.types import (
+    FIXED_NETWORK_ID,
     LATEST_NETWORK_ID,
     Lineup,
     MatchResult,
@@ -53,8 +56,9 @@ from colosseum.core.types import (
 from colosseum.envs.game import MultiAgentEnv
 from colosseum.envs.vector import SubprocessVectorEnv, VectorEnv
 from colosseum.networks.model import PolicyModel
+from colosseum.players.registry import FixedPlayers, build_frozen_model, make_bot
 from colosseum.worker.buffers import BufferPool, BufferSpec, RolloutBuffer
-from colosseum.worker.match_runner import ActRecord, EpisodeEnd, MatchRunner
+from colosseum.worker.match_runner import ActRecord, EpisodeEnd, MatchRunner, ScriptedPlayer
 
 logger = logging.getLogger(__name__)
 
@@ -106,6 +110,7 @@ class RolloutLoop:
         vec_env_kind: Literal["sync", "subprocess"] = "sync",
         subproc_workers: int | None = None,
         max_idle_steps: int = 1000,
+        fixed_players: FixedPlayers | None = None,
     ) -> None:
         if len(lineups) != num_envs:
             raise ValueError(f"worker {worker_id}: need one lineup per env: {len(lineups)} lineups for {num_envs} envs")
@@ -128,6 +133,14 @@ class RolloutLoop:
             raise ValueError(f"unknown vec_env_kind {vec_env_kind!r}")
         try:
             spec = vec_env.spec
+            # Fixed players (spec block 3): one bot factory per scripted agent and one model per frozen agent
+            # (its own architecture, weights from the main process), served under FIXED_NETWORK_ID.
+            self._fixed: dict[str, PolicyModel | ScriptedPlayer] = {}
+            if fixed_players is not None:
+                for aid, bot in fixed_players.bots.items():
+                    self._fixed[aid] = ScriptedPlayer(functools.partial(make_bot, bot, spec))
+                for aid, frozen in fixed_players.frozen.items():
+                    self._fixed[aid] = build_frozen_model(None, frozen, spec)
 
             specs: dict[str, BufferSpec] = {}
             for aid in self._agent_ids:
@@ -236,10 +249,12 @@ class RolloutLoop:
         return total
 
     # ------------------------------------------------------------------
-    # ModelPool
+    # PlayerPool
     # ------------------------------------------------------------------
 
-    def get(self, agent_id: str, network_id: str) -> PolicyModel | None:
+    def get(self, agent_id: str, network_id: str) -> PolicyModel | ScriptedPlayer | None:
+        if network_id == FIXED_NETWORK_ID:
+            return self._fixed.get(agent_id)
         return self._models.get(agent_id, {}).get(network_id)
 
     def _add_checkpoint(self, aid: str, ckpt_id: str, sd: Mapping[str, np.ndarray]) -> None:

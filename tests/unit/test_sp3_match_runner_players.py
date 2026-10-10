@@ -57,6 +57,22 @@ class UnitsTargetBot(ScriptedBot):
         return {"base": 0, "units": {"move": np.array([3, 0, 0, 0]), "target": np.array([3, 0, 0, 0])}}
 
 
+class MaskEditingBot(ScriptedBot):
+    """Unmasks every action in place, then plays action 1 (masked by MASK)."""
+
+    def act(self, obs, mask, info):
+        mask[...] = True
+        return np.int64(1)
+
+
+class ObsEditingBot(ScriptedBot):
+    """Overwrites its observation in place, then plays a legal action."""
+
+    def act(self, obs, mask, info):
+        obs[...] = -7.0
+        return np.int64(0)
+
+
 class EpisodeStartObserver(RecordingObserver):
     def on_episode_start(self, env, layout, episode_seed):
         self.events.append(("start", env, layout, episode_seed))
@@ -275,3 +291,39 @@ def test_neural_seats_records_carry_their_infos_entry():
     runner, obs, _games = _runner([Lineup("2p", [SeatAssignment("a")] * 2)], players)
     runner.step()
     assert [e[3].info for e in obs.events if e[0] == "act"] == [None]   # no infos entry -> None
+
+
+def test_a_bot_editing_obs_or_mask_in_place_changes_neither_the_gate_nor_the_record():
+    """The bot gets copies: an in-place edit cannot bypass the legality gate or corrupt ActRecord.obs/mask."""
+    def fresh_mask(k, t, s):
+        return np.array([True, False, True])
+
+    spec = _spec(mask_fn=fresh_mask)
+    players = {("a", "latest"): make_test_model(_role()),
+               ("bot", FIXED_NETWORK_ID): scripted_player(MaskEditingBot, spec)}
+    runner, _obs, _games = _runner([_bot_lineup("a", "bot")], players, mask_fn=fresh_mask)
+    runner.step()
+    with pytest.raises(PlayerError, match=r"agent 'bot': illegal action: action 1 at <root> is illegal"):
+        runner.step()
+
+    players[("bot", FIXED_NETWORK_ID)] = scripted_player(ObsEditingBot, spec)
+    runner, obs, _games = _runner([_bot_lineup("a", "bot")], players, mask_fn=fresh_mask)
+    for _ in range(2):
+        runner.step()
+    (record,) = [e[3] for e in obs.events if e[0] == "act" and e[2] == 1]
+    assert record.obs.tolist() == [0.0, 0.0, 1.0, 1.0, 0.0]
+    assert record.mask.tolist() == [True, False, True] and int(record.action) == 0
+
+
+def test_a_scripted_player_never_collects_even_under_latest():
+    """Spec block 3: only a trainable agent's latest model collects; a pool may serve a bot under 'latest'
+    (eval pools do), but such a seat with collect=True is a ValueError."""
+    spec = _spec()
+    players = {("a", "latest"): make_test_model(_role()), ("bot", "latest"): scripted_player(RecordingBot, spec)}
+    with pytest.raises(ValueError, match=r"env 0, seat 1: agent 'bot' is a scripted player with collect=True"):
+        _runner([Lineup("2p", [SeatAssignment("a"), SeatAssignment("bot")])], players)
+    runner, _obs, _games = _runner([Lineup("2p", [SeatAssignment("a"), SeatAssignment("bot", collect=False)])],
+                                   players)
+    runner.set_next_lineup(0, Lineup("2p", [SeatAssignment("a", collect=False), SeatAssignment("bot", collect=False)]))
+    with pytest.raises(ValueError, match=r"agent 'bot' is a scripted player with collect=True"):
+        runner.set_next_lineup(0, Lineup("2p", [SeatAssignment("bot"), SeatAssignment("a")]))

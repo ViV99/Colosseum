@@ -33,9 +33,10 @@ from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.ipc import QueueReader, SharedCounter, queue_depths, release_command_queues
 from colosseum.core.run_dir import RunDir
-from colosseum.core.types import LATEST_NETWORK_ID, Lineup, SeatAssignment
+from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, Lineup, SeatAssignment
 from colosseum.envs.game import GameSpec, RoleSpec
 from colosseum.metrics.wandb_logger import WandBLogger
+from colosseum.players.registry import FixedPlayers
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
 
@@ -88,13 +89,17 @@ def warn_static_ownership_skew(config: ColosseumConfig) -> None:
 
 @dataclass(frozen=True)
 class RunSetup:
-    """What a run needs before any process starts: the game's spec, every trainable agent's
-    roles, effective config (overrides merged) and role spec (the spaces its model is built for)."""
+    """What a run needs before any process starts: the game's spec, every agent's roles
+    (``player_roles``), the trainable agents' roles, effective configs (overrides merged) and role
+    specs (the spaces their models are built for), and the fixed players (loaded once in the main
+    process)."""
 
     spec: GameSpec
     agent_roles: dict[str, list[str]]
     agent_configs: dict[str, ColosseumConfig]
     role_specs: dict[str, RoleSpec]
+    player_roles: dict[str, list[str]]
+    fixed: FixedPlayers
 
 
 def validate_run_config(config: ColosseumConfig) -> None:
@@ -108,18 +113,21 @@ def validate_run_config(config: ColosseumConfig) -> None:
 def setup_run(config: ColosseumConfig, validate: bool = True) -> RunSetup:
     """``RunSetup`` of ``config``; ``validate`` first runs ``validate_run_config``."""
     from colosseum.core.registry import env_spec
-    from colosseum.core.roles import agent_role_spec, resolve_agent_roles
+    from colosseum.core.roles import agent_role_spec
+    from colosseum.players.registry import load_fixed_players, resolve_player_roles
 
     if validate:
         validate_run_config(config)
     spec = env_spec(config)
-    agent_roles = resolve_agent_roles(config, spec)
+    player_roles = resolve_player_roles(config, spec)
     agent_ids = config.get_trainable_agent_ids()
     return RunSetup(
         spec=spec,
-        agent_roles={aid: list(agent_roles[aid]) for aid in agent_ids},
+        agent_roles={aid: list(player_roles[aid]) for aid in agent_ids},
         agent_configs={aid: config.get_agent_config(aid) for aid in agent_ids},
-        role_specs={aid: agent_role_spec(spec, agent_roles[aid]) for aid in agent_ids},
+        role_specs={aid: agent_role_spec(spec, player_roles[aid]) for aid in agent_ids},
+        player_roles=player_roles,
+        fixed=load_fixed_players(config, spec),
     )
 
 
@@ -149,12 +157,14 @@ def _worker_main(
     results_queue: mp.Queue | None = None,
     command_queue: mp.Queue | None = None,
     metrics_queue: mp.Queue | None = None,
+    fixed_players: FixedPlayers | None = None,
 ) -> None:
     """Worker process body (see ``_worker_target``).
 
     Env and model factories are built INSIDE the process (``functools.partial`` over top-level
     functions is picklable under spawn, which the subprocess vector env needs to ship ``env_fn``
-    to its children). Models are built for each agent's role spec.
+    to its children). Models are built for each agent's role spec. ``fixed_players`` (numpy and
+    ``BotSpec`` data from the main process) become this worker's bots and frozen models.
     """
     from functools import partial
 
@@ -188,6 +198,7 @@ def _worker_main(
         vec_env_kind=config.rollout.vec_env,
         subproc_workers=config.rollout.subproc_workers,
         max_idle_steps=config.env.max_idle_steps,
+        fixed_players=fixed_players,
     )
 
 
@@ -297,7 +308,8 @@ def _resolve_lineups(
     ``WorkerCommand.new_checkpoints``), so they are numpy, never torch. Checkpoints listed in
     ``already_sent[agent]`` are referenced but not reloaded. A checkpoint that cannot be loaded
     (evicted or missing) is replaced by the latest weights with ``collect=True`` and a warning
-    (SP1 rule, R4-19).
+    (SP1 rule, R4-19). Latest and fixed seats (scripted / frozen agents, ``FIXED_NETWORK_ID``) pass
+    unchanged; every seat keeps its ``source``.
     """
     already_sent = already_sent or {}
     new_ckpts: dict[str, dict[str, dict[str, np.ndarray]]] = {aid: {} for aid in agent_ids}
@@ -306,8 +318,8 @@ def _resolve_lineups(
     for lineup in lineups:
         seats: list[SeatAssignment] = []
         for seat in lineup.seats:
-            if seat.network_id == LATEST_NETWORK_ID:
-                seats.append(SeatAssignment(seat.agent_id, LATEST_NETWORK_ID, seat.collect))
+            if seat.network_id in (LATEST_NETWORK_ID, FIXED_NETWORK_ID):
+                seats.append(SeatAssignment(seat.agent_id, seat.network_id, seat.collect, seat.source))
                 continue
             agent_new = new_ckpts.setdefault(seat.agent_id, {})
             ckpt_id = seat.network_id
@@ -321,9 +333,9 @@ def _resolve_lineups(
                     logger.warning(f"Checkpoint {ckpt_id} of {seat.agent_id} is missing; that seat plays "
                                    f"the latest weights and collects trajectories")
             if available:
-                seats.append(SeatAssignment(seat.agent_id, ckpt_id, seat.collect))
+                seats.append(SeatAssignment(seat.agent_id, ckpt_id, seat.collect, seat.source))
             else:
-                seats.append(SeatAssignment(seat.agent_id, LATEST_NETWORK_ID, True))
+                seats.append(SeatAssignment(seat.agent_id, LATEST_NETWORK_ID, True, seat.source))
         resolved.append(Lineup(layout=lineup.layout, seats=seats))
     return new_ckpts, resolved
 
@@ -396,9 +408,11 @@ class Launcher:
         setup = setup_run(cfg, validate=not self._validated)
         self._setup = setup
         logger.info(f"  Roles: {setup.agent_roles}; layouts: {sorted(setup.spec.layouts)}")
+        logger.info(f"  Fixed players: {cfg.fixed_agent_ids() or 'none'}")
         warn_static_ownership_skew(cfg)
 
-        coordinator = Coordinator(cfg, setup.spec, setup.agent_roles, checkpoint_dir=self._run_dir.checkpoints)
+        coordinator = Coordinator(cfg, setup.spec, setup.player_roles, checkpoint_dir=self._run_dir.checkpoints,
+                                  env_steps=lambda: int(self._env_step_counter.value))
 
         # Resume (before any process starts: a bad resume source fails fast).
         resume_states = self._resolve_resume(setup.agent_configs, setup.role_specs)
@@ -598,6 +612,7 @@ class Launcher:
                     checkpoint_state_dicts_by_agent=ckpt_dicts_by_agent,
                     results_queue=results_queue,
                     command_queue=command_queues[worker_id],
+                    fixed_players=setup.fixed,
                     metrics_queue=metrics_queue,
                 ),
                 daemon=worker_daemon,

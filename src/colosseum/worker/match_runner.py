@@ -25,7 +25,8 @@ agents under ``FIXED_NETWORK_ID``. A bot instance exists per ``(agent, env, seat
 player's factory at the first reset with the agent at that seat and kept between episodes (also across
 lineup changes). Bots get the observation cast to the role's dtypes, the normalized mask and
 ``StepResult.infos.get(seat)`` of the latest result (``None`` without one; MatchRunner already keeps
-that result, so infos cost nothing beyond one ``infos.get(seat)`` per decision). Every ``ActRecord`` (neural
+that result, so infos cost nothing beyond one ``infos.get(seat)`` per decision). Observation and mask are
+copies: a bot editing them in place changes neither the legality gate nor the record. Every ``ActRecord`` (neural
 seats included) carries that ``infos`` entry as ``ActRecord.info``. A bot's exception or illegal action
 is a ``PlayerError`` with the context "worker W, env E, seat P, episode step K, layout L: agent 'X'".
 
@@ -36,7 +37,8 @@ resolved with ``resolve_outcome``: default team score = mean of the team's seat 
 
 A lineup naming a snapshot the pool cannot provide is seated as the agent's latest weights with
 ``collect=True`` (SP1 rule; one warning per (agent, network)); latest and fixed seats must be in the
-pool. Only ``latest`` seats may collect: any other seat with ``collect=True`` is a ``ValueError``.
+pool. Only ``latest`` seats of neural players may collect: any other seat with ``collect=True`` (also a
+``ScriptedPlayer`` a pool serves under ``"latest"``) is a ``ValueError``.
 
 ``context`` is a prefix ending with ``", "`` (e.g. ``"worker 3, "``); env contract errors
 read ``"worker 3, env 1, seat 2, episode step 7, layout 4p: ..."``.
@@ -260,7 +262,8 @@ class MatchRunner:
         for seat, assignment in enumerate(lineup.seats):
             net = assignment.network_id
             needed = net if net in (LATEST_NETWORK_ID, FIXED_NETWORK_ID) else LATEST_NETWORK_ID
-            if self._players.get(assignment.agent_id, needed) is None:
+            player = self._players.get(assignment.agent_id, needed)
+            if player is None:
                 raise ValueError(
                     f"{self._context}env {env}: the player pool has no model for agent {assignment.agent_id!r} "
                     f"(network {needed!r})"
@@ -269,6 +272,11 @@ class MatchRunner:
                 raise ValueError(
                     f"{self._context}env {env}, seat {seat}: agent {assignment.agent_id!r} plays network "
                     f"{net!r} with collect=True; only {LATEST_NETWORK_ID!r} seats collect"
+                )
+            if assignment.collect and isinstance(player, ScriptedPlayer):
+                raise ValueError(
+                    f"{self._context}env {env}, seat {seat}: agent {assignment.agent_id!r} is a scripted player "
+                    f"with collect=True; only a trainable agent's {LATEST_NETWORK_ID!r} model collects"
                 )
 
     def _resolve(self, lineup: Lineup, env: int) -> Lineup:
@@ -382,7 +390,8 @@ class MatchRunner:
         where = self._where(e, seat, a.agent_id)
         bot = self._bots[(a.agent_id, e, seat)]
         try:
-            raw = bot.act(obs, mask, seat_info)
+            # copies: a bot editing them in place can neither bypass the gate nor change the record
+            raw = bot.act(tree_map(np.copy, obs), None if mask is None else tree_map(np.copy, mask), seat_info)
         except Exception as exc:  # noqa: BLE001 - any bot failure is reported with its context
             raise PlayerError(f"{where}: act raised {type(exc).__name__}: {exc}") from exc
         action = check_bot_action(self.spec.roles[role_name], raw, mask, where, action_spec=role_info.action)
