@@ -122,6 +122,20 @@ class BaseMatchmaker(ABC):
         return None
 
 
+def build_matchmaker(cls: type[BaseMatchmaker], context: MatchmakerContext, path: str | None) -> BaseMatchmaker:
+    """Construct the run's matchmaker (the coordinator and ``validate`` share it): a ``ConfigError`` the class
+    raises passes through; any other exception from its ``__init__`` becomes a ConfigError naming
+    ``matchmaking.matchmaker_class`` (``path``; the class name for the built-in one)."""
+    try:
+        return cls(context)
+    except ConfigError:
+        raise
+    except Exception as e:  # noqa: BLE001 - user code
+        name = path if path is not None else cls.__name__
+        raise ConfigError(f"matchmaking.matchmaker_class {name!r}: constructing it failed: "
+                          f"{type(e).__name__}: {e}") from e
+
+
 def load_matchmaker_class(path: str) -> type[BaseMatchmaker]:
     """Import ``matchmaking.matchmaker_class``; ConfigError unless it is a ``BaseMatchmaker`` subclass."""
     from colosseum.core.registry import import_class

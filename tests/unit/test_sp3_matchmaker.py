@@ -180,6 +180,21 @@ def test_runtime_fallback_takes_anchors_when_no_trainable_agent_plays_the_team()
         ("fallback", "bot", FIXED_NETWORK_ID, False)}
 
 
+def test_the_runtime_fallback_never_seats_a_zero_weight_anchor():
+    ctx = make_matchmaker_context(hunt_spec(), {"h": ["hunter"], "bot": ["prey"]}, kinds={"bot": "scripted"},
+                                  matchmaking={**only(snapshots=1.0), "anchors": {"bot": 0.0}})
+    with pytest.raises(RuntimeError, match="nobody can play this team"):     # validate_matchmaking rejects it
+        MixtureMatchmaker(ctx).lineup_for("h")
+
+
+def test_lineup_for_without_a_playable_layout_is_a_runtime_error():
+    ctx = make_matchmaker_context(hunt_spec(), {"h": ["hunter"], "bot": ["prey"]}, kinds={"bot": "scripted"},
+                                  matchmaking={"layouts": {"1v3": 1.0}})
+    ctx.agents["h"] = type(ctx.agents["h"])("h", "trainable", frozenset({"scout"}))   # a role in no layout
+    with pytest.raises(RuntimeError, match="no playable layout"):
+        MixtureMatchmaker(ctx).lineup_for("h")
+
+
 @pytest.mark.parametrize("weighting, exponent, share_of_c", [
     ("hard", 1.0, 0.9), ("hard", 2.0, 0.81 / 0.82), ("balanced", 2.0, 0.5), ("uniform", 2.0, 0.5),
 ])

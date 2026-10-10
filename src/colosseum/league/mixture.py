@@ -40,7 +40,14 @@ from collections.abc import Mapping, Sequence
 
 from colosseum.core.config import ColosseumConfig, MatchmakingConfig
 from colosseum.core.errors import ConfigError
-from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, SOURCE_OWNER, Lineup, SeatAssignment
+from colosseum.core.types import (
+    FIXED_NETWORK_ID,
+    LATEST_NETWORK_ID,
+    OPPONENT_CATEGORIES,
+    SOURCE_OWNER,
+    Lineup,
+    SeatAssignment,
+)
 from colosseum.envs.game import GameSpec
 from colosseum.league.base import BaseMatchmaker, MatchmakerContext
 from colosseum.league.lineups import enabled_layouts, permute_seats, playable_layouts
@@ -49,8 +56,8 @@ from colosseum.league.schedule import schedule_points, schedule_value
 
 logger = logging.getLogger(__name__)
 
-CATEGORIES = ("latest", "snapshots", "rivals", "anchors")
-FALLBACK = "fallback"
+CATEGORIES = OPPONENT_CATEGORIES[:4]   # latest, snapshots, rivals, anchors (the drawn categories)
+FALLBACK = OPPONENT_CATEGORIES[4]
 
 
 # ---------------------------------------------------------------------------
@@ -170,7 +177,7 @@ class MixtureMatchmaker(BaseMatchmaker):
         weights = enabled_layouts(spec, config)
         layouts = playable_layouts(spec, config, roles)
         if not layouts:
-            raise KeyError(f"agent {owner!r} has no playable layout (validate_matchmaking should have caught it)")
+            raise RuntimeError(f"agent {owner!r} has no playable layout (validate_matchmaking should have caught it)")
         layout = self._rng.choices(layouts, weights=[weights[name] for name in layouts], k=1)[0]
         own_team = self._rng.choice(owner_teams(spec, layout, roles))
         seats: list[SeatAssignment | None] = [None] * spec.layout_size(layout)
@@ -204,9 +211,7 @@ class MixtureMatchmaker(BaseMatchmaker):
             category = self._rng.choices(names, weights=[mix[c] for c in names], k=1)[0]
             source = category
         else:
-            category = "latest" if candidates["latest"] else "anchors"
-            if not candidates["anchors"]:
-                candidates["anchors"] = [(a, FIXED_NETWORK_ID) for a in anchors]
+            category = "latest" if candidates["latest"] else "anchors"   # anchors with a weight > 0 now only
             if not candidates[category]:
                 raise RuntimeError(f"agent {owner!r}, layout {layout!r}, team {team}: nobody can play this team "
                                    f"(validate_matchmaking should have caught it)")

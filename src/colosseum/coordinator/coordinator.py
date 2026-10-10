@@ -26,7 +26,7 @@ from colosseum.core.errors import ConfigError
 from colosseum.core.roles import agent_role_spec, role_signature
 from colosseum.core.types import Lineup, MatchResult
 from colosseum.envs.game import GameSpec
-from colosseum.league.base import BaseMatchmaker, MatchmakerContext, load_matchmaker_class
+from colosseum.league.base import BaseMatchmaker, MatchmakerContext, build_matchmaker, load_matchmaker_class
 from colosseum.league.lineups import check_lineup
 from colosseum.league.mixture import MixtureMatchmaker, validate_matchmaking
 from colosseum.league.pfsp import PfspStats
@@ -76,13 +76,7 @@ class Coordinator:
         )
         path = config.matchmaking.matchmaker_class
         matchmaker_cls = MixtureMatchmaker if path is None else load_matchmaker_class(path)
-        try:
-            self._matchmaker: BaseMatchmaker = matchmaker_cls(self._context)
-        except ConfigError:
-            raise
-        except Exception as e:  # noqa: BLE001 - a user class failing in __init__ is a config problem
-            raise ConfigError(f"matchmaking.matchmaker_class {path!r}: constructing it failed: "
-                              f"{type(e).__name__}: {e}") from e
+        self._matchmaker: BaseMatchmaker = build_matchmaker(matchmaker_cls, self._context, path)
 
     @property
     def player_roles(self) -> dict[str, list[str]]:

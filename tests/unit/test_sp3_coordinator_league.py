@@ -6,7 +6,7 @@ import pytest
 
 from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.errors import ConfigError
-from colosseum.core.registry import env_spec
+from colosseum.core.registry import env_spec, validate_config
 from colosseum.core.types import LATEST_NETWORK_ID, Lineup, MatchResult, SeatAssignment, SeatResult, TeamResult
 from colosseum.launcher import Launcher, setup_run
 from colosseum.league.base import BaseMatchmaker
@@ -46,6 +46,19 @@ class SnapshotCollectsMatchmaker(MirrorMatchmaker):
 
 class NotAMatchmaker:
     pass
+
+
+class CrashingInit(BaseMatchmaker):
+    def __init__(self, context):
+        raise RuntimeError("init boom")
+
+    def lineup_for(self, owner):
+        raise AssertionError("never built")
+
+
+class RejectingInit(CrashingInit):
+    def __init__(self, context):
+        raise ConfigError("my matchmaker needs two layouts")
 
 
 def coordinator(tmp_path, steps=None, **sections) -> Coordinator:
@@ -89,6 +102,19 @@ def test_lineups_of_a_custom_matchmaker_are_checked(tmp_path):
 def test_a_bad_matchmaker_class_is_a_config_error(tmp_path, path, message):
     with pytest.raises(ConfigError, match=message):
         coordinator(tmp_path, matchmaking={"matchmaker_class": path})
+
+
+@pytest.mark.parametrize("name, message", [
+    ("CrashingInit", "^matchmaking.matchmaker_class 'test_sp3_coordinator_league.CrashingInit': constructing it "
+                     "failed: RuntimeError: init boom$"),
+    ("RejectingInit", "^my matchmaker needs two layouts$"),        # the class's own ConfigError passes through
+])
+def test_the_coordinator_and_validate_report_a_failing_matchmaker_init_alike(tmp_path, name, message):
+    matchmaking = {"matchmaker_class": f"test_sp3_coordinator_league.{name}"}
+    with pytest.raises(ConfigError, match=message):
+        coordinator(tmp_path, matchmaking=matchmaking)
+    with pytest.raises(ConfigError, match=message):
+        validate_config(make_test_config("turns", matchmaking=matchmaking))
 
 
 def test_share_schedules_follow_the_coordinators_env_steps(tmp_path):

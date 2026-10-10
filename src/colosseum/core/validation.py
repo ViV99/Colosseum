@@ -471,7 +471,7 @@ def _check_matchmaker_class(config: ColosseumConfig, spec: GameSpec, player_role
     """A custom ``matchmaking.matchmaker_class``: imports, constructs, and its lineups pass ``check_lineup``."""
     import random
 
-    from colosseum.league.base import MatchmakerContext, load_matchmaker_class
+    from colosseum.league.base import MatchmakerContext, build_matchmaker, load_matchmaker_class
     from colosseum.league.lineups import check_lineup
 
     path = config.matchmaking.matchmaker_class
@@ -479,11 +479,7 @@ def _check_matchmaker_class(config: ColosseumConfig, spec: GameSpec, player_role
         return
     cls = load_matchmaker_class(path)
     context = MatchmakerContext.from_config(config, spec, player_roles, rng=random.Random(0))
-    try:
-        matchmaker = cls(context)
-    except Exception as e:  # noqa: BLE001 - user code
-        raise ConfigError(f"matchmaking.matchmaker_class {path!r}: constructing it failed: "
-                          f"{type(e).__name__}: {e}") from e
+    matchmaker = build_matchmaker(cls, context, path)
     for owner in context.trainable:
         for _ in range(VALIDATE_LINEUPS):
             try:
