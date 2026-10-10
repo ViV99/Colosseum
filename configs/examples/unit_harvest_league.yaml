@@ -1,0 +1,70 @@
+# Unit harvest league (SP3): the trainable agent `main` plays its latest weights, PFSP snapshots and two
+# scripted anchors, the game's bot `greedy` and `random`. The competition pipeline (README, docs/LEAGUE_GUIDE.md):
+#   colosseum record -c configs/examples/unit_harvest_league.yaml --player greedy --num-matches 300 \
+#     --output data/greedy --seed 0
+#   colosseum bc -c configs/examples/unit_harvest_league.yaml --agent main --data data/greedy --output bc.pt --epochs 5
+#   colosseum train -c configs/examples/unit_harvest_league.yaml --set run.name=harvest-league \
+#     --set agents.main.init.from=bc.pt --set agents.main.init.critic_warmup_steps=30 \
+#     --set agents.main.kickstart.teacher=greedy
+run:
+  name: null
+  dir: "runs"
+
+env:
+  env_class: "examples.unit_harvest.game.UnitHarvestGame"
+  kwargs: {max_units: 8, size: 8, num_resources: 6, initial_workers: 2, max_steps: 50}
+
+networks:
+  encoder_class: "examples.unit_harvest.models.HarvestEncoder"
+  core: null
+  policy_class: "examples.unit_harvest.models.HarvestPolicy"
+  value_class: "examples.unit_harvest.models.HarvestValue"
+  kwargs: {}
+
+algorithm:
+  gamma: 0.98
+  vtrace_lambda: 0.95
+  entropy_coeff: 0.01
+  learning_rate: 1.0e-3
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 32
+  num_workers: 2
+  envs_per_worker: 16
+  weight_sync_interval_sec: 1.0
+  torch_threads: 1
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  total_timesteps: 160000   # global env steps (T6.4 calibration: about 2 minutes on 8 cores)
+  seed: null
+
+matchmaking:
+  opponents: {latest: 0.5, snapshots: 0.2, rivals: 0.0, anchors: 0.3}
+  anchors: {greedy: 1.0, random: 1.0}
+
+checkpoint:
+  interval: 100           # train steps between snapshots
+  keep_last: 10
+  save_optimizer: true
+
+metrics:
+  use_wandb: false
+  log_interval: 10
+  console_interval_sec: 10.0
+
+agents:
+  main:                     # trainable; the pipeline sets init.from / kickstart.teacher with --set
+    init: {from: null, critic_warmup_steps: 0}
+    kickstart: {teacher: null}
+  greedy:
+    kind: scripted
+    class: examples.unit_harvest.bots.HarvestBot
+  random:
+    kind: scripted
+    class: colosseum.players.RandomBot

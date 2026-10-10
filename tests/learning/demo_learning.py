@@ -1,7 +1,8 @@
 """Support for the SP2 learning tests (T8.3) and ``scripts/units_experiment.py`` (T8.4).
 
-- ``train_in_process``: the real ``RolloutLoop`` and ``APPO`` in one process, every chunk through
-  ``to_payload``/``from_payload`` (fast tests);
+- ``train_in_process``: the real ``RolloutLoop`` and one algorithm per agent (APPO, or
+  ``AgentSetup.algorithm_fn``) in one process, with optional scripted / frozen players and scripted
+  kickstart teachers (SP3), every chunk through ``to_payload``/``from_payload`` (fast tests);
 - ``GreedyPolicy`` / ``ScriptedPolicy``: wrap a model's mode, or a numpy per-observation function,
   as a point-mass distribution. A greedy agent and the stochastic ``RandomPolicy`` can then meet in
   one ``play_lineups(..., deterministic=False)`` (``deterministic=True`` would make the random
@@ -39,6 +40,7 @@ from colosseum.envs.game import MultiAgentEnv, RoleSpec
 from colosseum.eval import load_eval_model, play_lineups
 from colosseum.networks.heads import make_distribution
 from colosseum.networks.model import PolicyModel, PolicyStep
+from colosseum.players.registry import BotSpec, FixedPlayers
 from colosseum.worker.rollout_loop import LoopIO, RolloutLoop
 from game_helpers import RandomPolicy
 
@@ -155,27 +157,54 @@ class AgentSetup:
     model_fn: Callable[[], PolicyModel]
     config: AlgorithmConfig
     action_spec: ActionSpec
+    # SP3: builds the algorithm instead of ``APPO(model_fn(), config, ...)``, e.g.
+    # ``learner.factory.build_algorithm`` with a kickstart teacher
+    algorithm_fn: Callable[[], Any] | None = None
 
 
 def train_in_process(*, env_fn: Callable[[], MultiAgentEnv], agents: Mapping[str, AgentSetup],
                      lineups: Sequence[Lineup], chunk_length: int = 16, batch_chunks: int = 4,
                      max_updates: int = 300, solved: Callable[[dict[str, PolicyModel]], bool],
                      check_every: int = 10, seed: int = 0,
-                     last_metrics: dict[str, dict[str, float]] | None = None) -> int:
-    """Collect with one ``RolloutLoop`` (one env per lineup) and train one ``APPO`` per agent.
+                     last_metrics: dict[str, dict[str, float]] | None = None,
+                     fixed_players: FixedPlayers | None = None,
+                     teachers: Mapping[str, BotSpec] | None = None,
+                     on_chunk: Callable[[TrajectoryChunk], None] | None = None) -> int:
+    """Collect with one ``RolloutLoop`` (one env per lineup) and train one algorithm per agent.
     Every update trains every agent on exactly ``batch_chunks`` of its chunks. Returns the number
     of updates after which ``solved(models)`` first held (checked every ``check_every``), or -1.
-    ``last_metrics`` (if given) receives each agent's train metrics of the last update."""
+    ``last_metrics`` (if given) receives each agent's train metrics of the last update.
+
+    SP3: ``fixed_players`` seat scripted / frozen agents (their seats in ``lineups`` use
+    ``FIXED_NETWORK_ID`` and never collect); ``teachers`` are scripted kickstart teachers per
+    trainable agent (the agent's weight payloads carry ``teacher_active=True``); ``on_chunk`` sees
+    every chunk after the payload round trip."""
     torch.manual_seed(seed)
-    algos = {a: APPO(s.model_fn(), s.config, s.action_spec, device="cpu") for a, s in agents.items()}
+    algos = {a: s.algorithm_fn() if s.algorithm_fn is not None else APPO(s.model_fn(), s.config, s.action_spec,
+                                                                           device="cpu")
+             for a, s in agents.items()}
+    teachers = dict(teachers or {})
+
+    def payload(agent_id: str) -> WeightPayload:
+        algo = algos[agent_id]
+        return WeightPayload.from_model(agent_id, algo.policy_version, algo.model,
+                                        teacher_active=agent_id in teachers)
+
     pending: dict[str, list[TrajectoryChunk]] = {a: [] for a in agents}
-    latest = {a: WeightPayload.from_model(a, algo.policy_version, algo.model) for a, algo in algos.items()}
-    io = LoopIO(send_chunk=lambda c: pending[c.agent_id].append(TrajectoryChunk.from_payload(c.to_payload())),
-                poll_weights=lambda agent_id: latest[agent_id])
+    latest = {a: payload(a) for a in agents}
+
+    def send(chunk_out) -> None:
+        chunk = TrajectoryChunk.from_payload(chunk_out.to_payload())
+        if on_chunk is not None:
+            on_chunk(chunk)
+        pending[chunk.agent_id].append(chunk)
+
+    io = LoopIO(send_chunk=send, poll_weights=lambda agent_id: latest[agent_id])
     loop = RolloutLoop(worker_id=0, env_fn=env_fn, num_envs=len(lineups), chunk_length=chunk_length,
                        agent_ids=list(agents), agent_roles={a: s.roles for a, s in agents.items()},
                        model_factories={a: s.model_fn for a, s in agents.items()}, io=io, lineups=list(lineups),
-                       weight_sync_interval=0.0, seed=seed)
+                       weight_sync_interval=0.0, seed=seed, fixed_players=fixed_players,
+                       teachers=teachers or None)
     try:
         for update in range(1, max_updates + 1):
             while any(len(chunks) < batch_chunks for chunks in pending.values()):
@@ -187,7 +216,7 @@ def train_in_process(*, env_fn: Callable[[], MultiAgentEnv], agents: Mapping[str
                 metrics = algo.train_step(batch)
                 if last_metrics is not None:
                     last_metrics[agent_id] = metrics
-                latest[agent_id] = WeightPayload.from_model(agent_id, algo.policy_version, algo.model)
+                latest[agent_id] = payload(agent_id)
             loop.sync_weights()
             if update % check_every == 0 and solved({a: algo.model for a, algo in algos.items()}):
                 return update
