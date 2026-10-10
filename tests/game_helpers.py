@@ -1245,3 +1245,46 @@ def _bot_with_spec(cls, spec: GameSpec, kwargs: dict) -> ScriptedBot:
 def scripted_player(cls, spec: GameSpec, **kwargs):
     """A ``ScriptedPlayer`` for a player pool: each instance is ``cls(**kwargs)`` with ``game_spec = spec``."""
     return ScriptedPlayer(functools.partial(_bot_with_spec, cls, spec, kwargs))
+
+
+# ---------------------------------------------------------------------------
+# SP3 (T3.2): matchmaker contexts over plain dicts
+# ---------------------------------------------------------------------------
+
+
+class StepCounter:
+    """A settable env-step source (``MatchmakerContext.env_steps_fn``, ``Coordinator(env_steps=...)``)."""
+
+    def __init__(self, value: int = 0) -> None:
+        self.value = int(value)
+
+    def __call__(self) -> int:
+        return self.value
+
+
+def make_matchmaker_context(spec, roles, *, kinds=None, matchmaking=None, per_agent=None, snapshots=None,
+                            scores=None, env_steps=None, seed: int = 0):
+    """A ``MatchmakerContext`` over plain dicts.
+
+    ``roles``: ``{agent: [roles]}`` in config order; ``kinds``: ``{agent: kind}`` (default trainable);
+    ``matchmaking``: the raw global section; ``per_agent``: raw per-agent overrides;
+    ``snapshots``: ``{agent: [checkpoint ids]}``; ``scores``: ``{(owner, (agent, network)): PFSP score}``
+    (default 0.5); ``env_steps``: a callable (default 0).
+    """
+    import random as _random
+
+    from colosseum.core.config import MatchmakingConfig, merge_matchmaking
+    from colosseum.league.base import AgentView, MatchmakerContext
+
+    kinds = kinds or {}
+    agents = {a: AgentView(a, kinds.get(a, "trainable"), frozenset(r)) for a, r in roles.items()}
+    trainable = [a for a in roles if agents[a].kind == "trainable"]
+    base = MatchmakingConfig.model_validate(matchmaking or {}).model_dump(by_alias=True)
+    configs = {a: MatchmakingConfig.model_validate(merge_matchmaking(base, (per_agent or {}).get(a, {})))
+               for a in trainable}
+    return MatchmakerContext(
+        spec=spec, agents=agents, trainable=trainable, matchmaking=configs, rng=_random.Random(seed),
+        snapshots_fn=lambda agent_id: list((snapshots or {}).get(agent_id, [])),
+        pfsp_fn=lambda layout, owner, player: (scores or {}).get((owner, player), 0.5),
+        env_steps_fn=env_steps if env_steps is not None else StepCounter(0),
+    )

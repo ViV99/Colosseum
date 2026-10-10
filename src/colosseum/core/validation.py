@@ -430,11 +430,22 @@ def _game_spec(config: ColosseumConfig) -> GameSpec:
         raise
 
 
+def _all_enabled_layouts(config: ColosseumConfig, spec: GameSpec) -> list[str]:
+    """Layouts any trainable agent may play (per-agent ``matchmaking.layouts`` included), first-seen order."""
+    from colosseum.league.lineups import enabled_layouts
+
+    names: dict[str, None] = {}
+    for aid in config.get_trainable_agent_ids():
+        names.update(dict.fromkeys(enabled_layouts(spec, config.get_agent_config(aid).matchmaking)))
+    return list(names)
+
+
 def validate_config(config: ColosseumConfig) -> ValidationReport:
     """Check a whole config before any process starts (spec block 9; SP3 spec block 1).
 
     - the env's ``GameSpec`` (``env_spec``; unsupported role spaces are a ConfigError), the
-      agents' roles (``resolve_agent_roles``) and the matchmaking checks (``validate_matchmaking``);
+      agents' roles (``resolve_agent_roles``) and the matchmaking checks
+      (``colosseum.league.mixture.validate_matchmaking``, per agent);
     - ``networks.critic_encoder_class`` only for agents whose roles declare a ``global_state_space``;
     - ``reset`` of every enabled layout and up to ``VALIDATE_STEPS`` random legal steps under the
       contract checks, with full ``space.contains`` checks of observations, global states and
@@ -449,14 +460,15 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
     Returns a ``ValidationReport``. Raises ConfigError (or EnvContractError for an env that breaks the
     contract).
     """
-    from colosseum.coordinator.matchmaker import enabled_layouts, validate_matchmaking
     from colosseum.core.roles import agent_role_spec, resolve_agent_roles
-    from colosseum.players.registry import load_fixed_players
+    from colosseum.league.mixture import validate_matchmaking
+    from colosseum.players.registry import load_fixed_players, resolve_player_roles
 
     report = ValidationReport()
     spec = _game_spec(config)
     agent_roles = resolve_agent_roles(config, spec)
-    validate_matchmaking(spec, agent_roles, config.matchmaking)
+    player_roles = resolve_player_roles(config, spec)
+    validate_matchmaking(spec, player_roles, config)
     fixed = load_fixed_players(config, spec)   # roles, classes, paths and role signatures of fixed agents
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_roles}
     role_specs = {aid: agent_role_spec(spec, roles) for aid, roles in agent_roles.items()}
@@ -466,7 +478,7 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
                 f"agent {aid!r}: networks.critic_encoder_class is set, but its roles {agent_roles[aid]} declare "
                 f"no global_state_space; remove critic_encoder_class or give the roles a global_state_space"
             )
-    layouts = list(enabled_layouts(spec, config.matchmaking))
+    layouts = _all_enabled_layouts(config, spec)
     samples = _exercise_env(config, spec, layouts)
     for aid, acfg in agent_configs.items():
         where = f"agent {aid!r}"

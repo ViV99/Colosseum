@@ -2,7 +2,8 @@
 
 Manages:
 - the players (trainable, scripted, frozen agents) and their roles; owner rotation over the trainable agents
-  in config order and one ``Lineup`` per env (``LineupMatchmaker`` until T3.2);
+  in config order and one ``Lineup`` per env from the matchmaker (``colosseum.league``), each checked by
+  ``check_lineup``;
 - checkpoint storage (learner checkpoint payloads -> ``CheckpointManager``; ``meta.json`` gets the
   agent's roles and their role signature);
 - match results, per-layout ratings of every player (``RatingBook``) and the PFSP statistics per player
@@ -18,14 +19,16 @@ from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
-from colosseum.coordinator.matchmaker import LineupMatchmaker
 from colosseum.coordinator.ratings import RatingBook
 from colosseum.core.config import ColosseumConfig
 from colosseum.core.errors import ConfigError
 from colosseum.core.roles import agent_role_spec, role_signature
 from colosseum.core.types import Lineup, MatchResult
 from colosseum.envs.game import GameSpec
-from colosseum.league.pfsp import DEFAULT_HALFLIFE_GAMES, PfspStats
+from colosseum.league.base import BaseMatchmaker, MatchmakerContext
+from colosseum.league.lineups import check_lineup
+from colosseum.league.mixture import MixtureMatchmaker, validate_matchmaking
+from colosseum.league.pfsp import PfspStats
 
 logger = logging.getLogger(__name__)
 
@@ -52,7 +55,8 @@ class Coordinator:
         self._rng = random.Random(config.training.seed)
         ckpt = config.checkpoint
         self._evicted: dict[str, list[str]] = {}   # evicted since the last take_evictions(), per agent
-        self._pfsp = PfspStats({a: DEFAULT_HALFLIFE_GAMES for a in trainable})
+        self._pfsp = PfspStats({aid: config.get_agent_config(aid).matchmaking.pfsp.halflife_games
+                                for aid in trainable})
         self._checkpoint_manager = CheckpointManager(
             base_dir=checkpoint_dir, keep_last=ckpt.keep_last, keep_every=ckpt.keep_every, interval=ckpt.interval,
             on_evict=self._on_evict,
@@ -62,10 +66,12 @@ class Coordinator:
                                  for a, roles in self._agent_roles.items()}
         self._match_results: deque[MatchResult] = deque(maxlen=10000)
         self._refresh_round = 0
-        self._matchmaker = LineupMatchmaker(
-            spec=spec, agent_roles=self._agent_roles, config=config.matchmaking,
-            checkpoints=self._checkpoint_ids, win_rate=self._ratings.win_rate, rng=self._rng,
+        validate_matchmaking(spec, self._player_roles, config)
+        self._context = MatchmakerContext.from_config(
+            config, spec, self._player_roles, rng=self._rng, snapshots_fn=self._checkpoint_ids,
+            pfsp_fn=self._pfsp.score, env_steps_fn=env_steps,
         )
+        self._matchmaker: BaseMatchmaker = MixtureMatchmaker(self._context)
 
     @property
     def player_roles(self) -> dict[str, list[str]]:
@@ -91,8 +97,13 @@ class Coordinator:
         return self._pfsp
 
     @property
-    def matchmaker(self) -> LineupMatchmaker:
+    def matchmaker(self) -> BaseMatchmaker:
         return self._matchmaker
+
+    @property
+    def context(self) -> MatchmakerContext:
+        """The matchmaker's read-only view of the run."""
+        return self._context
 
     @property
     def spec(self) -> GameSpec:
@@ -141,13 +152,19 @@ class Coordinator:
 
     def generate_lineups(self, num_envs: int, env_offset: int) -> list[Lineup]:
         """One lineup per env. Env ``e`` of this batch has global index ``g = env_offset + e``;
-        its owner is ``agents[(g + refresh_round) % n_trainable]`` (SP1 rotation), so every
-        trainable agent owns envs, and ownership rotates between refreshes."""
-        agents = self._trainable
+        its owner is ``trainable[(g + refresh_round) % n_trainable]`` (SP1 rotation over the trainable
+        agents in config order), so every trainable agent owns envs and ownership rotates between
+        refreshes. Every lineup passes ``check_lineup`` (ValueError naming the matchmaker class)."""
+        agents = self._context.trainable
         if not agents:
             raise ValueError("Coordinator has no trainable agents")
-        return [self._matchmaker.lineup_for(agents[(env_offset + e + self._refresh_round) % len(agents)])
-                for e in range(num_envs)]
+        who = type(self._matchmaker).__name__
+        lineups = []
+        for e in range(num_envs):
+            lineup = self._matchmaker.lineup_for(agents[(env_offset + e + self._refresh_round) % len(agents)])
+            check_lineup(self._context, lineup, who)
+            lineups.append(lineup)
+        return lineups
 
     def report_match_result(self, result: MatchResult) -> None:
         """Keep the result; update the ratings and the PFSP statistics of its layout."""

@@ -151,9 +151,9 @@ class DistributedSetup:
 
 def distributed_setup(config: ColosseumConfig, agent_ids: list[str]) -> DistributedSetup:
     """Validate the config and check the distributed scope (module docstring); ConfigError otherwise."""
-    from colosseum.coordinator.matchmaker import enabled_layouts
     from colosseum.core.registry import env_spec, validate_config
     from colosseum.core.roles import agent_role_spec, resolve_agent_roles
+    from colosseum.league.lineups import enabled_layouts
 
     validate_config(config)
     spec = env_spec(config)

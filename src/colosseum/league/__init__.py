@@ -11,6 +11,9 @@ import importlib
 from typing import Any
 
 _EXPORTS: dict[str, str] = {
+    "BaseMatchmaker": "colosseum.league.base",
+    "MatchmakerContext": "colosseum.league.base",
+    "MixtureMatchmaker": "colosseum.league.mixture",
     "PfspStats": "colosseum.league.pfsp",
 }
 
