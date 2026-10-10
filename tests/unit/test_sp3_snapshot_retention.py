@@ -105,6 +105,25 @@ def test_import_snapshots_links_model_and_meta_reads_the_source_only_and_applies
     assert new.import_snapshots(tmp_path / "old" / "checkpoints", "nobody") == []
 
 
+def test_the_import_log_counts_only_linked_snapshots_and_skips_absent_agents(tmp_path, caplog):
+    cfg = make_test_config("turns", agents={"a": {}, "b": {}}, checkpoint={"keep_last": 5})
+    old = make_coordinator(cfg, tmp_path / "old" / "checkpoints")
+    for version in (20, 40):
+        old.save_checkpoint_payload({"agent_id": "a", "policy_version": version, "model_state": model_state(cfg, "a"),
+                                     "trainer_state_bytes": b"opt"}, meta_extra={"env_steps": version})
+    store = CheckpointManager(tmp_path / "new" / "checkpoints", keep_last=5)
+    store.import_snapshots(tmp_path / "old" / "checkpoints", "a")
+    with caplog.at_level(logging.INFO):
+        store.import_snapshots(tmp_path / "old" / "checkpoints", "a")              # both already present
+        coord = make_coordinator(cfg, tmp_path / "third" / "checkpoints")
+        coord.import_snapshots(tmp_path / "old")                                   # "b" has no snapshots there
+    messages = [r.getMessage() for r in caplog.records]
+    assert any(m.startswith("Imported 0 snapshots of a") and "2 already present" in m for m in messages), messages
+    assert any(m.startswith("Imported 2 snapshots of a") for m in messages), messages
+    assert any("[a]: snapshot pool carried over" in m for m in messages)
+    assert not any("[b]: snapshot pool carried over" in m for m in messages), messages
+
+
 def test_import_snapshots_checks_the_role_signature(tmp_path):
     old = CheckpointManager(tmp_path / "old")
     old.save("a", 10, sd(10), meta_extra={"role_signature": "other-game"})

@@ -151,8 +151,11 @@ class Coordinator:
 
     def import_snapshots(self, run_dir: str | Path) -> None:
         """Run-dir resume (spec block 4): carry the stored snapshots of every trainable agent of ``run_dir``
-        into this run's store; a snapshot with another role signature is a ConfigError."""
+        into this run's store; a snapshot with another role signature is a ConfigError. Agents without
+        snapshots in ``run_dir`` (e.g. added since) are skipped silently."""
         for aid in self._trainable:
+            if not (Path(run_dir) / "checkpoints" / aid).is_dir():
+                continue
             kept = self._checkpoint_manager.import_snapshots(Path(run_dir) / "checkpoints", aid,
                                                              expected_signature=self._role_signatures[aid])
             logger.info(f"Resume [{aid}]: snapshot pool carried over from {run_dir}: {kept}")

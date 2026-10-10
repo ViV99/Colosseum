@@ -353,6 +353,7 @@ class CheckpointManager:
         entries = list(self._index.get(agent_id, []))
         present = {c.checkpoint_id for c in entries}
         agent_dir = self._agent_dir(agent_id)
+        imported = 0
         for info in infos:
             if info.checkpoint_id in present:
                 continue
@@ -368,11 +369,14 @@ class CheckpointManager:
                 raise
             entries.append(CheckpointInfo(info.checkpoint_id, agent_id, info.policy_version,
                                           agent_dir / info.checkpoint_id, info.timestamp, dict(info.meta)))
+            imported += 1
         entries.sort(key=lambda c: c.policy_version)
         self._index[agent_id], evicted = self._retain(agent_id, entries)
         kept = [c.checkpoint_id for c in self._index[agent_id]]
         if infos:
-            logger.info(f"Imported {len(infos)} snapshots of {agent_id} from {src_agent}; pool now {kept}")
+            skipped = len(infos) - imported
+            logger.info(f"Imported {imported} snapshots of {agent_id} from {src_agent}"
+                        f"{f' ({skipped} already present)' if skipped else ''}; pool now {kept}")
         self._notify_evicted(agent_id, evicted)
         return kept
 
