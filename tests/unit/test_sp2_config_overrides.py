@@ -185,6 +185,16 @@ def test_apply_overrides_unknown_path_raises(key):
         apply_overrides(base_data(), {key: 1})
 
 
+@pytest.mark.parametrize("key, whole", [
+    ("matchmaking.anchors.random", "--set matchmaking.anchors={random: ...}"),
+    ("matchmaking.opponents.latest.0", "--set matchmaking.opponents.latest={0: ...}"),
+])
+def test_setting_inside_an_anchor_map_or_a_schedule_hints_at_the_whole_value(key, whole):
+    with pytest.raises(ConfigError, match="set the whole value") as info:
+        apply_overrides(base_data(), {key: 0.2})
+    assert whole in str(info.value)
+
+
 def test_load_config_applies_overrides_before_validation(tmp_path):
     path = write_yaml(tmp_path, base_data())
     cfg = load_config(path, {"learner.batch_chunks": 4, "agents.alpha.learner.queue_size": 8})

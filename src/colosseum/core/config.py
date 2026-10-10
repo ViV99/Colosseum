@@ -1,4 +1,4 @@
-"""Pydantic v2 configuration models for the Colosseum framework (config v2, SP2).
+"""Pydantic v2 configuration models for the Colosseum framework (config v3, SP3; v2 = SP2).
 
 Every section of the training pipeline (algorithm, environment, network,
 rollout, learner, matchmaking, checkpointing, metrics, transport, run) has its own
@@ -389,8 +389,9 @@ class PfspConfig(StrictModel):
     weighting: Literal["hard", "balanced", "uniform"] = Field(
         default="hard", description="hard: (1 - x)^exponent; balanced: x(1 - x); uniform: 1 (x = the owner's EMA "
                                     "score against the candidate; floor 1e-6).")
-    exponent: float = Field(default=2.0, ge=0.0, description="Exponent of the hard weighting.")
-    halflife_games: float = Field(default=200.0, gt=0.0, description="EMA half-life of the PFSP score, in games.")
+    exponent: float = Field(default=2.0, ge=0.0, allow_inf_nan=False, description="Exponent of the hard weighting.")
+    halflife_games: float = Field(default=200.0, gt=0.0, allow_inf_nan=False,
+                                  description="EMA half-life of the PFSP score, in games.")
 
 
 class MatchmakingConfig(StrictModel):
@@ -409,7 +410,7 @@ class MatchmakingConfig(StrictModel):
                     "(weight 1 each); [] = none; a list of names (weight 1 each) or {name: weight or schedule}.",
     )
     pfsp: PfspConfig = Field(default_factory=PfspConfig)
-    layouts: dict[str, float] = Field(
+    layouts: dict[str, Annotated[float, Field(allow_inf_nan=False)]] = Field(
         default_factory=dict,
         description="Layout weights, e.g. {2p: 0.5, 4p: 0.5}. Empty = every layout with equal weight. Only "
                     "layouts with a seat for the data owner's role are drawn.",
@@ -744,10 +745,13 @@ class _AgentEntry(StrictModel):
 
 
 class TrainableAgent(_AgentEntry):
-    """A trainable agent (``kind: trainable``, the default): partial per-agent overrides.
+    """A trainable agent (``kind: trainable``, the default): partial per-agent overrides of ``networks``,
+    ``algorithm``, ``learner``, ``matchmaking``, ``init`` and ``kickstart``.
 
-    The section overrides are deep-merged onto the global sections before validation (R5-08), so an
-    override that sets only ``learning_rate`` keeps every other global algorithm value.
+    The section overrides are merged onto the global sections before validation (R5-08), so an
+    override that sets only ``learning_rate`` keeps every other global algorithm value. Every section is
+    deep-merged except ``matchmaking`` (``merge_matchmaking``: ``opponents`` and ``pfsp`` per key, while
+    ``anchors``, ``layouts`` and any schedule replace the global value whole).
 
     Caveat for ``networks``: the merge is key by key, so an override that switches to
     ``model_class`` still inherits the global ``encoder_class`` / ``policy_class`` /
@@ -891,10 +895,10 @@ class ColosseumConfig(StrictModel):
     run: RunConfig = Field(default_factory=RunConfig)
     agents: dict[str, AgentEntry] = Field(
         default_factory=dict,
-        description="Agents by id. kind: trainable (default; partial overrides of networks / algorithm / "
-                    "learner and roles), scripted (a ScriptedBot class with kwargs and roles) or frozen (fixed "
-                    "weights from a checkpoint dir or a .pt). Without a trainable agent an implicit trainable "
-                    "'agent_0' with the global settings exists.",
+        description="Agents by id. kind: trainable (default; roles and partial overrides of networks / "
+                    "algorithm / learner / matchmaking / init / kickstart), scripted (a ScriptedBot class with "
+                    "kwargs and roles) or frozen (fixed weights from a checkpoint dir or a .pt). Without a "
+                    "trainable agent an implicit trainable 'agent_0' with the global settings exists.",
     )
 
     @model_validator(mode="before")
@@ -997,12 +1001,13 @@ class ColosseumConfig(StrictModel):
         return self.agent_entry(agent_id).kind
 
     def get_agent_config(self, agent_id: str) -> ColosseumConfig:
-        """Effective config of one TRAINABLE agent: global sections deep-merged with its overrides."""
+        """Effective config of one TRAINABLE agent: the global sections merged with its overrides (``networks``,
+        ``algorithm``, ``learner``, ``init``, ``kickstart`` deep-merged; ``matchmaking`` by ``merge_matchmaking``)."""
         entry = self.agent_entry(agent_id)
         if entry.kind != "trainable":
             raise ConfigError(
                 f"agent '{agent_id}' is a {entry.kind} agent: only trainable agents have a training config "
-                f"(networks / algorithm / learner)"
+                f"(networks / algorithm / learner / matchmaking / init / kickstart)"
             )
         data = self.model_dump(by_alias=True)
         for section in _AGENT_SECTIONS:
@@ -1063,6 +1068,14 @@ def parse_override_value(raw: str, key: str | None = None) -> Any:
     return value
 
 
+def _holds_map(tp: Any) -> bool:
+    """True for an annotation that may hold a dict value (``{name: weight}`` anchors, schedules)."""
+    if typing.get_origin(tp) is Annotated:
+        tp = typing.get_args(tp)[0]
+    options = typing.get_args(tp) if typing.get_origin(tp) in (typing.Union, types.UnionType) else (tp,)
+    return any(option is dict or typing.get_origin(option) is dict for option in options)
+
+
 def _unwrap_optional(tp: Any) -> Any:
     if typing.get_origin(tp) in (typing.Union, types.UnionType):
         args = [a for a in typing.get_args(tp) if a is not type(None)]
@@ -1113,7 +1126,11 @@ def _check_override_path(parts: list[str]) -> None:
         elif tp is Any:
             return  # free-form dict (env.kwargs, agent override bodies): checked at validation
         else:
-            raise ConfigError(f"Cannot set '{'.'.join(parts)}': '{'.'.join(parts[:i])}' is not a section")
+            parent = ".".join(parts[:i])
+            if _holds_map(tp):   # an anchor map or a schedule: --set cannot reach inside it
+                raise ConfigError(f"Cannot set '{'.'.join(parts)}': '{parent}' is a map or a schedule, not a "
+                                  f"section; set the whole value, e.g. --set {parent}={{{part}: ...}}")
+            raise ConfigError(f"Cannot set '{'.'.join(parts)}': '{parent}' is not a section")
 
 
 # Old (SP2) knobs that ``--set`` accepts although they are not in the schema: the config models translate

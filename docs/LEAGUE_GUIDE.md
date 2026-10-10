@@ -182,7 +182,7 @@ matchmaking:
 
 ## 10. Override на агента
 
-`agents.<id>.matchmaking` (deep-merge на глобальную секцию) переопределяет `opponents`, `anchors`, `pfsp`, `layouts`, `teammates`, `teammate_self_prob`; `shuffle_seats` и `matchmaker_class` — только глобальные. Так же устроены `init` и `kickstart`: глобальная секция — дефолт для всех обучаемых агентов, `agents.<id>.init` / `.kickstart` переопределяют.
+`agents.<id>.matchmaking` переопределяет `opponents`, `anchors`, `pfsp`, `layouts`, `teammates`, `teammate_self_prob`; `shuffle_seats` и `matchmaker_class` — только глобальные. Слияние с глобальной секцией: `opponents` и `pfsp` — по ключам (заданная доля заменяет глобальную, остальные доли остаются; расписание доли заменяется целиком), а `anchors`, `layouts` и `teammates` / `teammate_self_prob` заменяют глобальное значение целиком (например, `layouts: {4p: 1}` агента не добавляется к глобальному `{2p: 1}`, а заменяет его). `init` и `kickstart` устроены как остальные секции агента (`networks`, `algorithm`, `learner`): глобальная секция — дефолт для всех обучаемых агентов, `agents.<id>.init` / `.kickstart` сливаются с ней по ключам. Доли `opponents` — относительные веса: они нормируются по заполнимым категориям (итог показывает `validate`). `--set` не заходит внутрь карты якорей или расписания: задавайте значение целиком, например `--set matchmaking.anchors={greedy: 2}`.
 
 ```yaml
 agents:
