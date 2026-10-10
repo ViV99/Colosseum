@@ -162,6 +162,21 @@ def test_a_run_dir_resume_imports_the_pool_and_a_checkpoint_dir_resume_does_not(
     assert ids(coord2.checkpoint_manager, "a") == []
 
 
+def test_eviction_callback_errors_after_the_first_are_logged(tmp_path, caplog):
+    def on_evict(agent, ckpt):
+        raise RuntimeError(f"callback failed for {ckpt}")
+
+    old = CheckpointManager(tmp_path / "old", keep_last=10)
+    for version in (10, 20, 30):
+        old.save("a", version, sd(version))
+    mgr = CheckpointManager(tmp_path / "store", keep_last=1, keep_every=0, on_evict=on_evict)
+    with caplog.at_level(logging.ERROR, logger="colosseum.coordinator.checkpoint_manager"):
+        with pytest.raises(RuntimeError, match="ckpt_v10"):
+            mgr.import_snapshots(tmp_path / "old", "a")
+    logged = [r for r in caplog.records if r.exc_info is not None]
+    assert [str(r.exc_info[1]) for r in logged] == ["callback failed for ckpt_v20"]
+
+
 def test_a_raising_eviction_callback_never_leaves_deleted_snapshots_in_the_index(tmp_path):
     seen = []
 

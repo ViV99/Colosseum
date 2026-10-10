@@ -312,8 +312,8 @@ class CheckpointManager:
         return kept, evicted
 
     def _notify_evicted(self, agent_id: str, evicted: list[str]) -> None:
-        """Call ``on_evict`` for every evicted id (the index is already updated); every callback runs, and the
-        first callback error is raised after the last one."""
+        """Call ``on_evict`` for every evicted id (the index is already updated); every callback runs, the
+        first callback error is raised after the last one, and every later error is logged."""
         if self._on_evict is None:
             return
         first_error: Exception | None = None
@@ -321,7 +321,11 @@ class CheckpointManager:
             try:
                 self._on_evict(agent_id, checkpoint_id)
             except Exception as e:
-                first_error = first_error or e
+                if first_error is None:
+                    first_error = e
+                else:
+                    logger.exception(f"on_evict({agent_id!r}, {checkpoint_id!r}) failed as well (the first "
+                                     f"eviction callback error is raised)")
         if first_error is not None:
             raise first_error
 

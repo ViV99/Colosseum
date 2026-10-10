@@ -56,6 +56,8 @@ class Coordinator:
         self._rng = random.Random(config.training.seed)
         ckpt = config.checkpoint
         self._evicted: dict[str, list[str]] = {}   # evicted since the last take_evictions(), per agent
+        # Only the launcher's match refresh drains evictions (take_evictions); without it nothing is buffered.
+        self._buffer_evictions = config.rollout.match_refresh_interval_sec > 0
         self._pfsp = PfspStats({aid: config.get_agent_config(aid).matchmaking.pfsp.halflife_games
                                 for aid in trainable})
         self._checkpoint_manager = CheckpointManager(
@@ -132,9 +134,12 @@ class Coordinator:
     def _on_evict(self, agent_id: str, checkpoint_id: str) -> None:
         """Storage evicted a snapshot (spec block 4): new lineups no longer draw it (the matchmaker's
         candidates come from the store), its PFSP statistics are dropped, and workers are told to unload it
-        (``take_evictions``)."""
+        (``take_evictions``; only with ``rollout.match_refresh_interval_sec > 0``: without a match refresh the
+        workers' lineups never change and nothing drains the buffer)."""
         logger.debug(f"Snapshot {checkpoint_id} of {agent_id} evicted")
         self._pfsp.forget((agent_id, checkpoint_id))
+        if not self._buffer_evictions:
+            return
         bucket = self._evicted.setdefault(agent_id, [])
         if checkpoint_id not in bucket:
             bucket.append(checkpoint_id)

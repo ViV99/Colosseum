@@ -37,6 +37,16 @@ def test_the_coordinator_hands_out_each_eviction_once(tmp_path):
     assert used <= {"latest", "ckpt_v30", "ckpt_v40"}          # evicted snapshots never enter new lineups
 
 
+def test_without_match_refresh_the_coordinator_keeps_no_evictions(tmp_path):
+    cfg = make_test_config("turns", checkpoint={"keep_last": 1, "keep_every": 0},
+                           rollout={"match_refresh_interval_sec": 0})
+    coord = make_coordinator(cfg, tmp_path / "ckpt")
+    for version in (10, 20, 30):
+        coord.checkpoint_manager.save("agent_0", version, sd(version))
+    assert coord.take_evictions() == {}                          # nobody drains them: nothing is buffered
+    assert [c.checkpoint_id for c in coord.checkpoint_manager.list_checkpoints("agent_0")] == ["ckpt_v30"]
+
+
 def test_drain_commands_merges_evictions():
     q = queue.Queue()
     q.put(WorkerCommand(lineups=[None], evict={"a": ["ckpt_v1"]}))
