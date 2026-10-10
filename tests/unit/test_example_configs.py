@@ -49,8 +49,9 @@ def test_every_example_config_validates(path, monkeypatch):
         # importorskip also silences Box2D's SWIG import-time DeprecationWarnings.
         pytest.importorskip("Box2D", reason="space_miners needs Box2D (pip install -e '.[examples]')")
     monkeypatch.chdir(REPO_ROOT)
-    result = CliRunner().invoke(main, ["validate", "-c", str(path)])
+    result = CliRunner().invoke(main, ["validate", "-c", str(path)])          # the full validate_config
     assert result.exit_code == 0, result.output
+    assert result.output.rstrip().endswith("Config is valid."), result.output
 
 
 def test_attention_example_builds_a_stateful_model():
