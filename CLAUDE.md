@@ -262,7 +262,7 @@ User writes env + encoder + networks → selects algorithm + matchmaking via con
 
 ## Implementation Status
 
-State after SP3 (players, league, warm start; developed on branch `sp3-league`, awaiting the owner's acceptance; SP2 was merged into `main` on 2026-10-09). Test suite: **1662** fast tests, **10** slow, **22** GPU-only (`pytest -m "not gpu and not slow"` is the CI suite).
+State after SP3 (players, league, warm start; developed on branch `sp3-league`, awaiting the owner's acceptance; SP2 was merged into `main` on 2026-10-09). Test suite: **1689** fast tests, **10** slow, **22** GPU-only (`pytest -m "not gpu and not slow"` is the CI suite).
 - SP3 records: spec `docs/superpowers/specs/2026-10-10-sp3-league-design.md` (Russian); plan `docs/superpowers/plans/2026-10-10-sp3-league/` (`00-overview.md` has the interface contract and amendments A1–A33; pre-flight rulings P1–P18); acceptance report and final-review records in `docs/superpowers/reports/` (`<date>-sp3-acceptance.md`, `<date>-sp3-review/`, written at acceptance; every ruling and deferred minor is in the report).
 - SP2 records: spec `docs/superpowers/specs/2026-10-08-sp2-game-model-design.md` (Russian); plan `docs/superpowers/plans/2026-10-08-sp2-game-model/` (`00-overview.md` has the interface contract and amendments R1–R18); acceptance report `docs/superpowers/reports/2026-10-09-sp2-acceptance.md` (criteria, measurements, every ruling, open items, all deferred task minors in its appendix); final review, fix wave and FIX-1/FIX-2 records `docs/superpowers/reports/2026-10-09-sp2-review/`.
 - SP1 records: `docs/superpowers/reports/2026-10-08-sp1-acceptance.md`; the pre-SP1 review `review/README.md` is a frozen snapshot (never edit it).
