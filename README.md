@@ -409,7 +409,7 @@ weights with one warning.
 |---|---|---|
 | ✔ | SP1 Foundation and stabilization | correct single-machine training, stateful model protocol, run dir, metrics, lifecycle |
 | ✔ | SP2 Game model | `GameSpec` / `MultiAgentEnv`, elimination, teams, roles, layouts, `Units`, Dict observations, bootstrap on the learner, centralized critic (accepted and merged 2026-10-09) |
-| ✔ | SP3 Players, league, warm start | scripted and frozen players, opponent mixes with PFSP over snapshots and anchors, snapshot retention, per-agent init / critic warm-up / kickstart (neural or DAgger), `colosseum record` (implemented on `sp3-league`; acceptance report in docs/superpowers/reports) |
+| ✔ | SP3 Players, league, warm start | scripted and frozen players, opponent mixes with PFSP over snapshots and anchors, snapshot retention, per-agent init / critic warm-up / kickstart (neural or DAgger), `colosseum record` (implemented on `sp3-league`; acceptance report `docs/superpowers/reports/2026-10-10-sp3-acceptance.md`; awaiting the owner's acceptance) |
 | | SP4 Selection and observability | match log, OpenSkill / Bradley–Terry ratings, `colosseum tournament`, dashboard, snapshot ratings, top-k snapshot storage |
 | | SP5 Distributed | hub and nodes, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images, distributed league, scripted/frozen players and SP3 warm start across machines |
 | | SP6 Speed and extensions | cuDNN RNN path, fast transformer unroll, GPU inference on workers, inference server, new algorithms |
