@@ -7,13 +7,14 @@ top-level classes, so ``functools.partial(Game, ...)`` or the class itself is a 
 
 from __future__ import annotations
 
+import functools
 import math
 import queue
 import shutil
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, ClassVar
 
 import gymnasium
 import numpy as np
@@ -27,6 +28,7 @@ from colosseum.core.ipc import assert_no_tensors
 from colosseum.core.specs import ActionSpec, ObsSpec
 from colosseum.core.tree import Tree, tree_get, tree_leaves, tree_map, tree_to_torch
 from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
+from colosseum.core.validation import random_legal_action
 from colosseum.envs.contract import EpisodeTracker
 from colosseum.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
 from colosseum.envs.spaces import Units
@@ -36,6 +38,7 @@ from colosseum.networks.cores import Core, GRUCore, LSTMCore, NoCore, WindowAtte
 from colosseum.networks.dist import Distribution, make_distribution
 from colosseum.networks.heads import UnitsHead
 from colosseum.networks.model import PolicyModel, PolicyStep, UnrollOutput
+from colosseum.players import ScriptedBot
 from colosseum.worker.buffers import BufferSpec, RolloutBuffer
 
 
@@ -1165,3 +1168,74 @@ def copy_sp2_run(tmp_path) -> Path:
     dst = Path(tmp_path) / "sp2_run"
     shutil.copytree(SP2_RUN, dst)
     return dst
+
+
+# ---------------------------------------------------------------------------
+# SP3 (T1.2): scripted bots and config entries for fixed players
+# ---------------------------------------------------------------------------
+
+
+class RecordingBot(ScriptedBot):
+    """Remembers every ``reset`` / ``act`` argument and plays a random legal action from its episode RNG.
+
+    ``RecordingBot.instances`` lists every bot constructed in this process, in order (tests clear it).
+    Each reset entry holds the first draw of the episode RNG (``draw``), so tests can compare RNGs.
+    """
+
+    instances: ClassVar[list[RecordingBot]] = []
+
+    def __init__(self) -> None:
+        self.resets: list[dict] = []
+        self.acts: list[dict] = []
+        self._role: RoleSpec | None = None
+        self._rng: np.random.Generator | None = None
+        RecordingBot.instances.append(self)
+
+    def reset(self, *, role, seat, layout, rng) -> None:
+        self.resets.append({"role": role, "seat": seat, "layout": layout, "draw": float(rng.random())})
+        self._role = self.game_spec.roles[role]
+        self._rng = rng
+
+    def act(self, obs, mask, info):
+        self.acts.append({"obs": obs, "mask": mask, "info": info})
+        return random_legal_action(self._role, mask, self._rng)
+
+
+class ConstantBot(ScriptedBot):
+    """Always the action ``value`` of a ``Discrete`` action space (DAgger and gate tests)."""
+
+    def __init__(self, value: int = 0) -> None:
+        self.value = int(value)
+
+    def act(self, obs, mask, info):
+        return np.int64(self.value)
+
+
+def scripted_agent(class_path: str = "colosseum.players.RandomBot", roles: list[str] | None = None,
+                   **kwargs) -> dict:
+    """An ``agents.<id>`` entry of a scripted agent (raw config dict)."""
+    entry: dict = {"kind": "scripted", "class": class_path, "kwargs": dict(kwargs)}
+    if roles is not None:
+        entry["roles"] = list(roles)
+    return entry
+
+
+def frozen_agent(path, roles: list[str] | None = None, networks: dict | None = None) -> dict:
+    """An ``agents.<id>`` entry of a frozen agent (raw config dict)."""
+    entry: dict = {"kind": "frozen", "path": str(path)}
+    if roles is not None:
+        entry["roles"] = list(roles)
+    if networks is not None:
+        entry["networks"] = dict(networks)
+    return entry
+
+
+def _bot_with_spec(cls, spec: GameSpec, kwargs: dict) -> ScriptedBot:
+    bot = cls(**kwargs)
+    bot.game_spec = spec
+    return bot
+
+
+def scripted_player(cls, spec: GameSpec, **kwargs):
+    """A bot factory for a player pool (``ScriptedPlayer(factory)`` from T1.3): ``cls(**kwargs)`` with ``spec``."""
+    return functools.partial(_bot_with_spec, cls, spec, kwargs)

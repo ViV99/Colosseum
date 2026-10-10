@@ -15,7 +15,7 @@ from typing import TYPE_CHECKING, Any
 from colosseum.core.errors import ConfigError
 
 if TYPE_CHECKING:
-    from colosseum.core.config import ColosseumConfig
+    from colosseum.core.config import ColosseumConfig, NetworkConfig
     from colosseum.envs.game import GameSpec, MultiAgentEnv, RoleSpec
     from colosseum.networks.model import PolicyModel
 
@@ -98,7 +98,12 @@ def env_spec(config: ColosseumConfig) -> GameSpec:
 
 
 def build_model(agent_config: ColosseumConfig, role: RoleSpec) -> PolicyModel:
-    """Build the agent's ``PolicyModel`` for ``role``'s spaces from ``agent_config.networks``.
+    """Build the agent's ``PolicyModel`` for ``role``'s spaces from ``agent_config.networks`` (``build_network``)."""
+    return build_network(agent_config.networks, role)
+
+
+def build_network(net: NetworkConfig, role: RoleSpec) -> PolicyModel:
+    """Build a ``PolicyModel`` for ``role``'s spaces from a ``networks`` section.
 
     - ``model_class``: ``cls(**inject, **networks.kwargs)``; it must be a ``PolicyModel``.
     - otherwise a ``ComposedModel``: ``encoder(**inject, **kwargs)``;
@@ -113,7 +118,6 @@ def build_model(agent_config: ColosseumConfig, role: RoleSpec) -> PolicyModel:
     from colosseum.networks.cores import Core, NoCore
     from colosseum.networks.model import PolicyModel
 
-    net = agent_config.networks
     kwargs = dict(net.kwargs)
     if net.model_class:
         model_cls = import_class(net.model_class)

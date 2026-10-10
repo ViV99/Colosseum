@@ -55,15 +55,13 @@ from typing import Any
 
 import numpy as np
 import torch
-from pydantic import ValidationError
 
-from colosseum.coordinator.checkpoint_manager import check_model_state, load_checkpoint_dir, read_weights_file
 from colosseum.coordinator.ratings import composition_key
-from colosseum.core.config import ColosseumConfig, NetworkConfig
+from colosseum.core.config import ColosseumConfig
 from colosseum.core.errors import ConfigError
 from colosseum.core.outcomes import pairwise_rank_score
-from colosseum.core.roles import agent_role_spec, resolve_agent_roles, role_signature
-from colosseum.core.types import LATEST_NETWORK_ID, Lineup, MatchResult, SeatAssignment, state_dict_from_numpy
+from colosseum.core.roles import agent_role_spec
+from colosseum.core.types import LATEST_NETWORK_ID, Lineup, MatchResult, SeatAssignment
 from colosseum.core.validation import _check_model
 from colosseum.envs.game import GameSpec, MultiAgentEnv
 from colosseum.envs.vector import VectorEnv
@@ -566,31 +564,6 @@ def summarize(spec: GameSpec, results: Sequence[MatchResult], *, agents: Sequenc
 # ---------------------------------------------------------------------------
 
 
-def _agent_model_config(config: ColosseumConfig, name: str) -> ColosseumConfig:
-    """``config.get_agent_config(name)`` for a configured agent, else the global sections."""
-    if name in config.get_trainable_agent_ids():
-        return config.get_agent_config(name)
-    return config.model_copy(update={"agents": {}})
-
-
-def _pt_roles(config: ColosseumConfig, spec: GameSpec, name: str, path: Path) -> list[str]:
-    if name in config.get_trainable_agent_ids():
-        return resolve_agent_roles(config, spec)[name]
-    roles = list(spec.roles)
-    signatures = {role_signature(spec.roles[r]) for r in roles}
-    if len(signatures) > 1:
-        raise ConfigError(
-            f"{path}: agent {name!r}: a .pt file without a matching agents.{name} entry plays every role of "
-            f"the game, but the roles {roles} have different spaces; name the agent after a configured "
-            f"agent (agents.<id>.roles) or use a checkpoint dir"
-        )
-    return roles
-
-
-def _architecture_key(model_config: ColosseumConfig, roles: Sequence[str]) -> str:
-    return json.dumps([model_config.networks.model_dump(mode="json", by_alias=True), list(roles)], sort_keys=True)
-
-
 def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
                     spec: GameSpec | None = None, validated: set[str] | None = None) -> tuple[PolicyModel, list[str]]:
     """Build and load one evaluation agent; returns ``(model in eval mode, roles)``.
@@ -598,8 +571,11 @@ def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
     - A checkpoint dir (read with ``load_checkpoint_dir``: strict, never modified): roles and
       ``role_signature`` from its ``meta.json`` (required; the signature must match the game's
       spaces for those roles), architecture from its ``networks`` (else the agent's config).
-    - A ``.pt`` state_dict: architecture and roles of ``agents.<name>`` when configured, else the
+    - A ``.pt`` state_dict: architecture and roles of ``agents.<name>`` when configured (a trainable
+      agent's effective networks and roles; a frozen agent's ``networks`` / ``roles`` overrides), else the
       global ``networks`` with every role of the game (which must share one signature).
+
+    Loading is ``players.registry.load_frozen`` + ``build_frozen_model`` (the loader frozen agents share).
 
     The built architecture is checked like ``validate_config`` checks an agent's model (``step``
     and ``unroll`` on the role's spaces), once per distinct (networks, roles): keys already in
@@ -608,63 +584,22 @@ def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
     Problems raise ConfigError naming the path; a path that is neither a dir nor a ``.pt`` file
     raises FileNotFoundError.
     """
-    from colosseum.core.registry import build_model, env_spec
+    from colosseum.core.registry import env_spec
+    from colosseum.players.registry import build_frozen_model, load_frozen
 
     spec = spec if spec is not None else env_spec(config)
-    p = Path(path)
-    model_config = _agent_model_config(config, name)
-    source = f"{p}: networks"
-    if p.is_dir():
-        source = f"Checkpoint {p}: networks of the config"
-        loaded = load_checkpoint_dir(p)
-        roles, signature = loaded["roles"], loaded["role_signature"]
-        if roles is None or signature is None:
-            raise ConfigError(f"Checkpoint {p}: meta.json has no roles/role_signature (not an SP2 checkpoint)")
-        unknown = sorted(set(roles) - set(spec.roles))
-        if unknown:
-            raise ConfigError(f"Checkpoint {p}: roles {unknown} are not roles of the game {sorted(spec.roles)}")
-        for role in roles:  # every role: one network serves them all
-            expected = role_signature(spec.roles[role])
-            if signature != expected:
-                raise ConfigError(
-                    f"Checkpoint {p}: role signature {signature!r} does not match the game's spaces for role "
-                    f"{role!r} ({expected!r}); it was trained on a different game or game version"
-                )
-        networks = loaded["meta"].get("networks")
-        if networks is not None:
-            try:
-                model_config = model_config.model_copy(update={"networks": NetworkConfig.model_validate(networks)})
-            except ValidationError as e:
-                raise ConfigError(f"Checkpoint {p}: invalid meta.json networks:\n{e}") from e
-            source = f"Checkpoint {p}: meta.json networks"
-        model_state = loaded["model_state"]
-    elif p.is_file() and p.suffix == ".pt":
-        roles = _pt_roles(config, spec, name, p)
-        try:
-            model_state = read_weights_file(p)
-        except ValueError as e:
-            raise ConfigError(f"{p}: {e}") from e
-    else:
-        raise FileNotFoundError(f"{p}: expected a checkpoint directory or a .pt file")
-    try:
-        model = build_model(model_config, agent_role_spec(spec, roles))
-    except ConfigError as e:
-        raise ConfigError(f"{p}: {e}") from e
-    except Exception as e:  # noqa: BLE001 - a checkpoint's networks are user data: any constructor failure
-        raise ConfigError(f"{p}: cannot build the agent's model ({type(e).__name__}: {e})") from e
-    role = agent_role_spec(spec, roles)
-    key = _architecture_key(model_config, roles)
+    frozen = load_frozen(config, name, path, spec)
+    model = build_frozen_model(config, frozen, spec)
+    role = agent_role_spec(spec, list(frozen.roles))
+    key = json.dumps([frozen.networks, list(frozen.roles)], sort_keys=True)
     if validated is None or key not in validated:
         try:
             _check_model(model, role, None, f"agent {name!r}")
         except ConfigError as e:
-            raise ConfigError(f"{source}: {e}") from e
+            raise ConfigError(f"{frozen.networks_source}: {e}") from e
         if validated is not None:
             validated.add(key)
-    check_model_state(model, model_state, str(p))
-    model.load_state_dict(state_dict_from_numpy(model_state))
-    model.eval()
-    return model, list(roles)
+    return model, list(frozen.roles)
 
 
 def default_layouts(spec: GameSpec, players: Mapping[str, Sequence[str]]) -> list[str]:

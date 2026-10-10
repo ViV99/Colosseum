@@ -342,6 +342,20 @@ def load_checkpoint_dir(ckpt_dir: str | Path) -> dict[str, Any]:
             "roles": meta.get("roles"), "role_signature": meta.get("role_signature")}
 
 
+def read_checkpoint_meta(ckpt_dir: str | Path) -> dict:
+    """The validated ``meta.json`` of one checkpoint dir, read without touching the dir.
+
+    A missing dir or an invalid ``meta.json`` raises ConfigError naming the dir.
+    """
+    path = Path(ckpt_dir)
+    try:
+        if not path.is_dir():
+            raise ValueError("not a directory")
+        return _parse_meta(path)
+    except ValueError as e:
+        raise ConfigError(f"Malformed checkpoint {path}: {e}") from e
+
+
 def _load_checkpoint_dir(ckpt_dir: Path, resume_from: str) -> dict[str, Any]:
     """Resume state from one checkpoint dir; any unreadable part (also a missing
     ``meta.json``, the only source of the version) raises ConfigError."""
