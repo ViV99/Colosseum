@@ -236,3 +236,20 @@ def test_record_cli(tmp_path, restore_root_logging):
     result = CliRunner().invoke(main, ["record", "-c", str(cfg), "--player", "bot", "-o", str(tmp_path / "y"),
                                        "--num-matches", "0"])
     assert result.exit_code == 2
+
+
+def test_an_odd_num_matches_against_opponents_is_rounded_up_on_two_team_layouts(tmp_path, caplog):
+    config = _turns(bot=RANDOM_BOT, other=RANDOM_BOT)
+    with caplog.at_level(logging.INFO, logger="colosseum.record"):
+        content = record(config, "bot", ["other"], layouts=None, num_matches=5, output=tmp_path / "a",
+                         num_envs=2, seed=0)
+    notes = [r for r in caplog.records if "rounded up" in r.getMessage()]
+    assert len(notes) == 1 and notes[0].levelno == logging.INFO and "using 6" in notes[0].getMessage()
+    assert (content["num_matches"], content["matches"], content["seat_episodes"]) == (6, 6, 6)
+    data = _part(tmp_path / "a" / "player")
+    assert sorted(int(obs[0, 1]) for obs in _seat_episodes(data)) == [0, 0, 0, 1, 1, 1]   # balanced sides
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="colosseum.record"):     # without --against: no pairs, no rounding
+        content = record(_turns(), "bot", [], layouts=None, num_matches=5, output=tmp_path / "b", num_envs=2, seed=0)
+    assert content["num_matches"] == 5 and content["matches"] == 5
+    assert not [r for r in caplog.records if "rounded up" in r.getMessage()]

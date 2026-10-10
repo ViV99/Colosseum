@@ -241,7 +241,9 @@ def eval_cmd(
 @click.option("--layout", "layouts", multiple=True,
               help="Layout to play (repeatable). Default: every layout the players can fill.")
 @click.option("--num-matches", "-n", default=100, type=click.IntRange(min=1), show_default=True,
-              help="Matches per layout (with --against: per opponent and layout)")
+              help="Matches per layout (with --against: per opponent and layout). With --against and a layout "
+                   "of two or more teams an odd count is rounded up, so the player plays every side equally "
+                   "often.")
 @click.option("--output", "-o", required=True, type=click.Path(file_okay=False),
               help="New or empty directory: <output>/<role>/part-NNNNN.pt (BC data) and record.json")
 @click.option("--num-envs", default=8, type=click.IntRange(min=1), show_default=True, help="Parallel environments")
@@ -283,9 +285,10 @@ def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tupl
 
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
-@click.option("--data", "-d", required=True, type=click.Path(exists=True),
-              help="BC data: a .pt file or a directory of .pt files (keys: observations, actions, "
-                   "optional action_masks, dones; trees in the agent's spaces)")
+@click.option("--data", "-d", "data", required=True, multiple=True, type=click.Path(exists=True),
+              help="BC data, repeatable: a .pt file, a directory of .pt files (keys: observations, actions, "
+                   "optional action_masks, dones; trees in the agent's spaces), or a 'colosseum record' output "
+                   "directory (its record.json selects the folders of the agent's roles)")
 @click.option("--output", "-o", required=True, type=click.Path(), help="Where to save the trained state_dict (.pt)")
 @click.option("--agent", "-a", "agent", default=None,
               help="Agent whose networks and roles are trained (default: the config's only trainable agent)")
@@ -297,7 +300,7 @@ def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tupl
               help="Window length for stateful models (default: bc.seq_len from the config, 64)")
 def bc(
     config: str,
-    data: str,
+    data: tuple[str, ...],
     output: str,
     agent: str | None,
     epochs: int,
@@ -334,7 +337,8 @@ def bc(
         elif agent not in agent_ids:
             raise ConfigError(f"--agent {agent!r} is not a trainable agent of the config ({agent_ids})")
         spec = env_spec(cfg)
-        role = agent_role_spec(spec, resolve_agent_roles(cfg, spec)[agent])
+        roles = resolve_agent_roles(cfg, spec)[agent]
+        role = agent_role_spec(spec, roles)
         agent_cfg = cfg.get_agent_config(agent)
         model = build_model(agent_cfg, role)
     device = agent_cfg.learner.device
@@ -345,11 +349,15 @@ def bc(
         lr=lr, device=device, seq_len=seq_len if seq_len is not None else agent_cfg.bc.seq_len,
     )
     with _config_errors():  # unreadable or malformed data, actions that do not fit the policy (DataError)
-        trainer.load_data(data)
+        from colosseum.bc.offline_bc import bc_data_sources
+
+        for source in bc_data_sources(data, roles):
+            trainer.load_data(source)
         metrics = trainer.train(num_epochs=epochs, batch_size=batch_size)
 
     torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, output)
-    message = f"BC training complete ({agent}): final-epoch NLL={metrics['bc_loss']:.4f}"
+    message = (f"BC training complete ({agent}): {int(metrics['num_samples'])} decisions, "
+               f"final-epoch NLL={metrics['bc_loss']:.4f}")
     if "accuracy" in metrics:
         message += f", accuracy={metrics['accuracy']:.3f}"
     click.echo(message)

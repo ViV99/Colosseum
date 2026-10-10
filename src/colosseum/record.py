@@ -192,8 +192,12 @@ def _schedule(spec: GameSpec, player: str, roles: Mapping[str, Sequence[str]], o
 
 def record(config: ColosseumConfig, player: str, against: Sequence[str], *, layouts: Sequence[str] | None,
            num_matches: int, output: str | Path, num_envs: int = 8, seed: int | None = None,
-           deterministic: bool = False) -> dict:
-    """Record ``player``'s decisions into ``output`` (module docstring); returns the ``record.json`` content."""
+           deterministic: bool = False, decisions_per_file: int = DECISIONS_PER_FILE) -> dict:
+    """Record ``player``'s decisions into ``output`` (module docstring); returns the ``record.json`` content.
+
+    With opponents and a layout of two or more teams among the chosen ones, an odd ``num_matches``
+    is rounded up (like ``colosseum eval``), so the player plays every side equally often.
+    """
     if num_matches < 1:
         raise ConfigError(f"num_matches must be >= 1, got {num_matches}")
     spec = env_spec(config)
@@ -212,9 +216,14 @@ def record(config: ColosseumConfig, player: str, against: Sequence[str], *, layo
     validated: set[str] = set()
     for option, (name, path) in [("--player", (p_name, p_path)), *(("--against", o) for o in opponents)]:
         models[name], roles[name] = load_player(config, name, path, spec=spec, validated=validated, option=option)
+    chosen = list(layouts) if layouts else list(spec.layouts)
+    if opponents and num_matches % 2 and any(spec.num_teams(name) >= 2 for name in chosen if name in spec.layouts):
+        logger.info("num_matches %d is odd; rounded up, using %d per opponent and layout so the player plays "
+                    "every side equally often", num_matches, num_matches + 1)
+        num_matches += 1
     lineups = _schedule(spec, p_name, roles, [name for name, _ in opponents], layouts, num_matches)
     out.mkdir(parents=True, exist_ok=True)
-    writers = {role: RoleWriter(out / role, spec.roles[role]) for role in roles[p_name]}
+    writers = {role: RoleWriter(out / role, spec.roles[role], decisions_per_file) for role in roles[p_name]}
     results = play_lineups(env_fn=lambda: make_env(config), models=models, lineups=lineups, num_envs=num_envs,
                            seed=seed, deterministic=deterministic, max_idle_steps=config.env.max_idle_steps,
                            observer=RecordObserver(writers, p_name))
