@@ -11,6 +11,8 @@ section are gone (the game structure comes from the env's ``GameSpec``); new are
 ``agents.<id>.roles``, ``algorithm.ratio_mode`` / ``unit_trace`` /
 ``entropy_reduction`` and ``networks.critic_encoder_class``; ``rollout.chunk_length``
 is at least 2.
+
+SP3: ``agents.<id>.kind`` (trainable / scripted / frozen) and the implicit trainable ``agent_0``.
 """
 
 from __future__ import annotations
@@ -24,10 +26,18 @@ import types
 import typing
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    ConfigDict,
+    Field,
+    ValidationError,
+    ValidationInfo,
+    field_validator,
+    model_validator,
+)
 
 from colosseum.core.errors import ConfigError
 
@@ -99,9 +109,11 @@ class TransportMode(str, Enum):
 
 
 class StrictModel(BaseModel):
-    """Base for every config model: unknown keys are errors, not silently ignored (R5-07)."""
+    """Base for every config model: unknown keys are errors, not silently ignored (R5-07). Fields with an
+    alias (``class``, ``from``, ``lambda``) accept their field name too (a ``model_dump()`` without aliases
+    validates again)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
 
 
 class AlgorithmConfig(StrictModel):
@@ -471,14 +483,53 @@ class TransportConfig(StrictModel):
 
 
 # ---------------------------------------------------------------------------
-# Per-agent config overrides
+# Agents (SP3 spec block 1): trainable, scripted and frozen
 # ---------------------------------------------------------------------------
 
 
-class AgentOverride(StrictModel):
-    """Per-agent overrides as partial dicts.
+AgentKind = Literal["trainable", "scripted", "frozen"]
 
-    They are deep-merged onto the global section before validation (R5-08), so an
+# Without any trainable agent in ``agents`` this trainable agent (global settings) exists implicitly.
+IMPLICIT_AGENT_ID = "agent_0"
+
+
+def _check_roles_list(roles: list[str] | None) -> list[str] | None:
+    if roles is not None:
+        if not roles:
+            raise ValueError("roles must not be empty (omit it to play every role)")
+        duplicates = sorted({r for r in roles if roles.count(r) > 1})
+        if duplicates:
+            raise ValueError(f"roles lists {duplicates} more than once")
+    return roles
+
+
+class _AgentEntry(StrictModel):
+    """Base of the three agent kinds: an unknown field is named together with the kind's fields."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _name_unknown_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        fields = cls.model_fields
+        allowed = set(fields) | {f.alias for f in fields.values() if f.alias}
+        unknown = sorted(str(key) for key in data if key not in allowed)
+        if unknown:
+            kind = data.get("kind", "trainable")
+            names = sorted(f.alias or name for name, f in fields.items())
+            hint = ""
+            if kind == "trainable" and {"class", "kwargs"} & set(unknown):
+                hint = "; a rule-based bot needs kind: scripted"
+            elif kind == "trainable" and "path" in unknown:
+                hint = "; fixed weights from a file need kind: frozen"
+            raise ValueError(f"unknown field(s) {unknown} for a {kind} agent (its fields: {names}){hint}")
+        return data
+
+
+class TrainableAgent(_AgentEntry):
+    """A trainable agent (``kind: trainable``, the default): partial per-agent overrides.
+
+    The section overrides are deep-merged onto the global sections before validation (R5-08), so an
     override that sets only ``learning_rate`` keeps every other global algorithm value.
 
     Caveat for ``networks``: the merge is key by key, so an override that switches to
@@ -488,26 +539,78 @@ class AgentOverride(StrictModel):
     ``kwargs`` explicitly if the new classes take different arguments).
     """
 
-    networks: dict[str, Any] | None = None
-    algorithm: dict[str, Any] | None = None
-    learner: dict[str, Any] | None = None
+    kind: Literal["trainable"] = "trainable"
     roles: list[str] | None = Field(
         default=None,
         description="Roles this agent plays (all must have the same spaces). Omitted = every role of the game, "
                     "which then must all have the same spaces.",
     )
+    networks: dict[str, Any] | None = None
+    algorithm: dict[str, Any] | None = None
+    learner: dict[str, Any] | None = None
+    matchmaking: dict[str, Any] | None = Field(default=None, description="Per-agent matchmaking override.")
+    init: dict[str, Any] | None = Field(default=None, description="Per-agent warm start (init) override.")
+    kickstart: dict[str, Any] | None = Field(default=None, description="Per-agent kickstart override.")
 
     @field_validator("roles")
     @classmethod
     def _check_roles(cls, roles: list[str] | None) -> list[str] | None:
-        if roles is not None:
-            if not roles:
-                raise ValueError("roles must not be empty (omit it to play every role)")
-            duplicates = sorted({r for r in roles if roles.count(r) > 1})
-            if duplicates:
-                raise ValueError(f"roles lists {duplicates} more than once")
-        return roles
+        return _check_roles_list(roles)
 
+    @field_validator("matchmaking", "init", "kickstart")
+    @classmethod
+    def _not_supported_yet(cls, value: dict[str, Any] | None, info: ValidationInfo) -> dict[str, Any] | None:
+        if value is not None:
+            raise ValueError(f"per-agent '{info.field_name}' sections are not supported yet; remove "
+                             f"agents.<id>.{info.field_name}")
+        return value
+
+
+# SP2 name of the per-agent override model.
+AgentOverride = TrainableAgent
+
+
+class ScriptedAgent(_AgentEntry):
+    """A rule-based bot (``kind: scripted``): a ``colosseum.players.ScriptedBot`` subclass built with ``kwargs``."""
+
+    kind: Literal["scripted"]
+    class_path: str = Field(..., alias="class",
+                            description="Dotted path to a colosseum.players.ScriptedBot subclass.")
+    kwargs: dict[str, Any] = Field(default_factory=dict, description="Constructor kwargs of the bot.")
+    roles: list[str] | None = Field(
+        default=None, description="Roles the bot plays (their spaces may differ). Omitted = every role of the game.",
+    )
+
+    @field_validator("class_path")
+    @classmethod
+    def _check_class_path(cls, value: str) -> str:
+        if "." not in value:
+            raise ValueError(f"class must be a dotted path 'package.module.Class', got {value!r}")
+        return value
+
+    @field_validator("roles")
+    @classmethod
+    def _check_roles(cls, roles: list[str] | None) -> list[str] | None:
+        return _check_roles_list(roles)
+
+
+class FrozenAgent(_AgentEntry):
+    """Fixed weights from a file (``kind: frozen``): a checkpoint dir (roles and networks from its
+    ``meta.json``) or a ``.pt`` state_dict (``networks``: partial override onto the global networks;
+    ``roles``: default every role of the game, which then must share one set of spaces)."""
+
+    kind: Literal["frozen"]
+    path: str = Field(..., min_length=1, description="Checkpoint dir or .pt state_dict.")
+    networks: dict[str, Any] | None = Field(default=None, description="Only with a .pt path.")
+    roles: list[str] | None = Field(default=None, description="Only with a .pt path.")
+
+    @field_validator("roles")
+    @classmethod
+    def _check_roles(cls, roles: list[str] | None) -> list[str] | None:
+        return _check_roles_list(roles)
+
+
+AgentEntry = Annotated[TrainableAgent | ScriptedAgent | FrozenAgent, Field(discriminator="kind")]
 
 _AGENT_SECTIONS = ("networks", "algorithm", "learner")
 
@@ -556,22 +659,32 @@ class ColosseumConfig(StrictModel):
     bc: BCConfig = Field(default_factory=BCConfig)
     transport: TransportConfig = Field(default_factory=TransportConfig)
     run: RunConfig = Field(default_factory=RunConfig)
-    agents: dict[str, AgentOverride] = Field(
+    agents: dict[str, AgentEntry] = Field(
         default_factory=dict,
-        description="Per-agent config overrides. Keys are agent IDs. "
-                    "Empty = single agent_0 using global config.",
+        description="Agents by id. kind: trainable (default; partial overrides of networks / algorithm / "
+                    "learner and roles), scripted (a ScriptedBot class with kwargs and roles) or frozen (fixed "
+                    "weights from a checkpoint dir or a .pt). Without a trainable agent an implicit trainable "
+                    "'agent_0' with the global settings exists.",
     )
 
     @field_validator("agents", mode="before")
     @classmethod
-    def _null_agent_means_no_override(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            return {k: ({} if v is None else v) for k, v in value.items()}
-        return value
+    def _default_kind(cls, value: Any) -> Any:
+        """``null`` = a trainable agent with no overrides; an entry without ``kind`` is trainable."""
+        if not isinstance(value, dict):
+            return value
+        out = {}
+        for agent_id, entry in value.items():
+            if entry is None:
+                entry = {}
+            if isinstance(entry, dict) and "kind" not in entry:
+                entry = {**entry, "kind": "trainable"}
+            out[agent_id] = entry
+        return out
 
     @field_validator("agents")
     @classmethod
-    def _check_agent_ids(cls, agents: dict[str, AgentOverride]) -> dict[str, AgentOverride]:
+    def _check_agent_ids(cls, agents: dict[str, Any]) -> dict[str, Any]:
         for agent_id in agents:
             try:
                 check_agent_id(agent_id)
@@ -581,52 +694,79 @@ class ColosseumConfig(StrictModel):
 
     @model_validator(mode="after")
     def _validate_agent_overrides(self) -> ColosseumConfig:
-        for agent_id in self.agents:
+        if self._has_implicit_agent() and IMPLICIT_AGENT_ID in self.agents:
+            raise ValueError(
+                f"agents.{IMPLICIT_AGENT_ID} is a {self.agents[IMPLICIT_AGENT_ID].kind} agent, but the config has no "
+                f"trainable agent, so '{IMPLICIT_AGENT_ID}' is the implicit trainable agent; rename the "
+                f"{self.agents[IMPLICIT_AGENT_ID].kind} agent or add a trainable agent"
+            )
+        for agent_id, entry in self.agents.items():
+            if entry.kind != "trainable":
+                continue
             try:
                 self.get_agent_config(agent_id)
             except ValidationError as e:
                 raise ValueError(f"agents.{agent_id}: invalid override:\n{e}") from None
         return self
 
+    def _has_implicit_agent(self) -> bool:
+        return not any(entry.kind == "trainable" for entry in self.agents.values())
+
+    def agent_ids(self) -> list[str]:
+        """Every agent in config order; the implicit trainable ``agent_0`` (if any) comes first."""
+        ids = list(self.agents)
+        return [IMPLICIT_AGENT_ID, *ids] if self._has_implicit_agent() else ids
+
     def _require_known_agent(self, agent_id: str) -> None:
-        """Raise ConfigError unless ``agent_id`` is a configured agent (or ``agent_0`` without ``agents``)."""
-        if self.agents and agent_id not in self.agents:
-            raise ConfigError(f"Unknown agent '{agent_id}'. Known agents: {sorted(self.agents)}")
-        if not self.agents and agent_id != "agent_0":
-            raise ConfigError(
-                f"Unknown agent '{agent_id}': without an 'agents' section the only agent is 'agent_0'"
-            )
+        """Raise ConfigError unless ``agent_id`` is a configured agent or the implicit ``agent_0``."""
+        if agent_id in self.agents or (agent_id == IMPLICIT_AGENT_ID and self._has_implicit_agent()):
+            return
+        if not self.agents:
+            raise ConfigError(f"Unknown agent '{agent_id}': without an 'agents' section the only agent is "
+                              f"'{IMPLICIT_AGENT_ID}'")
+        raise ConfigError(f"Unknown agent '{agent_id}'. Known agents: {self.agent_ids()}")
+
+    def agent_entry(self, agent_id: str) -> TrainableAgent | ScriptedAgent | FrozenAgent:
+        """The agent's config entry (the implicit ``agent_0`` is ``TrainableAgent()``)."""
+        self._require_known_agent(agent_id)
+        entry = self.agents.get(agent_id)
+        return entry if entry is not None else TrainableAgent()
+
+    def agent_kind(self, agent_id: str) -> AgentKind:
+        return self.agent_entry(agent_id).kind
 
     def get_agent_config(self, agent_id: str) -> ColosseumConfig:
-        """Effective config of one agent: global sections deep-merged with its override."""
-        self._require_known_agent(agent_id)
+        """Effective config of one TRAINABLE agent: global sections deep-merged with its overrides."""
+        entry = self.agent_entry(agent_id)
+        if entry.kind != "trainable":
+            raise ConfigError(
+                f"agent '{agent_id}' is a {entry.kind} agent: only trainable agents have a training config "
+                f"(networks / algorithm / learner)"
+            )
         data = self.model_dump(by_alias=True)
-        override = self.agents.get(agent_id)
-        if override is not None:
-            for section in _AGENT_SECTIONS:
-                part = getattr(override, section)
-                if part:
-                    data[section] = deep_merge(data[section], part)
+        for section in _AGENT_SECTIONS:
+            part = getattr(entry, section)
+            if part:
+                data[section] = deep_merge(data[section], part)
         data["agents"] = {}
         return ColosseumConfig.model_validate(data)
 
     def agent_roles(self, agent_id: str) -> list[str] | None:
-        """``agents.<id>.roles`` (None when omitted: the agent plays every role).
+        """``agents.<id>.roles`` of any kind (None when omitted).
 
         Call it on the top-level config, not on a ``get_agent_config()`` result (which has ``agents == {}``).
         """
-        self._require_known_agent(agent_id)
-        override = self.agents.get(agent_id)
-        return None if override is None or override.roles is None else list(override.roles)
+        roles = self.agent_entry(agent_id).roles
+        return None if roles is None else list(roles)
 
     def get_trainable_agent_ids(self) -> list[str]:
-        """Return list of trainable agent IDs.
+        """Trainable agent ids in config order (owner rotation order); ``["agent_0"]`` without any."""
+        ids = [agent_id for agent_id, entry in self.agents.items() if entry.kind == "trainable"]
+        return ids or [IMPLICIT_AGENT_ID]
 
-        If agents dict is empty, defaults to ``["agent_0"]`` (single-agent mode).
-        """
-        if not self.agents:
-            return ["agent_0"]
-        return list(self.agents.keys())
+    def fixed_agent_ids(self) -> list[str]:
+        """Scripted and frozen agent ids in config order."""
+        return [agent_id for agent_id, entry in self.agents.items() if entry.kind != "trainable"]
 
 
 # ---------------------------------------------------------------------------
@@ -669,19 +809,44 @@ def _unwrap_optional(tp: Any) -> Any:
     return tp
 
 
+def _model_members(tp: Any) -> list[type[BaseModel]] | None:
+    """The config models an annotation stands for: a model, an optional model or a union of models
+    (``Annotated`` discriminated unions included, e.g. agent entries); None for anything else."""
+    if typing.get_origin(tp) is typing.Annotated:
+        tp = typing.get_args(tp)[0]
+    tp = _unwrap_optional(tp)
+    if isinstance(tp, type) and issubclass(tp, BaseModel):
+        return [tp]
+    if typing.get_origin(tp) in (typing.Union, types.UnionType):
+        members = [a for a in typing.get_args(tp) if a is not type(None)]
+        if members and all(isinstance(m, type) and issubclass(m, BaseModel) for m in members):
+            return members
+    return None
+
+
 def _check_override_path(parts: list[str]) -> None:
-    """Walk the schema of ColosseumConfig along ``parts``; raise ConfigError on an unknown key."""
+    """Walk the schema of ColosseumConfig along ``parts``; raise ConfigError on an unknown key.
+
+    At a union of models (an agent entry) a key is valid if one of the members has it.
+    """
     tp: Any = ColosseumConfig
     for i, part in enumerate(parts):
-        tp = _unwrap_optional(tp)
         where = ".".join(parts[: i + 1])
-        if isinstance(tp, type) and issubclass(tp, BaseModel):
-            fields = tp.model_fields
-            name = next((n for n, f in fields.items() if part in (n, f.alias)), None)
-            if name is None:
-                raise ConfigError(f"Unknown config key '{where}' (valid keys here: {sorted(fields)})")
-            tp = fields[name].annotation
-        elif typing.get_origin(tp) is dict:
+        members = _model_members(tp)
+        if members is not None:
+            found = None
+            for model in members:
+                name = next((n for n, f in model.model_fields.items() if part in (n, f.alias)), None)
+                if name is not None:
+                    found = model.model_fields[name].annotation
+                    break
+            if found is None:
+                valid = sorted({f.alias or n for model in members for n, f in model.model_fields.items()})
+                raise ConfigError(f"Unknown config key '{where}' (valid keys here: {valid})")
+            tp = found
+            continue
+        tp = _unwrap_optional(tp)
+        if typing.get_origin(tp) is dict:
             tp = typing.get_args(tp)[1]
         elif tp is Any:
             return  # free-form dict (env.kwargs, agent override bodies): checked at validation
