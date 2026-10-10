@@ -149,10 +149,14 @@ def _make_config(num_workers: int, run_parent: str):
             "seed": 0,
         },
         matchmaking={
-            "mode": "self_play",
+            "opponents": {"latest": 0.5, "snapshots": 0.5, "rivals": 0.0, "anchors": 0.0},
+            "anchors": [],
+            "pfsp": {"weighting": "hard", "exponent": 1.0, "halflife_games": 200.0},
             "layouts": {LAYOUT: 1.0},
-            "latest_prob": 0.5,
+            "teammates": "self",
+            "teammate_self_prob": 0.5,
             "shuffle_seats": True,  # one agent, every seat latest+collect: shuffling is a no-op
+            "matchmaker_class": None,
         },
         checkpoint={
             "interval": 10**9,  # no checkpoints: every seat collects

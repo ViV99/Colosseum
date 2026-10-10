@@ -9,7 +9,7 @@ import numpy as np
 import pytest
 
 from colosseum.coordinator.matchmaker import LineupMatchmaker, permute_seats, validate_matchmaking
-from colosseum.core.config import MatchmakingConfig
+from colosseum.core.config import MatchmakingConfig, translate_sp2_matchmaking
 from colosseum.core.errors import ConfigError
 from colosseum.core.types import LATEST_NETWORK_ID, SeatAssignment
 from colosseum.envs.game import GameSpec, RoleSpec, SeatSpec
@@ -31,7 +31,8 @@ def hunt_spec() -> GameSpec:
 
 def make_mm(spec, agent_roles, *, seed=0, ckpts=None, win_rate=None, **config) -> LineupMatchmaker:
     return LineupMatchmaker(
-        spec=spec, agent_roles=agent_roles, config=MatchmakingConfig(**config),
+        spec=spec, agent_roles=agent_roles,
+        config=MatchmakingConfig.model_validate(translate_sp2_matchmaking(config)),
         checkpoints=lambda agent_id: list((ckpts or {}).get(agent_id, [])),
         win_rate=win_rate or (lambda layout, a, b: 0.5),
         rng=random.Random(seed),

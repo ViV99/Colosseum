@@ -38,7 +38,8 @@ def test_defaults():
     assert cfg.env.max_idle_steps == 1000 and cfg.env.kwargs == {}
     assert cfg.networks.critic_encoder_class is None
     m = cfg.matchmaking
-    assert (m.mode, m.layouts, m.self_play_ratio, m.pfsp_exponent, m.latest_prob) == ("self_play", {}, 0.5, 1.0, 0.5)
+    assert (m.opponents.latest, m.opponents.snapshots, m.layouts, m.pfsp.exponent, m.anchors) == \
+        (0.7, 0.2, {}, 2.0, None)
     assert (m.teammates, m.teammate_self_prob, m.shuffle_seats) == ("self", 0.5, True)
     assert (cfg.checkpoint.interval, cfg.checkpoint.keep_last, cfg.checkpoint.save_optimizer) == (1000, 20, True)
     assert cfg.checkpoint.keep_every == 10
@@ -64,18 +65,17 @@ def test_chunk_length_needs_two_slots():
 
 
 @pytest.mark.parametrize("kwargs", [
-    {"mode": "arena"}, {"layouts": {"2p": 0.0}}, {"layouts": {"2p": -1.0}}, {"self_play_ratio": 1.5},
-    {"latest_prob": -0.1}, {"teammates": "random"}, {"teammate_self_prob": 2.0}, {"pfsp_exponent": -1.0},
-    {"layouts": {"2p": float("nan")}},
+    {"opponents": {"latest": -1.0}}, {"layouts": {"2p": 0.0}}, {"layouts": {"2p": -1.0}}, {"pfsp": {"exponent": -1.0}},
+    {"teammates": "random"}, {"teammate_self_prob": 2.0}, {"mode": "league"}, {"layouts": {"2p": float("nan")}},
 ])
 def test_matchmaking_bounds(kwargs):
     with pytest.raises(ValidationError):
-        MatchmakingConfig(**kwargs)
+        MatchmakingConfig.model_validate(kwargs)
 
 
 def test_matchmaking_layout_weights():
-    m = MatchmakingConfig(mode="league", layouts={"2p": 0.25, "4p": 0.75}, teammates="mixed")
-    assert m.layouts == {"2p": 0.25, "4p": 0.75} and m.mode == "league"
+    m = MatchmakingConfig(layouts={"2p": 0.25, "4p": 0.75}, teammates="mixed")
+    assert m.layouts == {"2p": 0.25, "4p": 0.75} and m.teammates == "mixed"
 
 
 def test_checkpoint_bounds():
@@ -137,7 +137,7 @@ def test_overrides_reach_the_new_keys(tmp_path):
         "agents.hunter.roles": parse_override_value("[hunter]"),
     }
     cfg = load_config(_write(tmp_path, BASE), overrides)
-    assert cfg.matchmaking.layouts == {"2p": 1.0, "4p": 3.0} and cfg.matchmaking.mode == "league"
+    assert cfg.matchmaking.layouts == {"2p": 1.0, "4p": 3.0} and cfg.matchmaking.opponents.rivals == 0.5
     assert cfg.checkpoint.interval == 50 and cfg.env.max_idle_steps == 5
     assert cfg.agent_roles("hunter") == ["hunter"]
     with pytest.raises(ConfigError, match="Unknown config key 'self_play'"):

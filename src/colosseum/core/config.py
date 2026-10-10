@@ -33,6 +33,7 @@ from typing import Annotated, Any, Literal
 import yaml
 from pydantic import (
     BaseModel,
+    BeforeValidator,
     ConfigDict,
     Field,
     ValidationError,
@@ -42,6 +43,7 @@ from pydantic import (
 )
 
 from colosseum.core.errors import ConfigError
+from colosseum.league.schedule import ScheduleValue, parse_schedule
 
 logger = logging.getLogger(__name__)
 
@@ -118,6 +120,16 @@ class StrictModel(BaseModel):
     validates again)."""
 
     model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+# Matchmaking keys an agent may override (spec block 5); shuffle_seats and matchmaker_class stay global.
+AGENT_MATCHMAKING_KEYS = frozenset({"opponents", "anchors", "pfsp", "layouts", "teammates", "teammate_self_prob"})
+# SP2 matchmaking knobs: accepted only in the raw global matchmaking section, translated, never stored.
+SP2_MATCHMAKING_KNOBS = ("mode", "self_play_ratio", "latest_prob", "pfsp_exponent")
+_SP2_MATCHMAKING_DEFAULTS = {"mode": "self_play", "self_play_ratio": 0.5, "latest_prob": 0.5, "pfsp_exponent": 1.0}
+
+# A share or an anchor weight: a number or {step: value} points over the run's global env steps.
+ScheduleField = Annotated[ScheduleValue, BeforeValidator(parse_schedule)]
 
 
 class AlgorithmConfig(StrictModel):
@@ -366,28 +378,54 @@ class TrainingConfig(StrictModel):
     )
 
 
-class MatchmakingConfig(StrictModel):
-    """How the coordinator builds lineups (layout, match type, team cores, teammates, seats)."""
+class OpponentShares(StrictModel):
+    """Shares of the opponent categories, drawn independently for every opposing team (spec block 5).
 
-    mode: Literal["self_play", "league"] = Field(
-        default="self_play",
-        description="'self_play' = every match is self-play (self_play_ratio is treated as 1); "
-                    "'league' = self-play with probability self_play_ratio, else an arena match.",
+    Each is a number or a schedule ``{env_step: value}``. Empty categories pass their share to the
+    others in proportion; ``rivals`` counts as ``latest`` for a team the owner cannot play.
+    """
+
+    latest: ScheduleField = Field(default=0.7, description="The owner's latest weights (self-play); for a team "
+                                                            "the owner cannot play, another agent's latest by PFSP.")
+    snapshots: ScheduleField = Field(default=0.2, description="Stored snapshots of the agents that play the team "
+                                                               "(own, the opponent's in asymmetric games, others'), "
+                                                               "by PFSP.")
+    rivals: ScheduleField = Field(default=0.0, description="Latest weights of the other trainable agents that play "
+                                                            "the team (arena; they collect too), by PFSP.")
+    anchors: ScheduleField = Field(default=0.1, description="The owner's anchors (scripted / frozen agents) that "
+                                                             "play the team, by their weights.")
+
+
+class PfspConfig(StrictModel):
+    """Prioritized fictitious self-play over candidates of a category (spec block 5)."""
+
+    weighting: Literal["hard", "balanced", "uniform"] = Field(
+        default="hard", description="hard: (1 - x)^exponent; balanced: x(1 - x); uniform: 1 (x = the owner's EMA "
+                                    "score against the candidate; floor 1e-6).")
+    exponent: float = Field(default=2.0, ge=0.0, description="Exponent of the hard weighting.")
+    halflife_games: float = Field(default=200.0, gt=0.0, description="EMA half-life of the PFSP score, in games.")
+
+
+class MatchmakingConfig(StrictModel):
+    """How the coordinator builds lineups (spec block 5).
+
+    ``opponents``, ``anchors``, ``pfsp``, ``layouts``, ``teammates`` and ``teammate_self_prob`` may be
+    overridden per agent (``agents.<id>.matchmaking``); ``shuffle_seats`` and ``matchmaker_class``
+    are global only. The SP2 knobs (``mode``, ``self_play_ratio``, ``latest_prob``,
+    ``pfsp_exponent``) are translated from the raw global section (``translate_sp2_matchmaking``).
+    """
+
+    opponents: OpponentShares = Field(default_factory=OpponentShares)
+    anchors: list[str] | dict[str, ScheduleField] | None = Field(
+        default=None,
+        description="Scripted / frozen agents the owner meets as anchors: null = every scripted and frozen agent "
+                    "(weight 1 each); [] = none; a list of names (weight 1 each) or {name: weight or schedule}.",
     )
+    pfsp: PfspConfig = Field(default_factory=PfspConfig)
     layouts: dict[str, float] = Field(
         default_factory=dict,
         description="Layout weights, e.g. {2p: 0.5, 4p: 0.5}. Empty = every layout with equal weight. Only "
                     "layouts with a seat for the data owner's role are drawn.",
-    )
-    self_play_ratio: float = Field(
-        default=0.5, ge=0.0, le=1.0,
-        description="Probability of a self-play match in 'league' mode (the rest are arena matches).",
-    )
-    pfsp_exponent: float = Field(default=1.0, ge=0.0, description="Exponent p in PFSP priority: f(wr) = (1 - wr)^p.")
-    latest_prob: float = Field(
-        default=0.5, ge=0.0, le=1.0,
-        description="Self-play: probability that an opposing team core is the owner's latest policy "
-                    "(else one of its checkpoints).",
     )
     teammates: Literal["self", "mixed"] = Field(
         default="self",
@@ -399,8 +437,25 @@ class MatchmakingConfig(StrictModel):
     )
     shuffle_seats: bool = Field(
         default=True,
-        description="Permute teams with equal role composition and seats of the same role within a team.",
+        description="Permute teams with equal role composition and seats of the same role within a team (global).",
     )
+    matchmaker_class: str | None = Field(
+        default=None,
+        description="Dotted path to a colosseum.league.BaseMatchmaker subclass that replaces the built-in "
+                    "mixture (global).",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_sp2_knobs(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            knobs = [k for k in SP2_MATCHMAKING_KNOBS if k in data]
+            if knobs:
+                raise ValueError(
+                    f"{knobs} are SP2 matchmaking knobs: they are accepted only in the global matchmaking section "
+                    f"of the input config (translated into opponents and pfsp); write opponents/pfsp here"
+                )
+        return data
 
     @field_validator("layouts")
     @classmethod
@@ -409,6 +464,83 @@ class MatchmakingConfig(StrictModel):
         if bad:
             raise ValueError(f"matchmaking.layouts weights must be > 0, got {bad}")
         return layouts
+
+    @field_validator("anchors")
+    @classmethod
+    def _check_anchor_names(cls, anchors: Any) -> Any:
+        names = list(anchors) if anchors is not None else []
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ValueError(f"matchmaking.anchors: names must be non-empty strings, got {names}")
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"matchmaking.anchors lists {duplicates} more than once")
+        return anchors
+
+    @field_validator("matchmaker_class")
+    @classmethod
+    def _check_matchmaker_class(cls, path: str | None) -> str | None:
+        if path is not None and "." not in path:
+            raise ValueError(f"matchmaking.matchmaker_class must be a dotted path 'module.Class', got {path!r}")
+        return path
+
+
+def translate_sp2_matchmaking(raw: dict) -> dict:
+    """Pure translation of SP2 matchmaking knobs in a raw global section (spec block 5).
+
+    Without knobs: a deep copy. With at least one: missing knobs take SP2's defaults
+    (``mode: self_play``, ``self_play_ratio: 0.5``, ``latest_prob: 0.5``, ``pfsp_exponent: 1.0``);
+    ``spr = 1`` under ``self_play``, else ``self_play_ratio``; ``latest = spr * latest_prob``,
+    ``snapshots = spr * (1 - latest_prob)``, ``rivals = 1 - spr``, ``anchors = 0``, each rounded to
+    12 decimals; ``pfsp = {weighting: hard, exponent: pfsp_exponent}``. Knobs together with
+    ``opponents`` or ``pfsp``, or a knob out of range, raise ConfigError.
+    """
+    present = [k for k in SP2_MATCHMAKING_KNOBS if k in raw]
+    if not present:
+        return copy.deepcopy(raw)
+    clash = [k for k in ("opponents", "pfsp") if k in raw]
+    if clash:
+        raise ConfigError(
+            f"matchmaking: the SP2 knobs {present} cannot be combined with {clash}; drop the knobs and set "
+            f"matchmaking.opponents / matchmaking.pfsp only"
+        )
+    knobs = {**_SP2_MATCHMAKING_DEFAULTS, **{k: raw[k] for k in present}}
+
+    def number(name: str, low: float, high: float | None) -> float:
+        value = knobs[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not (
+                low <= value and (high is None or value <= high)):
+            bound = f"[{low}, {high}]" if high is not None else f">= {low}"
+            raise ConfigError(f"matchmaking.{name}={value!r} (SP2 knob) must be a number {bound}")
+        return float(value)
+
+    if knobs["mode"] not in ("self_play", "league"):
+        raise ConfigError(f"matchmaking.mode={knobs['mode']!r} (SP2 knob) must be 'self_play' or 'league'")
+    self_play_ratio = number("self_play_ratio", 0.0, 1.0)        # checked even where mode makes it unused
+    spr = 1.0 if knobs["mode"] == "self_play" else self_play_ratio
+    latest_prob = number("latest_prob", 0.0, 1.0)
+    exponent = number("pfsp_exponent", 0.0, None)
+    out = {k: copy.deepcopy(v) for k, v in raw.items() if k not in SP2_MATCHMAKING_KNOBS}
+    shares = {"latest": spr * latest_prob, "snapshots": spr * (1.0 - latest_prob), "rivals": 1.0 - spr,
+              "anchors": 0.0}
+    out["opponents"] = {name: round(share, 12) for name, share in shares.items()}  # 0.4 * 0.75 -> 0.3, not 0.30..04
+    out["pfsp"] = {"weighting": "hard", "exponent": exponent}
+    return out
+
+
+def merge_matchmaking(base: dict, override: dict) -> dict:
+    """A per-agent matchmaking override on the global section (spec block 5).
+
+    ``opponents`` and ``pfsp`` merge key by key (one share's schedule is replaced whole, never merged
+    point by point); every other key (``anchors``, ``layouts``, ...) replaces the global value.
+    Inputs are not mutated.
+    """
+    out = copy.deepcopy(base)
+    for key, value in override.items():
+        if key in ("opponents", "pfsp") and isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = {**out[key], **copy.deepcopy(value)}
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
 
 
 class CheckpointConfig(StrictModel):
@@ -587,12 +719,31 @@ class TrainableAgent(_AgentEntry):
     def _check_roles(cls, roles: list[str] | None) -> list[str] | None:
         return _check_roles_list(roles)
 
-    @field_validator("matchmaking", "init", "kickstart")
+    @field_validator("init", "kickstart")
     @classmethod
     def _not_supported_yet(cls, value: dict[str, Any] | None, info: ValidationInfo) -> dict[str, Any] | None:
         if value is not None:
             raise ValueError(f"per-agent '{info.field_name}' sections are not supported yet; remove "
                              f"agents.<id>.{info.field_name}")
+        return value
+
+    @field_validator("matchmaking")
+    @classmethod
+    def _check_matchmaking_override(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return value
+        knobs = sorted(set(value) & set(SP2_MATCHMAKING_KNOBS))
+        if knobs:
+            raise ValueError(f"matchmaking: {knobs} are SP2 knobs, accepted only in the global matchmaking "
+                             f"section; set opponents / pfsp in agents.<id>.matchmaking")
+        global_only = sorted(set(value) & {"shuffle_seats", "matchmaker_class"})
+        if global_only:
+            raise ValueError(f"matchmaking: {global_only} are global only; set them in the top-level "
+                             f"matchmaking section")
+        unknown = sorted(set(value) - AGENT_MATCHMAKING_KEYS)
+        if unknown:
+            raise ValueError(f"matchmaking: unknown keys {unknown}; an agent may override "
+                             f"{sorted(AGENT_MATCHMAKING_KEYS)}")
         return value
 
 
@@ -642,7 +793,7 @@ class FrozenAgent(_AgentEntry):
 
 AgentEntry = Annotated[TrainableAgent | ScriptedAgent | FrozenAgent, Field(discriminator="kind")]
 
-_AGENT_SECTIONS = ("networks", "algorithm", "learner")
+_AGENT_SECTIONS = ("networks", "algorithm", "learner", "matchmaking")
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -696,6 +847,23 @@ class ColosseumConfig(StrictModel):
                     "weights from a checkpoint dir or a .pt). Without a trainable agent an implicit trainable "
                     "'agent_0' with the global settings exists.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _translate_sp2_matchmaking_knobs(cls, data: Any) -> Any:
+        """SP2 knobs in the raw global matchmaking section -> opponents + pfsp, with one warning."""
+        if not isinstance(data, dict):
+            return data
+        raw = data.get("matchmaking")
+        if not isinstance(raw, dict) or not any(k in raw for k in SP2_MATCHMAKING_KNOBS):
+            return data
+        translated = translate_sp2_matchmaking(raw)
+        logger.warning(
+            f"SP2 matchmaking knobs {[k for k in SP2_MATCHMAKING_KNOBS if k in raw]} translated to "
+            f"opponents={translated['opponents']}, pfsp={translated['pfsp']}; write these in the config "
+            f"(the old knobs are not kept in config.resolved.yaml)"
+        )
+        return {**data, "matchmaking": translated}
 
     @field_validator("agents", mode="before")
     @classmethod
@@ -777,7 +945,8 @@ class ColosseumConfig(StrictModel):
         for section in _AGENT_SECTIONS:
             part = getattr(entry, section)
             if part:
-                data[section] = deep_merge(data[section], part)
+                merge = merge_matchmaking if section == "matchmaking" else deep_merge
+                data[section] = merge(data[section], part)
         data["agents"] = {}
         return ColosseumConfig.model_validate(data)
 
@@ -887,6 +1056,7 @@ def _check_override_path(parts: list[str]) -> None:
 # Old (SP2) knobs that ``--set`` accepts although they are not in the schema: the config models translate
 # them (one warning each) and never store them.
 LEGACY_OVERRIDE_KEYS: set[str] = {"checkpoint.pool_size"}
+LEGACY_OVERRIDE_KEYS.update(f"matchmaking.{knob}" for knob in SP2_MATCHMAKING_KNOBS)
 
 
 def apply_overrides(data: dict, overrides: dict[str, Any]) -> dict:

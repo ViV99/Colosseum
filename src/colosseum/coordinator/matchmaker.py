@@ -36,6 +36,7 @@ from colosseum.core.config import MatchmakingConfig
 from colosseum.core.errors import ConfigError
 from colosseum.core.types import LATEST_NETWORK_ID, Lineup, SeatAssignment
 from colosseum.envs.game import GameSpec
+from colosseum.league.schedule import schedule_value
 
 logger = logging.getLogger(__name__)
 
@@ -138,7 +139,13 @@ class LineupMatchmaker:
         self._win_rate = win_rate
         self._rng = rng
         self._layouts = enabled_layouts(spec, config)
-        self._self_play_ratio = 1.0 if config.mode == "self_play" else float(config.self_play_ratio)
+        # SP3 T3.1 shim: SP2's numbers read back from the v3 shares at env step 0 (exact for translated
+        # SP2 configs; anchors are ignored). The built-in MixtureMatchmaker replaces this class in T3.2.
+        latest = schedule_value(config.opponents.latest, 0)
+        snapshots = schedule_value(config.opponents.snapshots, 0)
+        self._self_play_ratio = 1.0 - schedule_value(config.opponents.rivals, 0)
+        self._latest_prob = latest / (latest + snapshots) if latest + snapshots > 0 else 1.0
+        self._pfsp_exponent = float(config.pfsp.exponent)
 
     @property
     def self_play_ratio(self) -> float:
@@ -150,7 +157,7 @@ class LineupMatchmaker:
         return [name for name in self._layouts if any(seat.role in roles for seat in self._spec.layouts[name])]
 
     def pfsp_weight(self, layout: str, owner: str, candidate: str) -> float:
-        p = self._config.pfsp_exponent
+        p = self._pfsp_exponent
         return max(PFSP_MIN_WEIGHT, (1.0 - self._win_rate(layout, owner, candidate)) ** p)
 
     def lineup_for(self, owner: str) -> Lineup:
@@ -188,7 +195,7 @@ class LineupMatchmaker:
 
     def _self_play_core(self, owner: str) -> tuple[str, str]:
         checkpoints = self._checkpoints(owner)
-        if not checkpoints or self._rng.random() < self._config.latest_prob:
+        if not checkpoints or self._rng.random() < self._latest_prob:
             return owner, LATEST_NETWORK_ID
         return owner, self._rng.choice(checkpoints)
 
