@@ -15,13 +15,17 @@ Roles (separate processes / machines):
                            weight push to the store.
 - ``run-workers``        : N rollout workers feeding the learner(s).
 
-Scope (SP2, spec block 10): self-play on the latest weights, without a coordinator, for games
-where every agent of the run plays every role of the enabled layouts. Each worker env gets a
-fixed lineup: a layout drawn by ``matchmaking.layouts`` and every seat the latest weights of one
-agent (agents in rotation over the envs). Anything else (asymmetric agents, leagues across
-machines) is a ConfigError pointing to SP5. Layouts are drawn once per worker env (ruling
-PR-3) from an RNG seeded by ``training.seed + worker_id``, and the agent rotation starts at env 0
-of worker 0, so every worker machine of a run starts with the same layout mix and rotation.
+Scope (SP2 spec block 10, kept by SP3 spec block 8): self-play on the latest weights, without a
+coordinator, for games where every agent of the run plays every role of the enabled layouts. Each
+worker env gets a fixed lineup: a layout drawn by ``matchmaking.layouts`` and every seat the latest
+weights of one agent (agents in rotation over the envs). ``check_distributed_scope`` refuses, by the
+values of the final config, everything SP3 added that cannot be reduced to this (scripted and frozen
+agents, ``init``, a custom matchmaker, per-agent matchmaking or kickstart, a teacher other than one
+global ``.pt``) with a ConfigError pointing to SP5; any opponent mix other than "latest only" is
+reduced to it with one warning (default and resolved configs write every share explicitly).
+Layouts are drawn once per worker env (ruling PR-3) from an RNG seeded by ``training.seed +
+worker_id``, and the agent rotation starts at env 0 of worker 0, so every worker machine of a run
+starts with the same layout mix and rotation.
 
 Budget and progress: there is no shared env-step counter across machines. Each
 distributed learner uses progress = consumed_samples / training.total_timesteps
@@ -44,6 +48,8 @@ import threading
 import time
 from dataclasses import dataclass
 from functools import partial
+from pathlib import Path
+from typing import TYPE_CHECKING
 
 from colosseum.core.config import ColosseumConfig, config_hash, load_config
 from colosseum.core.errors import ConfigError
@@ -53,6 +59,9 @@ from colosseum.envs.game import GameSpec, RoleSpec
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
 from colosseum.utils.seeding import apply_global_seed, learner_seed
+
+if TYPE_CHECKING:
+    from colosseum.coordinator.checkpoint_manager import CheckpointManager
 
 logger = logging.getLogger(__name__)
 
@@ -147,12 +156,87 @@ class DistributedSetup:
     role_specs: dict[str, RoleSpec]
 
 
+_SP5 = ("distributed mode (run-learner / run-workers) keeps the SP2 scope until SP5 (a hub and a league "
+        "across machines); train this config with 'colosseum train' on one machine, or remove")
+
+
+def _schedule_values(value) -> list[float]:
+    """Every value of a share: a number, or the points of a piecewise-linear schedule."""
+    return [float(v) for v in value.values()] if isinstance(value, dict) else [float(value)]
+
+
+def _latest_only(opponents) -> bool:
+    others = [v for name in ("snapshots", "rivals", "anchors") for v in _schedule_values(getattr(opponents, name))]
+    return all(v == 0 for v in others) and all(v > 0 for v in _schedule_values(opponents.latest))
+
+
+def _teacher_problem(config: ColosseumConfig, teacher: str) -> str | None:
+    """Why the global kickstart teacher is outside the SP2 form (one ``.pt`` file, the student's
+    architecture), or None. A scripted teacher needs labels from the workers, which ``run-workers``
+    does not write (no teachers, no ``teacher_active`` through the gRPC weight store)."""
+    agents = config.agents
+    if teacher in agents and agents[teacher].kind == "scripted":
+        return f"kickstart.teacher {teacher!r} (a scripted teacher: DAgger labels are written by local workers only)"
+    if teacher in agents or Path(teacher).suffix != ".pt" or Path(teacher).is_dir():
+        return (f"kickstart.teacher {teacher!r} (distributed mode takes one global .pt teacher with the "
+                f"student's architecture)")
+    return None
+
+
+def check_distributed_scope(config: ColosseumConfig) -> None:
+    """Spec block 8: refuse SP3 settings distributed mode cannot honour (ConfigError naming SP5) and
+    warn once when some trainable agent's opponent mix is reduced to "latest only". Decides by the
+    values of the final config, not by which keys the YAML wrote."""
+    problems: list[str] = []
+    fixed = config.fixed_agent_ids()
+    if fixed:
+        problems.append(f"scripted/frozen agents {fixed} (anchors, fixed opponents, teachers)")
+    if config.matchmaking.matchmaker_class is not None:
+        problems.append(f"matchmaking.matchmaker_class {config.matchmaking.matchmaker_class!r}")
+    trainable = config.get_trainable_agent_ids()
+    agent_configs = {aid: config.get_agent_config(aid) for aid in trainable}
+    for aid, acfg in agent_configs.items():
+        if acfg.matchmaking != config.matchmaking:
+            problems.append(f"agents.{aid}.matchmaking (opponent selection per agent)")
+        if acfg.init.from_ is not None:
+            problems.append(f"init.from {acfg.init.from_!r} of agent {aid!r}")
+        if acfg.init.critic_warmup_steps > 0:
+            problems.append(f"init.critic_warmup_steps={acfg.init.critic_warmup_steps} of agent {aid!r}")
+        if acfg.kickstart != config.kickstart:
+            problems.append(f"agents.{aid}.kickstart (a kickstart teacher per agent)")
+    teacher = config.kickstart.teacher
+    if teacher is not None:
+        problem = _teacher_problem(config, teacher)
+        if problem is not None:
+            problems.append(problem)
+    if problems:
+        raise ConfigError(f"{_SP5}: " + "; ".join(problems))
+    reduced = {aid: acfg.matchmaking.opponents.model_dump(mode="json")
+               for aid, acfg in agent_configs.items() if not _latest_only(acfg.matchmaking.opponents)}
+    if reduced:
+        logger.warning(f"distributed mode plays every seat with the agents' latest weights (SP2 scope; leagues "
+                       f"across machines come with SP5): matchmaking.opponents {reduced} reduced to latest only")
+
+
+def distributed_checkpoint_manager(config: ColosseumConfig, base_dir: str | Path) -> CheckpointManager:
+    """The distributed learner's snapshot storage: the local retention (``keep_last``, every
+    ``keep_every``-th, the final snapshot; ``trainer_state.pt`` only in the ``keep_last`` window).
+    Nothing listens for evictions: distributed workers play latest weights only."""
+    from colosseum.coordinator.checkpoint_manager import CheckpointManager
+
+    ckpt = config.checkpoint
+    return CheckpointManager(base_dir=base_dir, keep_last=ckpt.keep_last, keep_every=ckpt.keep_every,
+                             interval=ckpt.interval)
+
+
 def distributed_setup(config: ColosseumConfig, agent_ids: list[str]) -> DistributedSetup:
-    """Validate the config and check the distributed scope (module docstring); ConfigError otherwise."""
+    """Check the distributed scope (``check_distributed_scope``, module docstring), then validate the
+    config; ConfigError otherwise."""
     from colosseum.core.registry import env_spec, validate_config
     from colosseum.core.roles import agent_role_spec, resolve_agent_roles
     from colosseum.league.lineups import enabled_layouts
 
+    check_distributed_scope(config)  # first: a refused setting is reported before any file it names is read
     validate_config(config)
     spec = env_spec(config)
     all_roles = resolve_agent_roles(config, spec)
@@ -248,11 +332,8 @@ def run_distributed_learner(
 
     # Checkpoint persistence (drained off-thread so training never blocks). Always on:
     # the learner's final snapshot is saved even without periodic checkpoints.
-    from colosseum.coordinator.checkpoint_manager import CheckpointManager
     checkpoint_queue: queue.Queue = queue.Queue(maxsize=16)
-    ckpt_cfg = config.checkpoint
-    coordinator_ckpt = CheckpointManager(base_dir=run_dir.checkpoints, keep_last=ckpt_cfg.keep_last,
-                                         keep_every=ckpt_cfg.keep_every, interval=ckpt_cfg.interval)
+    coordinator_ckpt = distributed_checkpoint_manager(config, run_dir.checkpoints)
 
     # The kickstart teacher (if any) is read here, before training starts, into a numpy spec.
     teacher = resolve_teacher(config, agent_id, setup.spec)
