@@ -22,6 +22,12 @@ from colosseum.networks.state import tree_map as state_tree_map
 
 # Network id of an agent's current weights, as opposed to a checkpoint id ("ckpt_v<N>").
 LATEST_NETWORK_ID = "latest"
+# Network id of the seats of scripted and frozen agents (one fixed player per agent; never collects).
+FIXED_NETWORK_ID = "fixed"
+# SeatAssignment.source of the data owner's team; the core of every opposing team carries its category.
+SOURCE_OWNER = "owner"
+# Opponent categories of the built-in matchmaker (SP3 spec block 5); "fallback" marks the runtime fallback.
+OPPONENT_CATEGORIES = ("latest", "snapshots", "rivals", "anchors", "fallback")
 
 # Values of TrajectoryChunk.kind (int8).
 SLOT_ACT, SLOT_BOOT, SLOT_PAD = 0, 1, 2
@@ -234,11 +240,17 @@ def validate_slot_structure(chunk: TrajectoryChunk) -> None:
 
 @dataclass
 class SeatAssignment:
-    """Who plays one seat: an agent's latest weights or a checkpoint, and whether it collects."""
+    """Who plays one seat: an agent's latest weights, a snapshot (``ckpt_v<N>``) or a scripted / frozen agent
+    (``FIXED_NETWORK_ID``), and whether the seat collects (only ``latest`` seats may).
+
+    ``source``: "" (eval, tests), ``SOURCE_OWNER`` for the data owner's team, or one of
+    ``OPPONENT_CATEGORIES`` for an opposing team (every seat of a team carries its team's value).
+    """
 
     agent_id: str
     network_id: str = LATEST_NETWORK_ID
     collect: bool = True
+    source: str = ""
 
 
 @dataclass
@@ -251,7 +263,8 @@ class Lineup:
 
 @dataclass
 class SeatResult:
-    """One seat of a finished match. ``reward`` is the undiscounted episode return."""
+    """One seat of a finished match. ``reward`` is the undiscounted episode return; ``source`` is the
+    seat's ``SeatAssignment.source``."""
 
     seat: int
     role: str
@@ -260,6 +273,7 @@ class SeatResult:
     network_id: str
     reward: float
     eliminated_step: int | None = None
+    source: str = ""
 
 
 @dataclass

@@ -40,6 +40,7 @@ from colosseum.networks.heads import UnitsHead
 from colosseum.networks.model import PolicyModel, PolicyStep, UnrollOutput
 from colosseum.players import ScriptedBot
 from colosseum.worker.buffers import BufferSpec, RolloutBuffer
+from colosseum.worker.match_runner import ScriptedPlayer
 
 
 def _vec(*values: float) -> np.ndarray:
@@ -692,7 +693,8 @@ class TickGame(MultiAgentEnv):
     ``global_state`` (if enabled) is ``[k, t + 0.5 * s]``. ``obs_dtype`` sets the observation
     Box dtype (e.g. ``np.uint8``). ``mask_fn(k, t, seat)`` gives the
     acting seats' masks (``None`` = no masks). ``log`` records ``(k, t, seed, actions)``
-    for every reset (``actions`` None) and step.
+    for every reset (``actions`` None) and step. With ``infos`` every acting seat gets
+    ``infos[seat] = {"k", "t", "seat"}``.
     """
 
     def __init__(
@@ -705,6 +707,7 @@ class TickGame(MultiAgentEnv):
         mask_fn: Callable[[int, int, int], Any] | None = None,
         tag: int = 0,
         obs_dtype: Any = np.float32,
+        infos: bool = False,
     ) -> None:
         self.scripts = [list(script)] if isinstance(script[0], Tick) else [list(s) for s in script]
         act = action_space if action_space is not None else gymnasium.spaces.Discrete(3)
@@ -719,6 +722,7 @@ class TickGame(MultiAgentEnv):
         self.layout = next(iter(self.spec.layouts))
         self.num_seats = num_seats
         self.global_state_enabled = global_state
+        self.infos_enabled = infos
         self.mask_fn = mask_fn
         self.tag = tag
         self.k = -1
@@ -739,6 +743,8 @@ class TickGame(MultiAgentEnv):
             res.action_masks = {s: self.mask_fn(self.k, self.t, s) for s in acting}
         if self.global_state_enabled:
             res.global_state = {s: self._gs(s) for s in acting}
+        if self.infos_enabled:
+            res.infos = {s: {"k": self.k, "t": self.t, "seat": s} for s in acting}
         return res
 
     def reset(self, seed: int | None, layout: str) -> StepResult:
@@ -1237,5 +1243,5 @@ def _bot_with_spec(cls, spec: GameSpec, kwargs: dict) -> ScriptedBot:
 
 
 def scripted_player(cls, spec: GameSpec, **kwargs):
-    """A bot factory for a player pool (``ScriptedPlayer(factory)`` from T1.3): ``cls(**kwargs)`` with ``spec``."""
-    return functools.partial(_bot_with_spec, cls, spec, kwargs)
+    """A ``ScriptedPlayer`` for a player pool: each instance is ``cls(**kwargs)`` with ``game_spec = spec``."""
+    return ScriptedPlayer(functools.partial(_bot_with_spec, cls, spec, kwargs))
