@@ -6,7 +6,9 @@ frozen agent (network ``"fixed"``). Source: the member pairs of a result (``coor
 seats of different teams, score by team ranks, weight ``1 / (T - 1)`` split between the counted pairs, a
 draw = 0.5). Only pairs with O@latest on one side and anything but O@latest on the other count. The EMA step
 of a pair of weight ``w`` is ``1 - 2 ** (-w / halflife_games)``; before the first game the score is the prior
-(0.5). Statistics of an evicted snapshot are dropped (``forget``); a resumed run starts empty (as SP2 ratings).
+(0.5). Statistics of an evicted snapshot are dropped (``forget``) and stay dropped: results that still
+contain it (episodes that were running at the eviction) are ignored for it, since snapshot ids are never
+reused within a run. A resumed run starts empty (as SP2 ratings).
 
 ``pfsp_weight`` turns a score into a candidate weight for the matchmaker: ``hard`` ``(1 - x) ** p`` (focus on
 the players O loses to), ``balanced`` ``x * (1 - x)`` (focus on even players), ``uniform`` 1; floor 1e-6.
@@ -59,6 +61,7 @@ class PfspStats:
         self._halflife = {agent_id: float(h) for agent_id, h in halflife_by_agent.items()}
         self._prior = float(prior)
         self._table: dict[str, dict[str, dict[PlayerKey, list[float]]]] = {}
+        self._forgotten: set[PlayerKey] = set()   # evicted snapshots: late results never bring them back
 
     def update(self, result: MatchResult) -> None:
         """Fold one finished match into the statistics of its layout."""
@@ -67,7 +70,7 @@ class PfspStats:
             self._record(result.layout, pair.b, pair.net_b, (pair.a, pair.net_a), 1.0 - pair.score_a, pair.weight)
 
     def _record(self, layout: str, owner: str, network: str, player: PlayerKey, score: float, weight: float) -> None:
-        if network != LATEST_NETWORK_ID or player == (owner, LATEST_NETWORK_ID):
+        if network != LATEST_NETWORK_ID or player == (owner, LATEST_NETWORK_ID) or player in self._forgotten:
             return
         halflife = self._halflife.get(owner)
         if halflife is None:
@@ -90,8 +93,9 @@ class PfspStats:
         return 0.0 if cell is None else cell[1]
 
     def forget(self, player: PlayerKey) -> None:
-        """Drop ``player`` everywhere (an evicted snapshot)."""
+        """Drop ``player`` everywhere (an evicted snapshot) and ignore it in later results."""
         key = tuple(player)
+        self._forgotten.add(key)
         for owners in self._table.values():
             for players in owners.values():
                 players.pop(key, None)

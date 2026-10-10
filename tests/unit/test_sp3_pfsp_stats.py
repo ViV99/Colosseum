@@ -107,6 +107,28 @@ def test_forget_drops_a_player_in_every_layout_and_for_every_owner():
     assert stats.games("2p", "a", ("b", "latest")) == 1.0
 
 
+def test_a_late_result_never_brings_a_forgotten_snapshot_back():
+    stats = PfspStats({"a": DEFAULT_HALFLIFE_GAMES})
+    stats.update(duel("a", "latest", "a", "ckpt_v10", 1, 2))
+    stats.forget(("a", "ckpt_v10"))
+    stats.update(duel("a", "latest", "a", "ckpt_v10", 1, 2))         # an episode in progress at the eviction
+    stats.update(duel("a", "latest", "a", "ckpt_v20", 2, 1))
+    assert "a@ckpt_v10" not in stats.snapshot()["2p"]["a"]
+    assert stats.games("2p", "a", ("a", "ckpt_v10")) == 0.0
+    assert stats.games("2p", "a", ("a", "ckpt_v20")) == 1.0
+
+
+def test_late_results_after_evictions_keep_the_coordinator_table_small(tmp_path):
+    cfg = make_test_config("turns", checkpoint={"keep_last": 1, "keep_every": 0})
+    coord = make_coordinator(cfg, tmp_path / "ckpt")
+    state = {"w": np.zeros((2, 3), np.float32)}
+    coord.checkpoint_manager.save("agent_0", 10, state)
+    for version in (20, 30, 40):
+        coord.checkpoint_manager.save("agent_0", version, state)       # evicts the previous snapshot
+        coord.report_match_result(duel("agent_0", "latest", "agent_0", f"ckpt_v{version - 10}", 1, 2))
+    assert coord.ratings_snapshot()["2p"].get("pfsp", {}).get("agent_0", {}) == {}
+
+
 def test_member_pairs_carry_the_network_ids_of_both_sides():
     assert member_pairs(duel("a", "latest", "rnd", FIXED_NETWORK_ID, 1, 2)) == [
         MemberPair("cross", "a", "rnd", 1.0, 1.0, "player", "player", "latest", "fixed")]
