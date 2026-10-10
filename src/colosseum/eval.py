@@ -2,12 +2,13 @@
 
 Engine
 ------
-``play_lineups`` plays explicit ``Lineup``s with explicit ``PolicyModel`` instances on the same
-``MatchRunner`` core as training: seat lifecycle, masks, per-seat model states, results by team.
-``Lineup.seats[*].agent_id`` is a key of ``models``; ``network_id`` is ignored (every seat uses
-``models[agent_id]``). Every lineup is played once, to completion. Envs left without a scheduled
-lineup keep playing their last one until the rest finish; those extra episodes are discarded,
-so short episodes are not favoured. The in-process API is what the learning tests and the
+``play_lineups`` plays explicit ``Lineup``s with explicit players on the same ``MatchRunner`` core as
+training: seat lifecycle, masks, per-seat model states, results by team. ``models`` maps every
+``agent_id`` of the lineups to a ``PolicyModel``, a ``ScriptedPlayer`` or a ``ScriptedBot`` instance (a
+prototype: every (agent, env, seat) plays a deep copy with ``game_spec`` set); ``network_id`` is ignored
+(every seat uses ``models[agent_id]``). Every lineup is played once, to completion. Envs left without
+a scheduled lineup keep playing their last one until the rest finish; those extra episodes are
+discarded, so short episodes are not favoured. The in-process API is what the learning tests and the
 future ``colosseum tournament`` (SP4) use.
 
 Schedules (CLI, ``schedule_lineups``)
@@ -43,6 +44,8 @@ Statistics (``summarize``), per layout, by the layout's outcome kind
 from __future__ import annotations
 
 import contextlib
+import copy
+import functools
 import itertools
 import json
 import logging
@@ -66,7 +69,8 @@ from colosseum.core.validation import _check_model
 from colosseum.envs.game import GameSpec, MultiAgentEnv
 from colosseum.envs.vector import VectorEnv
 from colosseum.networks.model import PolicyModel
-from colosseum.worker.match_runner import EpisodeEnd, MatchRunner
+from colosseum.players.scripted import ScriptedBot
+from colosseum.worker.match_runner import EpisodeEnd, MatchRunner, ScriptedPlayer
 
 logger = logging.getLogger(__name__)
 
@@ -167,13 +171,19 @@ def schedule_lineups(spec: GameSpec, layout: str, players: Mapping[str, Sequence
 
 
 class _FixedModels:
-    """``ModelPool`` that serves ``models[agent_id]`` for any network id."""
+    """``PlayerPool`` that serves ``models[agent_id]`` (a model or a ``ScriptedPlayer``) for any network id."""
 
-    def __init__(self, models: Mapping[str, PolicyModel]) -> None:
+    def __init__(self, models: Mapping[str, PolicyModel | ScriptedPlayer]) -> None:
         self._models = models
 
-    def get(self, agent_id: str, network_id: str) -> PolicyModel | None:
+    def get(self, agent_id: str, network_id: str) -> PolicyModel | ScriptedPlayer | None:
         return self._models.get(agent_id)
+
+
+def _copy_bot(prototype: ScriptedBot, spec: GameSpec) -> ScriptedBot:
+    bot = copy.deepcopy(prototype)
+    bot.game_spec = spec
+    return bot
 
 
 class _Collector:
@@ -210,7 +220,7 @@ class _Collector:
 def play_lineups(
     *,
     env_fn: Callable[[], MultiAgentEnv],
-    models: Mapping[str, PolicyModel],
+    models: Mapping[str, PolicyModel | ScriptedBot | ScriptedPlayer],
     lineups: Sequence[Lineup],
     num_envs: int = 8,
     seed: int | None = None,
@@ -220,7 +230,8 @@ def play_lineups(
     """Play every lineup once, to completion; one ``MatchResult`` per lineup, in completion order.
 
     ``seed`` seeds the episode resets and a forked torch RNG, so the caller's global RNG is
-    untouched. Models run in eval mode; their train/eval flags are restored on return.
+    untouched. Models run in eval mode; their train/eval flags are restored on return. Scripted players
+    need no eval mode; a ``ScriptedBot`` instance is never played itself (deep copies are).
     """
     lineups = list(lineups)
     if not lineups:
@@ -230,20 +241,23 @@ def play_lineups(
         raise ValueError(f"play_lineups: lineups use unknown agents {unknown}")
     if num_envs < 1:
         raise ValueError(f"play_lineups: num_envs must be >= 1, got {num_envs}")
+    neural = [m for m in models.values() if isinstance(m, PolicyModel)]
     rng = torch.random.fork_rng(devices=[]) if seed is not None else contextlib.nullcontext()
-    was_training = [(m, m.training) for model in models.values() for m in model.modules()]
+    was_training = [(m, m.training) for model in neural for m in model.modules()]
     try:
         with rng:
             if seed is not None:
                 torch.manual_seed(seed)
-            for model in models.values():
+            for model in neural:
                 model.eval()
             n = min(num_envs, len(lineups))
             pending = deque(lineups[n:])
             collector = _Collector(pending, [True] * n)
             vec_env = VectorEnv(env_fn, n)
             try:
-                runner = MatchRunner(vec_env=vec_env, lineups=lineups[:n], models=_FixedModels(models),
+                pool = {name: ScriptedPlayer(functools.partial(_copy_bot, player, vec_env.spec))
+                        if isinstance(player, ScriptedBot) else player for name, player in models.items()}
+                runner = MatchRunner(vec_env=vec_env, lineups=lineups[:n], models=_FixedModels(pool),
                                      observer=collector, seed=seed, max_idle_steps=max_idle_steps,
                                      deterministic=deterministic, context="eval, ", match_id_prefix="eval")
             except BaseException:
@@ -607,17 +621,37 @@ def default_layouts(spec: GameSpec, players: Mapping[str, Sequence[str]]) -> lis
     return [name for name in spec.layouts if schedule_lineups(spec, name, players, 1)]
 
 
-def evaluate(config: ColosseumConfig, agents: Mapping[str, str], *, layouts: Sequence[str] | None,
+def evaluate(config: ColosseumConfig, agents: Mapping[str, str | None], *, layouts: Sequence[str] | None,
              num_matches: int, seed: int | None = None, deterministic: bool = False,
              num_envs: int = 8) -> EvalReport:
-    """Load ``agents`` (name -> checkpoint dir or ``.pt``), schedule, play and summarize."""
+    """Load ``agents`` (name -> checkpoint dir or ``.pt``; ``None`` = the scripted or frozen agent of that name
+    in the config), schedule, play and summarize."""
     from colosseum.core.registry import env_spec, make_env
+    from colosseum.players.registry import BotSpec, make_bot, resolve_player_roles
 
     spec = env_spec(config)
-    models: dict[str, PolicyModel] = {}
+    models: dict[str, PolicyModel | ScriptedPlayer] = {}
     players: dict[str, list[str]] = {}
     validated: set[str] = set()  # each distinct architecture is checked once
+    config_roles: dict[str, list[str]] | None = None
     for name, path in agents.items():
+        if path is None:
+            entry = config.agent_entry(name)          # ConfigError for an unknown name
+            if entry.kind == "trainable":
+                raise ConfigError(f"-a {name}: '{name}' is a trainable agent, whose weights are not in the config; "
+                                  f"use -a {name}=<checkpoint dir or .pt>")
+            if entry.kind == "scripted":
+                if config_roles is None:
+                    config_roles = resolve_player_roles(config, spec)
+                bot = BotSpec(entry.class_path, dict(entry.kwargs))
+                make_bot(bot, spec)                    # a bad class or kwargs fail here, as a ConfigError
+                models[name] = ScriptedPlayer(functools.partial(make_bot, bot, spec))
+                players[name] = list(config_roles[name])
+                continue
+            path = entry.path
+            p = Path(path)
+            if not (p.is_dir() or (p.is_file() and p.suffix == ".pt")):
+                raise ConfigError(f"agents.{name}.path={path!r}: expected a checkpoint dir or a .pt file")
         models[name], players[name] = load_eval_model(config, name, path, spec=spec, validated=validated)
     chosen = list(dict.fromkeys(layouts)) if layouts else default_layouts(spec, players)
     unknown = sorted(set(chosen) - set(spec.layouts))

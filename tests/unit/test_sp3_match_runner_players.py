@@ -327,3 +327,37 @@ def test_a_scripted_player_never_collects_even_under_latest():
     runner.set_next_lineup(0, Lineup("2p", [SeatAssignment("a", collect=False), SeatAssignment("bot", collect=False)]))
     with pytest.raises(ValueError, match=r"agent 'bot' is a scripted player with collect=True"):
         runner.set_next_lineup(0, Lineup("2p", [SeatAssignment("bot"), SeatAssignment("a")]))
+
+
+class _AnyNetworkBotPool:
+    """Eval-style pool: serves the bot under every network id it knows ('latest', 'fixed'); ``snapshots``
+    says whether it also serves it under a snapshot id."""
+
+    def __init__(self, players, bot, *, snapshots: bool) -> None:
+        self.players, self.bot, self.snapshots = players, bot, snapshots
+
+    def get(self, agent_id, network_id):
+        if agent_id == "bot":
+            return self.bot if self.snapshots or not network_id.startswith("ckpt_v") else None
+        return self.players.get((agent_id, network_id))
+
+
+def test_a_missing_snapshot_of_a_scripted_player_is_an_error_not_a_collecting_seat():
+    """The SP1 fallback (missing network -> latest with collect=True) never seats a bot: a lineup naming a
+    snapshot of a scripted player whose pool entry under 'latest' is a ScriptedPlayer is a ValueError."""
+    spec = _spec()
+    players = {("a", "latest"): make_test_model(_role())}
+    bot = scripted_player(RecordingBot, spec)
+    lineup = Lineup("2p", [SeatAssignment("a"), SeatAssignment("bot", "ckpt_v3", False)])
+
+    def runner(pool):
+        return MatchRunner(vec_env=VectorEnv(lambda: TickGame(TURNS, 2), 1), lineups=[lineup], models=pool,
+                           observer=RecordingObserver(), seed=0, context="eval, ")
+
+    with pytest.raises(ValueError, match=r"eval, env 0, seat 1: network 'ckpt_v3' of 'bot' is not loaded and 'bot' "
+                                         r"is a scripted player"):
+        runner(_AnyNetworkBotPool(players, bot, snapshots=False))
+    served = runner(_AnyNetworkBotPool(players, bot, snapshots=True))   # served under the snapshot id: no fallback
+    assert [(s.agent_id, s.network_id, s.collect) for s in served.lineup(0).seats] == [
+        ("a", "latest", True), ("bot", "ckpt_v3", False)]
+    served.close()

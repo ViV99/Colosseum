@@ -6,14 +6,16 @@ can monkeypatch it there).
 
 from __future__ import annotations
 
+import json
 from collections.abc import Sequence
+from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 import torch
 
 from colosseum.core.config import ColosseumConfig
-from colosseum.core.errors import ConfigError, EnvContractError
+from colosseum.core.errors import ConfigError, EnvContractError, PlayerError
 from colosseum.core.registry import build_model, env_spec, make_env
 from colosseum.core.specs import ActionSpec, ObsSpec
 from colosseum.core.tree import (
@@ -37,6 +39,14 @@ VALIDATE_STEPS = 8  # random legal steps per enabled layout
 #   column 1: A R A B   (a truncation, a new episode, a chunk-end bootstrap)
 _CHUNK_KINDS = ((SLOT_ACT, SLOT_ACT), (SLOT_ACT, SLOT_BOOT), (SLOT_PAD, SLOT_ACT), (SLOT_PAD, SLOT_BOOT))
 _CHUNK_RESET_AFTER = ((False, False), (True, True), (True, False), (True, False))
+
+
+@dataclass
+class ValidationReport:
+    """What ``colosseum validate`` prints after the per-agent OK lines: the effective behaviour that is not
+    visible in the config (fixed players; later the opponent mix and init reports)."""
+
+    lines: list[str] = field(default_factory=list)
 
 
 def _seeded(space: Any, rng: np.random.Generator) -> Any:
@@ -316,6 +326,99 @@ def _check_kickstart_teacher(config: ColosseumConfig, agent_configs: dict[str, C
                           f"training.kickstart_teacher={path!r} (agent {aid!r})")
 
 
+def _check_frozen_players(config: ColosseumConfig, spec: GameSpec, fixed: Any, samples: dict[str, tuple],
+                          report: ValidationReport) -> None:
+    """Every frozen agent: its model is built and its weights loaded (``build_frozen_model``); each distinct
+    architecture gets the model check of trainable agents once."""
+    from colosseum.core.roles import agent_role_spec
+    from colosseum.players.registry import build_frozen_model
+
+    checked: set[str] = set()
+    for aid, frozen in fixed.frozen.items():
+        model = build_frozen_model(config, frozen, spec)
+        key = json.dumps([frozen.networks, list(frozen.roles)], sort_keys=True)
+        if key not in checked:
+            sample = next((samples[r] for r in frozen.roles if r in samples), None)
+            try:
+                _check_model(model, agent_role_spec(spec, list(frozen.roles)), sample, f"agent {aid!r}")
+            except ConfigError as e:
+                raise ConfigError(f"{frozen.networks_source}: {e}") from e
+            checked.add(key)
+        report.lines.append(f"agent '{aid}' (frozen): {frozen.source}, roles {list(frozen.roles)}")
+
+
+def _check_scripted_players(config: ColosseumConfig, spec: GameSpec, fixed: Any, layouts: Sequence[str],
+                            report: ValidationReport) -> None:
+    """Play every scripted agent in each enabled layout where it has a seat: one bot per such seat, other
+    seats random legal, up to ``VALIDATE_STEPS`` steps under the contract checks; every bot action goes
+    through ``check_bot_action``. A bot failure is a ConfigError naming the agent (SP2 context format)."""
+    from colosseum.envs.contract import EpisodeTracker
+    from colosseum.players.registry import make_bot
+    from colosseum.players.scripted import bot_rng, check_bot_action
+
+    for aid, bot_spec in fixed.bots.items():
+        roles = set(fixed.roles[aid])
+        played = [name for name in layouts if any(s.role in roles for s in spec.layouts[name])]
+        decisions = 0
+        rng = np.random.default_rng(0)
+        env = make_env(config)
+        try:
+            for layout in played:
+                tracker = EpisodeTracker(spec, max_idle_steps=config.env.max_idle_steps, context="validate")
+                try:
+                    result = env.reset(seed=0, layout=layout)
+                except EnvContractError:
+                    raise
+                except Exception as e:
+                    raise ConfigError(f"env.reset(seed=0, layout={layout!r}) of {config.env.env_class!r} failed: "
+                                      f"{type(e).__name__}: {e}") from e
+                masks = tracker.on_reset(layout, result)
+                bots = {}
+                for seat, seat_spec in enumerate(spec.layouts[layout]):
+                    if seat_spec.role not in roles:
+                        continue
+                    bots[seat] = make_bot(bot_spec, spec)
+                    try:
+                        bots[seat].reset(role=seat_spec.role, seat=seat, layout=layout, rng=bot_rng(0, seat, aid))
+                    except Exception as e:
+                        raise ConfigError(f"validate, seat {seat}, episode step 0, layout {layout}: agent {aid!r}: "
+                                          f"reset raised {type(e).__name__}: {e}") from e
+                for step in range(VALIDATE_STEPS):
+                    if result.episode_over:
+                        break
+                    actions = {}
+                    for seat in sorted(result.acting):
+                        role = spec.roles[spec.role_of(layout, seat)]
+                        if seat not in bots:
+                            actions[seat] = random_legal_action(role, masks[seat], rng)
+                            continue
+                        where = f"validate, seat {seat}, episode step {step}, layout {layout}: agent {aid!r}"
+                        obs = tree_map(np.copy, _as_spec(ObsSpec.from_space(role.observation_space), result.obs[seat]))
+                        mask = None if masks[seat] is None else tree_map(np.copy, masks[seat])  # as MatchRunner
+                        try:
+                            raw = bots[seat].act(obs, mask, (result.infos or {}).get(seat))
+                        except Exception as e:
+                            raise ConfigError(f"{where}: act raised {type(e).__name__}: {e}") from e
+                        try:
+                            actions[seat] = check_bot_action(role, raw, masks[seat], where)
+                        except PlayerError as e:
+                            raise ConfigError(str(e)) from e
+                        decisions += 1
+                    try:
+                        result = env.step(actions)
+                    except EnvContractError:
+                        raise
+                    except Exception as e:
+                        raise ConfigError(f"env.step of {config.env.env_class!r} failed in layout {layout!r} at "
+                                          f"episode step {step + 1}: {type(e).__name__}: {e}") from e
+                    masks = tracker.on_step(actions, result)
+        finally:
+            env.close()
+        what = (f"played {decisions} decisions in layouts {played}" if played
+                else f"has no seat in the enabled layouts {list(layouts)}")
+        report.lines.append(f"agent '{aid}' (scripted {bot_spec.class_path}): roles {sorted(roles)}; {what}")
+
+
 def _game_spec(config: ColosseumConfig) -> GameSpec:
     """``env_spec``; a role space colosseum does not support (``ObsSpec``/``ActionSpec.from_space``
     raise TypeError/ValueError, which ``GameSpec.validate`` wraps) becomes a ConfigError."""
@@ -327,8 +430,8 @@ def _game_spec(config: ColosseumConfig) -> GameSpec:
         raise
 
 
-def validate_config(config: ColosseumConfig) -> None:
-    """Check a whole config before any process starts (spec block 9).
+def validate_config(config: ColosseumConfig) -> ValidationReport:
+    """Check a whole config before any process starts (spec block 9; SP3 spec block 1).
 
     - the env's ``GameSpec`` (``env_spec``; unsupported role spaces are a ConfigError), the
       agents' roles (``resolve_agent_roles``) and the matchmaking checks (``validate_matchmaking``);
@@ -338,16 +441,23 @@ def validate_config(config: ColosseumConfig) -> None:
       final observations;
     - every agent's model: ``step`` on its role's observations and ``unroll`` on a synthetic chunk
       with BOOT/PAD slots, resets and ``global_state``;
-    - the kickstart teacher: one role signature for all agents, weights that fit every agent.
+    - the kickstart teacher: one role signature for all agents, weights that fit every agent;
+    - every frozen agent: weights, role signature and its architecture (once per architecture); every
+      scripted agent: imported, constructed and played in each enabled layout where it has a seat, every
+      action through the legality gate.
 
-    Raises ConfigError (or EnvContractError for an env that breaks the contract).
+    Returns a ``ValidationReport``. Raises ConfigError (or EnvContractError for an env that breaks the
+    contract).
     """
     from colosseum.coordinator.matchmaker import enabled_layouts, validate_matchmaking
     from colosseum.core.roles import agent_role_spec, resolve_agent_roles
+    from colosseum.players.registry import load_fixed_players
 
+    report = ValidationReport()
     spec = _game_spec(config)
     agent_roles = resolve_agent_roles(config, spec)
     validate_matchmaking(spec, agent_roles, config.matchmaking)
+    fixed = load_fixed_players(config, spec)   # roles, classes, paths and role signatures of fixed agents
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_roles}
     role_specs = {aid: agent_role_spec(spec, roles) for aid, roles in agent_roles.items()}
     for aid, acfg in agent_configs.items():
@@ -356,7 +466,8 @@ def validate_config(config: ColosseumConfig) -> None:
                 f"agent {aid!r}: networks.critic_encoder_class is set, but its roles {agent_roles[aid]} declare "
                 f"no global_state_space; remove critic_encoder_class or give the roles a global_state_space"
             )
-    samples = _exercise_env(config, spec, list(enabled_layouts(spec, config.matchmaking)))
+    layouts = list(enabled_layouts(spec, config.matchmaking))
+    samples = _exercise_env(config, spec, layouts)
     for aid, acfg in agent_configs.items():
         where = f"agent {aid!r}"
         try:
@@ -368,3 +479,6 @@ def validate_config(config: ColosseumConfig) -> None:
         sample = next((samples[r] for r in agent_roles[aid] if r in samples), None)
         _check_model(model, role_specs[aid], sample, where)
     _check_kickstart_teacher(config, agent_configs, role_specs)
+    _check_frozen_players(config, spec, fixed, samples, report)
+    _check_scripted_players(config, spec, fixed, layouts, report)
+    return report

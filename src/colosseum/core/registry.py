@@ -16,6 +16,7 @@ from colosseum.core.errors import ConfigError
 
 if TYPE_CHECKING:
     from colosseum.core.config import ColosseumConfig, NetworkConfig
+    from colosseum.core.validation import ValidationReport
     from colosseum.envs.game import GameSpec, MultiAgentEnv, RoleSpec
     from colosseum.networks.model import PolicyModel
 
@@ -154,11 +155,10 @@ def build_network(net: NetworkConfig, role: RoleSpec) -> PolicyModel:
     return ComposedModel(encoder, core, policy, value, critic)
 
 
-def validate_config(config: ColosseumConfig) -> None:
-    """Every check that can run before a run starts (spec block 9); see ``colosseum.core.validation``.
-
-    Callers use this name (``registry.validate_config``), so tests can monkeypatch it here.
-    """
+def validate_config(config: ColosseumConfig) -> ValidationReport:
+    """Every check that can run before a run starts; see ``colosseum.core.validation``. Returns the report
+    ``colosseum validate`` prints. Callers use this name (``registry.validate_config``), so tests can
+    monkeypatch it here."""
     from colosseum.core.validation import validate_config as _validate_config
 
-    _validate_config(config)
+    return _validate_config(config)

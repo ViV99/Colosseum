@@ -36,8 +36,9 @@ resolved with ``resolve_outcome``: default team score = mean of the team's seat 
 ``SeatAssignment.source`` is copied into ``SeatResult.source``.
 
 A lineup naming a snapshot the pool cannot provide is seated as the agent's latest weights with
-``collect=True`` (SP1 rule; one warning per (agent, network)); latest and fixed seats must be in the
-pool. Only ``latest`` seats of neural players may collect: any other seat with ``collect=True`` (also a
+``collect=True`` (SP1 rule; one warning per (agent, network)), unless the pool serves that agent's
+``"latest"`` as a ``ScriptedPlayer`` (a ``ValueError``: a bot never collects); latest and fixed seats must
+be in the pool. Only ``latest`` seats of neural players may collect: any other seat with ``collect=True`` (also a
 ``ScriptedPlayer`` a pool serves under ``"latest"``) is a ``ValueError``.
 
 ``context`` is a prefix ending with ``", "`` (e.g. ``"worker 3, "``); env contract errors
@@ -280,14 +281,21 @@ class MatchRunner:
                 )
 
     def _resolve(self, lineup: Lineup, env: int) -> Lineup:
-        """Validate ``lineup`` and replace snapshots the pool cannot provide by latest + collect."""
+        """Validate ``lineup`` and replace snapshots the pool cannot provide by latest + collect (never for a
+        scripted player: ValueError)."""
         self._check_lineup(lineup, env)
         seats = []
-        for assignment in lineup.seats:
+        for seat, assignment in enumerate(lineup.seats):
             aid, net = assignment.agent_id, assignment.network_id
             if self._players.get(aid, net) is not None:
                 seats.append(SeatAssignment(aid, net, assignment.collect, assignment.source))
                 continue
+            if isinstance(self._players.get(aid, LATEST_NETWORK_ID), ScriptedPlayer):
+                raise ValueError(
+                    f"{self._context}env {env}, seat {seat}: network {net!r} of {aid!r} is not loaded and {aid!r} "
+                    f"is a scripted player; the missing-network fallback seats {LATEST_NETWORK_ID!r} with "
+                    f"collect=True, which only a trainable agent's model may do"
+                )
             if (aid, net) not in self._warned_missing:
                 self._warned_missing.add((aid, net))
                 logger.warning(

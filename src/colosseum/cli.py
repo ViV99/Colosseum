@@ -74,14 +74,17 @@ def main() -> None:
 
 @contextmanager
 def _config_errors() -> Iterator[None]:
-    """A config (or env contract, or input data) problem found at startup: one line on stderr,
-    exit code 1, no traceback."""
-    from colosseum.core.errors import ConfigError, EnvContractError
+    """A config (or env contract, or input data) problem found at startup, or a scripted player's error:
+    one line on stderr, exit code 1, no traceback."""
+    from colosseum.core.errors import ConfigError, EnvContractError, PlayerError
 
     try:
         yield
     except (ConfigError, EnvContractError) as e:
         click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+    except PlayerError as e:
+        click.echo(f"Player error: {e}", err=True)
         sys.exit(1)
 
 
@@ -105,12 +108,12 @@ def _parse_overrides(overrides: tuple[str, ...]) -> dict:
     return result
 
 
-def _parse_agent_spec(spec: str) -> tuple[str, str]:
-    """``name=path`` -> (name, path)."""
+def _parse_agent_spec(spec: str) -> tuple[str, str | None]:
+    """``name=path`` -> (name, path); ``name`` -> (name, None): a scripted or frozen agent of the config."""
     name, sep, path = spec.partition("=")
-    if not sep or not name or not path:
-        raise click.BadParameter(f"expected name=path, got {spec!r}", param_hint="'--agent'")
-    return name, path
+    if not name or (sep and not path):
+        raise click.BadParameter(f"expected name or name=path, got {spec!r}", param_hint="'--agent'")
+    return name, (path if sep else None)
 
 
 @main.command()
@@ -134,15 +137,18 @@ def train(config: str, overrides: tuple[str, ...]) -> None:
 @click.option("--set", "overrides", multiple=True,
               help="Override config values (e.g., --set env.max_idle_steps=200)." + _SET_HELP_YAML)
 def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
-    """Validate a config: GameSpec, roles, matchmaking, env steps under the contract, every agent's model."""
+    """Validate a config: GameSpec, roles, matchmaking, env steps under the contract, every agent's model,
+    every scripted agent played under the legality gate, every frozen agent loaded."""
     with _config_errors():
         from colosseum.core.config import load_config
         from colosseum.core.registry import validate_config
 
         cfg = load_config(config, _parse_overrides(overrides) or None)
-        validate_config(cfg)
-        for aid in cfg.get_trainable_agent_ids():
-            click.echo(f"  OK: agent '{aid}'")
+        report = validate_config(cfg)
+        for aid in cfg.agent_ids():
+            click.echo(f"  OK: agent '{aid}' ({cfg.agent_kind(aid)})")
+        for line in report.lines:
+            click.echo(f"  {line}")
     click.echo("Config is valid.")
 
 
@@ -150,9 +156,9 @@ def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
 @click.option("--config", "-c", required=True, type=click.Path(exists=True),
               help="Config YAML: its env is used for every match; agents.<name> / networks build .pt agents")
 @click.option("--agent", "-a", "agents", required=True, multiple=True,
-              help="name=path. path is a checkpoint dir (architecture and roles from its meta.json) or a "
-                   ".pt state_dict (architecture and roles of agents.<name>, else the global networks "
-                   "playing every role). Repeatable.")
+              help="name=path or name. path is a checkpoint dir (architecture and roles from its meta.json) or "
+                   "a .pt state_dict (architecture and roles of agents.<name>, else the global networks playing "
+                   "every role). A bare name is a scripted or frozen agent of the config. Repeatable.")
 @click.option("--layout", "layouts", multiple=True,
               help="Layout to evaluate (repeatable). Default: every layout the agents can fill.")
 @click.option("--num-matches", "-n", default=100, type=click.IntRange(min=1), show_default=True,
@@ -198,7 +204,12 @@ def eval_cmd(
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
             raise click.BadParameter(f"duplicate agent names {duplicates}", param_hint="'--agent'")
-        for _name, path in specs:
+        for name, path in specs:
+            if path is None:
+                if name not in cfg.agent_ids():
+                    raise click.BadParameter(f"{name!r} is not an agent of the config; use name=path for a "
+                                             f"checkpoint dir or a .pt file", param_hint="'--agent'")
+                continue
             p = Path(path)
             if not (p.is_dir() or (p.is_file() and p.suffix == ".pt")):
                 raise click.BadParameter(f"{p}: expected a checkpoint directory or a .pt file",
