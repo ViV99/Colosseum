@@ -335,7 +335,8 @@ mask forbids is a data error.
 
 Warm start is per agent (`init`, `kickstart`; global sections are the defaults): `init.from` loads weights only
 (strict, or partial with `strict: false`), `critic_warmup_steps` first trains the value path alone while the learner's
-policy stays bit-identical (the workers act with their own initial weights until the first weight sync, as in SP2),
+policy stays bit-identical (the statistics of the observation normalizers are frozen; the critic's global-state
+normalizer keeps learning; the workers act with their own initial weights until the first weight sync, as in SP2),
 and `kickstart` adds `lambda * KL(teacher‖student)` per decider (a neural teacher: a frozen agent or a checkpoint dir
 brings its own architecture, a bare `.pt` path is built with the student's) or `lambda * -log pi(teacher's action)` (a
 scripted teacher, DAgger labels written by the workers), decaying linearly over `decay_steps` after the warm-up.

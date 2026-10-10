@@ -82,11 +82,12 @@ class PolicyModel(nn.Module, ABC):
         )
 
     @torch.no_grad()
-    def update_normalizers(self, obs: Tree, global_state: Tree | None = None) -> None:
+    def update_normalizers(self, obs: Tree | None, global_state: Tree | None = None) -> None:
         """Update every ``NormalizeObs`` submodule from the leaf at its path of its source tree.
 
-        Called once per train step with all fresh observations (leaves ``[N, ...]``). A
-        global-state normalizer is skipped when ``global_state`` is None.
+        Called once per train step with all fresh observations (leaves ``[N, ...]``). A normalizer
+        is skipped when its source tree is None: ``obs=None`` updates only the global-state
+        normalizers (the value path; APPO's critic warm-up).
         """
         for module in self.modules():
             if isinstance(module, NormalizeObs):

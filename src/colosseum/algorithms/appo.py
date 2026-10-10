@@ -24,8 +24,10 @@
   ``reset_after`` (a chunk-end BOOT repeats the next chunk's first ACT).
 - Critic warm-up (``critic_warmup_steps``, spec block 6 of SP3): the first N train steps optimize only
   ``value_loss_coeff * value_loss`` over ``PolicyModel.value_parameters()``; every other parameter has
-  ``requires_grad`` off for the step (no gradient, no Adam update or state), normalizer statistics are not
-  updated, kickstart is off and its decay waits; policy loss and entropy are still reported.
+  ``requires_grad`` off for the step (no gradient, no Adam update or state), the statistics of the
+  observation normalizers are frozen (the policy stays bit-identical) while the value path's global-state
+  normalizers keep learning (the critic's inputs do not jump at the end of the warm-up), kickstart is off and
+  its decay waits; policy loss and entropy are still reported.
 - Kickstart from a scripted teacher (``KickstartLoss(None)``, DAgger): ``lambda * mean(-log pi(a_teacher))`` over
   the labeled ACT slots, joint for one decider and the mean over valid deciders with ``Units``; metric
   ``kickstart_label_frac``. ``teacher_active`` (lambda > 0) goes to the workers with the weights.
@@ -509,12 +511,19 @@ class APPO(BaseAlgorithm):
         """Clip to ``max_grad_norm``; return the total gradient norm BEFORE clipping."""
         return torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._config.max_grad_norm)
 
-    def _update_normalizers(self, batch: dict) -> None:
-        """Once per train step: observations of ACT slots and of BOOT slots with ``reset_after``."""
+    def _update_normalizers(self, batch: dict, value_path_only: bool = False) -> None:
+        """Once per train step: observations of ACT slots and of BOOT slots with ``reset_after``.
+
+        ``value_path_only`` (the critic warm-up): only the global-state normalizers, which feed the value path
+        alone; the observation normalizers (the policy's inputs) stay frozen."""
         kind = batch["kind"]
         sel = (kind == SLOT_ACT) | ((kind == SLOT_BOOT) & batch["reset_after"].bool())
-        obs = tree_map(lambda t: t[sel], batch["obs"])
         gs = None if batch["global_state"] is None else tree_map(lambda t: t[sel], batch["global_state"])
+        if value_path_only:
+            if gs is not None:
+                self._model.update_normalizers(None, gs)
+            return
+        obs = tree_map(lambda t: t[sel], batch["obs"])
         self._model.update_normalizers(obs, gs)
 
     def train_step(self, chunks: list[TrajectoryChunk]) -> dict[str, float]:
@@ -533,8 +542,9 @@ class APPO(BaseAlgorithm):
         full_batch = self._prepare_batch(chunks)
         grad_norm_sum = torch.zeros((), dtype=torch.float64, device=full_batch["kind"].device)
         finite_updates = torch.zeros_like(grad_norm_sum)
-        if not warmup:                   # frozen during the warm-up: the workers' policy stays bit-identical
-            self._update_normalizers(full_batch)
+        # During the warm-up only the value path's (global-state) normalizers learn: the workers' policy stays
+        # bit-identical, and the critic's inputs do not jump when the warm-up ends.
+        self._update_normalizers(full_batch, value_path_only=warmup)
         frozen = [p for p in self._frozen_in_warmup if p.requires_grad] if warmup else []
         for p in frozen:                 # no gradient: Adam updates neither them nor their state
             p.requires_grad_(False)

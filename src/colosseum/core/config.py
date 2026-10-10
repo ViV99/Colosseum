@@ -616,8 +616,8 @@ class InitConfig(StrictModel):
     critic_warmup_steps: int = Field(
         default=0, ge=0,
         description="The first N learner train steps update only the value path (PolicyModel.value_parameters()): "
-                    "policy, entropy and kickstart losses off, normalizer statistics frozen, kickstart decay "
-                    "starts afterwards.",
+                    "policy, entropy and kickstart losses off, observation-normalizer statistics frozen (the "
+                    "critic's global-state normalizers keep learning), kickstart decay starts afterwards.",
     )
 
 

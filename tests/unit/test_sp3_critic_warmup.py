@@ -1,5 +1,6 @@
 """Critic warm-up (spec block 6): only the value path learns for the first N train steps, and the
-policy the workers receive stays bit-identical, normalizer statistics included (T4.3)."""
+policy the workers receive stays bit-identical, observation-normalizer statistics included (T4.3); the
+critic's global-state normalizer keeps learning (fix-wave ruling C-I2)."""
 from __future__ import annotations
 
 import copy
@@ -118,6 +119,8 @@ def test_warmup_trains_only_the_value_path_and_keeps_the_workers_policy_bit_iden
     batch = chunks(model)
     keys = value_keys(model)
     before = WeightPayload.from_model("a", 0, model).state_dict           # what the workers receive
+    value_norm = {k for k in before if k.startswith("critic_encoder.norm.")}  # value path: keeps learning
+    assert value_norm
     for _ in range(3):
         assert algo.critic_warming_up
         metrics = algo.train_step(batch)
@@ -126,9 +129,12 @@ def test_warmup_trains_only_the_value_path_and_keeps_the_workers_policy_bit_iden
     after = WeightPayload.from_model("a", algo.policy_version, model).state_dict
     assert algo.policy_version == 3 and not algo.critic_warming_up
     for key, value in before.items():
-        if key not in keys:                                                # policy weights AND normalizer buffers
+        if key not in keys | value_norm:                                   # policy weights AND obs normalizers
             assert np.array_equal(value, after[key]), key
     assert any(not np.array_equal(before[k], after[k]) for k in keys)
+    assert after["critic_encoder.norm.rms.count"] > before["critic_encoder.norm.rms.count"]
+    assert not np.array_equal(before["critic_encoder.norm.rms.mean"], after["critic_encoder.norm.rms.mean"])
+    assert np.array_equal(before["encoder.norm.rms.count"], after["encoder.norm.rms.count"])
     value_ids = {id(p) for p in model.value_parameters()}
     adam = {id(p) for p in algo._optimizer.state}
     assert adam and adam <= value_ids                                     # no Adam state for frozen parameters
