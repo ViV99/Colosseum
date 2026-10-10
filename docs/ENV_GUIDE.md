@@ -350,6 +350,8 @@ networks:
 памяти), `LSTMCore` / `GRUCore` (`hidden_size`, `num_layers`), `WindowAttentionCore` (`d_model`,
 `window`, `num_heads`, `num_layers`; пример — `configs/examples/tic_tac_toe_attention.yaml`).
 
+Свой `model_class` с нормализаторами, переопределяющий `PolicyModel.update_normalizers(obs, global_state)`, должен принимать `obs=None`: во время прогрева критика (`agents.<id>.init.critic_warmup_steps`, `docs/LEAGUE_GUIDE.md` раздел 8) APPO вызывает `update_normalizers(None, global_state)`, чтобы обновлялись только нормализаторы пути value (глобального состояния), а статистика нормализаторов наблюдений не менялась. Базовая реализация пропускает нормализатор, у которого дерево-источник равно `None`.
+
 ## 9. Проверка
 
 ```bash

@@ -88,11 +88,12 @@ command line: `colosseum train -c configs/examples/unit_harvest_league.yaml --se
 --set agents.main.init.critic_warmup_steps=30 --set agents.main.kickstart.teacher=greedy` (`record`, `bc` and
 `eval` take `--set` too).
 
-On an 8-core CPU recording takes about 17 s, BC about 9 s and training about 126 s (wall clock with process start-up;
-measured once, 2026-10-10). The trained agent beats `random` in 100% of games and scores 0.50 against `greedy` (win 1,
-draw 0.5; on this game a good policy mostly draws with the bot: all 100 games were draws). Recipes for leagues,
-anchors, asymmetric games and custom matchmakers: [`docs/LEAGUE_GUIDE.md`](docs/LEAGUE_GUIDE.md) (Russian). `data/`
-and `bc.pt` are yours to delete.
+On an 8-core CPU recording takes about 17 s, BC about 16 s (about 10 s with `OMP_NUM_THREADS=1`: torch's default 8
+threads slow the small BC batches down) and training about 124–126 s (wall clock with process start-up; measured
+2026-10-10, the second time at the SP3 acceptance). The trained agent beats `random` in 100% of games and scores 0.50
+against `greedy` (win 1, draw 0.5; on this game a good policy mostly draws with the bot: all 100 games were draws).
+Recipes for leagues, anchors, asymmetric games and custom matchmakers: [`docs/LEAGUE_GUIDE.md`](docs/LEAGUE_GUIDE.md)
+(Russian). `data/` and `bc.pt` are yours to delete.
 
 ## Demo games
 
