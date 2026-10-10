@@ -42,9 +42,12 @@ training:
   seed: null
 
 matchmaking:
-  mode: self_play
   teammates: self           # homogeneous teams
-  latest_prob: 0.8
+  # SP3 (spec block 9): a team of uniformly random legal players as an anchor; against it aggression
+  # pays, which the passive draw-seeking self-play policy lacks. Share: T6.3 ruling (measurement in
+  # docs/benchmarks.md, «team_tag: доля якоря»).
+  opponents: {latest: 0.6, snapshots: 0.2, rivals: 0.0, anchors: 0.2}
+  anchors: [random]
 
 checkpoint:
   interval: 100           # train steps between snapshots
@@ -55,3 +58,8 @@ metrics:
   use_wandb: false
   log_interval: 10
   console_interval_sec: 10.0
+
+agents:                   # only a scripted agent: the trainable agent_0 is added implicitly
+  random:
+    kind: scripted
+    class: colosseum.players.RandomBot
