@@ -435,7 +435,8 @@ class RolloutLoop:
         spec = self._teacher_specs.get(agent_id)
         if spec is None or not self._teacher_active[agent_id]:
             return None
-        layout = self._episode_layout[env] or self._runner.lineup(env).layout
+        layout = self._episode_layout[env]
+        assert layout is not None, "on_episode_start runs before the first decision of every episode"
         role = self._spec.role_of(layout, seat)
         where = (f"worker {self.worker_id}, env {env}, seat {seat}, episode step {self._episode_step[env]}, "
                  f"layout {layout}: kickstart teacher of agent {agent_id!r}")

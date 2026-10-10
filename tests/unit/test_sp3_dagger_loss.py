@@ -143,3 +143,32 @@ def test_a_student_learns_the_teachers_action():
         obs = torch.randn(64, 4)
         probs = model.step(obs, None, torch.ones(64, 3, dtype=torch.bool)).dist.log_prob(torch.full((64,), 2)).exp()
     assert float(probs.mean()) > 0.9
+
+
+def test_appo_dagger_loss_with_units_is_the_bc_nll_over_labeled_act_slots():
+    torch.manual_seed(0)
+    model = make_test_model(UNITS)
+    label = np.array([1, 2, 0, 1], np.int64)
+    chunks = [labeled(synthetic_chunk(model, UNITS, "AAATP", seed=i), label, every=2) for i in range(3)]
+    algo = APPO(model, AlgorithmConfig(), ActionSpec.from_space(UNITS.action_space),
+                kickstart=KickstartLoss(None, initial_lambda=1.0))
+    out = algo.compute_loss(chunks)
+    dist, actions, has, is_act = student_view(model, chunks)
+    nll, _valid = per_sample_nll(dist, actions, 4)
+    rows = (has & is_act).reshape(-1)
+    assert float(out["kickstart_loss"]) == pytest.approx(float(nll[rows].mean()), rel=1e-5)
+    assert float(out["kickstart_label_frac"]) == pytest.approx(float(rows.sum()) / float(is_act.sum()))
+    out["total_loss"].backward()
+    grads = [p.grad for p in model.parameters() if p.grad is not None]
+    assert grads and all(torch.isfinite(g).all() for g in grads)
+
+
+def test_the_label_share_is_reported_during_the_critic_warmup():
+    torch.manual_seed(0)
+    model = make_test_model(ROLE3)
+    chunks = [labeled(synthetic_chunk(model, ROLE3, "AAAAAB", seed=s), np.int64(2), every=2) for s in range(2)]
+    algo = APPO(model, AlgorithmConfig(), ActionSpec.from_space(ROLE3.action_space),
+                kickstart=KickstartLoss(None, initial_lambda=1.0), critic_warmup_steps=1)
+    metrics = algo.train_step(chunks)
+    assert metrics["critic_warmup"] == 1.0 and metrics["kickstart_loss"] == 0.0
+    assert metrics["kickstart_label_frac"] == pytest.approx(0.6)          # 3 of the 5 ACT slots per chunk

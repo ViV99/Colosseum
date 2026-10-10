@@ -30,7 +30,8 @@
   its decay waits; policy loss and entropy are still reported.
 - Kickstart from a scripted teacher (``KickstartLoss(None)``, DAgger): ``lambda * mean(-log pi(a_teacher))`` over
   the labeled ACT slots, joint for one decider and the mean over valid deciders with ``Units``; metric
-  ``kickstart_label_frac``. ``teacher_active`` (lambda > 0) goes to the workers with the weights.
+  ``kickstart_label_frac`` = the labelled share of the ACT slots (reported during the warm-up too).
+  ``teacher_active`` (lambda > 0) goes to the workers with the weights.
 """
 
 from __future__ import annotations
@@ -430,10 +431,12 @@ class APPO(BaseAlgorithm):
         kickstart_loss = self._zero_loss
         label_frac = self._zero_loss
         kick = self._kickstart
+        if kick is not None and kick.teacher is None and batch["has_teacher"] is not None:
+            # the labelled share of ACT slots, whether or not the label loss is on (warm-up, lambda = 0)
+            label_frac = (batch["has_teacher"].bool() & is_act).sum().float() / n_act
         if kick is not None and kick.current_lambda > 0 and not warmup:
             if kick.teacher is None:                         # scripted teacher (DAgger): labels in the chunks
                 if batch["has_teacher"] is not None:
-                    label_frac = (batch["has_teacher"].bool() & is_act).sum().float() / n_act
                     with self._autocast():
                         kickstart_loss = kick.compute_labels(
                             student_dist=out.dist, teacher_actions=self._label_actions(batch),
