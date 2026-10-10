@@ -34,11 +34,13 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
     """Newest WorkerCommand, merged over all drained ones.
 
     Checkpoints are sent to a worker only once (as deltas), so ``new_checkpoints`` of all
-    drained commands are merged. Lineups are merged per env: a later command's lineup wins,
-    and a ``None`` entry keeps the earlier command's lineup for that env.
+    drained commands are merged, and ``evict`` lists of all drained commands are merged (union,
+    first-seen order). Lineups are merged per env: a later command's lineup wins, and a ``None``
+    entry keeps the earlier command's lineup for that env.
     """
     latest: WorkerCommand | None = None
     merged: dict[str, dict[str, Any]] = {}
+    evict: dict[str, list[str]] = {}
     lineups: list[Lineup | None] = []
     while True:
         try:
@@ -47,6 +49,9 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
             break
         for aid, ckpts in cmd.new_checkpoints.items():
             merged.setdefault(aid, {}).update(ckpts)
+        for aid, ckpt_ids in cmd.evict.items():
+            bucket = evict.setdefault(aid, [])
+            bucket.extend(c for c in ckpt_ids if c not in bucket)
         if len(cmd.lineups) > len(lineups):
             lineups.extend([None] * (len(cmd.lineups) - len(lineups)))
         for e, lineup in enumerate(cmd.lineups):
@@ -55,7 +60,7 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
         latest = cmd
     if latest is None:
         return None
-    return WorkerCommand(lineups=lineups, new_checkpoints=merged)
+    return WorkerCommand(lineups=lineups, new_checkpoints=merged, evict=evict)
 
 
 def report_worker_stats(q, worker_id: int, stats: dict) -> None:

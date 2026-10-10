@@ -303,11 +303,14 @@ class WorkerCommand:
 
     ``lineups[e]`` replaces env ``e``'s lineup at its next episode end (``None`` = keep).
     ``new_checkpoints`` (``{agent_id: {checkpoint_id: numpy state_dict}}``) carries only the
-    checkpoints the worker does not have yet; they are loaded at once.
+    checkpoints the worker does not have yet; they are loaded at once. ``evict``
+    (``{agent_id: [checkpoint_id, ...]}``) lists snapshots the storage deleted: the worker unloads each one
+    as soon as no current or staged lineup of its envs uses it; ids it does not hold are ignored.
     """
 
     lineups: list[Lineup | None]
     new_checkpoints: dict[str, dict[str, dict[str, np.ndarray]]] = field(default_factory=dict)
+    evict: dict[str, list[str]] = field(default_factory=dict)
 
 
 @dataclass

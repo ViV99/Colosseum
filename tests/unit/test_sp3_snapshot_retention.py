@@ -16,7 +16,8 @@ from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.core.config import CheckpointConfig, ColosseumConfig, load_config
 from colosseum.core.errors import ConfigError
 from colosseum.core.registry import build_model
-from colosseum.launcher import Launcher
+from colosseum.core.roles import role_signature
+from colosseum.launcher import Launcher, setup_run
 from game_helpers import agent_role_of, make_coordinator, make_test_config, make_test_run_dir
 
 
@@ -159,3 +160,52 @@ def test_a_run_dir_resume_imports_the_pool_and_a_checkpoint_dir_resume_does_not(
     coord2 = make_coordinator(from_ckpt, launcher2._run_dir.checkpoints)
     launcher2._import_snapshot_pool(coord2)
     assert ids(coord2.checkpoint_manager, "a") == []
+
+
+def test_a_raising_eviction_callback_never_leaves_deleted_snapshots_in_the_index(tmp_path):
+    seen = []
+
+    def on_evict(agent, ckpt):
+        seen.append(ckpt)
+        raise RuntimeError(f"callback failed for {ckpt}")
+
+    mgr = CheckpointManager(tmp_path / "store", keep_last=1, keep_every=0, on_evict=on_evict)
+    mgr.save("a", 10, sd(10))
+    with pytest.raises(RuntimeError, match="ckpt_v10"):
+        mgr.save("a", 20, sd(20))
+    assert ids(mgr) == ["ckpt_v20"] and seen == ["ckpt_v10"]
+    assert sorted(p.name for p in (tmp_path / "store" / "a").iterdir()) == ["ckpt_v20"]
+    old = CheckpointManager(tmp_path / "old", keep_last=10)
+    for version in (30, 40, 50):
+        old.save("a", version, sd(version))
+    with pytest.raises(RuntimeError, match="ckpt_v20"):             # every callback runs, the first error is raised
+        mgr.import_snapshots(tmp_path / "old", "a")
+    assert ids(mgr) == ["ckpt_v50"] and seen == ["ckpt_v10", "ckpt_v20", "ckpt_v30", "ckpt_v40"]
+    assert all(info.path.is_dir() for info in mgr.list_checkpoints("a"))
+
+
+def test_a_resume_from_a_snapshot_without_trainer_state_warns_that_the_optimizer_starts_fresh(tmp_path, caplog):
+    cfg = make_test_config("solo")
+    old = CheckpointManager(tmp_path / "old" / "checkpoints")
+    old.save("agent_0", 10, model_state(cfg), meta_extra={"env_steps": 100, **_signed(cfg)})   # no trainer_state.pt
+
+    def resume(source, name, **checkpoint):
+        resumed = make_test_config("solo", training={"resume_from": str(source)}, checkpoint=checkpoint)
+        launcher = Launcher(resumed, make_test_run_dir(resumed, tmp_path, name=name))
+        setup = setup_run(resumed, validate=False)
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="colosseum.launcher"):
+            launcher._resolve_resume(setup.agent_configs, setup.role_specs)
+        return [r.getMessage() for r in caplog.records if "trainer_state.pt" in r.getMessage()]
+
+    for source in (tmp_path / "old", tmp_path / "old" / "checkpoints" / "agent_0" / "ckpt_v10"):
+        (msg,) = resume(source, f"r-{source.name}")
+        assert "ckpt_v10" in msg and "optimizer" in msg and "start fresh" in msg
+    assert resume(tmp_path / "old", "no-opt", save_optimizer=False) == []
+    old.save("agent_0", 20, model_state(cfg), trainer_state=b"opt", meta_extra={"env_steps": 200, **_signed(cfg)})
+    assert resume(tmp_path / "old", "with-state") == []
+
+
+def _signed(config) -> dict:
+    roles, role = agent_role_of(config, "agent_0")
+    return {"roles": roles, "role_signature": role_signature(role)}

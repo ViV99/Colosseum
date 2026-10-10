@@ -25,6 +25,9 @@ slots of every collecting seat (slot rules of spec block 4):
   seat from collecting for its agent; a seat that starts collecting takes a parked buffer
   of that agent first (``BufferPool``).
 - A chunk's ``policy_version`` is the agent's version at its first slot.
+- Snapshot eviction (spec block 3): ids in ``WorkerCommand.evict`` are unloaded as soon as no env's
+  current or staged lineup uses them; a later lineup naming one gets the agent's latest weights
+  (``MatchRunner``'s SP1 fallback).
 """
 
 from __future__ import annotations
@@ -157,6 +160,7 @@ class RolloutLoop:
             # Model pool: agent -> network id -> model ("latest" + frozen checkpoints).
             self._models: dict[str, dict[str, PolicyModel]] = {}
             self._policy_versions: dict[str, int] = {aid: 0 for aid in self._agent_ids}
+            self._pending_evict: set[tuple[str, str]] = set()   # (agent, snapshot id) to unload once unused
             for aid in self._agent_ids:
                 latest = self._model_factories[aid]()
                 latest.eval()
@@ -284,6 +288,11 @@ class RolloutLoop:
         for e, lineup in enumerate(cmd.lineups):
             if lineup is not None:
                 self._runner.set_next_lineup(e, lineup)
+        for aid, ckpt_ids in cmd.evict.items():
+            loaded = self._models.get(aid, {})
+            self._pending_evict.update((aid, c) for c in ckpt_ids if c in loaded and c != LATEST_NETWORK_ID)
+        if self._pending_evict:
+            self._unload_unused()
 
     # ------------------------------------------------------------------
     # MatchObserver
@@ -362,6 +371,8 @@ class RolloutLoop:
                 del tracks[seat]
             if collector is not None and seat not in tracks:
                 self._start_collecting(env, seat, collector)
+        if self._pending_evict:
+            self._unload_unused()
 
     # ------------------------------------------------------------------
     # Helpers
@@ -371,6 +382,18 @@ class RolloutLoop:
         if agent_id not in self._models:
             raise ValueError(f"worker {self.worker_id}: env {env}, seat {seat}: unknown agent {agent_id!r}")
         self._tracks[env][seat] = _SeatTrack(agent_id=agent_id, buffer=self._pool.acquire(agent_id))
+
+    def _unload_unused(self) -> None:
+        """Unload pending evicted snapshots that no env's current or staged lineup uses."""
+        used: set[tuple[str, str]] = set()
+        for e in range(self._runner.num_envs):
+            for lu in (self._runner.lineup(e), self._runner.next_lineup(e)):
+                if lu is not None:
+                    used.update((s.agent_id, s.network_id) for s in lu.seats)
+        for aid, ckpt_id in sorted(self._pending_evict - used):
+            del self._models[aid][ckpt_id]
+            self._pending_evict.discard((aid, ckpt_id))
+            logger.info(f"Worker {self.worker_id}: agent {aid}: unloaded evicted snapshot {ckpt_id}")
 
     def _buffered_acts(self, aid: str) -> int:
         n = self._pool.parked_acts(aid)

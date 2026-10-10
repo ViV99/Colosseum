@@ -373,6 +373,8 @@ class Launcher:
         self._agent_ids: list[str] = []
         self._checkpoint_queues: dict[str, mp.Queue] = {}
         self._checkpoint_meta: dict[str, dict] = {}
+        # Per worker: snapshots evicted by the storage that are still to be delivered ({agent: ids}).
+        self._worker_evictions: list[dict[str, set[str]]] = []
         # Set by launch(): the main process's single metrics sink (T6.3) and its queue-depth source.
         self._hub = None
         self._metrics_writer = None
@@ -446,6 +448,7 @@ class Launcher:
         worker_sent_ckpts: list[dict[str, set]] = [
             {aid: set() for aid in trainable_agents} for _ in range(cfg.rollout.num_workers)
         ]
+        self._worker_evictions = [{} for _ in range(cfg.rollout.num_workers)]
         # Track every queue so shutdown can cancel feeder threads and avoid the interpreter
         # blocking on unflushed data when consumers have exited.
         self._all_queues = [metrics_queue, results_queue, *command_queues]
@@ -668,7 +671,8 @@ class Launcher:
                 self._reported_failures.add(failure.name)
                 return 1
             if refresh_interval > 0 and time.monotonic() - last_refresh >= refresh_interval:
-                self._refresh_worker_matches(coordinator, agent_ids, command_queues, worker_sent_ckpts)
+                self._refresh_worker_matches(coordinator, agent_ids, command_queues, worker_sent_ckpts,
+                                             self._worker_evictions)
                 last_refresh = time.monotonic()
             time.sleep(0.2)
 
@@ -766,8 +770,15 @@ class Launcher:
         the checkpoint otherwise); every resumed agent's weights are checked against its
         architecture (ConfigError before any process starts); the global env-step counter
         continues from the largest resumed ``env_steps``, so the budget and LR progress continue.
+        A checkpoint without ``trainer_state.pt`` (e.g. an imported or ``keep_every`` snapshot) while
+        ``checkpoint.save_optimizer`` is on is announced by a WARNING: the optimizer / LR state starts fresh.
         """
-        from colosseum.coordinator.checkpoint_manager import check_model_state, resolve_resume
+        from colosseum.coordinator.checkpoint_manager import (
+            RESUME_PT_FILE,
+            check_model_state,
+            classify_resume_source,
+            resolve_resume,
+        )
         from colosseum.core.registry import build_model
         from colosseum.core.roles import role_signature
 
@@ -780,6 +791,12 @@ class Launcher:
             if state is not None:
                 check_model_state(build_model(acfg, role_specs[aid]), state["model_state"], state["source"])
                 logger.info(f"Resume [{aid}]: {state['source']} (policy_version {state['policy_version']})")
+                if (state.get("trainer_state") is None and self._config.checkpoint.save_optimizer
+                        and classify_resume_source(resume_from) != RESUME_PT_FILE):
+                    logger.warning(
+                        f"Resume [{aid}]: checkpoint {state['source']} has no trainer_state.pt; the weights and "
+                        f"policy_version are restored, the optimizer / LR state and trainer counters start fresh"
+                    )
             resume_states[aid] = state
         start_env_steps = max((s["env_steps"] for s in resume_states.values() if s), default=0)
         if start_env_steps > 0:
@@ -827,23 +844,33 @@ class Launcher:
         agent_ids: list[str],
         command_queues: list[mp.Queue],
         worker_sent_ckpts: list[dict[str, set]],
+        worker_evictions: list[dict[str, set[str]]] | None = None,
     ) -> None:
         """Advance the owner rotation and send every worker fresh lineups.
 
         Lineups for worker ``w`` are generated at global env offset ``w * envs_per_worker``. Each
-        command carries only checkpoints that the worker does not have yet. A checkpoint counts as
-        delivered only after its command was put successfully; a full command queue means the
-        worker skips this round and gets the deltas with the next refresh.
+        command carries only checkpoints that the worker does not have yet, and the snapshots evicted
+        since they were last delivered to it (``worker_evictions[w]``; ``None`` = no retry state). A
+        delivery counts only after its command was put successfully; a full command queue means the
+        worker skips this round and gets the deltas and evictions with the next refresh.
         """
         from colosseum.core.types import WorkerCommand
 
         num_envs = self._config.rollout.envs_per_worker
+        if worker_evictions is None:
+            worker_evictions = [{} for _ in command_queues]
+        for aid, ckpt_ids in coordinator.take_evictions().items():
+            for pending in worker_evictions:
+                pending.setdefault(aid, set()).update(ckpt_ids)
         coordinator.next_round()
         for worker_id, cq in enumerate(command_queues):
             sent = worker_sent_ckpts[worker_id]
+            pending = worker_evictions[worker_id]
             lineups = coordinator.generate_lineups(num_envs, env_offset=worker_id * num_envs)
             new_ckpts, lineups = _resolve_lineups(lineups, coordinator, agent_ids, already_sent=sent)
-            cmd = WorkerCommand(lineups=list(lineups), new_checkpoints={aid: c for aid, c in new_ckpts.items() if c})
+            evict = {aid: sorted(ids) for aid, ids in pending.items() if ids}
+            cmd = WorkerCommand(lineups=list(lineups), new_checkpoints={aid: c for aid, c in new_ckpts.items() if c},
+                                evict=evict)
             try:
                 cq.put_nowait(cmd)
             except queue.Full:
@@ -851,6 +878,9 @@ class Launcher:
                 continue
             for aid, ckpts in new_ckpts.items():
                 sent.setdefault(aid, set()).update(ckpts)
+            for aid, ids in evict.items():
+                sent.get(aid, set()).difference_update(ids)
+                pending[aid].difference_update(ids)
 
     def _shutdown(self) -> list[str]:
         """Stop every child within SHUTDOWN_GRACE_SEC; returns the names that had to be terminated.

@@ -17,7 +17,8 @@ contain ``.`` (``core.config.check_agent_id``). A ``path`` stored in
 Retention (SP3 spec block 4), after every save and import: the newest ``keep_last`` snapshots, every
 snapshot whose version is a multiple of ``interval * keep_every`` (``keep_every > 0``), every final
 snapshot (``meta.json`` ``final: true``) and the snapshot just saved are kept; every other one is evicted
-(``on_evict(agent_id, checkpoint_id)`` is called after each). Only the newest ``keep_last`` keep
+(``on_evict(agent_id, checkpoint_id)`` is called for each, after the index no longer lists it, so a
+raising callback never leaves deleted dirs in the index). Only the newest ``keep_last`` keep
 ``trainer_state.pt``: resume only ever needs the latest snapshots.
 
 Writes go to ``.tmp-<id>-<rand>/`` and are moved into place with ``os.replace``.
@@ -281,13 +282,16 @@ class CheckpointManager:
         entries = [c for c in self._index.get(agent_id, []) if c.checkpoint_id != checkpoint_id]
         entries.append(CheckpointInfo(checkpoint_id, agent_id, int(policy_version), final_dir, timestamp, meta))
         entries.sort(key=lambda c: c.policy_version)
-        self._index[agent_id] = self._retain(agent_id, entries, protect=checkpoint_id)
+        self._index[agent_id], evicted = self._retain(agent_id, entries, protect=checkpoint_id)
         logger.info(f"Saved checkpoint {checkpoint_id} of {agent_id} (pool {len(self._index[agent_id])}; "
                     f"keep_last {self._keep_last}, keep_every {self._keep_every})")
+        self._notify_evicted(agent_id, evicted)
         return checkpoint_id
 
-    def _retain(self, agent_id: str, entries: list[CheckpointInfo], protect: str | None = None) -> list[CheckpointInfo]:
-        """Apply the retention rules to ``entries`` (sorted by version); returns the kept ones."""
+    def _retain(self, agent_id: str, entries: list[CheckpointInfo],
+                protect: str | None = None) -> tuple[list[CheckpointInfo], list[str]]:
+        """Apply the retention rules to ``entries`` (sorted by version); returns the kept ones and the ids
+        evicted (the caller updates the index first, then calls ``_notify_evicted``)."""
         newest = {c.checkpoint_id for c in entries[-self._keep_last:]}
         period = self._interval * self._keep_every
         keep = set(newest) | ({protect} if protect is not None else set())
@@ -295,17 +299,31 @@ class CheckpointManager:
             if (period > 0 and c.policy_version % period == 0) or c.meta.get("final") is True:
                 keep.add(c.checkpoint_id)
         kept: list[CheckpointInfo] = []
+        evicted: list[str] = []
         for c in entries:
             if c.checkpoint_id not in keep:
                 self._evict(agent_id, c.checkpoint_id)
                 logger.debug(f"Evicted checkpoint {c.checkpoint_id} of {agent_id}")
-                if self._on_evict is not None:
-                    self._on_evict(agent_id, c.checkpoint_id)
+                evicted.append(c.checkpoint_id)
                 continue
             kept.append(c)
             if c.checkpoint_id not in newest:
                 (c.path / TRAINER_FILE).unlink(missing_ok=True)
-        return kept
+        return kept, evicted
+
+    def _notify_evicted(self, agent_id: str, evicted: list[str]) -> None:
+        """Call ``on_evict`` for every evicted id (the index is already updated); every callback runs, and the
+        first callback error is raised after the last one."""
+        if self._on_evict is None:
+            return
+        first_error: Exception | None = None
+        for checkpoint_id in evicted:
+            try:
+                self._on_evict(agent_id, checkpoint_id)
+            except Exception as e:
+                first_error = first_error or e
+        if first_error is not None:
+            raise first_error
 
     def import_snapshots(self, src_checkpoints_dir: str | Path, agent_id: str,
                          expected_signature: str | None = None) -> list[str]:
@@ -347,10 +365,11 @@ class CheckpointManager:
             entries.append(CheckpointInfo(info.checkpoint_id, agent_id, info.policy_version,
                                           agent_dir / info.checkpoint_id, info.timestamp, dict(info.meta)))
         entries.sort(key=lambda c: c.policy_version)
-        self._index[agent_id] = self._retain(agent_id, entries)
+        self._index[agent_id], evicted = self._retain(agent_id, entries)
         kept = [c.checkpoint_id for c in self._index[agent_id]]
         if infos:
             logger.info(f"Imported {len(infos)} snapshots of {agent_id} from {src_agent}; pool now {kept}")
+        self._notify_evicted(agent_id, evicted)
         return kept
 
     def _evict(self, agent_id: str, checkpoint_id: str) -> None:

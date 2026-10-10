@@ -49,6 +49,7 @@ class Coordinator:
         # One RNG for matchmaking and seat permutations: runs with the same seed get the same schedule.
         self._rng = random.Random(config.training.seed)
         ckpt = config.checkpoint
+        self._evicted: dict[str, list[str]] = {}   # evicted since the last take_evictions(), per agent
         self._checkpoint_manager = CheckpointManager(
             base_dir=checkpoint_dir, keep_last=ckpt.keep_last, keep_every=ckpt.keep_every, interval=ckpt.interval,
             on_evict=self._on_evict,
@@ -101,9 +102,17 @@ class Coordinator:
         return self._role_signatures[agent_id]
 
     def _on_evict(self, agent_id: str, checkpoint_id: str) -> None:
-        """Storage evicted a snapshot (spec block 4): the matchmaker's candidates come from the store, so it is
-        gone from new lineups."""
+        """Storage evicted a snapshot (spec block 4): new lineups no longer draw it (the matchmaker's
+        candidates come from the store), and workers are told to unload it (``take_evictions``)."""
         logger.debug(f"Snapshot {checkpoint_id} of {agent_id} evicted")
+        bucket = self._evicted.setdefault(agent_id, [])
+        if checkpoint_id not in bucket:
+            bucket.append(checkpoint_id)
+
+    def take_evictions(self) -> dict[str, list[str]]:
+        """Snapshots evicted since the previous call, per agent in eviction order (each id once)."""
+        evicted, self._evicted = self._evicted, {}
+        return evicted
 
     def import_snapshots(self, run_dir: str | Path) -> None:
         """Run-dir resume (spec block 4): carry the stored snapshots of every trainable agent of ``run_dir``
