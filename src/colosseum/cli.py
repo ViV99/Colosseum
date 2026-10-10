@@ -229,6 +229,58 @@ def eval_cmd(
         click.echo(f"Result written to {output}")
 
 
+@main.command("record")
+@click.option("--config", "-c", required=True, type=click.Path(exists=True),
+              help="Config YAML: its env is used for every match; its scripted/frozen agents can be named")
+@click.option("--player", "-p", required=True,
+              help="Who is recorded: a scripted or frozen agent of the config, or name=path (checkpoint dir or .pt)")
+@click.option("--against", "against", multiple=True,
+              help="Opponent (same forms as --player; repeatable): each one plays the player in eval's pair "
+                   "rotation and only the player's seats are recorded. Without --against the player takes every "
+                   "seat and every seat is recorded.")
+@click.option("--layout", "layouts", multiple=True,
+              help="Layout to play (repeatable). Default: every layout the players can fill.")
+@click.option("--num-matches", "-n", default=100, type=click.IntRange(min=1), show_default=True,
+              help="Matches per layout (with --against: per opponent and layout)")
+@click.option("--output", "-o", required=True, type=click.Path(file_okay=False),
+              help="New or empty directory: <output>/<role>/part-NNNNN.pt (BC data) and record.json")
+@click.option("--num-envs", default=8, type=click.IntRange(min=1), show_default=True, help="Parallel environments")
+@click.option("--seed", default=None, type=int, help="Seed for env resets, bots and sampling")
+@click.option("--deterministic", is_flag=True, default=False,
+              help="Neural players act greedily (scripted bots are unaffected)")
+def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tuple[str, ...], num_matches: int,
+               output: str, num_envs: int, seed: int | None, deterministic: bool) -> None:
+    """Record a player's decisions as behavioural-cloning data (read by 'colosseum bc --data <output>').
+
+    Exit code: 0 done, 1 config error (unknown player, a layout the player cannot fill without
+    --against, a non-empty output directory) or a scripted player's illegal action, 2 bad
+    command-line arguments, 130 SIGINT, 143 SIGTERM.
+    """
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    with _config_errors():  # also a scripted player's error (PlayerError)
+        from colosseum.core.config import load_config
+        from colosseum.core.registry import validate_config
+        from colosseum.eval import EvalReport
+        from colosseum.record import RECORD_FILE, record
+
+        cfg = load_config(config)
+        validate_config(cfg)
+        content = record(cfg, player, list(against), layouts=list(layouts) or None, num_matches=num_matches,
+                         output=output, num_envs=num_envs, seed=seed, deterministic=deterministic)
+    summary = content["summary"]
+    report = EvalReport(agents=summary["agents"], num_matches=summary["num_matches"],
+                        deterministic=summary["deterministic"], layouts=summary["layouts"])
+    click.echo("\n" + report.text())
+    click.echo(f"Recorded {content['decisions']} decisions ({content['seat_episodes']} seat-episodes of "
+               f"{content['matches']} matches) into {output}:")
+    for role, cell in content["roles"].items():
+        click.echo(f"  {role}: {cell['seat_episodes']} seat-episodes, {cell['decisions']} decisions, "
+                   f"{len(cell['files'])} file(s)")
+    click.echo(f"Description: {output}/{RECORD_FILE}")
+
+
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
 @click.option("--data", "-d", required=True, type=click.Path(exists=True),

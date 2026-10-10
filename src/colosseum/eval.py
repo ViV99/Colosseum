@@ -70,7 +70,7 @@ from colosseum.envs.game import GameSpec, MultiAgentEnv
 from colosseum.envs.vector import VectorEnv
 from colosseum.networks.model import PolicyModel
 from colosseum.players.scripted import ScriptedBot
-from colosseum.worker.match_runner import EpisodeEnd, MatchRunner, ScriptedPlayer
+from colosseum.worker.match_runner import EpisodeEnd, MatchObserver, MatchRunner, ScriptedPlayer
 
 logger = logging.getLogger(__name__)
 
@@ -187,29 +187,49 @@ def _copy_bot(prototype: ScriptedBot, spec: GameSpec) -> ScriptedBot:
 
 
 class _Collector:
-    """``MatchObserver`` that keeps the result of every scheduled lineup and feeds the next one."""
+    """``MatchObserver`` that keeps the result of every scheduled lineup and feeds the next one.
 
-    def __init__(self, pending: deque[Lineup], scheduled: list[bool]) -> None:
+    ``inner`` (optional) receives every callback; ``on_episode_end`` only for scheduled episodes,
+    and for the extra episodes of envs left without a lineup the optional ``on_episode_discarded(env)``.
+    """
+
+    def __init__(self, pending: deque[Lineup], scheduled: list[bool], inner: MatchObserver | None = None) -> None:
         self.runner: MatchRunner | None = None
         self.results: list[MatchResult] = []
         self._pending = pending
         self._scheduled = scheduled
+        self._inner = inner
 
     def on_act(self, env, seat, record) -> None:
-        pass
+        if self._inner is not None:
+            self._inner.on_act(env, seat, record)
 
     def on_rewards(self, env, rewards) -> None:
-        pass
+        if self._inner is not None:
+            self._inner.on_rewards(env, rewards)
 
     def on_terminated(self, env, seats) -> None:
-        pass
+        if self._inner is not None:
+            self._inner.on_terminated(env, seats)
 
     def on_lineup_applied(self, env, old, new) -> None:
-        pass
+        if self._inner is not None:
+            self._inner.on_lineup_applied(env, old, new)
+
+    def on_episode_start(self, env: int, layout: str, episode_seed: int | None) -> None:
+        hook = getattr(self._inner, "on_episode_start", None)
+        if hook is not None:
+            hook(env, layout, episode_seed)
 
     def on_episode_end(self, env: int, end: EpisodeEnd) -> None:
         if self._scheduled[env]:
             self.results.append(end.result)
+            if self._inner is not None:
+                self._inner.on_episode_end(env, end)
+        else:
+            discard = getattr(self._inner, "on_episode_discarded", None)
+            if discard is not None:
+                discard(env)
         if self._pending:
             self.runner.set_next_lineup(env, self._pending.popleft())  # applied at this episode end
             self._scheduled[env] = True
@@ -226,12 +246,14 @@ def play_lineups(
     seed: int | None = None,
     deterministic: bool = False,
     max_idle_steps: int = 1000,
+    observer: MatchObserver | None = None,
 ) -> list[MatchResult]:
     """Play every lineup once, to completion; one ``MatchResult`` per lineup, in completion order.
 
     ``seed`` seeds the episode resets and a forked torch RNG, so the caller's global RNG is
     untouched. Models run in eval mode; their train/eval flags are restored on return. Scripted players
     need no eval mode; a ``ScriptedBot`` instance is never played itself (deep copies are).
+    ``observer`` (optional) sees every decision and episode of the scheduled lineups; see ``_Collector``.
     """
     lineups = list(lineups)
     if not lineups:
@@ -252,7 +274,7 @@ def play_lineups(
                 model.eval()
             n = min(num_envs, len(lineups))
             pending = deque(lineups[n:])
-            collector = _Collector(pending, [True] * n)
+            collector = _Collector(pending, [True] * n, inner=observer)
             vec_env = VectorEnv(env_fn, n)
             try:
                 pool = {name: ScriptedPlayer(functools.partial(_copy_bot, player, vec_env.spec))
@@ -616,6 +638,37 @@ def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
     return model, list(frozen.roles)
 
 
+def load_player(config: ColosseumConfig, name: str, path: str | None, *, spec: GameSpec,
+                validated: set[str] | None = None,
+                option: str = "-a") -> tuple[PolicyModel | ScriptedPlayer, list[str]]:
+    """One player of ``eval -a`` / ``record --player`` / ``record --against``: ``path=None`` is the scripted
+    or frozen agent ``name`` of the config (a trainable agent needs a path: ConfigError naming ``option``),
+    otherwise a checkpoint dir or a ``.pt`` (``load_eval_model``). Returns ``(player, roles)``.
+
+    A path that is neither a directory nor a ``.pt`` file is a ConfigError."""
+    from colosseum.players.registry import BotSpec, make_bot, resolve_player_roles
+
+    if path is None:
+        entry = config.agent_entry(name)          # ConfigError for an unknown name
+        if entry.kind == "trainable":
+            raise ConfigError(f"{option} {name}: '{name}' is a trainable agent, whose weights are not in the config; "
+                              f"use {option} {name}=<checkpoint dir or .pt>")
+        if entry.kind == "scripted":
+            bot = BotSpec(entry.class_path, dict(entry.kwargs))
+            make_bot(bot, spec)                    # a bad class or kwargs fail here, as a ConfigError
+            roles = list(resolve_player_roles(config, spec)[name])
+            return ScriptedPlayer(functools.partial(make_bot, bot, spec)), roles
+        path = entry.path
+        p = Path(path)
+        if not (p.is_dir() or (p.is_file() and p.suffix == ".pt")):
+            raise ConfigError(f"agents.{name}.path={path!r}: expected a checkpoint dir or a .pt file")
+    else:
+        p = Path(path)
+        if not (p.is_dir() or (p.is_file() and p.suffix == ".pt")):
+            raise ConfigError(f"{option} {name}={path}: expected a checkpoint dir or a .pt file")
+    return load_eval_model(config, name, path, spec=spec, validated=validated)
+
+
 def default_layouts(spec: GameSpec, players: Mapping[str, Sequence[str]]) -> list[str]:
     """Every layout of the game for which ``schedule_lineups`` has at least one lineup."""
     return [name for name in spec.layouts if schedule_lineups(spec, name, players, 1)]
@@ -627,32 +680,13 @@ def evaluate(config: ColosseumConfig, agents: Mapping[str, str | None], *, layou
     """Load ``agents`` (name -> checkpoint dir or ``.pt``; ``None`` = the scripted or frozen agent of that name
     in the config), schedule, play and summarize."""
     from colosseum.core.registry import env_spec, make_env
-    from colosseum.players.registry import BotSpec, make_bot, resolve_player_roles
 
     spec = env_spec(config)
     models: dict[str, PolicyModel | ScriptedPlayer] = {}
     players: dict[str, list[str]] = {}
     validated: set[str] = set()  # each distinct architecture is checked once
-    config_roles: dict[str, list[str]] | None = None
     for name, path in agents.items():
-        if path is None:
-            entry = config.agent_entry(name)          # ConfigError for an unknown name
-            if entry.kind == "trainable":
-                raise ConfigError(f"-a {name}: '{name}' is a trainable agent, whose weights are not in the config; "
-                                  f"use -a {name}=<checkpoint dir or .pt>")
-            if entry.kind == "scripted":
-                if config_roles is None:
-                    config_roles = resolve_player_roles(config, spec)
-                bot = BotSpec(entry.class_path, dict(entry.kwargs))
-                make_bot(bot, spec)                    # a bad class or kwargs fail here, as a ConfigError
-                models[name] = ScriptedPlayer(functools.partial(make_bot, bot, spec))
-                players[name] = list(config_roles[name])
-                continue
-            path = entry.path
-            p = Path(path)
-            if not (p.is_dir() or (p.is_file() and p.suffix == ".pt")):
-                raise ConfigError(f"agents.{name}.path={path!r}: expected a checkpoint dir or a .pt file")
-        models[name], players[name] = load_eval_model(config, name, path, spec=spec, validated=validated)
+        models[name], players[name] = load_player(config, name, path, spec=spec, validated=validated)
     chosen = list(dict.fromkeys(layouts)) if layouts else default_layouts(spec, players)
     unknown = sorted(set(chosen) - set(spec.layouts))
     if unknown:
