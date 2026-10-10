@@ -28,6 +28,14 @@ slots of every collecting seat (slot rules of spec block 4):
 - Snapshot eviction (spec block 3): ids in ``WorkerCommand.evict`` are unloaded as soon as no env's
   current or staged lineup uses them; a later lineup naming one gets the agent's latest weights
   (``MatchRunner``'s SP1 fallback).
+- **Scripted kickstart teachers (DAgger).** For an agent in ``teachers`` every decision of a seat that
+  collects for it is also given to a teacher instance of that (agent, env, seat) with the same ``obs``,
+  ``mask`` and ``info`` (copies); its checked action goes into the ACT slot (``teacher_action``,
+  ``has_teacher``). An instance is created at its first use and reset at the first decision of every
+  episode in which the agent collects at that seat (lazily; ``on_episode_start`` records the layout and
+  seed), with ``bot_rng(episode_seed, seat, f"{agent}/teacher")``. The learner's
+  ``WeightPayload.teacher_active`` switches the queries off (lambda 0). A failure or an illegal action of
+  a teacher is a ``PlayerError`` with the context "worker W, env E, seat P, episode step K, layout L".
 """
 
 from __future__ import annotations
@@ -39,13 +47,15 @@ import time
 from collections import defaultdict
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 import numpy as np
 import torch
 
+from colosseum.core.errors import PlayerError
 from colosseum.core.roles import agent_role_spec
 from colosseum.core.specs import ActionSpec, ObsSpec
+from colosseum.core.tree import tree_map
 from colosseum.core.types import (
     FIXED_NETWORK_ID,
     LATEST_NETWORK_ID,
@@ -59,7 +69,8 @@ from colosseum.core.types import (
 from colosseum.envs.game import MultiAgentEnv
 from colosseum.envs.vector import SubprocessVectorEnv, VectorEnv
 from colosseum.networks.model import PolicyModel
-from colosseum.players.registry import FixedPlayers, build_frozen_model, make_bot
+from colosseum.players.registry import BotSpec, FixedPlayers, build_frozen_model, make_bot
+from colosseum.players.scripted import ScriptedBot, bot_rng, check_bot_action
 from colosseum.worker.buffers import BufferPool, BufferSpec, RolloutBuffer
 from colosseum.worker.match_runner import ActRecord, EpisodeEnd, MatchRunner, ScriptedPlayer
 
@@ -88,6 +99,14 @@ class _SeatTrack:
     pending_reward: float = 0.0
 
 
+@dataclass
+class _TeacherBot:
+    """A scripted kickstart teacher instance of one (student agent, env, seat)."""
+
+    bot: ScriptedBot
+    episode: int = -1          # the env's episode counter at its last reset
+
+
 class RolloutLoop:
     """One worker's rollout loop over ``num_envs`` envs (module docstring).
 
@@ -114,6 +133,7 @@ class RolloutLoop:
         subproc_workers: int | None = None,
         max_idle_steps: int = 1000,
         fixed_players: FixedPlayers | None = None,
+        teachers: Mapping[str, BotSpec] | None = None,
     ) -> None:
         if len(lineups) != num_envs:
             raise ValueError(f"worker {worker_id}: need one lineup per env: {len(lineups)} lineups for {num_envs} envs")
@@ -122,6 +142,17 @@ class RolloutLoop:
         self._agent_ids = list(agent_ids)
         self._model_factories = dict(model_factories)
         self._weight_sync_interval = weight_sync_interval
+        self._teacher_specs = dict(teachers or {})
+        unknown = sorted(set(self._teacher_specs) - set(self._agent_ids))
+        if unknown:
+            raise ValueError(f"worker {worker_id}: kickstart teachers for unknown agents {unknown}")
+        self._teacher_active = {aid: True for aid in self._teacher_specs}   # until the learner says otherwise
+        self._teacher_bots: dict[tuple[str, int, int], _TeacherBot] = {}
+        # Per env: the current episode's layout, seed, counter and step (teacher resets and error context).
+        self._episode_layout: list[str | None] = [None] * num_envs
+        self._episode_seed: list[int | None] = [None] * num_envs
+        self._episode_count = [0] * num_envs
+        self._episode_step = [0] * num_envs
 
         if seed is not None:
             torch.manual_seed(seed)
@@ -136,6 +167,7 @@ class RolloutLoop:
             raise ValueError(f"unknown vec_env_kind {vec_env_kind!r}")
         try:
             spec = vec_env.spec
+            self._spec = spec
             # Fixed players (spec block 3): one bot factory per scripted agent and one model per frozen agent
             # (its own architecture, weights from the main process), served under FIXED_NETWORK_ID.
             self._fixed: dict[str, PolicyModel | ScriptedPlayer] = {}
@@ -154,8 +186,10 @@ class RolloutLoop:
                     global_state=(
                         None if role.global_state_space is None else ObsSpec.from_space(role.global_state_space)
                     ),
+                    teacher=aid in self._teacher_specs,
                 )
             self._pool = BufferPool(chunk_length, specs)
+            self._buffer_specs = specs
 
             # Model pool: agent -> network id -> model ("latest" + frozen checkpoints).
             self._models: dict[str, dict[str, PolicyModel]] = {}
@@ -216,6 +250,8 @@ class RolloutLoop:
             if payload is not None:
                 self._models[aid][LATEST_NETWORK_ID].load_state_dict(payload.to_torch_state_dict())
                 self._policy_versions[aid] = int(payload.policy_version)
+                if aid in self._teacher_active:
+                    self._teacher_active[aid] = bool(payload.teacher_active)
         self._last_weight_sync = time.monotonic()
 
     def run(self, should_stop: Callable[[], bool], max_env_steps: int = 0) -> None:
@@ -302,6 +338,7 @@ class RolloutLoop:
         track = self._tracks[env].get(seat)
         if track is None:
             return
+        label = self._teacher_label(env, seat, track.agent_id, record)
         buf = track.buffer
         if buf.free_slots == 1:
             if buf.has_open:
@@ -312,11 +349,12 @@ class RolloutLoop:
         if buf.slots_used == 0:
             buf.begin(record.pre_state, self._policy_versions[track.agent_id])
         buf.write_act(record.obs, record.global_state, record.mask, record.action, record.log_prob,
-                      record.unit_log_probs, track.pending_reward)
+                      record.unit_log_probs, track.pending_reward, teacher_action=label)
         track.pending_reward = 0.0
         self._recorded[track.agent_id] += 1
 
     def on_rewards(self, env: int, rewards: dict[int, float]) -> None:
+        self._episode_step[env] += 1            # called once per env step
         for seat, r in rewards.items():
             track = self._tracks[env].get(seat)
             if track is None:
@@ -360,6 +398,13 @@ class RolloutLoop:
         if self._io.report_result is not None:
             self._io.report_result(end.result)
 
+    def on_episode_start(self, env: int, layout: str, episode_seed: int | None) -> None:
+        """MatchRunner hook after every env reset: the episode's layout and seed (teacher resets)."""
+        self._episode_layout[env] = layout
+        self._episode_seed[env] = episode_seed
+        self._episode_count[env] += 1
+        self._episode_step[env] = 0
+
     def on_lineup_applied(self, env: int, old: Lineup, new: Lineup) -> None:
         tracks = self._tracks[env]
         for seat in range(max(len(old.seats), len(new.seats))):
@@ -382,6 +427,41 @@ class RolloutLoop:
         if agent_id not in self._models:
             raise ValueError(f"worker {self.worker_id}: env {env}, seat {seat}: unknown agent {agent_id!r}")
         self._tracks[env][seat] = _SeatTrack(agent_id=agent_id, buffer=self._pool.acquire(agent_id))
+
+    def _teacher_label(self, env: int, seat: int, agent_id: str, record: ActRecord) -> Any:
+        """The scripted kickstart teacher's checked action for a collecting seat's decision, or None (no teacher,
+        or the learner switched it off: ``WeightPayload.teacher_active``). PlayerError with context when the
+        bot fails or plays an illegal action."""
+        spec = self._teacher_specs.get(agent_id)
+        if spec is None or not self._teacher_active[agent_id]:
+            return None
+        layout = self._episode_layout[env] or self._runner.lineup(env).layout
+        role = self._spec.role_of(layout, seat)
+        where = (f"worker {self.worker_id}, env {env}, seat {seat}, episode step {self._episode_step[env]}, "
+                 f"layout {layout}: kickstart teacher of agent {agent_id!r}")
+        key = (agent_id, env, seat)
+        teacher = self._teacher_bots.get(key)
+        if teacher is None:
+            try:
+                teacher = self._teacher_bots[key] = _TeacherBot(make_bot(spec, self._spec))
+            except Exception as e:  # noqa: BLE001 - user code; reported with its context
+                raise PlayerError(f"{where}: creating the teacher failed ({type(e).__name__}: {e})") from e
+        if teacher.episode != self._episode_count[env]:
+            try:
+                teacher.bot.reset(role=role, seat=seat, layout=layout,
+                                  rng=bot_rng(self._episode_seed[env], seat, f"{agent_id}/teacher"))
+            except Exception as e:  # noqa: BLE001 - user code
+                raise PlayerError(f"{where}: reset raised {type(e).__name__}: {e}") from e
+            teacher.episode = self._episode_count[env]
+        mask = record.mask
+        try:
+            # copies: a teacher editing them in place changes neither the legality gate nor the recorded slot
+            action = teacher.bot.act(tree_map(np.copy, record.obs), None if mask is None else tree_map(np.copy, mask),
+                                     record.info)
+        except Exception as e:  # noqa: BLE001 - user code
+            raise PlayerError(f"{where}: act raised {type(e).__name__}: {e}") from e
+        return check_bot_action(self._spec.roles[role], action, mask, where,
+                                action_spec=self._buffer_specs[agent_id].action)
 
     def _unload_unused(self) -> None:
         """Unload pending evicted snapshots that no env's current or staged lineup uses."""

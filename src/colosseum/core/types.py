@@ -63,6 +63,8 @@ class TrajectoryChunk:
     ``actions``, ``action_masks``) have leaves ``[S, ...]`` with their native dtypes.
     ``behavior_unit_logp`` (``[S, K]``) exists only when the role's action has ``K > 1``
     deciders. ``initial_state`` is the model state before slot 0 (leaves ``[1, ...]``).
+    ``teacher_action`` / ``has_teacher`` (both or neither) exist only for an agent with a scripted
+    kickstart teacher: the teacher's action on ACT slots it labelled, zeros elsewhere.
     """
 
     agent_id: str
@@ -78,6 +80,8 @@ class TrajectoryChunk:
     reset_after: torch.Tensor
     behavior_logp: torch.Tensor
     behavior_unit_logp: torch.Tensor | None
+    teacher_action: Tree | None = None   # [S, ...] scripted kickstart teacher's action (DAgger), action-tree layout
+    has_teacher: torch.Tensor | None = None   # [S] bool: the slot carries a teacher label (ACT slots only)
 
     @property
     def num_slots(self) -> int:
@@ -102,6 +106,8 @@ class TrajectoryChunk:
             reset_after=fn(self.reset_after),
             behavior_logp=fn(self.behavior_logp),
             behavior_unit_logp=None if self.behavior_unit_logp is None else fn(self.behavior_unit_logp),
+            teacher_action=_map_optional(fn, self.teacher_action),
+            has_teacher=None if self.has_teacher is None else fn(self.has_teacher),
         )
 
     def to(self, device: str | torch.device) -> TrajectoryChunk:
@@ -130,12 +136,15 @@ class TrajectoryChunk:
             "behavior_unit_logp": (
                 None if self.behavior_unit_logp is None else tensor_to_numpy(self.behavior_unit_logp)
             ),
+            "teacher_action": None if self.teacher_action is None else tree_to_numpy(self.teacher_action),
+            "has_teacher": None if self.has_teacher is None else tensor_to_numpy(self.has_teacher),
         }
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> TrajectoryChunk:
         """Rebuild a chunk (CPU tensors) from :meth:`to_payload` output."""
         gs, masks, unit_logp = payload["global_state"], payload["action_masks"], payload["behavior_unit_logp"]
+        teacher, has = payload.get("teacher_action"), payload.get("has_teacher")   # absent before SP3
         return cls(
             agent_id=str(payload["agent_id"]),
             policy_version=int(payload["policy_version"]),
@@ -150,6 +159,8 @@ class TrajectoryChunk:
             reset_after=numpy_to_tensor(payload["reset_after"]),
             behavior_logp=numpy_to_tensor(payload["behavior_logp"]),
             behavior_unit_logp=None if unit_logp is None else numpy_to_tensor(unit_logp),
+            teacher_action=None if teacher is None else tree_to_torch(teacher),
+            has_teacher=None if has is None else numpy_to_tensor(has),
         )
 
 
@@ -163,6 +174,7 @@ _SLOT_RULES = (
     "a BOOT that does not follow an open ACT",
     "a PAD that does not follow the end of an episode",
     "a BOOT without reset_after before the last slot",
+    "a teacher label on a non-ACT slot",
 )
 
 
@@ -190,7 +202,8 @@ def validate_slot_structure(chunk: TrajectoryChunk) -> None:
     resets the recurrent state from ``reset_after``): a terminal ACT and a PAD have
     ``reset_after``, an open ACT has not, and only ACTs are ``terminal``. The earliest broken
     slot is reported. A cheap numpy check over ``kind`` / ``terminal`` / ``reset_after``; the
-    slot letters for the message are spelled only on failure.
+    slot letters for the message are spelled only on failure. A teacher label (``has_teacher``) only
+    on ACT slots.
     """
     kind = chunk.kind.cpu().numpy()
     terminal = chunk.terminal.cpu().numpy().astype(bool)
@@ -204,6 +217,9 @@ def validate_slot_structure(chunk: TrajectoryChunk) -> None:
         )
     if kind.size == 0:
         raise ValueError(f"{where}): the chunk has no slots")
+    has_teacher = None if chunk.has_teacher is None else chunk.has_teacher.cpu().numpy().astype(bool)
+    if has_teacher is not None and has_teacher.shape != kind.shape:
+        raise ValueError(f"{where}): has_teacher must have the shape {kind.shape} of kind, got {has_teacher.shape}")
 
     def fail(slot: int, problem: str) -> ValueError:
         return ValueError(f"{where}, slots {_spell_slots(kind, terminal, reset_after)!r}): slot {slot}: {problem}")
@@ -230,6 +246,7 @@ def validate_slot_structure(chunk: TrajectoryChunk) -> None:
         boot & ~prev_open,                      # a BOOT that does not follow an open ACT
         pad & ~prev_pad & ~prev_ends,           # a PAD (first of a run) not after an episode end
         boot & ~reset_after & not_last,         # a BOOT without reset_after before the last slot
+        has_teacher & ~act if has_teacher is not None else np.zeros(kind.size, dtype=bool),   # a label off ACT
     )
     # Earliest broken slot; ties go to the first rule in _SLOT_RULES.
     found = [(int(np.argmax(mask)), r) for r, mask in enumerate(broken) if mask.any()]
@@ -315,19 +332,26 @@ class WorkerCommand:
 
 @dataclass
 class WeightPayload:
-    """Model weights flowing from a learner to workers (numpy, never torch)."""
+    """Model weights flowing from a learner to workers (numpy, never torch).
+
+    ``teacher_active``: True while a scripted kickstart teacher has lambda > 0: the worker keeps asking it
+    (DAgger).
+    """
 
     agent_id: str
     policy_version: int
     state_dict: dict[str, np.ndarray] = field(default_factory=dict)
+    teacher_active: bool = False
 
     @classmethod
-    def from_model(cls, agent_id: str, policy_version: int, model: nn.Module) -> WeightPayload:
+    def from_model(cls, agent_id: str, policy_version: int, model: nn.Module,
+                   teacher_active: bool = False) -> WeightPayload:
         """Snapshot ``model``'s current weights as a numpy payload."""
         return cls(
             agent_id=agent_id,
             policy_version=int(policy_version),
             state_dict=state_dict_to_numpy(model.state_dict()),
+            teacher_active=bool(teacher_active),
         )
 
     def to_torch_state_dict(self) -> dict[str, torch.Tensor]:

@@ -22,7 +22,7 @@ from colosseum.core.types import Lineup, MatchResult, TrajectoryChunk, WeightPay
 from colosseum.envs.game import MultiAgentEnv
 from colosseum.metrics.aggregator import WORKER_STATS_INTERVAL_SEC
 from colosseum.networks.model import PolicyModel
-from colosseum.players.registry import FixedPlayers
+from colosseum.players.registry import BotSpec, FixedPlayers
 from colosseum.worker.rollout_loop import LATEST_NETWORK_ID, LoopIO, RolloutLoop
 
 __all__ = ["LATEST_NETWORK_ID", "report_worker_stats", "rollout_worker_process"]
@@ -99,6 +99,7 @@ def rollout_worker_process(
     stats_interval_sec: float = WORKER_STATS_INTERVAL_SEC,
     max_idle_steps: int = 1000,
     fixed_players: FixedPlayers | None = None,
+    teachers: Mapping[str, BotSpec] | None = None,
 ) -> None:
     """Worker process entry point (see module docstring).
 
@@ -108,7 +109,8 @@ def rollout_worker_process(
     commands are drained (merged) from ``command_queue``. ``max_env_steps`` limits this
     worker's env steps (0 = until stopped). Env steps are added to ``env_step_counter``
     about every 0.5 s and once more on exit. ``fixed_players``: scripted and frozen agents, built
-    inside this process (served under ``FIXED_NETWORK_ID``; they never collect).
+    inside this process (served under ``FIXED_NETWORK_ID``; they never collect). ``teachers``: scripted
+    kickstart teachers by student agent (``BotSpec``, never instances; DAgger labels in the chunks).
     """
     configure_torch_threads(torch_threads)
 
@@ -153,7 +155,7 @@ def rollout_worker_process(
         lineups=lineups, weight_sync_interval=weight_sync_interval,
         checkpoint_state_dicts_by_agent=checkpoint_state_dicts_by_agent, seed=seed,
         vec_env_kind=vec_env_kind, subproc_workers=subproc_workers, max_idle_steps=max_idle_steps,
-        fixed_players=fixed_players,
+        fixed_players=fixed_players, teachers=teachers,
     )
     last_stats = [time.monotonic()]
 

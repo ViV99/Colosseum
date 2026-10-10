@@ -304,9 +304,9 @@ def _check_model(model: Any, role: RoleSpec, sample: tuple | None, where: str) -
 
 def _check_kickstart_teachers(config: ColosseumConfig, spec: GameSpec, agent_configs: dict[str, ColosseumConfig],
                               role_specs: dict[str, RoleSpec], samples: dict[str, tuple | None]) -> None:
-    """Every trainable agent's kickstart teacher resolves (roles included); a neural one builds with its
-    weights, can be unrolled on the student's chunks (state-layout rule), and the KL between teacher and
-    student is finite on a synthetic batch of the role's observations."""
+    """Every trainable agent's kickstart teacher resolves (roles included, scripted teachers too); a neural one
+    builds with its weights, can be unrolled on the student's chunks (state-layout rule), and the KL between
+    teacher and student is finite on a synthetic batch of the role's observations."""
     from colosseum.learner.factory import build_teacher_model, check_teacher_compat, resolve_teacher
 
     for aid, acfg in agent_configs.items():
@@ -537,9 +537,9 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
     - every agent's model: ``step`` on its role's observations and ``unroll`` on a synthetic chunk
       with BOOT/PAD slots, resets and ``global_state``;
     - the critic warm-up's requirements (``init.critic_warmup_steps``);
-    - every agent's kickstart teacher (``learner.factory.resolve_teacher``): its roles, its weights, the
-      state-layout rule (``learner.factory.check_teacher_compat``) and a finite teacher/student KL on a
-      synthetic batch;
+    - every agent's kickstart teacher (``learner.factory.resolve_teacher``): its roles (a scripted teacher
+      too: it is a scripted agent, checked below), and for a neural one its weights, the state-layout rule
+      (``learner.factory.check_teacher_compat``) and a finite teacher/student KL on a synthetic batch;
     - every agent's ``init`` source (strict / partial report in ``ValidationReport.lines``), except for
       agents ``training.resume_from`` restores (``learner.factory.resume_source_of``), which ignore it;
     - every frozen agent: weights, role signature and its architecture (once per architecture); every

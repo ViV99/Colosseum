@@ -15,7 +15,7 @@ from colosseum.core.specs import ActionSpec
 from colosseum.envs.game import RoleSpec
 from colosseum.learner.factory import build_algorithm, check_teacher_compat, resolve_teacher
 from colosseum.networks.dist import make_distribution
-from colosseum.networks.model import UnrollOutput
+from colosseum.networks.model import PolicyModel, UnrollOutput
 from game_helpers import (
     SP2_CHECKPOINT,
     SP2_TTT_TINY,
@@ -162,3 +162,42 @@ def test_the_sp2_checkpoint_fixture_works_as_a_kickstart_teacher():
     algo = build_algorithm(cfg.get_agent_config("agent_0"), role, spec, device="cpu", teacher=teacher)
     chunks = [synthetic_chunk(algo.model, role, "AAAB", seed=s, agent_id="agent_0") for s in range(2)]
     assert algo.train_step(chunks)["kickstart_loss"] > 0
+
+
+def test_a_stateless_frozen_teacher_trains_a_recurrent_student_end_to_end(tmp_path):
+    # T4.4 review: the headline rule change (any stateless teacher for a recurrent student) through the config path
+    cfg = frozen_teacher_config(tmp_path, teacher_networks={"model_class": "game_helpers.GameTestModel",
+                                                            "kwargs": {"core": "none", "hidden": 16}},
+                                student_networks={"kwargs": {"core": "lstm", "hidden": 16}})
+    validate_config(cfg)
+    spec = env_spec(cfg)
+    _roles, role = agent_role_of(cfg, "agent_0")
+    algo = build_algorithm(cfg.get_agent_config("agent_0"), role, spec, device="cpu",
+                           teacher=resolve_teacher(cfg, "agent_0", spec))
+    assert algo.model.is_stateful and not algo._kickstart.teacher.is_stateful
+    chunks = [synthetic_chunk(algo.model, role, "AATP", seed=s, agent_id="agent_0") for s in range(2)]
+    assert algo.train_step(chunks)["kickstart_loss"] > 0
+
+
+class EmptyStateModel(GameTestModel):
+    """A stateless network whose ``initial_state`` is an empty container (``is_stateful`` is True)."""
+
+    is_stateful = PolicyModel.is_stateful              # the protocol's rule: ``initial_state(1) is not None``
+
+    def initial_state(self, batch_size, device="cpu"):
+        return {}
+
+    def unroll(self, obs, state0, reset_after, action_mask=None, global_state=None, with_value=True):
+        return super().unroll(obs, None, reset_after, action_mask, global_state=global_state, with_value=with_value)
+
+
+def test_state_layout_check_and_kickstart_loss_share_one_stateless_predicate():
+    def empty() -> EmptyStateModel:
+        return EmptyStateModel(ROLE.observation_space, ROLE.action_space)
+
+    teacher = empty()
+    assert teacher.is_stateful and KickstartLoss(teacher)._teacher_stateful     # is_stateful decides for both
+    for student in (make_test_model(ROLE, core="lstm"), make_test_model(ROLE, core="none")):
+        with pytest.raises(ValueError, match="state layout"):
+            APPO(student, AlgorithmConfig(), SPEC, kickstart=KickstartLoss(empty()))
+    APPO(empty(), AlgorithmConfig(), SPEC, kickstart=KickstartLoss(teacher))     # the same (empty) layout

@@ -322,6 +322,13 @@ def validate_chunk_payload(payload: Any) -> None:
         if not isinstance(unit_logp, np.ndarray) or unit_logp.ndim != 2:
             raise ValueError("chunk payload field 'behavior_unit_logp' must be None or a numpy array [S, K]")
         trees.append(("behavior_unit_logp", unit_logp))
+    teacher_action, has_teacher = payload.get("teacher_action"), payload.get("has_teacher")
+    if (teacher_action is None) != (has_teacher is None):
+        raise ValueError("chunk payload fields 'teacher_action' and 'has_teacher' come together")
+    if teacher_action is not None:
+        trees.append(("teacher_action", teacher_action))
+        if not isinstance(has_teacher, np.ndarray) or has_teacher.ndim != 1 or has_teacher.shape[0] != num_slots:
+            raise ValueError(f"chunk payload field 'has_teacher' must be a 1-D numpy array [S={num_slots}]")
     for name, tree in trees:
         if tree is None:
             raise ValueError(f"chunk payload field {name!r} is missing")

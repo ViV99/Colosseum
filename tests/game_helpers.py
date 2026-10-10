@@ -1323,3 +1323,32 @@ def write_ckpt_dir(root, config, agent_id: str = "agent_0", *, model=None, polic
             "networks": net.model_dump(mode="json", by_alias=True)}
     (path / "meta.json").write_text(json.dumps(meta))
     return path
+
+
+# ---------------------------------------------------------------------------
+# SP3 (T4.5): a scripted kickstart teacher for DAgger tests
+# ---------------------------------------------------------------------------
+
+
+class LabelBot(ScriptedBot):
+    """Always plays ``action`` (a discrete index); ``fail="raise"`` raises in ``act``.
+
+    Every call is appended to the class-level ``LabelBot.calls`` (tests clear it): ``("init", id)``,
+    ``("reset", id, role, seat, layout, first rng draw)``, ``("act", id, obs, info)``.
+    """
+
+    calls: ClassVar[list[tuple]] = []
+
+    def __init__(self, action: int = 1, fail: str = "") -> None:
+        super().__init__()
+        self.action, self.fail = int(action), fail
+        LabelBot.calls.append(("init", id(self)))
+
+    def reset(self, *, role, seat, layout, rng) -> None:
+        LabelBot.calls.append(("reset", id(self), role, seat, layout, float(rng.random())))
+
+    def act(self, obs, mask, info):
+        LabelBot.calls.append(("act", id(self), np.array(obs, copy=True), info))
+        if self.fail == "raise":
+            raise RuntimeError("teacher bot failure")
+        return np.int64(self.action)

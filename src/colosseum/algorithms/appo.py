@@ -26,6 +26,9 @@
   ``value_loss_coeff * value_loss`` over ``PolicyModel.value_parameters()``; every other parameter has
   ``requires_grad`` off for the step (no gradient, no Adam update or state), normalizer statistics are not
   updated, kickstart is off and its decay waits; policy loss and entropy are still reported.
+- Kickstart from a scripted teacher (``KickstartLoss(None)``, DAgger): ``lambda * mean(-log pi(a_teacher))`` over
+  the labeled ACT slots, joint for one decider and the mean over valid deciders with ``Units``; metric
+  ``kickstart_label_frac``. ``teacher_active`` (lambda > 0) goes to the workers with the weights.
 """
 
 from __future__ import annotations
@@ -87,7 +90,7 @@ def resolve_modes(config: AlgorithmConfig, action_spec: ActionSpec) -> tuple[Rat
 # Layout of every key ``APPO._prepare_batch`` produces (``_select_chunks`` rejects others).
 _TIME_MAJOR_KEYS = frozenset({
     "obs", "global_state", "actions", "action_masks", "kind", "reward", "terminal", "reset_after",
-    "behavior_logp", "behavior_unit_logp",
+    "behavior_logp", "behavior_unit_logp", "teacher_action", "has_teacher",
 })                                   # trees / tensors with leaves [S, B, ...]
 _STATE_KEY = "initial_state"         # State pytree, leaves [B, ...]
 
@@ -137,7 +140,8 @@ class APPO(BaseAlgorithm):
     ):
         self._model = model.to(device)
         if kickstart is not None:
-            check_teacher_state_layout(self._model, kickstart.teacher)
+            if kickstart.teacher is not None:
+                check_teacher_state_layout(self._model, kickstart.teacher)
             kickstart.to(device)
         self._config = config
         self._action_spec = action_spec
@@ -205,6 +209,12 @@ class APPO(BaseAlgorithm):
         return self._ratio_mode, self._unit_trace, self._entropy_reduction
 
     @property
+    def teacher_active(self) -> bool:
+        """A scripted kickstart teacher with lambda > 0: the workers keep labelling decisions."""
+        k = self._kickstart
+        return k is not None and k.teacher is None and k.current_lambda > 0
+
+    @property
     def critic_warming_up(self) -> bool:
         """True during the first ``critic_warmup_steps`` train steps (value path only)."""
         return self._critic_warmup_done < self._critic_warmup_steps
@@ -239,6 +249,7 @@ class APPO(BaseAlgorithm):
                 return None
             return tree_stack([get(c) for c in chunks], axis=1)
 
+        teacher_action, has_teacher = self._stack_labels(chunks)
         batch_cpu = {
             "obs": stack(lambda c: c.obs),
             "global_state": stack(lambda c: c.global_state),
@@ -250,6 +261,8 @@ class APPO(BaseAlgorithm):
             "reset_after": stack(lambda c: c.reset_after),
             "behavior_logp": stack(lambda c: c.behavior_logp),
             "behavior_unit_logp": stack(lambda c: c.behavior_unit_logp),
+            "teacher_action": teacher_action,
+            "has_teacher": has_teacher,
         }
 
         def move(t: Tensor) -> Tensor:
@@ -260,6 +273,28 @@ class APPO(BaseAlgorithm):
         batch: dict[str, Any] = {k: None if v is None else tree_map(move, v) for k, v in batch_cpu.items()}
         batch["initial_state"] = state_to(cat_batch([c.initial_state for c in chunks]), device)
         return batch
+
+    @staticmethod
+    def _stack_labels(chunks: list[TrajectoryChunk]) -> tuple[Any, Tensor | None]:
+        """Teacher labels ``[S, B, ...]`` and ``has_teacher [S, B]`` (None if no chunk has labels). Chunks
+        without labels (parked buffers, the delay of the teacher flag) get zeros and False."""
+        template = next((c for c in chunks if c.has_teacher is not None), None)
+        if template is None:
+            return None, None
+        actions = [c.teacher_action if c.has_teacher is not None
+                   else tree_map(torch.zeros_like, template.teacher_action) for c in chunks]
+        flags = [c.has_teacher if c.has_teacher is not None else torch.zeros_like(template.has_teacher)
+                 for c in chunks]
+        return tree_stack(actions, axis=1), torch.stack(flags, dim=1)
+
+    def _label_actions(self, batch: dict) -> Any:
+        """Teacher actions ``[S*B, ...]`` where a slot is labeled, else the recorded action (always legal under
+        the slot's mask, so every log-prob is finite)."""
+        S, B = batch["kind"].shape
+        labeled = batch["has_teacher"].bool().reshape(S * B)
+        teacher = tree_map(lambda t: t.reshape(S * B, *t.shape[2:]), batch["teacher_action"])
+        return tree_map(lambda t, a: torch.where(labeled.reshape(-1, *([1] * (t.dim() - 1))), t, a),
+                        teacher, self._flat_actions(batch))
 
     def _autocast(self) -> torch.autocast:
         """AMP autocast context (a no-op unless AMP is enabled on CUDA)."""
@@ -391,13 +426,25 @@ class APPO(BaseAlgorithm):
             total_loss = policy_loss + cfg.value_loss_coeff * value_loss - cfg.entropy_coeff * entropy
 
         kickstart_loss = self._zero_loss
-        if self._kickstart is not None and self._kickstart.current_lambda > 0 and not warmup:
-            with self._autocast():
-                kickstart_loss = self._kickstart.compute(
-                    student_dist=out.dist, obs=batch["obs"], reset_after=batch["reset_after"],
-                    state0=batch["initial_state"], action_mask=batch["action_masks"],
-                    actions=self._flat_actions(batch), is_act=is_act, reduction=self._entropy_reduction,
-                )
+        label_frac = self._zero_loss
+        kick = self._kickstart
+        if kick is not None and kick.current_lambda > 0 and not warmup:
+            if kick.teacher is None:                         # scripted teacher (DAgger): labels in the chunks
+                if batch["has_teacher"] is not None:
+                    label_frac = (batch["has_teacher"].bool() & is_act).sum().float() / n_act
+                    with self._autocast():
+                        kickstart_loss = kick.compute_labels(
+                            student_dist=out.dist, teacher_actions=self._label_actions(batch),
+                            has_teacher=batch["has_teacher"], is_act=is_act,
+                            reduction="sum" if K == 1 else "mean_valid",
+                        )
+            else:
+                with self._autocast():
+                    kickstart_loss = kick.compute(
+                        student_dist=out.dist, obs=batch["obs"], reset_after=batch["reset_after"],
+                        state0=batch["initial_state"], action_mask=batch["action_masks"],
+                        actions=self._flat_actions(batch), is_act=is_act, reduction=self._entropy_reduction,
+                    )
             total_loss = total_loss + kickstart_loss
 
         result = {
@@ -408,9 +455,11 @@ class APPO(BaseAlgorithm):
             **self._diagnostics(batch, ev, is_act, n_act, valid, n_valid, unit_log_ratio, joint_log_ratio,
                                 trace_log_rho, vt.vs),
         }
-        if self._kickstart is not None:
+        if kick is not None:
             result["kickstart_loss"] = kickstart_loss.detach()
-            result["kickstart_lambda"] = torch.tensor(self._kickstart.current_lambda, device=total_loss.device)
+            result["kickstart_lambda"] = torch.tensor(kick.current_lambda, device=total_loss.device)
+            if kick.teacher is None:                         # every minibatch, so the step mean is right
+                result["kickstart_label_frac"] = label_frac.detach()
         return result
 
     @torch.no_grad()

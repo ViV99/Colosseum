@@ -35,7 +35,7 @@ from colosseum.core.run_dir import RunDir
 from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, Lineup, SeatAssignment
 from colosseum.envs.game import GameSpec, RoleSpec
 from colosseum.metrics.wandb_logger import WandBLogger
-from colosseum.players.registry import FixedPlayers
+from colosseum.players.registry import BotSpec, FixedPlayers
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
 
@@ -160,13 +160,15 @@ def _worker_main(
     command_queue: mp.Queue | None = None,
     metrics_queue: mp.Queue | None = None,
     fixed_players: FixedPlayers | None = None,
+    teachers: Mapping[str, BotSpec] | None = None,
 ) -> None:
     """Worker process body (see ``_worker_target``).
 
     Env and model factories are built INSIDE the process (``functools.partial`` over top-level
     functions is picklable under spawn, which the subprocess vector env needs to ship ``env_fn``
     to its children). Models are built for each agent's role spec. ``fixed_players`` (numpy and
-    ``BotSpec`` data from the main process) become this worker's bots and frozen models.
+    ``BotSpec`` data from the main process) become this worker's bots and frozen models; ``teachers``
+    (``BotSpec`` by student agent) its scripted kickstart teachers (DAgger).
     """
     from functools import partial
 
@@ -201,6 +203,7 @@ def _worker_main(
         subproc_workers=config.rollout.subproc_workers,
         max_idle_steps=config.env.max_idle_steps,
         fixed_players=fixed_players,
+        teachers=teachers,
     )
 
 
@@ -582,6 +585,8 @@ class Launcher:
             self._supervisor.add(f"learner-{aid}", learner_proc)
             logger.info(f"Learner started for agent {aid}")
 
+        # Scripted kickstart teachers (DAgger) run on the workers; they travel as BotSpec data.
+        scripted_teachers = {aid: t.bot for aid, t in self._teachers.items() if t is not None and t.kind == "scripted"}
         for worker_id in range(cfg.rollout.num_workers):
             lineups = coordinator.generate_lineups(
                 cfg.rollout.envs_per_worker, env_offset=worker_id * cfg.rollout.envs_per_worker,
@@ -614,6 +619,7 @@ class Launcher:
                     results_queue=results_queue,
                     command_queue=command_queues[worker_id],
                     fixed_players=setup.fixed,
+                    teachers=scripted_teachers,
                     metrics_queue=metrics_queue,
                 ),
                 daemon=worker_daemon,

@@ -10,7 +10,7 @@ import torch
 
 from colosseum.core.errors import ConfigError
 from colosseum.core.ipc import assert_no_tensors
-from colosseum.core.registry import build_model, env_spec
+from colosseum.core.registry import build_model, env_spec, validate_config
 from colosseum.learner.factory import TeacherSpec, build_algorithm, resolve_teacher
 from game_helpers import agent_role_of, make_test_config, make_test_run_dir, write_ckpt_dir, write_test_config
 
@@ -96,10 +96,28 @@ def test_bad_teacher_references_are_config_errors(teacher, message):
         resolve_teacher(cfg, "agent_0", env_spec(cfg))
 
 
-def test_a_scripted_teacher_is_not_supported_yet():
-    cfg = make_test_config("turns", agents={"agent_0": {"kickstart": {"teacher": "bot"}}, "bot": BOT})
-    with pytest.raises(ConfigError, match="scripted"):
-        resolve_teacher(cfg, "agent_0", env_spec(cfg))
+def test_a_scripted_agent_is_a_dagger_teacher():
+    from colosseum.players.registry import BotSpec
+
+    cfg = make_test_config("turns", agents={"agent_0": {"kickstart": {"teacher": "bot", "lambda": 0.7}}, "bot": BOT})
+    teacher = resolve_teacher(cfg, "agent_0", env_spec(cfg))
+    assert teacher.kind == "scripted" and teacher.frozen is None and teacher.lambda_ == 0.7
+    assert teacher.bot == BotSpec("colosseum.players.RandomBot", {})
+    algo = _build(cfg, "agent_0", teacher)
+    assert algo._kickstart.teacher is None and algo.teacher_active
+    validate_config(cfg)
+
+
+def test_a_scripted_teacher_must_play_every_role_of_its_student():
+    cfg = make_test_config("asymmetric", agents={
+        "hunter": {"roles": ["hunter"]},
+        "prey": {"roles": ["prey"], "kickstart": {"teacher": "chaser"}},
+        "chaser": {**BOT, "roles": ["hunter"]},
+    })
+    with pytest.raises(ConfigError, match="every role"):
+        resolve_teacher(cfg, "prey", env_spec(cfg))
+    with pytest.raises(ConfigError, match="every role"):                  # validate rejects it before any process
+        validate_config(cfg)
 
 
 def test_teachers_are_per_agent(tmp_path):
@@ -146,6 +164,43 @@ def test_launcher_passes_numpy_teacher_specs_and_the_spec_to_learners(tmp_path, 
     assert isinstance(kwargs["teacher"], TeacherSpec) and kwargs["teacher"].source == str(path)
     assert kwargs["spec"] == env_spec(cfg)
     assert_no_tensors(kwargs, "learner kwargs")
+
+
+def test_launcher_passes_scripted_teachers_to_the_workers(tmp_path, monkeypatch, restore_global_rng):
+    import colosseum.launcher as launcher_module
+    from colosseum.players.registry import BotSpec
+
+    cfg = make_test_config("turns", agents={"agent_0": {"kickstart": {"teacher": "bot"}}, "bot": BOT},
+                           matchmaking={"anchors": []})
+    started: dict[str, dict] = {}
+
+    class _Stop(Exception):
+        pass
+
+    class FakeProcess:
+        exitcode = 0
+
+        def __init__(self, target, kwargs, name=None, daemon=None):
+            self.target, self.kwargs = target, kwargs
+
+        def start(self):
+            role = "learner" if self.target is launcher_module._learner_target else "worker"
+            started[role] = self.kwargs
+            if role == "worker":
+                raise _Stop
+
+        def is_alive(self):
+            return False
+
+        def join(self, timeout=None):
+            pass
+
+    monkeypatch.setattr(launcher_module.mp, "Process", FakeProcess)
+    with pytest.raises(_Stop):
+        launcher_module.Launcher(cfg, make_test_run_dir(cfg, tmp_path)).launch()
+    assert started["worker"]["teachers"] == {"agent_0": BotSpec("colosseum.players.RandomBot", {})}
+    assert started["learner"]["teacher"].kind == "scripted"
+    assert_no_tensors(started["worker"]["teachers"], "worker teachers")
 
 
 def test_the_distributed_learner_builds_through_the_factory(tmp_path, monkeypatch, restore_global_rng,

@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import re
+from collections.abc import Sequence
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
@@ -75,19 +76,33 @@ def _load_frozen(config: ColosseumConfig, agent_id: str, path: str, spec: GameSp
         raise ConfigError(f"{where}: {e}") from e
 
 
+def _check_teacher_roles(config: ColosseumConfig, spec: GameSpec, agent_id: str, teacher_roles: Sequence[str],
+                         where: str) -> None:
+    from colosseum.players.registry import resolve_player_roles
+
+    student_roles = resolve_player_roles(config, spec)[agent_id]
+    missing = [r for r in student_roles if r not in teacher_roles]
+    if missing:
+        raise ConfigError(f"{where}: the teacher plays roles {list(teacher_roles)}; a teacher must play every role "
+                          f"of its student ({list(student_roles)}), missing {missing}")
+
+
 def resolve_teacher(config: ColosseumConfig, agent_id: str, spec: GameSpec) -> TeacherSpec | None:
     """The kickstart teacher of trainable ``agent_id`` (effective ``kickstart`` section), or None.
 
-    ``teacher`` is the name of a frozen agent (its own architecture), a ``.pt`` path (the student's
-    architecture, SP2) or a checkpoint dir (architecture and roles from its ``meta.json``). The name
-    of a trainable agent is a ConfigError with a hint; so is a teacher that does not play every role of
-    its student. Main process only (it reads weight files).
+    ``teacher`` is the name of a frozen agent (neural, its own architecture) or of a scripted agent
+    (DAgger: ``BotSpec``), a ``.pt`` path (the student's architecture, SP2) or a checkpoint dir
+    (architecture and roles from its ``meta.json``). The teacher must play every role of its student;
+    the name of a trainable agent is a ConfigError with a hint. Main process only (it reads weight files).
     """
+    from colosseum.players.registry import resolve_player_roles
+
     ks = config.get_agent_config(agent_id).kickstart
     if ks.teacher is None:
         return None
     ref = ks.teacher
     where = f"agent {agent_id!r}: kickstart.teacher={ref!r}"
+    settings = {"lambda_": float(ks.lambda_), "decay_steps": int(ks.decay_steps), "kl": ks.kl}
     if ref in agent_ids(config):
         kind = config.agent_kind(ref)
         if kind == "trainable":
@@ -95,9 +110,11 @@ def resolve_teacher(config: ColosseumConfig, agent_id: str, spec: GameSpec) -> T
                 f"{where} names a trainable agent; a teacher is fixed: to learn from a snapshot, declare it as a "
                 f"frozen agent with path (agents.<name>: {{kind: frozen, path: <checkpoint dir>}}) and name that agent"
             )
-        if kind == "scripted":
-            raise ConfigError(f"{where} names a scripted agent; scripted kickstart teachers are not supported yet")
         entry = config.agent_entry(ref)
+        if kind == "scripted":
+            _check_teacher_roles(config, spec, agent_id, resolve_player_roles(config, spec)[ref], where)
+            return TeacherSpec(kind="scripted", source=f"scripted agent {ref!r}",
+                               bot=BotSpec(entry.class_path, dict(entry.kwargs)), **settings)
         frozen = _load_frozen(config, ref, entry.path, spec, where)
         source = f"frozen agent {ref!r} ({entry.path})"
     else:
@@ -110,15 +127,8 @@ def resolve_teacher(config: ColosseumConfig, agent_id: str, spec: GameSpec) -> T
             raise ConfigError(f"{where} is neither an agent of the config ({agent_ids(config)}) nor an existing .pt "
                               f"file or checkpoint dir")
         source = ref
-    from colosseum.players.registry import resolve_player_roles
-
-    student_roles = resolve_player_roles(config, spec)[agent_id]
-    missing = [r for r in student_roles if r not in frozen.roles]
-    if missing:
-        raise ConfigError(f"{where}: the teacher plays roles {list(frozen.roles)}; a teacher must play every role of "
-                          f"its student ({list(student_roles)}), missing {missing}")
-    return TeacherSpec(kind="neural", source=source, lambda_=float(ks.lambda_), decay_steps=int(ks.decay_steps),
-                       kl=ks.kl, frozen=frozen)
+    _check_teacher_roles(config, spec, agent_id, frozen.roles, where)
+    return TeacherSpec(kind="neural", source=source, frozen=frozen, **settings)
 
 
 def build_teacher_model(agent_config: ColosseumConfig, teacher: TeacherSpec, spec: GameSpec) -> PolicyModel:
@@ -149,8 +159,8 @@ def build_kickstart(agent_config: ColosseumConfig, teacher: TeacherSpec | None, 
         return None
     from colosseum.bc.kickstart import KickstartLoss
 
-    if teacher.kind != "neural":
-        raise ConfigError(f"kickstart teacher {teacher.source}: scripted kickstart teachers are not supported yet")
+    if teacher.kind == "scripted":                 # DAgger: the workers write the labels into the chunks
+        return KickstartLoss(None, initial_lambda=teacher.lambda_, decay_steps=teacher.decay_steps)
     model = build_teacher_model(agent_config, teacher, spec)
     model.to(device)
     return KickstartLoss(model, initial_lambda=teacher.lambda_, decay_steps=teacher.decay_steps,
