@@ -1,16 +1,24 @@
-"""Per-interval aggregation of match results (by layout and role) and system throughput."""
+"""Per-interval aggregation of match results (by layout and role, played opponent shares) and system
+throughput."""
 
 from __future__ import annotations
 
 import time
-from collections import defaultdict
+from collections import Counter, defaultdict
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any
 
 import numpy as np
 
-from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, MatchResult, SeatResult
+from colosseum.core.types import (
+    FIXED_NETWORK_ID,
+    LATEST_NETWORK_ID,
+    OPPONENT_CATEGORIES,
+    SOURCE_OWNER,
+    MatchResult,
+    SeatResult,
+)
 
 OPPONENT_TYPES = ("latest", "past", "arena", "anchor")
 # Default cadence of worker stats (``rollout_worker_process(stats_interval_sec=...)``).
@@ -34,6 +42,54 @@ def opponent_type(result: MatchResult, seat: SeatResult) -> str | None:
     if any(s.network_id != LATEST_NETWORK_ID for s in opponents):
         return "past"
     return "latest"
+
+
+def opponent_draws(result: MatchResult) -> tuple[str, list[tuple[str, str | None]]] | None:
+    """The matchmaker's draws behind a result: ``(owner, [(category, anchor or None) per opposing team])``.
+
+    The owner's team is the team whose seats carry ``SOURCE_OWNER``; the owner is the only agent with
+    latest weights on it. None for results without matchmaker sources (eval, tests) and for owner
+    teams with the latest weights of several agents (``teammates: mixed``): their owner is ambiguous,
+    and leaving them out does not bias the shares (teammates are drawn independently of opponents).
+    The anchor of a team drawn from ``anchors`` is its most frequent agent on ``fixed`` seats.
+    """
+    by_team: dict[int, list[SeatResult]] = defaultdict(list)
+    for seat in result.seats:
+        by_team[seat.team].append(seat)
+    owner_teams = [team for team, seats in by_team.items() if seats[0].source == SOURCE_OWNER]
+    if len(owner_teams) != 1:
+        return None
+    owner_team = owner_teams[0]
+    latest = {s.agent_id for s in by_team[owner_team] if s.network_id == LATEST_NETWORK_ID}
+    if len(latest) != 1:
+        return None
+    draws: list[tuple[str, str | None]] = []
+    for team in sorted(by_team):
+        if team == owner_team:
+            continue
+        category = by_team[team][0].source
+        if category not in OPPONENT_CATEGORIES:
+            return None
+        anchor = None
+        if category == "anchors":
+            fixed = Counter(s.agent_id for s in by_team[team] if s.network_id == FIXED_NETWORK_ID)
+            anchor = fixed.most_common(1)[0][0] if fixed else None
+        draws.append((category, anchor))
+    return latest.pop(), draws
+
+
+@dataclass
+class _OpponentCell:
+    """Opposing teams of one (owner, layout) and the categories / anchors they were drawn from."""
+
+    teams: int = 0
+    categories: Counter = field(default_factory=Counter)
+    anchors: Counter = field(default_factory=Counter)
+
+    def summary(self) -> dict[str, Any]:
+        n = self.teams
+        return {"teams": n, "categories": {c: self.categories[c] / n for c in OPPONENT_CATEGORIES},
+                "anchors": {a: k / n for a, k in sorted(self.anchors.items())}}
 
 
 def _wdl_counts() -> dict[str, list[int]]:
@@ -64,7 +120,10 @@ class EpisodeAggregator:
     - mean return and episode length, W/D/L by opponent type (win: the seat's team ranks strictly
       better than every other team; draw: ties the best one), seat counts;
     - ``by_layout[layout][role]``: episodes (seats), mean return, mean episode length, mean team
-      score, the share of seats eliminated before the episode end, and W/D/L by opponent type.
+      score, the share of seats eliminated before the episode end, and W/D/L by opponent type;
+    - ``opponents[layout]``: opposing teams drawn for the agent as data owner, the played share of
+      every opponent category and of every anchor (``opponent_draws``; played, not drawn: a staged
+      lineup can be replaced before it is played).
     """
 
     def __init__(self) -> None:
@@ -78,6 +137,8 @@ class EpisodeAggregator:
         # agent -> layout -> role -> sums
         self._by_layout: dict[str, dict[str, dict[str, _RoleCell]]] = defaultdict(
             lambda: defaultdict(lambda: defaultdict(_RoleCell)))
+        # owner -> layout -> opposing teams by category / anchor
+        self._opponents: dict[str, dict[str, _OpponentCell]] = defaultdict(lambda: defaultdict(_OpponentCell))
 
     def add(self, result: MatchResult) -> None:
         ranks = {team.team: team.rank for team in result.teams}
@@ -107,6 +168,15 @@ class EpisodeAggregator:
             idx = 0 if own < best_other else (1 if own == best_other else 2)
             self._wdl[agent_id][kind][idx] += 1
             cell.wdl[kind][idx] += 1
+        draws = opponent_draws(result)
+        if draws is not None and draws[1]:          # cooperative layouts have no opposing team
+            owner, teams = draws
+            opponents = self._opponents[owner][result.layout]
+            for category, anchor in teams:
+                opponents.teams += 1
+                opponents.categories[category] += 1
+                if anchor is not None:
+                    opponents.anchors[anchor] += 1
 
     def flush(self) -> dict[str, dict[str, Any]]:
         """Stats since the previous flush, per agent; resets the accumulators."""
@@ -123,6 +193,8 @@ class EpisodeAggregator:
                 "wdl": {t: list(v) for t, v in self._wdl[agent_id].items()},
                 "seat_counts": list(self._seats[agent_id]),
                 "by_layout": by_layout,
+                "opponents": {layout: cell.summary()
+                              for layout, cell in sorted(self._opponents.get(agent_id, {}).items())},
             }
         self._reset()
         return out

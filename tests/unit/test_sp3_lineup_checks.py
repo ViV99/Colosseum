@@ -111,6 +111,21 @@ def test_every_role_needs_a_trainable_agent_or_an_anchor_of_the_owner():
         validate_matchmaking(spec, roles, cfg(agents=agents, matchmaking={"anchors": {"bot": 0.0}}))
 
 
+def test_role_coverage_holds_at_every_schedule_point_by_anchors_with_a_positive_weight():
+    """A role nobody trainable plays needs an anchor with a positive weight at EVERY schedule point."""
+    spec = GameSpec(
+        roles={"hunter": HUNTER, "prey": PREY},
+        layouts={"pairs": (SeatSpec("hunter", 0), SeatSpec("prey", 0), SeatSpec("hunter", 1), SeatSpec("prey", 1))},
+    )
+    agents = {"h": {"roles": ["hunter"]}, "early": {**BOT, "roles": ["prey"]}, "late": {**BOT, "roles": ["prey"]}}
+    roles = {"h": ["hunter"], "early": ["prey"], "late": ["prey"]}
+    decaying = cfg(agents=agents, matchmaking={"anchors": {"early": {0: 1.0, 1000: 0.0}}})
+    with pytest.raises(ConfigError, match="env step 1000.*prey"):        # the only prey player fades out
+        validate_matchmaking(spec, roles, decaying)
+    crossing = cfg(agents=agents, matchmaking={"anchors": {"early": {0: 1.0, 1000: 0.0}, "late": {0: 0.0, 1000: 1.0}}})
+    validate_matchmaking(spec, roles, crossing)
+
+
 def test_every_agent_needs_a_playable_layout():
     spec = GameSpec(
         roles={"hunter": HUNTER, "prey": PREY},

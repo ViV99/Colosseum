@@ -23,7 +23,7 @@ import queue
 import signal
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 import numpy as np
@@ -319,7 +319,7 @@ def _resolve_lineups(
         seats: list[SeatAssignment] = []
         for seat in lineup.seats:
             if seat.network_id in (LATEST_NETWORK_ID, FIXED_NETWORK_ID):
-                seats.append(SeatAssignment(seat.agent_id, seat.network_id, seat.collect, seat.source))
+                seats.append(replace(seat))
                 continue
             agent_new = new_ckpts.setdefault(seat.agent_id, {})
             ckpt_id = seat.network_id
@@ -333,9 +333,9 @@ def _resolve_lineups(
                     logger.warning(f"Checkpoint {ckpt_id} of {seat.agent_id} is missing; that seat plays "
                                    f"the latest weights and collects trajectories")
             if available:
-                seats.append(SeatAssignment(seat.agent_id, ckpt_id, seat.collect, seat.source))
+                seats.append(replace(seat))
             else:
-                seats.append(SeatAssignment(seat.agent_id, LATEST_NETWORK_ID, True, seat.source))
+                seats.append(replace(seat, network_id=LATEST_NETWORK_ID, collect=True))
         resolved.append(Lineup(layout=lineup.layout, seats=seats))
     return new_ckpts, resolved
 
@@ -389,6 +389,11 @@ class Launcher:
         """Env steps taken by all workers so far (the global budget counter)."""
         return self._env_step_counter.value
 
+    def _build_coordinator(self, setup: RunSetup) -> Coordinator:
+        """The run's coordinator; its matchmaker reads the global env-step counter (share schedules)."""
+        return Coordinator(self._config, setup.spec, setup.player_roles, checkpoint_dir=self._run_dir.checkpoints,
+                           env_steps=lambda: int(self._env_step_counter.value))
+
     def launch(self) -> int:
         """Run the full training pipeline; returns the process exit code.
 
@@ -413,8 +418,7 @@ class Launcher:
         logger.info(f"  Fixed players: {cfg.fixed_agent_ids() or 'none'}")
         warn_static_ownership_skew(cfg)
 
-        coordinator = Coordinator(cfg, setup.spec, setup.player_roles, checkpoint_dir=self._run_dir.checkpoints,
-                                  env_steps=lambda: int(self._env_step_counter.value))
+        coordinator = self._build_coordinator(setup)
 
         # Resume (before any process starts: a bad resume source fails fast).
         resume_states = self._resolve_resume(setup.agent_configs, setup.role_specs)

@@ -11,8 +11,9 @@ import gymnasium
 import numpy as np
 import pytest
 
-from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, SOURCE_OWNER, SeatAssignment
+from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, SOURCE_OWNER, Lineup, SeatAssignment
 from colosseum.envs.game import GameSpec, RoleSpec, SeatSpec
+from colosseum.league.base import BaseMatchmaker
 from colosseum.league.lineups import check_lineup, permute_seats
 from colosseum.league.mixture import MixtureMatchmaker, effective_mix
 from game_helpers import StepCounter, make_matchmaker_context
@@ -365,37 +366,130 @@ def test_permute_seats_rejects_a_wrong_seat_count():
         permute_seats(spec, "2p", [SeatAssignment("a")], random.Random(0))
 
 
+class BrokenMatchmaker(BaseMatchmaker):
+    """Seats a scripted agent on its latest weights (``matchmaking.matchmaker_class`` of the test below)."""
+
+    def lineup_for(self, owner: str) -> Lineup:
+        layout = next(iter(self.context.spec.layouts))
+        return Lineup(layout, [SeatAssignment(owner), SeatAssignment("bot")])
+
+
 def test_coordinator_draws_from_the_mixture_with_per_agent_halflives_and_checks_lineups(tmp_path):
     from colosseum.coordinator.coordinator import Coordinator
     from colosseum.core.registry import env_spec
-    from colosseum.core.types import Lineup
-    from colosseum.league.base import BaseMatchmaker
+    from colosseum.core.types import MatchResult, SeatResult, TeamResult
     from colosseum.players.registry import resolve_player_roles
     from game_helpers import make_test_config, scripted_agent
 
+    agents = {"a": {"matchmaking": {"pfsp": {"halflife_games": 50}}}, "b": {}, "bot": scripted_agent()}
     config = make_test_config(
-        "turns", agents={"a": {"matchmaking": {"pfsp": {"halflife_games": 50}}}, "b": {}, "bot": scripted_agent()},
+        "turns", agents=agents,
         matchmaking={"opponents": {"latest": {0: 1.0, 1000: 0.0}, "snapshots": 0.0, "rivals": 0.0,
                                    "anchors": {0: 0.0, 1000: 1.0}}})
     spec = env_spec(config)
     steps = StepCounter(0)
     coordinator = Coordinator(config, spec, resolve_player_roles(config, spec), tmp_path / "ckpt", env_steps=steps)
-    assert coordinator.pfsp._halflife == {"a": 50.0, "b": 200.0}
     assert isinstance(coordinator.matchmaker, MixtureMatchmaker)
     assert coordinator.context.trainable == ["a", "b"] and coordinator.context.fixed == ["bot"]
     lineups = coordinator.generate_lineups(4, 0)
     assert [next(s.agent_id for s in lu.seats if s.source == SOURCE_OWNER) for lu in lineups] == ["a", "b", "a", "b"]
     assert all(s.network_id == LATEST_NETWORK_ID for lu in lineups for s in lu.seats)
+    layout = lineups[0].layout
+    # Per-agent half-lives: one win of a@latest over b@latest moves each owner's EMA by 1 - 2^(-1/halflife).
+    coordinator.report_match_result(MatchResult(
+        match_id="m", layout=layout, outcome_kind="wdl",
+        seats=[SeatResult(0, "player", 0, "a", LATEST_NETWORK_ID, 1.0, source=SOURCE_OWNER),
+               SeatResult(1, "player", 1, "b", LATEST_NETWORK_ID, -1.0, source="rivals")],
+        teams=[TeamResult(0, 1.0, 1.0), TeamResult(1, 2.0, -1.0)], episode_length=4))
+    assert coordinator.pfsp.score(layout, "a", ("b", LATEST_NETWORK_ID)) == pytest.approx(
+        0.5 + 0.5 * (1 - 2 ** (-1 / 50)))
+    assert coordinator.pfsp.score(layout, "b", ("a", LATEST_NETWORK_ID)) == pytest.approx(
+        0.5 - 0.5 * (1 - 2 ** (-1 / 200)))
     steps.value = 1000                                  # the coordinator's env steps drive the schedules
     for lineup in coordinator.generate_lineups(4, 0):
         assert [(s.agent_id, s.network_id, s.collect, s.source) for s in lineup.seats if s.source != SOURCE_OWNER] \
             == [("bot", FIXED_NETWORK_ID, False, "anchors")]
 
-    class Broken(BaseMatchmaker):
-        def lineup_for(self, owner: str) -> Lineup:
-            return Lineup(lineup_layout, [SeatAssignment(owner), SeatAssignment("bot")])
-
-    lineup_layout = lineups[0].layout
-    coordinator._matchmaker = Broken(coordinator.context)
-    with pytest.raises(ValueError, match="Broken: invalid lineup .*'bot' must play network 'fixed'"):
+    broken = make_test_config("turns", agents=agents,
+                              matchmaking={"matchmaker_class": "test_sp3_matchmaker.BrokenMatchmaker"})
+    coordinator = Coordinator(broken, spec, resolve_player_roles(broken, spec), tmp_path / "ckpt2")
+    with pytest.raises(ValueError, match="BrokenMatchmaker: invalid lineup .*'bot' must play network 'fixed'"):
         coordinator.generate_lineups(1, 0)
+
+
+def test_ffa_15_players_draws_every_opposing_core_independently():
+    """SP2's FFA guarantee: in a 15-player free-for-all the owner's latest plays one seat, and each of
+    the 14 opposing cores is drawn on its own (latest and snapshots mix inside one lineup)."""
+    spec = GameSpec.symmetric(15, OBS, ACT)
+    ctx = make_matchmaker_context(spec, {"a": ["player"]}, matchmaking=only(latest=0.5, snapshots=0.5),
+                                  snapshots={"a": ["ckpt_v1", "ckpt_v2"]})
+    mm = MixtureMatchmaker(ctx)
+    networks, latest_per_lineup = Counter(), Counter()
+    for _ in range(400):
+        lineup = mm.lineup_for("a")
+        check_lineup(ctx, lineup, "test")
+        assert lineup.layout == "15p"
+        owner = [s for s in lineup.seats if s.source == SOURCE_OWNER]
+        assert [(s.agent_id, s.network_id, s.collect) for s in owner] == [("a", LATEST_NETWORK_ID, True)]
+        opposing = [s for s in lineup.seats if s.source != SOURCE_OWNER]
+        assert len(opposing) == 14
+        for s in opposing:
+            assert (s.source == "latest") == (s.network_id == LATEST_NETWORK_ID) == s.collect
+        networks.update(s.network_id for s in opposing)
+        latest_per_lineup[sum(s.network_id == LATEST_NETWORK_ID for s in opposing)] += 1
+    total = sum(networks.values())
+    assert abs(networks[LATEST_NETWORK_ID] / total - 0.5) < TOL, networks
+    assert abs(networks["ckpt_v1"] / total - 0.25) < TOL and abs(networks["ckpt_v2"] / total - 0.25) < TOL
+    assert len(latest_per_lineup) >= 6, latest_per_lineup       # binomial(14, 0.5) spread, not all-or-nothing
+
+
+def test_teammates_mixed_also_mixes_an_opposing_team():
+    """SP2's guarantee: two prey agents mix inside the prey team when the owner is the hunter."""
+    ctx = make_matchmaker_context(hunt_spec(), {"h": ["hunter"], "p1": ["prey"], "p2": ["prey"]},
+                                  matchmaking={"teammates": "mixed", "teammate_self_prob": 0.5})
+    mm = MixtureMatchmaker(ctx)
+    distinct = Counter()
+    for _ in range(DRAWS):
+        lineup = mm.lineup_for("h")
+        check_lineup(ctx, lineup, "test")
+        hunter, *prey = lineup.seats
+        assert (hunter.agent_id, hunter.source) == ("h", SOURCE_OWNER)
+        assert all(s.network_id == LATEST_NETWORK_ID and s.collect for s in prey)
+        assert len({s.source for s in prey}) == 1 and prey[0].source == "latest"
+        distinct[len({s.agent_id for s in prey})] += 1
+    # the two non-core prey seats keep the core with probability 0.5 each, else take the other agent
+    assert abs(distinct[1] / DRAWS - 0.25) < TOL, distinct
+
+
+def test_seats_of_a_role_nobody_trainable_plays_go_only_to_anchors_with_a_positive_weight_now():
+    """Two anchors with crossing weight schedules cover the prey role: at a step where one weight is 0
+    only the other is seated."""
+    spec = GameSpec(
+        roles={"hunter": HUNTER, "prey": PREY},
+        layouts={"pairs": (SeatSpec("hunter", 0), SeatSpec("prey", 0), SeatSpec("hunter", 1), SeatSpec("prey", 1))},
+    )
+    steps = StepCounter(0)
+    ctx = make_matchmaker_context(
+        spec, {"h": ["hunter"], "early": ["prey"], "late": ["prey"]}, kinds={"early": "scripted", "late": "frozen"},
+        matchmaking={"anchors": {"early": {0: 1.0, 1000: 0.0}, "late": {0: 0.0, 1000: 1.0}}, "shuffle_seats": False},
+        env_steps=steps)
+    mm = MixtureMatchmaker(ctx)
+
+    def prey_players() -> Counter:
+        players = Counter()
+        for _ in range(300):
+            lineup = mm.lineup_for("h")
+            check_lineup(ctx, lineup, "test")
+            players.update((s.agent_id, s.network_id, s.collect) for s in (lineup.seats[1], lineup.seats[3]))
+        return players
+
+    assert set(prey_players()) == {("early", FIXED_NETWORK_ID, False)}
+    steps.value = 1000
+    assert set(prey_players()) == {("late", FIXED_NETWORK_ID, False)}
+    steps.value = 500
+    assert set(prey_players()) == {("early", FIXED_NETWORK_ID, False), ("late", FIXED_NETWORK_ID, False)}
+    only_early = make_matchmaker_context(          # validate_matchmaking rejects this config; the runtime never
+        spec, {"h": ["hunter"], "early": ["prey"]}, kinds={"early": "scripted"},   # seats a zero-weight anchor
+        matchmaking={"anchors": {"early": {0: 1.0, 1000: 0.0}}}, env_steps=StepCounter(1000))
+    with pytest.raises(RuntimeError, match="nobody plays role 'prey'"):
+        MixtureMatchmaker(only_early).lineup_for("h")

@@ -2,8 +2,9 @@
 
 Manages:
 - the players (trainable, scripted, frozen agents) and their roles; owner rotation over the trainable agents
-  in config order and one ``Lineup`` per env from the matchmaker (``colosseum.league``), each checked by
-  ``check_lineup``;
+  in config order and one ``Lineup`` per env from the matchmaker (``colosseum.league``: the built-in
+  ``MixtureMatchmaker`` or ``matchmaking.matchmaker_class``), each checked by ``check_lineup``; every
+  finished match goes to ``matchmaker.on_result``;
 - checkpoint storage (learner checkpoint payloads -> ``CheckpointManager``; ``meta.json`` gets the
   agent's roles and their role signature);
 - match results, per-layout ratings of every player (``RatingBook``) and the PFSP statistics per player
@@ -25,7 +26,7 @@ from colosseum.core.errors import ConfigError
 from colosseum.core.roles import agent_role_spec, role_signature
 from colosseum.core.types import Lineup, MatchResult
 from colosseum.envs.game import GameSpec
-from colosseum.league.base import BaseMatchmaker, MatchmakerContext
+from colosseum.league.base import BaseMatchmaker, MatchmakerContext, load_matchmaker_class
 from colosseum.league.lineups import check_lineup
 from colosseum.league.mixture import MixtureMatchmaker, validate_matchmaking
 from colosseum.league.pfsp import PfspStats
@@ -71,7 +72,15 @@ class Coordinator:
             config, spec, self._player_roles, rng=self._rng, snapshots_fn=self._checkpoint_ids,
             pfsp_fn=self._pfsp.score, env_steps_fn=env_steps,
         )
-        self._matchmaker: BaseMatchmaker = MixtureMatchmaker(self._context)
+        path = config.matchmaking.matchmaker_class
+        matchmaker_cls = MixtureMatchmaker if path is None else load_matchmaker_class(path)
+        try:
+            self._matchmaker: BaseMatchmaker = matchmaker_cls(self._context)
+        except ConfigError:
+            raise
+        except Exception as e:  # noqa: BLE001 - a user class failing in __init__ is a config problem
+            raise ConfigError(f"matchmaking.matchmaker_class {path!r}: constructing it failed: "
+                              f"{type(e).__name__}: {e}") from e
 
     @property
     def player_roles(self) -> dict[str, list[str]]:
@@ -167,10 +176,12 @@ class Coordinator:
         return lineups
 
     def report_match_result(self, result: MatchResult) -> None:
-        """Keep the result; update the ratings and the PFSP statistics of its layout."""
+        """Keep the result; update the ratings and the PFSP statistics of its layout, then
+        ``matchmaker.on_result``."""
         self._match_results.append(result)
         self._ratings.update(result)
         self._pfsp.update(result)
+        self._matchmaker.on_result(result)
 
     @property
     def match_results(self) -> list[MatchResult]:

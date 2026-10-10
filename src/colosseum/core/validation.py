@@ -32,6 +32,7 @@ from colosseum.envs.game import GameSpec, RoleSpec, StepResult
 from colosseum.networks.dist import Distribution
 
 VALIDATE_STEPS = 8  # random legal steps per enabled layout
+VALIDATE_LINEUPS = 16  # lineups drawn per trainable agent from a custom matchmaker
 
 # Synthetic chunk of the model check, time-major [S=4, B=2], spelled like the chunk v2 tests
 # (A open ACT, T terminal ACT, R truncation BOOT, B chunk-end BOOT, P PAD):
@@ -440,12 +441,43 @@ def _all_enabled_layouts(config: ColosseumConfig, spec: GameSpec) -> list[str]:
     return list(names)
 
 
+def _check_matchmaker_class(config: ColosseumConfig, spec: GameSpec, player_roles: dict[str, list[str]]) -> None:
+    """A custom ``matchmaking.matchmaker_class``: imports, constructs, and its lineups pass ``check_lineup``."""
+    import random
+
+    from colosseum.league.base import MatchmakerContext, load_matchmaker_class
+    from colosseum.league.lineups import check_lineup
+
+    path = config.matchmaking.matchmaker_class
+    if path is None:
+        return
+    cls = load_matchmaker_class(path)
+    context = MatchmakerContext.from_config(config, spec, player_roles, rng=random.Random(0))
+    try:
+        matchmaker = cls(context)
+    except Exception as e:  # noqa: BLE001 - user code
+        raise ConfigError(f"matchmaking.matchmaker_class {path!r}: constructing it failed: "
+                          f"{type(e).__name__}: {e}") from e
+    for owner in context.trainable:
+        for _ in range(VALIDATE_LINEUPS):
+            try:
+                lineup = matchmaker.lineup_for(owner)
+            except Exception as e:  # noqa: BLE001 - user code
+                raise ConfigError(f"matchmaking.matchmaker_class {path!r}: lineup_for({owner!r}) raised "
+                                  f"{type(e).__name__}: {e}") from e
+            try:
+                check_lineup(context, lineup, cls.__name__)
+            except ValueError as e:
+                raise ConfigError(f"matchmaking.matchmaker_class {path!r}: {e}") from e
+
+
 def validate_config(config: ColosseumConfig) -> ValidationReport:
     """Check a whole config before any process starts (spec block 9; SP3 spec block 1).
 
     - the env's ``GameSpec`` (``env_spec``; unsupported role spaces are a ConfigError), the
-      agents' roles (``resolve_agent_roles``) and the matchmaking checks
-      (``colosseum.league.mixture.validate_matchmaking``, per agent);
+      agents' roles (``resolve_agent_roles``), the matchmaking checks per agent
+      (``colosseum.league.mixture.validate_matchmaking``), a custom matchmaker's lineups, and the
+      effective opponent mix of every agent (``ValidationReport.lines``);
     - ``networks.critic_encoder_class`` only for agents whose roles declare a ``global_state_space``;
     - ``reset`` of every enabled layout and up to ``VALIDATE_STEPS`` random legal steps under the
       contract checks, with full ``space.contains`` checks of observations, global states and
@@ -461,7 +493,7 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
     contract).
     """
     from colosseum.core.roles import agent_role_spec, resolve_agent_roles
-    from colosseum.league.mixture import validate_matchmaking
+    from colosseum.league.mixture import describe_mix, validate_matchmaking
     from colosseum.players.registry import load_fixed_players, resolve_player_roles
 
     report = ValidationReport()
@@ -469,6 +501,11 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
     agent_roles = resolve_agent_roles(config, spec)
     player_roles = resolve_player_roles(config, spec)
     validate_matchmaking(spec, player_roles, config)
+    _check_matchmaker_class(config, spec, player_roles)
+    if config.matchmaking.matchmaker_class is not None:
+        report.lines.append(f"matchmaker: {config.matchmaking.matchmaker_class} (custom; the mix below is the "
+                            f"configured matchmaking section, which it may ignore)")
+    report.lines.extend(describe_mix(config, spec))
     fixed = load_fixed_players(config, spec)   # roles, classes, paths and role signatures of fixed agents
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_roles}
     role_specs = {aid: agent_role_spec(spec, roles) for aid, roles in agent_roles.items()}

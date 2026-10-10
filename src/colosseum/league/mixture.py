@@ -24,7 +24,7 @@ For an env whose training data belongs to owner O (the coordinator rotates owner
    another trainable agent's latest weights with that role, a snapshot of the core's agent or one
    of O's anchors with that role); a seat of a role the core does not play gets the latest
    weights of a uniformly drawn trainable agent with that role, else one of O's anchors with it
-   (by weight).
+   and a positive weight now (by weight).
 5. Only seats with the latest weights of trainable agents collect.
 6. ``shuffle_seats``: ``permute_seats`` (teams of equal role composition, seats of equal role).
 
@@ -271,7 +271,7 @@ class MixtureMatchmaker(BaseMatchmaker):
         players = [a for a in ctx.trainable if role in ctx.agents[a].roles]
         if players:
             return self._rng.choice(players), LATEST_NETWORK_ID
-        options = [a for a in anchors if a in ctx.agents and role in ctx.agents[a].roles]
+        options = [a for a, w in anchors.items() if w > 0 and a in ctx.agents and role in ctx.agents[a].roles]
         if not options:
             raise RuntimeError(f"nobody plays role {role!r} (validate_matchmaking should have caught it)")
         return self._weighted([(a, FIXED_NETWORK_ID) for a in options], [anchors[a] for a in options])
@@ -297,8 +297,8 @@ def validate_matchmaking(spec: GameSpec, player_roles: Mapping[str, Sequence[str
 
     - ``layouts`` names layouts of the game; ``anchors`` names scripted or frozen agents;
     - O has at least one playable layout;
-    - every role of every playable layout is played by a trainable agent or by an anchor of O
-      (with a positive weight at some schedule point);
+    - at every schedule point, every role of every playable layout is played by a trainable agent or
+      by an anchor of O with a positive weight at that point;
     - for every playable layout, opposing team and schedule point some category with a positive
       share can be filled (snapshots count as available).
     """
@@ -326,16 +326,21 @@ def validate_matchmaking(spec: GameSpec, player_roles: Mapping[str, Sequence[str
             raise ConfigError(f"{where} (roles {sorted(roles)}) has no seat in its enabled layouts "
                               f"{sorted(enabled_layouts(spec, m))}; check agents.{owner}.roles and matchmaking.layouts")
         points = schedule_points_of(m)
-        live_anchors = {a for p in points for a, w in context.anchors_at(owner, p).items() if w > 0}
-        covered = trainable_roles | {role for a in live_anchors for role in context.agents[a].roles}
+        # Roles covered at each schedule point: weights are piecewise linear between the points, so
+        # coverage at every point means coverage at every env step.
+        covered = {point: trainable_roles | {role for a, w in context.anchors_at(owner, point).items()
+                                             if w > 0 and a in context.agents for role in context.agents[a].roles}
+                   for point in points}
         for layout in layouts:
-            missing = sorted({seat.role for seat in spec.layouts[layout]} - covered)
-            if missing:
-                raise ConfigError(
-                    f"{where}, layout {layout!r}: no trainable agent and no anchor of {owner!r} plays role(s) "
-                    f"{missing}; add an agent or a scripted/frozen anchor with these roles, or leave {layout!r} out "
-                    f"of matchmaking.layouts"
-                )
+            for point in points:
+                missing = sorted({seat.role for seat in spec.layouts[layout]} - covered[point])
+                if missing:
+                    raise ConfigError(
+                        f"{where}, layout {layout!r}: at env step {point} no trainable agent and no anchor of "
+                        f"{owner!r} with a positive weight plays role(s) {missing}; add an agent or a scripted/frozen "
+                        f"anchor with these roles (with a positive weight at every schedule point), or leave "
+                        f"{layout!r} out of matchmaking.layouts"
+                    )
             for team in opposing_teams(spec, layout, roles):
                 for point in points:
                     shares, available = _structural(context, owner, layout, team, point)
