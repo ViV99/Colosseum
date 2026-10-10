@@ -189,6 +189,13 @@ def _latest_checkpoint_dir(agent_dir: Path) -> Path | None:
     return max(found)[1] if found else None
 
 
+def _check_init_signature(found: str, signature: str, what: str, where: str) -> None:
+    """The ``init`` source's role signature must be the student's (same answer by path and by frozen name)."""
+    if found != signature:
+        raise ConfigError(f"{where}: {what} has role signature {found!r}, but the agent's roles have "
+                          f"{signature!r}: the observation/action/global-state spaces differ")
+
+
 def _checkpoint_weights(ckpt_dir: Path, signature: str, where: str) -> tuple[dict[str, np.ndarray], str]:
     from colosseum.coordinator.checkpoint_manager import load_checkpoint_dir
 
@@ -197,9 +204,7 @@ def _checkpoint_weights(ckpt_dir: Path, signature: str, where: str) -> tuple[dic
     if found is None:
         raise ConfigError(f"{where}: checkpoint {ckpt_dir} has no role_signature in its meta.json (written before "
                           f"SP2); init from its model.pt file instead")
-    if found != signature:
-        raise ConfigError(f"{where}: checkpoint {ckpt_dir} has role signature {found!r}, but the agent's roles "
-                          f"have {signature!r}: the observation/action/global-state spaces differ")
+    _check_init_signature(found, signature, f"checkpoint {ckpt_dir}", where)
     return state["model_state"], str(ckpt_dir)
 
 
@@ -207,13 +212,17 @@ def _init_weights(config: ColosseumConfig, agent_id: str, ref: str, signature: s
                   where: str) -> tuple[dict[str, np.ndarray], str]:
     """``(numpy state_dict, source)`` of an ``init.from`` reference."""
     from colosseum.coordinator.checkpoint_manager import MODEL_FILE, read_weights_file
+    from colosseum.core.roles import agent_role_spec, role_signature
 
     if ref in agent_ids(config):
         kind = config.agent_kind(ref)
         if kind == "frozen":
             entry = config.agent_entry(ref)
             frozen = _load_frozen(config, ref, entry.path, spec, where)
-            return dict(frozen.model_state), f"frozen agent {ref!r} ({entry.path})"
+            source = f"frozen agent {ref!r} ({entry.path})"
+            found = role_signature(agent_role_spec(spec, list(frozen.roles)))
+            _check_init_signature(found, signature, source, where)
+            return dict(frozen.model_state), source
         if kind == "scripted":
             raise ConfigError(f"{where}: {ref!r} is a scripted agent, which has no weights; record its games "
                               f"(colosseum record), train a network on them (colosseum bc) and init from that .pt")
@@ -234,6 +243,26 @@ def _init_weights(config: ColosseumConfig, agent_id: str, ref: str, signature: s
             raise ConfigError(f"{where}: {e}") from e
     raise ConfigError(f"{where} is neither a frozen agent of the config nor a .pt file, a checkpoint dir (with "
                       f"{MODEL_FILE}) or a run dir (with checkpoints/)")
+
+
+def resume_source_of(config: ColosseumConfig, agent_id: str) -> str | None:
+    """Where ``training.resume_from`` will restore trainable ``agent_id`` from, decided from the file system
+    only (nothing loaded): a ``.pt`` or checkpoint-dir source restores every agent; a run dir restores the
+    agents with a ``ckpt_v<N>`` (with ``model.pt``) there. None without ``resume_from``, for an agent the
+    run dir does not restore, or for a source that is none of these (the launcher's resume reports it)."""
+    from colosseum.coordinator.checkpoint_manager import RESUME_RUN_DIR, classify_resume_source
+
+    resume_from = config.training.resume_from
+    if not resume_from:
+        return None
+    try:
+        kind = classify_resume_source(resume_from)
+    except ConfigError:
+        return None
+    if kind == RESUME_RUN_DIR:
+        ckpt = _latest_checkpoint_dir(Path(resume_from) / "checkpoints" / agent_id)
+        return str(ckpt) if ckpt is not None else None
+    return str(resume_from)
 
 
 def resolve_init(config: ColosseumConfig, agent_id: str, spec: GameSpec) -> InitState | None:

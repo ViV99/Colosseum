@@ -471,7 +471,8 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
     - every agent's model: ``step`` on its role's observations and ``unroll`` on a synthetic chunk
       with BOOT/PAD slots, resets and ``global_state``;
     - every agent's kickstart teacher (``learner.factory.resolve_teacher``) and its weights;
-    - every agent's ``init`` source (strict / partial report in ``ValidationReport.lines``);
+    - every agent's ``init`` source (strict / partial report in ``ValidationReport.lines``), except for
+      agents ``training.resume_from`` restores (``learner.factory.resume_source_of``), which ignore it;
     - every frozen agent: weights, role signature and its architecture (once per architecture); every
       scripted agent: imported, constructed and played in each enabled layout where it has a seat, every
       action through the legality gate.
@@ -481,7 +482,7 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
     """
     from colosseum.core.roles import agent_role_spec, resolve_agent_roles
     from colosseum.league.mixture import describe_mix, validate_matchmaking
-    from colosseum.learner.factory import resolve_init
+    from colosseum.learner.factory import resolve_init, resume_source_of
     from colosseum.players.registry import load_fixed_players, resolve_player_roles
 
     report = ValidationReport()
@@ -516,7 +517,12 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
         sample = next((samples[r] for r in agent_roles[aid] if r in samples), None)
         _check_model(model, role_specs[aid], sample, where)
     _check_kickstart_teachers(config, spec, agent_configs)
-    for aid in agent_configs:
+    for aid, acfg in agent_configs.items():
+        resumed = resume_source_of(config, aid)
+        if resumed is not None:   # spec block 6: an agent restored by resume_from ignores init
+            if acfg.init.from_ is not None:
+                report.lines.append(f"agent {aid!r}: resumes from {resumed}; init.from ignored")
+            continue
         init = resolve_init(config, aid, spec)
         if init is not None:
             report.lines.extend(init.report)

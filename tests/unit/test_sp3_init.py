@@ -10,6 +10,7 @@ import numpy as np
 import pytest
 import torch
 
+from colosseum.coordinator.checkpoint_manager import read_weights_file
 from colosseum.core.config import load_config
 from colosseum.core.errors import ConfigError
 from colosseum.core.registry import build_model, env_spec, validate_config
@@ -135,6 +136,24 @@ def test_frozen_agent_by_name(tmp_path):
                            matchmaking={"anchors": []})
     init = _resolve(cfg)
     assert "frozen agent 'prev'" in init.source and init.strict
+    expected = read_weights_file(ckpt / "model.pt")
+    assert sorted(init.model_state) == sorted(expected)
+    assert all(np.array_equal(init.model_state[k], expected[k]) for k in expected)
+
+
+def test_frozen_agent_by_name_must_have_the_students_role_signature(tmp_path):
+    """By name and by path the same checkpoint gives the same answer: a hunter snapshot is no prey init,
+    not even partially."""
+    base = make_test_config("asymmetric")
+    ckpt = write_ckpt_dir(tmp_path / "hunter", base, "hunter")
+    for ref, extra in ((str(ckpt), {}), ("old_hunter", {"old_hunter": {"kind": "frozen", "path": str(ckpt)}})):
+        cfg = make_test_config("asymmetric", agents={"hunter": {"roles": ["hunter"]},
+                                                     "prey": {"roles": ["prey"],
+                                                              "init": {"from": ref, "strict": False}},
+                                                     **extra},
+                               matchmaking={"anchors": []})
+        with pytest.raises(ConfigError, match="role signature .* but the agent's roles have"):
+            _resolve(cfg, "prey")
 
 
 @pytest.mark.parametrize("agents, source, message", [
@@ -235,3 +254,25 @@ def test_the_launcher_passes_init_states_to_learners(tmp_path, monkeypatch, rest
         launcher_module.Launcher(cfg, make_test_run_dir(cfg, tmp_path)).launch()
     (kwargs,) = learner_kwargs
     assert isinstance(kwargs["init_state"], InitState) and kwargs["init_state"].strict
+
+
+@pytest.mark.parametrize("source", ["run_dir", "checkpoint_dir", "pt"])
+def test_validate_skips_the_init_of_agents_restored_by_resume(tmp_path, source):
+    base = make_test_config("turns")
+    ckpt = write_ckpt_dir(tmp_path / "old" / "checkpoints" / "agent_0", base, policy_version=4)
+    resume_from = {"run_dir": tmp_path / "old", "checkpoint_dir": ckpt, "pt": _pt(tmp_path, _model())}[source]
+    cfg = make_test_config("turns", init={"from": str(tmp_path / "deleted.pt")},
+                           training={"resume_from": str(resume_from)})
+    lines = validate_config(cfg).lines                                 # the missing init source is not read
+    restored = ckpt if source == "run_dir" else resume_from
+    assert f"agent 'agent_0': resumes from {restored}; init.from ignored" in lines
+    assert "training.resume_from is set: agents restored from it ignore init" in lines
+
+
+def test_validate_still_checks_the_init_of_agents_the_run_dir_does_not_restore(tmp_path):
+    base = make_test_config("turns", agents={"a": {}, "b": {}})
+    write_ckpt_dir(tmp_path / "old" / "checkpoints" / "a", base, "a")
+    cfg = make_test_config("turns", agents={"a": {}, "b": {}}, init={"from": str(tmp_path / "deleted.pt")},
+                           training={"resume_from": str(tmp_path / "old")})
+    with pytest.raises(ConfigError, match="agent 'b': init.from=.*neither a frozen agent"):
+        validate_config(cfg)
