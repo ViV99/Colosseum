@@ -22,7 +22,8 @@ weights of one agent (agents in rotation over the envs). ``check_distributed_sco
 values of the final config, everything SP3 added that cannot be reduced to this (scripted and frozen
 agents, ``init``, a custom matchmaker, per-agent matchmaking or kickstart, a teacher other than one
 global ``.pt``) with a ConfigError pointing to SP5; any opponent mix other than "latest only" is
-reduced to it with one warning (default and resolved configs write every share explicitly).
+reduced to it with one warning, which also names a ``teammates: mixed`` that is ignored (default and
+resolved configs write every share explicitly).
 Layouts are drawn once per worker env (ruling PR-3) from an RNG seeded by ``training.seed +
 worker_id``, and the agent rotation starts at env 0 of worker 0, so every worker machine of a run
 starts with the same layout mix and rotation.
@@ -185,8 +186,8 @@ def _teacher_problem(config: ColosseumConfig, teacher: str) -> str | None:
 
 def check_distributed_scope(config: ColosseumConfig) -> None:
     """Spec block 8: refuse SP3 settings distributed mode cannot honour (ConfigError naming SP5) and
-    warn once when some trainable agent's opponent mix is reduced to "latest only". Decides by the
-    values of the final config, not by which keys the YAML wrote."""
+    warn once when some trainable agent's opponent mix is reduced to "latest only" or ``teammates: mixed`` is
+    ignored. Decides by the values of the final config, not by which keys the YAML wrote."""
     problems: list[str] = []
     fixed = config.fixed_agent_ids()
     if fixed:
@@ -213,9 +214,13 @@ def check_distributed_scope(config: ColosseumConfig) -> None:
         raise ConfigError(f"{_SP5}: " + "; ".join(problems))
     reduced = {aid: acfg.matchmaking.opponents.model_dump(mode="json")
                for aid, acfg in agent_configs.items() if not _latest_only(acfg.matchmaking.opponents)}
-    if reduced:
+    mixed = any(acfg.matchmaking.teammates == "mixed" for acfg in agent_configs.values())
+    if reduced or mixed:
+        ignored = [f"matchmaking.opponents {reduced} reduced to latest only"] if reduced else []
+        if mixed:
+            ignored.append("matchmaking.teammates: mixed is ignored (a team's seats all play its core agent)")
         logger.warning(f"distributed mode plays every seat with the agents' latest weights (SP2 scope; leagues "
-                       f"across machines come with SP5): matchmaking.opponents {reduced} reduced to latest only")
+                       f"across machines come with SP5): {'; '.join(ignored)}")
 
 
 def distributed_checkpoint_manager(config: ColosseumConfig, base_dir: str | Path) -> CheckpointManager:

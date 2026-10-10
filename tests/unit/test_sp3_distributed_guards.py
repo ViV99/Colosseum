@@ -120,6 +120,18 @@ def test_any_mix_but_latest_only_is_reduced_with_one_warning(opponents, warned, 
     assert len(_reductions(caplog)) == (1 if warned else 0)
 
 
+@pytest.mark.parametrize("opponents", [LATEST_ONLY, {"latest": 0.7, "snapshots": 0.2, "rivals": 0.0, "anchors": 0.1}],
+                         ids=["latest-only", "default"])
+def test_the_one_warning_also_says_that_mixed_teammates_are_ignored(opponents, caplog):
+    config = make_test_config("turns", matchmaking={"opponents": opponents, "teammates": "mixed"})
+    with caplog.at_level(logging.WARNING, logger="colosseum.distributed"):
+        distributed_setup(config, ["agent_0"])
+    warnings = [r.getMessage() for r in caplog.records
+                if r.name == "colosseum.distributed" and r.levelno == logging.WARNING]
+    assert len(warnings) == 1 and "teammates: mixed is ignored" in warnings[0], warnings
+    assert ("reduced to latest only" in warnings[0]) == (opponents is not LATEST_ONLY)
+
+
 def test_sp2_configs_resolved_configs_and_the_sp2_kickstart_form_start(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="colosseum.distributed"):
         distributed_setup(load_config(SP2_TTT), ["agent_0"])         # mode self_play, latest_prob 0.8
