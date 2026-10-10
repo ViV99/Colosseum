@@ -431,7 +431,7 @@ Known limitations today:
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 1662 tests
+.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 1689 tests
 .venv/bin/python -m pytest -m slow -v                       # 10 tests, about 15 min: the 7 demo-game learning tests,
                                                             # the unit_harvest pipeline test, 2 torch.compile checks
 .venv/bin/python -m pytest -m gpu -v                        # 22 tests, CUDA machine only, see docs/GPU_CHECKS.md
