@@ -1288,3 +1288,35 @@ def make_matchmaker_context(spec, roles, *, kinds=None, matchmaking=None, per_ag
         pfsp_fn=lambda layout, owner, player: (scores or {}).get((owner, player), 0.5),
         env_steps_fn=env_steps if env_steps is not None else StepCounter(0),
     )
+
+
+# ---------------------------------------------------------------------------
+# SP3 (T4.1): checkpoint dirs for warm-start tests
+# ---------------------------------------------------------------------------
+
+
+def write_ckpt_dir(root, config, agent_id: str = "agent_0", *, model=None, policy_version: int = 5,
+                   networks: dict | None = None, seed: int = 0):
+    """``root/ckpt_v<policy_version>`` with ``model.pt`` and ``meta.json`` as the coordinator writes them, for
+    trainable ``agent_id`` of ``config``: its networks (or ``networks``), roles and role signature. ``model``
+    defaults to a fresh model of those networks (torch seed ``seed``). Returns the dir."""
+    import json
+
+    from colosseum.core.config import NetworkConfig
+    from colosseum.core.registry import build_model
+    from colosseum.core.roles import role_signature
+
+    roles, role = agent_role_of(config, agent_id)
+    agent_config = config.get_agent_config(agent_id)
+    net = NetworkConfig.model_validate(networks) if networks is not None else agent_config.networks
+    if model is None:
+        torch.manual_seed(seed)
+        model = build_model(agent_config.model_copy(update={"networks": net}), role)
+    path = Path(root) / f"ckpt_v{policy_version}"
+    path.mkdir(parents=True)
+    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, path / "model.pt")
+    meta = {"agent_id": agent_id, "checkpoint_id": path.name, "policy_version": policy_version, "timestamp": 0.0,
+            "final": True, "env_steps": 100, "roles": list(roles), "role_signature": role_signature(role),
+            "networks": net.model_dump(mode="json", by_alias=True)}
+    (path / "meta.json").write_text(json.dumps(meta))
+    return path

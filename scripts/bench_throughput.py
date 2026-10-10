@@ -164,6 +164,8 @@ def _make_config(num_workers: int, run_parent: str):
             "keep_every": 0,
             "save_optimizer": True,
         },
+        init={"from": None, "strict": True, "critic_warmup_steps": 0},
+        kickstart={"teacher": None, "lambda": 1.0, "decay_steps": 50_000, "kl": "forward"},
         run={"dir": run_parent, "name": f"bench-w{num_workers}"},
         metrics={"use_wandb": False, "log_interval": 1, "console_interval_sec": SYSTEM_RECORD_INTERVAL_S},
         transport={"mode": "local"},

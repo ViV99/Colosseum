@@ -45,8 +45,6 @@ import time
 from dataclasses import dataclass
 from functools import partial
 
-import torch
-
 from colosseum.core.config import ColosseumConfig, config_hash, load_config
 from colosseum.core.errors import ConfigError
 from colosseum.core.run_dir import RunDir, safe_path_component
@@ -211,10 +209,9 @@ def run_distributed_learner(
     Starts a TrajectoryService on ``traj_port`` (workers send chunks here), trains with the
     configured algorithm, and pushes weights to the WeightStore at ``weight_store_address``.
     """
-    from colosseum.core.registry import build_model, import_class
     from colosseum.core.roles import role_signature
-    from colosseum.core.specs import ActionSpec
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
+    from colosseum.learner.factory import build_algorithm, resolve_teacher
     from colosseum.learner.learner import learner_process, resolve_device
 
     setup_process_logging(None, f"learner-{agent_id}", console_level=logging.INFO)
@@ -257,28 +254,11 @@ def run_distributed_learner(
     coordinator_ckpt = CheckpointManager(base_dir=run_dir.checkpoints, keep_last=ckpt_cfg.keep_last,
                                          keep_every=ckpt_cfg.keep_every, interval=ckpt_cfg.interval)
 
-    algo_cls = import_class(acfg.algorithm.algorithm_class)
-    action_spec = ActionSpec.from_space(role_spec.action_space)
-    teacher_path = acfg.training.kickstart_teacher
+    # The kickstart teacher (if any) is read here, before training starts, into a numpy spec.
+    teacher = resolve_teacher(config, agent_id, setup.spec)
 
     def algorithm_factory():
-        model = build_model(acfg, role_spec)
-        kickstart = None
-        if teacher_path:
-            from colosseum.bc.kickstart import KickstartLoss
-            teacher = build_model(acfg, role_spec)
-            teacher.load_state_dict(torch.load(teacher_path, weights_only=True, map_location=device))
-            teacher.to(device)
-            kickstart = KickstartLoss(
-                teacher,
-                initial_lambda=acfg.training.kickstart_lambda,
-                decay_steps=acfg.training.kickstart_decay_steps,
-                direction=acfg.training.kickstart_kl,
-            )
-        kwargs = {"device": device, "pin_memory": acfg.learner.pin_memory}
-        if kickstart is not None:
-            kwargs["kickstart"] = kickstart
-        return algo_cls(model, acfg.algorithm, action_spec, **kwargs)
+        return build_algorithm(acfg, role_spec, setup.spec, device=device, teacher=teacher)
 
     stop_event = threading.Event()
     supervisor = ProcessSupervisor(stop_event)

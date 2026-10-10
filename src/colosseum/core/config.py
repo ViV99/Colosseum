@@ -14,6 +14,8 @@ is at least 2.
 
 SP3: ``agents.<id>.kind`` (trainable / scripted / frozen) and the implicit trainable ``agent_0``.
 SP3: ``checkpoint.keep_last`` / ``keep_every`` (``pool_size`` is read as ``keep_last``).
+SP3: ``init`` and ``kickstart`` sections (global + per agent); ``training.kickstart_*`` are translated
+into ``kickstart``.
 """
 
 from __future__ import annotations
@@ -37,7 +39,6 @@ from pydantic import (
     ConfigDict,
     Field,
     ValidationError,
-    ValidationInfo,
     field_validator,
     model_validator,
 )
@@ -127,6 +128,9 @@ AGENT_MATCHMAKING_KEYS = frozenset({"opponents", "anchors", "pfsp", "layouts", "
 # SP2 matchmaking knobs: accepted only in the raw global matchmaking section, translated, never stored.
 SP2_MATCHMAKING_KNOBS = ("mode", "self_play_ratio", "latest_prob", "pfsp_exponent")
 _SP2_MATCHMAKING_DEFAULTS = {"mode": "self_play", "self_play_ratio": 0.5, "latest_prob": 0.5, "pfsp_exponent": 1.0}
+# SP2 kickstart knobs of the training section -> keys of the top-level kickstart section.
+SP2_KICKSTART_KNOBS = {"kickstart_teacher": "teacher", "kickstart_lambda": "lambda",
+                       "kickstart_decay_steps": "decay_steps", "kickstart_kl": "kl"}
 
 # A share or an anchor weight: a number or {step: value} points over the run's global env steps.
 ScheduleField = Annotated[ScheduleValue, BeforeValidator(parse_schedule)]
@@ -359,23 +363,6 @@ class TrainingConfig(StrictModel):
                     "state_dict (e.g. a BC output; weights only, policy_version 0). Policy versions "
                     "and the global env-step counter continue from the checkpoint.",
     )
-    kickstart_teacher: str | None = Field(
-        default=None,
-        description="Path to a frozen teacher .pt state_dict (e.g. a BC model), built from this "
-                    "agent's networks config. When set, a decaying KL term between teacher and "
-                    "student is added to the RL loss (direction: kickstart_kl). None disables it.",
-    )
-    kickstart_lambda: float = Field(
-        default=1.0, ge=0.0, description="Initial weight of the kickstart KL term (decays to 0).",
-    )
-    kickstart_decay_steps: int = Field(
-        default=50_000, ge=1, description="Training steps over which the kickstart lambda decays to 0.",
-    )
-    kickstart_kl: Literal["forward", "reverse"] = Field(
-        default="forward",
-        description="Kickstart KL direction: 'forward' = KL(teacher || student) (Kickstarting / "
-                    "AlphaStar / VPT, mode-covering); 'reverse' = KL(student || teacher).",
-    )
 
 
 class OpponentShares(StrictModel):
@@ -527,6 +514,29 @@ def translate_sp2_matchmaking(raw: dict) -> dict:
     return out
 
 
+def translate_sp2_kickstart(raw: dict) -> dict:
+    """Move SP2's ``training.kickstart_*`` of a raw config into a top-level ``kickstart`` section.
+
+    Returns ``raw`` itself when there is nothing to translate, else a new dict (inputs are not
+    mutated). Old knobs together with a top-level ``kickstart`` raise ConfigError.
+    """
+    training = raw.get("training")
+    if not isinstance(training, dict):
+        return raw
+    present = [k for k in SP2_KICKSTART_KNOBS if k in training]
+    if not present:
+        return raw
+    if raw.get("kickstart") is not None:
+        raise ConfigError(
+            f"training.{', training.'.join(present)} (SP2 knobs) cannot be combined with a top-level kickstart "
+            f"section; move them into kickstart: {{teacher, lambda, decay_steps, kl}}"
+        )
+    out = dict(raw)
+    out["training"] = {k: v for k, v in training.items() if k not in SP2_KICKSTART_KNOBS}
+    out["kickstart"] = {SP2_KICKSTART_KNOBS[k]: copy.deepcopy(training[k]) for k in present}
+    return out
+
+
 def merge_matchmaking(base: dict, override: dict) -> dict:
     """A per-agent matchmaking override on the global section (spec block 5).
 
@@ -586,6 +596,51 @@ class CheckpointConfig(StrictModel):
         logger.warning(f"checkpoint.pool_size is the SP2 name of checkpoint.keep_last; read as keep_last: "
                        f"{data['keep_last']} (rename it in the config)")
         return data
+
+
+class InitConfig(StrictModel):
+    """Warm start of a trainable agent's weights (spec block 6). The top-level section is the default of
+    every trainable agent; ``agents.<id>.init`` deep-merges onto it."""
+
+    from_: str | None = Field(
+        default=None, alias="from",
+        description=".pt state_dict | checkpoint dir (model.pt, role signature checked) | run dir (the agent's "
+                    "latest checkpoint there) | name of a frozen agent. Weights only: policy version 0, a fresh "
+                    "optimizer, counters from zero. Ignored for agents restored by training.resume_from.",
+    )
+    strict: bool = Field(
+        default=True,
+        description="false: load only the tensors whose name and shape match; the rest are listed by validate "
+                    "and in the log (no matching tensor at all is an error).",
+    )
+    critic_warmup_steps: int = Field(
+        default=0, ge=0,
+        description="The first N learner train steps update only the value path (PolicyModel.value_parameters()): "
+                    "policy, entropy and kickstart losses off, normalizer statistics frozen, kickstart decay "
+                    "starts afterwards.",
+    )
+
+
+class KickstartConfig(StrictModel):
+    """A decaying pull of the student towards a teacher (spec block 6). The top-level section is the default
+    of every trainable agent; ``agents.<id>.kickstart`` deep-merges onto it."""
+
+    teacher: str | None = Field(
+        default=None,
+        description="Name of a frozen or scripted agent, or a path: a .pt (the student's architecture) or a "
+                    "checkpoint dir (its own architecture from meta.json). None = no kickstart.",
+    )
+    lambda_: float = Field(
+        default=1.0, ge=0.0, alias="lambda",
+        description="Initial weight of the kickstart term; decays linearly to 0 over decay_steps train steps "
+                    "(after the critic warm-up).",
+    )
+    decay_steps: int = Field(default=50_000, ge=1, description="Train steps over which lambda decays to 0.")
+    kl: Literal["forward", "reverse"] = Field(
+        default="forward",
+        description="Neural teachers: 'forward' = KL(teacher || student), 'reverse' = KL(student || teacher). "
+                    "Scripted teachers use the label loss -log pi(a_teacher) instead.",
+    )
 
 
 class MetricsConfig(StrictModel):
@@ -719,14 +774,6 @@ class TrainableAgent(_AgentEntry):
     def _check_roles(cls, roles: list[str] | None) -> list[str] | None:
         return _check_roles_list(roles)
 
-    @field_validator("init", "kickstart")
-    @classmethod
-    def _not_supported_yet(cls, value: dict[str, Any] | None, info: ValidationInfo) -> dict[str, Any] | None:
-        if value is not None:
-            raise ValueError(f"per-agent '{info.field_name}' sections are not supported yet; remove "
-                             f"agents.<id>.{info.field_name}")
-        return value
-
     @field_validator("matchmaking")
     @classmethod
     def _check_matchmaking_override(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
@@ -793,7 +840,7 @@ class FrozenAgent(_AgentEntry):
 
 AgentEntry = Annotated[TrainableAgent | ScriptedAgent | FrozenAgent, Field(discriminator="kind")]
 
-_AGENT_SECTIONS = ("networks", "algorithm", "learner", "matchmaking")
+_AGENT_SECTIONS = ("networks", "algorithm", "learner", "matchmaking", "init", "kickstart")
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -836,6 +883,8 @@ class ColosseumConfig(StrictModel):
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     matchmaking: MatchmakingConfig = Field(default_factory=MatchmakingConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    init: InitConfig = Field(default_factory=InitConfig)
+    kickstart: KickstartConfig = Field(default_factory=KickstartConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     bc: BCConfig = Field(default_factory=BCConfig)
     transport: TransportConfig = Field(default_factory=TransportConfig)
@@ -864,6 +913,20 @@ class ColosseumConfig(StrictModel):
             f"(the old knobs are not kept in config.resolved.yaml)"
         )
         return {**data, "matchmaking": translated}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _translate_sp2_kickstart_knobs(cls, data: Any) -> Any:
+        """SP2's training.kickstart_* -> the top-level kickstart section, with one warning."""
+        if not isinstance(data, dict):
+            return data
+        translated = translate_sp2_kickstart(data)
+        if translated is not data:
+            logger.warning(
+                f"training.kickstart_* are SP2 knobs; translated to kickstart: {translated['kickstart']} (write that "
+                f"section instead; the old keys are not kept in config.resolved.yaml)"
+            )
+        return translated
 
     @field_validator("agents", mode="before")
     @classmethod
@@ -1057,6 +1120,7 @@ def _check_override_path(parts: list[str]) -> None:
 # them (one warning each) and never store them.
 LEGACY_OVERRIDE_KEYS: set[str] = {"checkpoint.pool_size"}
 LEGACY_OVERRIDE_KEYS.update(f"matchmaking.{knob}" for knob in SP2_MATCHMAKING_KNOBS)
+LEGACY_OVERRIDE_KEYS.update(f"training.{knob}" for knob in SP2_KICKSTART_KNOBS)
 
 
 def apply_overrides(data: dict, overrides: dict[str, Any]) -> dict:

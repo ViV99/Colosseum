@@ -302,29 +302,15 @@ def _check_model(model: Any, role: RoleSpec, sample: tuple | None, where: str) -
                               f"teacher run the policy path only)")
 
 
-def _check_kickstart_teacher(config: ColosseumConfig, agent_configs: dict[str, ColosseumConfig],
-                             role_specs: dict[str, RoleSpec]) -> None:
-    """One global teacher (spec block 6): its role signature must be every agent's, its weights
-    must fit every agent's model."""
-    from colosseum.coordinator.checkpoint_manager import check_model_state, read_weights_file
-    from colosseum.core.roles import role_signature
+def _check_kickstart_teachers(config: ColosseumConfig, spec: GameSpec,
+                              agent_configs: dict[str, ColosseumConfig]) -> None:
+    """Every trainable agent's kickstart teacher resolves, and a neural one builds with its weights."""
+    from colosseum.learner.factory import build_teacher_model, resolve_teacher
 
-    path = config.training.kickstart_teacher
-    if not path:
-        return
-    signatures = {aid: role_signature(role) for aid, role in role_specs.items()}
-    if len(set(signatures.values())) > 1:
-        raise ConfigError(
-            f"training.kickstart_teacher is one global teacher, but the agents {sorted(signatures)} play roles "
-            f"with different spaces; train such agents without kickstart (per-agent teachers come in SP3)"
-        )
-    try:
-        teacher_state = read_weights_file(path)
-    except ValueError as e:
-        raise ConfigError(f"training.kickstart_teacher={path!r}: {e}") from e
     for aid, acfg in agent_configs.items():
-        check_model_state(build_model(acfg, role_specs[aid]), teacher_state,
-                          f"training.kickstart_teacher={path!r} (agent {aid!r})")
+        teacher = resolve_teacher(config, aid, spec)
+        if teacher is not None and teacher.kind == "neural":
+            build_teacher_model(acfg, teacher, spec)
 
 
 def _check_frozen_players(config: ColosseumConfig, spec: GameSpec, fixed: Any, samples: dict[str, tuple],
@@ -484,7 +470,7 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
       final observations;
     - every agent's model: ``step`` on its role's observations and ``unroll`` on a synthetic chunk
       with BOOT/PAD slots, resets and ``global_state``;
-    - the kickstart teacher: one role signature for all agents, weights that fit every agent;
+    - every agent's kickstart teacher (``learner.factory.resolve_teacher``) and its weights;
     - every frozen agent: weights, role signature and its architecture (once per architecture); every
       scripted agent: imported, constructed and played in each enabled layout where it has a seat, every
       action through the legality gate.
@@ -527,7 +513,7 @@ def validate_config(config: ColosseumConfig) -> ValidationReport:
             raise ConfigError(f"{where}: failed to build the model from networks: {type(e).__name__}: {e}") from e
         sample = next((samples[r] for r in agent_roles[aid] if r in samples), None)
         _check_model(model, role_specs[aid], sample, where)
-    _check_kickstart_teacher(config, agent_configs, role_specs)
+    _check_kickstart_teachers(config, spec, agent_configs)
     _check_frozen_players(config, spec, fixed, samples, report)
     _check_scripted_players(config, spec, fixed, layouts, report)
     return report

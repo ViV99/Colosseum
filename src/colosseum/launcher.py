@@ -24,10 +24,9 @@ import signal
 import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, replace
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import torch
 
 from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
@@ -39,6 +38,9 @@ from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.players.registry import FixedPlayers
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
+
+if TYPE_CHECKING:
+    from colosseum.learner.factory import TeacherSpec
 
 logger = logging.getLogger(__name__)
 
@@ -223,17 +225,19 @@ def _learner_main(
     total_timesteps: int = 0,
     num_learners: int = 1,
     seed: int | None = None,
+    spec: GameSpec | None = None,
+    teacher: TeacherSpec | None = None,
 ) -> None:
     """Learner process body (see ``_learner_target``).
 
     ``num_learners`` (learner processes on this machine) feeds the automatic torch thread count
     when ``learner.torch_threads`` is unset. ``seed`` (from ``utils.seeding.learner_seed``) seeds
-    this process before the model is built. The model (and a kickstart teacher) is built for
-    ``role_spec``, the spaces of the agent's roles.
+    this process before the model is built. The model is built for ``role_spec``, the spaces of the
+    agent's roles. The algorithm (and a kickstart teacher resolved by the main process) is built by
+    ``learner.factory.build_algorithm``.
     """
-    from colosseum.core.registry import build_model, import_class
-    from colosseum.core.specs import ActionSpec
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
+    from colosseum.learner.factory import build_algorithm
     from colosseum.learner.learner import learner_process, resolve_device
     from colosseum.utils.seeding import apply_global_seed
 
@@ -245,35 +249,8 @@ def _learner_main(
         config.rollout.torch_threads, num_learners,
     ))
 
-    algo_class_path = config.algorithm.algorithm_class
-    if not algo_class_path:
-        raise ValueError(
-            "algorithm.algorithm_class is not set. "
-            "Provide a dotted import path (e.g. 'colosseum.algorithms.appo.APPO')."
-        )
-    algo_cls = import_class(algo_class_path)
-    action_spec = ActionSpec.from_space(role_spec.action_space)
-    teacher_path = config.training.kickstart_teacher
-
     def algorithm_factory():
-        model = build_model(config, role_spec)
-        kickstart = None
-        if teacher_path:
-            from colosseum.bc.kickstart import KickstartLoss
-            teacher = build_model(config, role_spec)
-            teacher.load_state_dict(torch.load(teacher_path, weights_only=True, map_location=device))
-            teacher.to(device)
-            kickstart = KickstartLoss(
-                teacher,
-                initial_lambda=config.training.kickstart_lambda,
-                decay_steps=config.training.kickstart_decay_steps,
-                direction=config.training.kickstart_kl,
-            )
-            logger.info(f"Kickstart enabled for {agent_id} from {teacher_path}")
-        kwargs = {"device": device, "pin_memory": config.learner.pin_memory}
-        if kickstart is not None:
-            kwargs["kickstart"] = kickstart
-        return algo_cls(model, config.algorithm, action_spec, **kwargs)
+        return build_algorithm(config, role_spec, spec, device=device, teacher=teacher)
 
     learner_process(
         agent_id=agent_id,
@@ -373,6 +350,8 @@ class Launcher:
         self._agent_ids: list[str] = []
         self._checkpoint_queues: dict[str, mp.Queue] = {}
         self._checkpoint_meta: dict[str, dict] = {}
+        # Set by launch(): every trainable agent's kickstart teacher, resolved in this process (numpy specs).
+        self._teachers: dict[str, TeacherSpec | None] = {}
         # Per worker: snapshots evicted by the storage that are still to be delivered ({agent: ids}).
         self._worker_evictions: list[dict[str, set[str]]] = []
         # Set by launch(): the main process's single metrics sink (T6.3) and its queue-depth source.
@@ -423,6 +402,9 @@ class Launcher:
         # Resume (before any process starts: a bad resume source fails fast).
         resume_states = self._resolve_resume(setup.agent_configs, setup.role_specs)
         self._import_snapshot_pool(coordinator)
+        from colosseum.learner.factory import resolve_teacher
+        # Kickstart teachers are resolved here (ConfigError before any process starts) into numpy specs.
+        self._teachers = {aid: resolve_teacher(cfg, aid, setup.spec) for aid in trainable_agents}
 
         from colosseum.core.config import config_hash
         cfg_hash = config_hash(cfg)
@@ -580,6 +562,8 @@ class Launcher:
                     total_timesteps=cfg.training.total_timesteps,
                     num_learners=len(trainable_agents),
                     seed=learner_seed(cfg.training.seed, agent_index),
+                    spec=setup.spec,
+                    teacher=self._teachers.get(aid),
                 ),
                 daemon=True,
             )

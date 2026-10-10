@@ -100,8 +100,6 @@ def test_a_fixed_agent_named_agent_0_without_trainable_agents_is_an_error(tmp_pa
     ({"kind": "frozen"}, ["path"]),
     ({"kind": "scripted", "class": "a.B", "roles": []}, ["empty"]),
     ({"kind": "frozen", "path": "x.pt", "roles": ["p", "p"]}, ["more than once"]),
-    ({"init": {"from": "bc.pt"}}, ["not supported yet"]),
-    ({"kickstart": {"teacher": "x"}}, ["not supported yet"]),
 ])
 def test_bad_agent_entries_are_config_errors_with_a_hint(tmp_path, entry, words):
     with pytest.raises(ConfigError) as info:

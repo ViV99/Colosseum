@@ -3,7 +3,7 @@
 Adds ``lambda * KL`` between a frozen teacher policy and the student to the RL loss.
 Lambda decays linearly from ``initial_lambda`` to 0 over ``decay_steps`` train steps.
 
-Direction (``training.kickstart_kl``):
+Direction (``kickstart.kl``):
 - ``"forward"`` (default): KL(teacher || student), mode-covering (Kickstarting, AlphaStar, VPT);
 - ``"reverse"``: KL(student || teacher), mode-seeking.
 
