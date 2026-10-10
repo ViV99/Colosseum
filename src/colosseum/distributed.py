@@ -253,7 +253,9 @@ def run_distributed_learner(
     # the learner's final snapshot is saved even without periodic checkpoints.
     from colosseum.coordinator.checkpoint_manager import CheckpointManager
     checkpoint_queue: queue.Queue = queue.Queue(maxsize=16)
-    coordinator_ckpt = CheckpointManager(base_dir=run_dir.checkpoints, pool_size=config.checkpoint.pool_size)
+    ckpt_cfg = config.checkpoint
+    coordinator_ckpt = CheckpointManager(base_dir=run_dir.checkpoints, keep_last=ckpt_cfg.keep_last,
+                                         keep_every=ckpt_cfg.keep_every, interval=ckpt_cfg.interval)
 
     algo_cls = import_class(acfg.algorithm.algorithm_class)
     action_spec = ActionSpec.from_space(role_spec.action_space)

@@ -28,7 +28,7 @@ TINY: dict[str, str] = {
     "learner.batch_chunks": "2",
     "learner.queue_size": "16",
     "checkpoint.interval": "20",
-    "checkpoint.pool_size": "5",
+    "checkpoint.keep_last": "5",
     "metrics.log_interval": "1",
     "metrics.console_interval_sec": "1.0",
 }

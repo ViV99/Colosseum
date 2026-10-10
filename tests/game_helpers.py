@@ -1057,7 +1057,7 @@ def make_test_config(game: str, **sections):
                     "weight_sync_interval_sec": 0.5, "match_refresh_interval_sec": 1.0},
         "learner": {"device": "cpu", "batch_chunks": 2, "queue_size": 16},
         "training": {"total_timesteps": 2000, "seed": 0},
-        "checkpoint": {"interval": 20, "pool_size": 5},
+        "checkpoint": {"interval": 20, "keep_last": 5, "keep_every": 0},
         "metrics": {"use_wandb": False, "log_interval": 1, "console_interval_sec": 1.0},
     }
     if agents is not None:

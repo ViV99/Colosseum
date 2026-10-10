@@ -48,7 +48,11 @@ class Coordinator:
         self._env_steps = env_steps
         # One RNG for matchmaking and seat permutations: runs with the same seed get the same schedule.
         self._rng = random.Random(config.training.seed)
-        self._checkpoint_manager = CheckpointManager(base_dir=checkpoint_dir, pool_size=config.checkpoint.pool_size)
+        ckpt = config.checkpoint
+        self._checkpoint_manager = CheckpointManager(
+            base_dir=checkpoint_dir, keep_last=ckpt.keep_last, keep_every=ckpt.keep_every, interval=ckpt.interval,
+            on_evict=self._on_evict,
+        )
         self._ratings = RatingBook(spec, trainable)
         self._role_signatures = {a: role_signature(agent_role_spec(spec, roles))
                                  for a, roles in self._agent_roles.items()}
@@ -95,6 +99,19 @@ class Coordinator:
 
     def role_signature(self, agent_id: str) -> str:
         return self._role_signatures[agent_id]
+
+    def _on_evict(self, agent_id: str, checkpoint_id: str) -> None:
+        """Storage evicted a snapshot (spec block 4): the matchmaker's candidates come from the store, so it is
+        gone from new lineups."""
+        logger.debug(f"Snapshot {checkpoint_id} of {agent_id} evicted")
+
+    def import_snapshots(self, run_dir: str | Path) -> None:
+        """Run-dir resume (spec block 4): carry the stored snapshots of every trainable agent of ``run_dir``
+        into this run's store; a snapshot with another role signature is a ConfigError."""
+        for aid in self._trainable:
+            kept = self._checkpoint_manager.import_snapshots(Path(run_dir) / "checkpoints", aid,
+                                                             expected_signature=self._role_signatures[aid])
+            logger.info(f"Resume [{aid}]: snapshot pool carried over from {run_dir}: {kept}")
 
     def _checkpoint_ids(self, agent_id: str) -> list[str]:
         return [c.checkpoint_id for c in self._checkpoint_manager.list_checkpoints(agent_id)]

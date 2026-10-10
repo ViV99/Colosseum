@@ -1,4 +1,5 @@
-"""Checkpoint storage: atomic per-agent checkpoints, FIFO pool, resume resolution.
+"""Checkpoint storage: atomic per-agent snapshots, retention (``keep_last`` / ``keep_every`` / final),
+the run-dir pool import, resume resolution.
 
 Layout (``base_dir`` is ``<run_dir>/checkpoints``)::
 
@@ -12,6 +13,12 @@ A checkpoint's path is always ``base_dir/agent_id/checkpoint_id``; both ids must
 safe path components (``core.config.check_path_component``), and agent ids may not
 contain ``.`` (``core.config.check_agent_id``). A ``path`` stored in
 ``meta.json`` (older layouts, copied runs) is never used (R6-06).
+
+Retention (SP3 spec block 4), after every save and import: the newest ``keep_last`` snapshots, every
+snapshot whose version is a multiple of ``interval * keep_every`` (``keep_every > 0``), every final
+snapshot (``meta.json`` ``final: true``) and the snapshot just saved are kept; every other one is evicted
+(``on_evict(agent_id, checkpoint_id)`` is called after each). Only the newest ``keep_last`` keep
+``trainer_state.pt``: resume only ever needs the latest snapshots.
 
 Writes go to ``.tmp-<id>-<rand>/`` and are moved into place with ``os.replace``.
 Replacing an existing id first moves it aside to ``.tmp-old-<id>-<rand>/``. Eviction
@@ -33,6 +40,7 @@ import re
 import shutil
 import time
 import uuid
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -177,12 +185,27 @@ def _clean_tmp_dirs(agent_dir: Path) -> None:
             logger.info(f"Removed stale checkpoint write dir {d}")
 
 
-class CheckpointManager:
-    """Saves checkpoints atomically and keeps a FIFO pool of ``pool_size`` per agent."""
+def _link_or_copy(src: Path, dst: Path) -> None:
+    """Hard-link ``src`` to ``dst``; copy when links are impossible (another file system, no support)."""
+    try:
+        os.link(src, dst)
+    except OSError:
+        shutil.copy2(src, dst)
 
-    def __init__(self, base_dir: str | Path, pool_size: int = 20) -> None:
+
+class CheckpointManager:
+    """Saves snapshots atomically and applies the retention rules per agent (module docstring)."""
+
+    def __init__(self, base_dir: str | Path, keep_last: int = 20, keep_every: int = 0, interval: int = 1,
+                 on_evict: Callable[[str, str], None] | None = None) -> None:
+        if keep_last < 1 or keep_every < 0 or interval < 1:
+            raise ValueError(f"CheckpointManager: need keep_last >= 1, keep_every >= 0, interval >= 1; got "
+                             f"{keep_last}, {keep_every}, {interval}")
         self._base_dir = Path(base_dir)
-        self._pool_size = pool_size
+        self._keep_last = int(keep_last)
+        self._keep_every = int(keep_every)
+        self._interval = int(interval)
+        self._on_evict = on_evict
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._index: dict[str, list[CheckpointInfo]] = {}
         self._scan()
@@ -218,7 +241,7 @@ class CheckpointManager:
         trainer_state: dict | bytes | None = None,
         meta_extra: dict | None = None,
     ) -> str:
-        """Write ``ckpt_v<policy_version>`` atomically and evict the oldest beyond ``pool_size``.
+        """Write ``ckpt_v<policy_version>`` atomically, then apply the retention rules (this snapshot is always kept).
 
         The files are written into ``.tmp-<id>-<rand>/`` and the directory is moved into
         place with ``os.replace``. An existing checkpoint with the same id is replaced.
@@ -258,14 +281,77 @@ class CheckpointManager:
         entries = [c for c in self._index.get(agent_id, []) if c.checkpoint_id != checkpoint_id]
         entries.append(CheckpointInfo(checkpoint_id, agent_id, int(policy_version), final_dir, timestamp, meta))
         entries.sort(key=lambda c: c.policy_version)
-        while len(entries) > self._pool_size:
-            victim = next(c for c in entries if c.checkpoint_id != checkpoint_id)
-            entries.remove(victim)
-            self._evict(agent_id, victim.checkpoint_id)
-            logger.debug(f"Evicted checkpoint {victim.checkpoint_id} of {agent_id}")
-        self._index[agent_id] = entries
-        logger.info(f"Saved checkpoint {checkpoint_id} of {agent_id} (pool {len(entries)}/{self._pool_size})")
+        self._index[agent_id] = self._retain(agent_id, entries, protect=checkpoint_id)
+        logger.info(f"Saved checkpoint {checkpoint_id} of {agent_id} (pool {len(self._index[agent_id])}; "
+                    f"keep_last {self._keep_last}, keep_every {self._keep_every})")
         return checkpoint_id
+
+    def _retain(self, agent_id: str, entries: list[CheckpointInfo], protect: str | None = None) -> list[CheckpointInfo]:
+        """Apply the retention rules to ``entries`` (sorted by version); returns the kept ones."""
+        newest = {c.checkpoint_id for c in entries[-self._keep_last:]}
+        period = self._interval * self._keep_every
+        keep = set(newest) | ({protect} if protect is not None else set())
+        for c in entries:
+            if (period > 0 and c.policy_version % period == 0) or c.meta.get("final") is True:
+                keep.add(c.checkpoint_id)
+        kept: list[CheckpointInfo] = []
+        for c in entries:
+            if c.checkpoint_id not in keep:
+                self._evict(agent_id, c.checkpoint_id)
+                logger.debug(f"Evicted checkpoint {c.checkpoint_id} of {agent_id}")
+                if self._on_evict is not None:
+                    self._on_evict(agent_id, c.checkpoint_id)
+                continue
+            kept.append(c)
+            if c.checkpoint_id not in newest:
+                (c.path / TRAINER_FILE).unlink(missing_ok=True)
+        return kept
+
+    def import_snapshots(self, src_checkpoints_dir: str | Path, agent_id: str,
+                         expected_signature: str | None = None) -> list[str]:
+        """Carry a previous run's snapshots of ``agent_id`` (``<src>/<agent_id>/ckpt_v*``) into this store.
+
+        ``model.pt`` and ``meta.json`` are hard-linked (copied where a link fails), ``trainer_state.pt`` never;
+        then the retention rules apply. The source is only read (no tmp cleanup), a malformed snapshot there
+        is a ConfigError (as a strict resume). Ids already in this store are skipped. With
+        ``expected_signature`` every source snapshot must carry that ``role_signature``. Returns the ids of the
+        agent's snapshots after retention.
+        """
+        src_agent = Path(src_checkpoints_dir) / check_agent_id(agent_id)
+        infos = _read_agent_dir(src_agent, strict=True)
+        if expected_signature is not None:
+            for info in infos:
+                signature = info.meta.get("role_signature")
+                if signature != expected_signature:
+                    raise ConfigError(
+                        f"Snapshot {info.path}: role signature {signature!r} differs from the agent's "
+                        f"{expected_signature!r}; the snapshot pool of the resumed run cannot be carried over "
+                        f"(resume from a checkpoint dir to start with an empty pool)"
+                    )
+        entries = list(self._index.get(agent_id, []))
+        present = {c.checkpoint_id for c in entries}
+        agent_dir = self._agent_dir(agent_id)
+        for info in infos:
+            if info.checkpoint_id in present:
+                continue
+            agent_dir.mkdir(parents=True, exist_ok=True)
+            tmp_dir = agent_dir / f"{_TMP_PREFIX}{info.checkpoint_id}-{uuid.uuid4().hex[:8]}"
+            tmp_dir.mkdir()
+            try:
+                for name in (MODEL_FILE, META_FILE):
+                    _link_or_copy(info.path / name, tmp_dir / name)
+                os.replace(tmp_dir, agent_dir / info.checkpoint_id)
+            except BaseException:
+                shutil.rmtree(tmp_dir, ignore_errors=True)
+                raise
+            entries.append(CheckpointInfo(info.checkpoint_id, agent_id, info.policy_version,
+                                          agent_dir / info.checkpoint_id, info.timestamp, dict(info.meta)))
+        entries.sort(key=lambda c: c.policy_version)
+        self._index[agent_id] = self._retain(agent_id, entries)
+        kept = [c.checkpoint_id for c in self._index[agent_id]]
+        if infos:
+            logger.info(f"Imported {len(infos)} snapshots of {agent_id} from {src_agent}; pool now {kept}")
+        return kept
 
     def _evict(self, agent_id: str, checkpoint_id: str) -> None:
         """Rename the checkpoint out of the ``ckpt_v*`` namespace, then delete it."""

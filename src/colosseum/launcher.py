@@ -416,6 +416,7 @@ class Launcher:
 
         # Resume (before any process starts: a bad resume source fails fast).
         resume_states = self._resolve_resume(setup.agent_configs, setup.role_specs)
+        self._import_snapshot_pool(coordinator)
 
         from colosseum.core.config import config_hash
         cfg_hash = config_hash(cfg)
@@ -785,6 +786,15 @@ class Launcher:
             self._env_step_counter.add(start_env_steps)
             logger.info(f"Resume: env-step counter continues from {start_env_steps}")
         return resume_states
+
+    def _import_snapshot_pool(self, coordinator: Coordinator) -> None:
+        """A resume from a run dir carries its snapshot pool into this run (spec block 4), before the first
+        lineups are drawn; a resume from a checkpoint dir or a .pt starts with an empty pool."""
+        from colosseum.coordinator.checkpoint_manager import RESUME_RUN_DIR, classify_resume_source
+
+        resume_from = self._config.training.resume_from
+        if resume_from and classify_resume_source(resume_from) == RESUME_RUN_DIR:
+            coordinator.import_snapshots(resume_from)
 
     def _save_checkpoint(self, payload: dict) -> None:
         aid = payload["agent_id"]

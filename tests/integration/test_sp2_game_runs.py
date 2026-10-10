@@ -89,7 +89,9 @@ def test_resume_continues_versions_and_checks_the_role_signature(tmp_path):
     assert f"(policy_version {version})" in second.log("main")
     assert f"env-step counter continues from {done}" in second.log("main")
     assert train_steps(second, "agent_0")[0] == version + 1
-    assert min(m["policy_version"] for m in metas(second, "agent_0")) > version
+    resumed = [m["policy_version"] for m in metas(second, "agent_0")]
+    # SP3 T2.1: the first run's stored snapshots are carried into the new pool (its final one is never evicted)
+    assert version in resumed and max(resumed) > version, (version, resumed)
 
     ckpt = first.root / "checkpoints" / "agent_0" / f"ckpt_v{version}"
     (ckpt / "meta.json").write_text(json.dumps({**final, "role_signature": "another-game"}))

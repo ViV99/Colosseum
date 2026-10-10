@@ -156,7 +156,8 @@ def _make_config(num_workers: int, run_parent: str):
         },
         checkpoint={
             "interval": 10**9,  # no checkpoints: every seat collects
-            "pool_size": 10,
+            "keep_last": 10,
+            "keep_every": 0,
             "save_optimizer": True,
         },
         run={"dir": run_parent, "name": f"bench-w{num_workers}"},

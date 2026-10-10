@@ -40,7 +40,8 @@ def test_defaults():
     m = cfg.matchmaking
     assert (m.mode, m.layouts, m.self_play_ratio, m.pfsp_exponent, m.latest_prob) == ("self_play", {}, 0.5, 1.0, 0.5)
     assert (m.teammates, m.teammate_self_prob, m.shuffle_seats) == ("self", 0.5, True)
-    assert (cfg.checkpoint.interval, cfg.checkpoint.pool_size, cfg.checkpoint.save_optimizer) == (1000, 20, True)
+    assert (cfg.checkpoint.interval, cfg.checkpoint.keep_last, cfg.checkpoint.save_optimizer) == (1000, 20, True)
+    assert cfg.checkpoint.keep_every == 10
     assert cfg.rollout.chunk_length == 256
     assert cfg.get_trainable_agent_ids() == ["agent_0"] and cfg.agent_roles("agent_0") is None
 

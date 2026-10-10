@@ -143,11 +143,11 @@ def test_full_pipeline_with_checkpoint_pool(tmp_path):
         # ~300 train steps before the env-step budget stops the run: checkpoints at
         # 40, 80, ... and a final one at stop -> the FIFO pool keeps the last 5
         # (exact versions depend on timing).
-        checkpoint={"interval": 40, "pool_size": 5},
+        checkpoint={"interval": 40, "keep_last": 5, "keep_every": 0},
     )
     run = make_test_run_dir(config, tmp_path)
     Launcher(config, run).launch()
-    ckpts = CheckpointManager(run.checkpoints, pool_size=5).list_checkpoints("agent_0")
+    ckpts = CheckpointManager(run.checkpoints, keep_last=5).list_checkpoints("agent_0")
     versions = [c.policy_version for c in ckpts]
     assert len(versions) == 5, versions
     assert all(a < b for a, b in zip(versions, versions[1:])), versions

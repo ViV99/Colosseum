@@ -28,7 +28,7 @@ from game_helpers import FakeAlgorithm, make_coordinator, make_test_config
 
 
 def make_config(**training) -> ColosseumConfig:
-    return make_test_config("solo", training=training, checkpoint={"pool_size": 2},
+    return make_test_config("solo", training=training, checkpoint={"keep_last": 2},
                             matchmaking={"latest_prob": 0.0, "shuffle_seats": False})
 
 
@@ -57,7 +57,7 @@ def test_eviction_never_touches_dirs_outside_base_dir(tmp_path):
     torch.save({k: torch.tensor(v) for k, v in sd().items()}, copied / "model.pt")
     (copied / "meta.json").write_text(json.dumps({"path": str(outside), "policy_version": 1}))
 
-    mgr = CheckpointManager(base, pool_size=2)
+    mgr = CheckpointManager(base, keep_last=2)
     mgr.save("agent_0", 2, sd(2))
     mgr.save("agent_0", 3, sd(3))
 
@@ -68,8 +68,8 @@ def test_eviction_never_touches_dirs_outside_base_dir(tmp_path):
 
 def test_scan_reads_only_own_dir_and_derives_path(tmp_path):
     base = tmp_path / "ckpts"
-    CheckpointManager(base, pool_size=5).save("a", 7, sd(7))
-    mgr = CheckpointManager(base, pool_size=5)
+    CheckpointManager(base, keep_last=5).save("a", 7, sd(7))
+    mgr = CheckpointManager(base, keep_last=5)
     info = mgr.latest("a")
     assert info.checkpoint_id == "ckpt_v7"
     assert info.path == base / "a" / "ckpt_v7"
@@ -77,7 +77,7 @@ def test_scan_reads_only_own_dir_and_derives_path(tmp_path):
 
 
 def test_save_is_atomic_on_failure(tmp_path, monkeypatch):
-    mgr = CheckpointManager(tmp_path, pool_size=5)
+    mgr = CheckpointManager(tmp_path, keep_last=5)
     mgr.save("a", 1, sd(1))
 
     def boom(*args, **kwargs):
@@ -122,7 +122,7 @@ def test_interrupted_eviction_never_leaves_a_half_deleted_checkpoint(tmp_path, m
     """Eviction renames the victim to ``.tmp-evict-*`` before deleting it, so a crash or a
     partial delete never leaves a ``ckpt_v*`` dir that breaks a strict run-dir resume (T5.4)."""
     run = tmp_path / "run"
-    mgr = CheckpointManager(run / "checkpoints", pool_size=2)
+    mgr = CheckpointManager(run / "checkpoints", keep_last=2)
     mgr.save("a", 1, sd(1))
     mgr.save("a", 2, sd(2))
     deleted: list[Path] = []
@@ -216,7 +216,7 @@ def test_normal_ids_still_work(tmp_path):
 
 
 def test_duplicate_id_is_replaced_not_duplicated(tmp_path):
-    mgr = CheckpointManager(tmp_path, pool_size=5)
+    mgr = CheckpointManager(tmp_path, keep_last=5)
     mgr.save("a", 3, sd(1.0))
     mgr.save("a", 3, sd(30.0), trainer_state={"policy_version": 3})
     assert [c.checkpoint_id for c in mgr.list_checkpoints("a")] == ["ckpt_v3"]
@@ -236,7 +236,7 @@ def test_trainer_state_bytes_written_verbatim(tmp_path):
 
 def test_resolve_resume_checkpoint_dir_run_dir_and_pt(tmp_path):
     base = tmp_path / "old_run" / "checkpoints"
-    mgr = CheckpointManager(base, pool_size=5)
+    mgr = CheckpointManager(base, keep_last=5)
     buf = io.BytesIO()
     torch.save({"policy_version": 12}, buf)
     mgr.save("agent_0", 5, sd(5), meta_extra={"env_steps": 500})

@@ -19,6 +19,10 @@ def test_training_resumes_from_the_sp2_run_dir(tmp_path):
     log = run.log("main")
     assert "Resume [agent_0]:" in log and f"(policy_version {SP2_CHECKPOINT_VERSION})" in log
     assert f"env-step counter continues from {SP2_CHECKPOINT_ENV_STEPS}" in log
-    versions = _versions(run.root / "checkpoints" / "agent_0")
-    assert versions and min(versions) > SP2_CHECKPOINT_VERSION       # T2.1: the imported ckpt_v3 joins the pool
+    agent_dir = run.root / "checkpoints" / "agent_0"
+    versions = _versions(agent_dir)
+    assert versions[0] == SP2_CHECKPOINT_VERSION and len(versions) >= 2   # the SP2 snapshot joined the new pool
+    imported = agent_dir / f"ckpt_v{SP2_CHECKPOINT_VERSION}"
+    assert sorted(p.name for p in imported.iterdir()) == ["meta.json", "model.pt"]   # final: kept; no trainer state
+    assert "snapshot pool carried over" in log
     assert _versions(source / "checkpoints" / "agent_0") == [SP2_CHECKPOINT_VERSION]  # the source is untouched

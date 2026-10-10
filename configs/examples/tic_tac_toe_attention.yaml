@@ -44,7 +44,7 @@ matchmaking:
 
 checkpoint:
   interval: 100
-  pool_size: 10
+  keep_last: 10
 
 metrics:
   use_wandb: false

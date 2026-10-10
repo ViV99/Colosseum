@@ -54,7 +54,7 @@ matchmaking:
 
 checkpoint:
   interval: 100            # train steps
-  pool_size: 10
+  keep_last: 10
   save_optimizer: true
 
 metrics:

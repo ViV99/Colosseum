@@ -44,7 +44,7 @@ matchmaking:
 
 checkpoint:
   interval: 10
-  pool_size: 5
+  keep_last: 5
   save_optimizer: true
 
 metrics:

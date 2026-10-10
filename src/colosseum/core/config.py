@@ -13,6 +13,7 @@ section are gone (the game structure comes from the env's ``GameSpec``); new are
 is at least 2.
 
 SP3: ``agents.<id>.kind`` (trainable / scripted / frozen) and the implicit trainable ``agent_0``.
+SP3: ``checkpoint.keep_last`` / ``keep_every`` (``pool_size`` is read as ``keep_last``).
 """
 
 from __future__ import annotations
@@ -21,6 +22,7 @@ import copy
 import datetime
 import hashlib
 import json
+import logging
 import re
 import types
 import typing
@@ -40,6 +42,8 @@ from pydantic import (
 )
 
 from colosseum.core.errors import ConfigError
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Ids used as path components
@@ -408,15 +412,26 @@ class MatchmakingConfig(StrictModel):
 
 
 class CheckpointConfig(StrictModel):
-    """Checkpoint settings. Checkpoints are stored in the run dir (``<run>/checkpoints/``)."""
+    """Snapshot storage (SP3 spec block 4). Snapshots live in the run dir (``<run>/checkpoints/``).
+
+    Kept: the newest ``keep_last`` (with ``trainer_state.pt``), every snapshot whose version is a multiple of
+    ``interval * keep_every`` (``model.pt`` + ``meta.json``), and every final snapshot. ``pool_size`` (SP2) is
+    read as ``keep_last`` with a warning.
+    """
 
     interval: int = Field(
         default=1000, ge=1,
         description="Save a checkpoint every N TRAINING steps (optimizer updates / policy versions), not env "
                     "steps (was self_play.checkpoint_interval).",
     )
-    pool_size: int = Field(
-        default=20, ge=1, description="Max checkpoints kept in the FIFO pool per agent (was self_play.pool_size).",
+    keep_last: int = Field(
+        default=20, ge=1,
+        description="The newest N snapshots per agent are kept, with trainer_state.pt (was pool_size, a FIFO pool).",
+    )
+    keep_every: int = Field(
+        default=10, ge=0,
+        description="Also keep every snapshot whose version is a multiple of interval * keep_every (model.pt and "
+                    "meta.json only); 0 = off.",
     )
     save_optimizer: bool = Field(
         default=True,
@@ -424,6 +439,21 @@ class CheckpointConfig(StrictModel):
                     "kickstart, counters) as trainer_state.pt. Without it a resume restores weights and "
                     "policy_version only.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _translate_pool_size(cls, data: Any) -> Any:
+        """SP2's ``pool_size`` is ``keep_last`` (one warning); both together are an error."""
+        if not isinstance(data, dict) or "pool_size" not in data:
+            return data
+        if "keep_last" in data:
+            raise ValueError("checkpoint.pool_size (SP2) and checkpoint.keep_last are both set; keep only keep_last "
+                             "(pool_size is its old name)")
+        data = dict(data)
+        data["keep_last"] = data.pop("pool_size")
+        logger.warning(f"checkpoint.pool_size is the SP2 name of checkpoint.keep_last; read as keep_last: "
+                       f"{data['keep_last']} (rename it in the config)")
+        return data
 
 
 class MetricsConfig(StrictModel):
@@ -854,6 +884,11 @@ def _check_override_path(parts: list[str]) -> None:
             raise ConfigError(f"Cannot set '{'.'.join(parts)}': '{'.'.join(parts[:i])}' is not a section")
 
 
+# Old (SP2) knobs that ``--set`` accepts although they are not in the schema: the config models translate
+# them (one warning each) and never store them.
+LEGACY_OVERRIDE_KEYS: set[str] = {"checkpoint.pool_size"}
+
+
 def apply_overrides(data: dict, overrides: dict[str, Any]) -> dict:
     """Return a copy of raw config ``data`` with dotted-path ``overrides`` applied.
 
@@ -865,7 +900,8 @@ def apply_overrides(data: dict, overrides: dict[str, Any]) -> dict:
         parts = key.split(".")
         if not all(parts):
             raise ConfigError(f"Malformed override key '{key}'")
-        _check_override_path(parts)
+        if key not in LEGACY_OVERRIDE_KEYS:
+            _check_override_path(parts)
         node = out
         for part in parts[:-1]:
             child = node.get(part)

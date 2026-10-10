@@ -146,7 +146,12 @@ def test_resume_continues_versions_env_steps_and_lr(tmp_path):
     second_train = [r for r in second.records("train") if r["agent"] == "agent_0"]
     assert second_train[0]["train_step"] == first_final + 1, (first_final, second_train[0])
     versions = checkpoint_versions(second, "agent_0")
-    assert versions and min(versions) > first_final, (first_final, versions)
+    assert [v for v in versions if v > first_final], (first_final, versions)
+    # SP3 T2.1: a run-dir resume carries the first run's stored snapshots (model.pt + meta.json) into the pool
+    carried = [v for v in versions if v <= first_final]
+    assert first_final in carried and set(carried) <= set(checkpoint_versions(first, "agent_0")), (carried, versions)
+    assert not any((second.root / "checkpoints" / "agent_0" / f"ckpt_v{v}" / "trainer_state.pt").is_file()
+                   for v in carried)
     assert versions[-1] == max(r["train_step"] for r in second_train), (versions, second_train[-1])
     second_meta = final_meta(second, "agent_0")
     assert second_meta["final"] is True and second_meta["env_steps"] >= budget
