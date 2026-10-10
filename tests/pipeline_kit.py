@@ -74,7 +74,8 @@ UNIT_HARVEST = PipelineGame("unit_harvest_league", "greedy", "examples.unit_harv
 TIC_TAC_TOE_SMOKE = PipelineSettings(record_matches=20, bc_epochs=2, critic_warmup_steps=2, kickstart_teacher=BC_NET,
                                      kickstart_lambda=1.0, kickstart_decay_steps=50, eval_matches=4,
                                      train_sets=SMOKE_SETTINGS)
-# T6.4 calibration (ruling): budgets of the slow unit_harvest pipeline test.
+# T6.4 calibration (ruling): budgets of the slow unit_harvest pipeline test, kept as set in T6.2; measured
+# (seeds 0-2, 8 cores): record 17 s, bc 9 s, train 101-104 s, eval 19 s, the whole test 146-149 s.
 UNIT_HARVEST_SETTINGS = PipelineSettings(record_matches=300, bc_epochs=5, critic_warmup_steps=30,
                                          kickstart_teacher="greedy", kickstart_lambda=1.0, kickstart_decay_steps=300,
                                          eval_matches=60, train_sets={"rollout.num_workers": 2}, init_from="path")
