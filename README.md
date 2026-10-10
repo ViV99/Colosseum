@@ -75,10 +75,11 @@ colosseum eval -c configs/examples/unit_harvest_league.yaml -a trained=$NEW -a g
   --num-matches 100 --deterministic
 ```
 
-On an 8-core CPU recording takes about 17 s, BC about 17 s and training about 126 s (wall clock with process
-start-up; measured once, 2026-10-10). The trained agent beats `random` in 100% of games and scores 0.50 against
-`greedy` (win = 1, draw = 0.5; on this game a good policy mostly draws with the bot: all 100 games were draws). Recipes for leagues, anchors, asymmetric games and custom matchmakers:
-[`docs/LEAGUE_GUIDE.md`](docs/LEAGUE_GUIDE.md) (Russian). `data/` and `bc.pt` are yours to delete.
+On an 8-core CPU recording takes about 17 s, BC about 17 s and training about 126 s (wall clock with process start-up;
+measured once, 2026-10-10). The trained agent beats `random` in 100% of games and scores 0.50 against `greedy` (win 1,
+draw 0.5; on this game a good policy mostly draws with the bot: all 100 games were draws). Recipes for leagues,
+anchors, asymmetric games and custom matchmakers: [`docs/LEAGUE_GUIDE.md`](docs/LEAGUE_GUIDE.md) (Russian). `data/`
+and `bc.pt` are yours to delete.
 
 ## Demo games
 
@@ -280,7 +281,7 @@ Inside a list, YAML 1.1 rules apply: `--set x=[1e-4,2]` keeps `1e-4` as a string
 | `matchmaking` | `opponents` (`latest` 0.7, `snapshots` 0.2, `rivals` 0, `anchors` 0.1; each a number or a schedule `{env_step: share}`), `anchors` (null = every scripted and frozen agent; a list of names or `{name: weight-or-schedule}`), `pfsp` (`weighting` `hard` / `balanced` / `uniform`, `exponent` 2.0, `halflife_games` 200), `layouts` (`{layout: weight}`; empty = every layout equally), `teammates` (`self` / `mixed`), `teammate_self_prob` 0.5, `shuffle_seats` (true), `matchmaker_class` (null; a `colosseum.league.BaseMatchmaker` subclass). SP2's `mode`, `self_play_ratio`, `latest_prob`, `pfsp_exponent` are translated with one warning |
 | `checkpoint` | `interval` 1000 (train steps), `keep_last` 20, `keep_every` 10 (every N-th snapshot kept for good; 0 = off), `save_optimizer` (true); the final snapshot is never deleted; SP2's `pool_size` = `keep_last` |
 | `init` | `from` (null; `.pt`, checkpoint dir, run dir or a frozen agent's name), `strict` (true; false loads tensors with matching names and shapes), `critic_warmup_steps` 0 (train steps that update only the value path) |
-| `kickstart` | `teacher` (null; a frozen or scripted agent's name, a `.pt` or a checkpoint dir), `lambda` 1.0, `decay_steps` 50000 (train steps after the warm-up), `kl` (`forward` / `reverse`, neural teachers) |
+| `kickstart` | `teacher` (null; a frozen or scripted agent's name, a checkpoint dir, or a `.pt` built with the student's architecture), `lambda` 1.0, `decay_steps` 50000 (train steps after the warm-up), `kl` (`forward` / `reverse`, neural teachers) |
 | `metrics` | `log_interval` 10 (train steps), `console_interval_sec` 10, `use_wandb` (false), `wandb_project` (`colosseum`), `wandb_entity` |
 | `bc` | `seq_len` 64 (sequence length for stateful models in `colosseum bc`) |
 | `transport` | `grpc_max_message_mb` 64 (distributed mode); `mode` and `grpc_port` are unused until SP5 |
@@ -333,10 +334,12 @@ recorded action (the mean over valid deciders for actions with units); masks are
 mask forbids is a data error.
 
 Warm start is per agent (`init`, `kickstart`; global sections are the defaults): `init.from` loads weights only
-(strict, or partial with `strict: false`), `critic_warmup_steps` first trains the value path alone while the workers
-keep the initial policy bit for bit, and `kickstart` adds `lambda * KL(teacher‖student)` per decider (a neural teacher
-of any architecture) or `lambda * -log pi(teacher's action)` (a scripted teacher, DAgger labels written by the
-workers), decaying linearly over `decay_steps` after the warm-up. `training.resume_from` takes precedence over `init`.
+(strict, or partial with `strict: false`), `critic_warmup_steps` first trains the value path alone while the learner's
+policy stays bit-identical (the workers act with their own initial weights until the first weight sync, as in SP2),
+and `kickstart` adds `lambda * KL(teacher‖student)` per decider (a neural teacher: a frozen agent or a checkpoint dir
+brings its own architecture, a bare `.pt` path is built with the student's) or `lambda * -log pi(teacher's action)` (a
+scripted teacher, DAgger labels written by the workers), decaying linearly over `decay_steps` after the warm-up.
+`training.resume_from` takes precedence over `init`.
 
 ## Evaluation
 
