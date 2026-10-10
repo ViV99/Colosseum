@@ -40,7 +40,7 @@ from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
 
 if TYPE_CHECKING:
-    from colosseum.learner.factory import TeacherSpec
+    from colosseum.learner.factory import InitState, TeacherSpec
 
 logger = logging.getLogger(__name__)
 
@@ -227,6 +227,7 @@ def _learner_main(
     seed: int | None = None,
     spec: GameSpec | None = None,
     teacher: TeacherSpec | None = None,
+    init_state: InitState | None = None,
 ) -> None:
     """Learner process body (see ``_learner_target``).
 
@@ -234,10 +235,11 @@ def _learner_main(
     when ``learner.torch_threads`` is unset. ``seed`` (from ``utils.seeding.learner_seed``) seeds
     this process before the model is built. The model is built for ``role_spec``, the spaces of the
     agent's roles. The algorithm (and a kickstart teacher resolved by the main process) is built by
-    ``learner.factory.build_algorithm``.
+    ``learner.factory.build_algorithm``; ``init_state`` (resolved by the main process) is loaded into the
+    fresh model: weights only, so policy version 0, a fresh optimizer and zero counters.
     """
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
-    from colosseum.learner.factory import build_algorithm
+    from colosseum.learner.factory import apply_init, build_algorithm
     from colosseum.learner.learner import learner_process, resolve_device
     from colosseum.utils.seeding import apply_global_seed
 
@@ -250,7 +252,10 @@ def _learner_main(
     ))
 
     def algorithm_factory():
-        return build_algorithm(config, role_spec, spec, device=device, teacher=teacher)
+        algorithm = build_algorithm(config, role_spec, spec, device=device, teacher=teacher)
+        if init_state is not None:
+            apply_init(algorithm.model, init_state)   # weights only: version 0, fresh optimizer
+        return algorithm
 
     learner_process(
         agent_id=agent_id,
@@ -352,6 +357,8 @@ class Launcher:
         self._checkpoint_meta: dict[str, dict] = {}
         # Set by launch(): every trainable agent's kickstart teacher, resolved in this process (numpy specs).
         self._teachers: dict[str, TeacherSpec | None] = {}
+        # Set by launch(): every trainable agent's init weights (numpy), None when absent or resumed.
+        self._init_states: dict[str, InitState | None] = {}
         # Per worker: snapshots evicted by the storage that are still to be delivered ({agent: ids}).
         self._worker_evictions: list[dict[str, set[str]]] = []
         # Set by launch(): the main process's single metrics sink (T6.3) and its queue-depth source.
@@ -405,6 +412,7 @@ class Launcher:
         from colosseum.learner.factory import resolve_teacher
         # Kickstart teachers are resolved here (ConfigError before any process starts) into numpy specs.
         self._teachers = {aid: resolve_teacher(cfg, aid, setup.spec) for aid in trainable_agents}
+        self._init_states = self._resolve_init(setup.spec, resume_states)
 
         from colosseum.core.config import config_hash
         cfg_hash = config_hash(cfg)
@@ -564,6 +572,7 @@ class Launcher:
                     seed=learner_seed(cfg.training.seed, agent_index),
                     spec=setup.spec,
                     teacher=self._teachers.get(aid),
+                    init_state=self._init_states.get(aid),
                 ),
                 daemon=True,
             )
@@ -791,6 +800,26 @@ class Launcher:
             self._env_step_counter.add(start_env_steps)
             logger.info(f"Resume: env-step counter continues from {start_env_steps}")
         return resume_states
+
+    def _resolve_init(self, spec: GameSpec, resume_states: Mapping[str, dict | None]) -> dict[str, InitState | None]:
+        """``init`` weights per trainable agent (spec block 6). An agent restored by ``training.resume_from``
+        ignores ``init`` (logged), so a run continues with the same config."""
+        from colosseum.learner.factory import resolve_init
+
+        states: dict[str, InitState | None] = {}
+        for aid in self._config.get_trainable_agent_ids():
+            resumed = resume_states.get(aid)
+            if resumed is not None:
+                if self._config.get_agent_config(aid).init.from_ is not None:
+                    logger.info(f"Agent '{aid}' resumes from {resumed['source']}; its init.from is ignored")
+                states[aid] = None
+                continue
+            state = resolve_init(self._config, aid, spec)
+            if state is not None:
+                for line in state.report:
+                    logger.info(line)
+            states[aid] = state
+        return states
 
     def _import_snapshot_pool(self, coordinator: Coordinator) -> None:
         """A resume from a run dir carries its snapshot pool into this run (spec block 4), before the first
