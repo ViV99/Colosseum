@@ -2,8 +2,10 @@
 
 The player (a scripted or frozen agent of the config, or ``name=path`` for a checkpoint dir or a
 ``.pt``) plays on the eval engine (``play_lineups`` on ``MatchRunner``):
-- without opponents it takes every seat of every layout it can fill, and every seat is recorded;
-  a layout with a role the player does not play needs ``--against``;
+- without opponents it takes every seat of every layout it can fill, and every seat is recorded.
+  Without ``--layout``, the layouts with a role the player does not play are skipped with one INFO
+  line naming them (ruling P8); a ConfigError ("add --against") only when no layout is left or an
+  explicit ``--layout`` cannot be filled by the player alone;
 - every opponent (``--against``) forms a pair with the player, scheduled like ``colosseum eval``
   (``schedule_lineups``: the orientation rotates per match, ``num_matches`` per pair and layout);
   only the player's seats are recorded.
