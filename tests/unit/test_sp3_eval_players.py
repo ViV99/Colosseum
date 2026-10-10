@@ -14,6 +14,7 @@ from colosseum.cli import main
 from colosseum.core.config import load_config
 from colosseum.core.errors import ConfigError
 from colosseum.core.registry import build_model
+from colosseum.core.types import Lineup, SeatAssignment
 from colosseum.eval import evaluate, play_lineups, schedule_lineups
 from colosseum.players import ScriptedBot
 from colosseum.players.registry import BotSpec, make_bot
@@ -66,6 +67,17 @@ def test_play_lineups_takes_bot_prototypes_and_scripted_players():
     rnd = ScriptedPlayer(functools.partial(make_bot, BotSpec("colosseum.players.RandomBot", {}), spec))
     assert len(play_lineups(env_fn=TurnTakingGame, models={"net": model, "bot": rnd}, lineups=lineups,
                             num_envs=2, seed=0)) == 4
+
+
+def test_play_lineups_never_collects_so_default_seat_assignments_work_for_bots():
+    spec = TurnTakingGame().spec
+    model = make_test_model(spec.roles["player"])
+    lineups = [Lineup("2p", [SeatAssignment("net"), SeatAssignment("bot")]),        # default collect=True
+               Lineup("2p", [SeatAssignment("bot"), SeatAssignment("net")])]
+    results = play_lineups(env_fn=TurnTakingGame, models={"net": model, "bot": FirstLegalBot()}, lineups=lineups,
+                           num_envs=2, seed=0)
+    assert len(results) == 2 and {s.agent_id for r in results for s in r.seats} == {"net", "bot"}
+    assert all(seat.collect for lineup in lineups for seat in lineup.seats)    # the caller's lineups are untouched
 
 
 def test_evaluate_takes_scripted_and_frozen_agents_by_name(tmp_path):

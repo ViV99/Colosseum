@@ -45,6 +45,7 @@ from __future__ import annotations
 
 import contextlib
 import copy
+import dataclasses
 import functools
 import itertools
 import json
@@ -250,12 +251,15 @@ def play_lineups(
 ) -> list[MatchResult]:
     """Play every lineup once, to completion; one ``MatchResult`` per lineup, in completion order.
 
+    Evaluation never collects: every seat is played with ``collect=False`` (copies of the lineups; the
+    caller's are not changed), so a default ``SeatAssignment(agent_id)`` works for a scripted seat too.
     ``seed`` seeds the episode resets and a forked torch RNG, so the caller's global RNG is
     untouched. Models run in eval mode; their train/eval flags are restored on return. Scripted players
     need no eval mode; a ``ScriptedBot`` instance is never played itself (deep copies are).
     ``observer`` (optional) sees every decision and episode of the scheduled lineups; see ``_Collector``.
     """
-    lineups = list(lineups)
+    lineups = [Lineup(lineup.layout, [dataclasses.replace(seat, collect=False) for seat in lineup.seats])
+               for lineup in lineups]
     if not lineups:
         return []
     unknown = sorted({seat.agent_id for lineup in lineups for seat in lineup.seats} - set(models))

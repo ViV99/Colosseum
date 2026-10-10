@@ -74,7 +74,7 @@ def test_random_bot_anchor_is_beaten_while_only_latest_seats_collect():
 
     def solved(models) -> bool:
         greedy = GreedyPolicy(models["agent_0"], action_spec)
-        eval_seats = [SeatAssignment("g"), SeatAssignment("random", collect=False)]
+        eval_seats = [SeatAssignment("g"), SeatAssignment("random")]          # play_lineups never collects
         results = play(DuelBandit, {"g": greedy, "random": random_player},
                        [Lineup("2p", eval_seats if m % 2 == 0 else eval_seats[::-1]) for m in range(64)])
         return win_rate(results, "g") >= 0.9
