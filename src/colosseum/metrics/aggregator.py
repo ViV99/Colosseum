@@ -10,9 +10,9 @@ from typing import Any
 
 import numpy as np
 
-from colosseum.core.types import LATEST_NETWORK_ID, MatchResult, SeatResult
+from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, MatchResult, SeatResult
 
-OPPONENT_TYPES = ("latest", "past", "arena")
+OPPONENT_TYPES = ("latest", "past", "arena", "anchor")
 # Default cadence of worker stats (``rollout_worker_process(stats_interval_sec=...)``).
 WORKER_STATS_INTERVAL_SEC = 2.0
 
@@ -20,13 +20,15 @@ WORKER_STATS_INTERVAL_SEC = 2.0
 def opponent_type(result: MatchResult, seat: SeatResult) -> str | None:
     """Kind of opposition a seat met; teammates are not opponents.
 
-    'arena' (a seat of another team plays another agent), 'past' (one plays a checkpoint of the
-    seat's agent), 'latest' (all play the agent's latest weights), or None (no other team: solo
-    or cooperative layouts).
+    'anchor' (a seat of another team is played by a scripted or frozen agent), 'arena' (a seat of another
+    team plays another agent), 'past' (one plays a snapshot of the seat's agent), 'latest' (all play the
+    agent's latest weights), or None (no other team: solo or cooperative layouts).
     """
     opponents = [s for s in result.seats if s.team != seat.team]
     if not opponents:
         return None
+    if any(s.network_id == FIXED_NETWORK_ID for s in opponents):
+        return "anchor"
     if any(s.agent_id != seat.agent_id for s in opponents):
         return "arena"
     if any(s.network_id != LATEST_NETWORK_ID for s in opponents):

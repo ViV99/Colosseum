@@ -79,21 +79,21 @@ def test_episode_aggregator_wdl_from_team_ranks_and_layout_breakdown():
                    {0: 1, 1: 2, 2: 2, 3: 4}, length=10))
     agg.add(result("solo", [seat(0, 0, "s", reward=3.0)], {0: 1}, scores={0: 3.0}, length=10))
     out = agg.flush()
-    assert out["a"]["wdl"] == {"latest": [1, 2, 3], "past": [1, 0, 0], "arena": [1, 0, 0]}
+    assert out["a"]["wdl"] == {"latest": [1, 2, 3], "past": [1, 0, 0], "arena": [1, 0, 0], "anchor": [0, 0, 0]}
     assert out["a"]["episodes"] == 8 and out["a"]["seat_counts"] == [3, 3, 1, 1]
     assert out["b"]["wdl"]["arena"] == [0, 0, 1]
     assert out["s"]["return_mean"] == 3.0 and out["s"]["wdl"]["latest"] == [0, 0, 0]
     four = out["a"]["by_layout"]["4p"]["player"]
     assert four["episodes"] == 4 and four["eliminated_frac"] == 0.25
     assert four["length_mean"] == 10.0 and four["wdl"] == {"latest": [1, 0, 3], "past": [0, 0, 0],
-                                                           "arena": [0, 0, 0]}
+                                                           "arena": [0, 0, 0], "anchor": [0, 0, 0]}
     two = out["a"]["by_layout"]["2p"]["player"]  # the checkpoint seat of the first duel is not a's
     assert two["episodes"] == 4 and two["length_mean"] == pytest.approx((7 + 9 + 9 + 5) / 4)
-    assert two["wdl"] == {"latest": [0, 2, 0], "past": [1, 0, 0], "arena": [1, 0, 0]}
+    assert two["wdl"] == {"latest": [0, 2, 0], "past": [1, 0, 0], "arena": [1, 0, 0], "anchor": [0, 0, 0]}
     assert out["b"]["by_layout"]["2p"]["player"]["wdl"]["arena"] == [0, 0, 1]
     assert out["s"]["by_layout"] == {"solo": {"player": {
         "episodes": 1, "return_mean": 3.0, "length_mean": 10.0, "team_score_mean": 3.0, "eliminated_frac": 0.0,
-        "wdl": {"latest": [0, 0, 0], "past": [0, 0, 0], "arena": [0, 0, 0]}}}}
+        "wdl": {"latest": [0, 0, 0], "past": [0, 0, 0], "arena": [0, 0, 0], "anchor": [0, 0, 0]}}}}
     assert set(out["a"]["by_layout"]) == {"2p", "4p"}
     assert agg.flush() == {}
 

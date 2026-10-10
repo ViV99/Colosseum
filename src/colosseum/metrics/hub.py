@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import numbers
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from pathlib import Path
 from typing import Any
 
@@ -63,14 +63,22 @@ def wr_vs_past_over_layouts(layouts: Mapping[str, Mapping[str, Any]], agent_id: 
     return total / weight if weight else None
 
 
-def wr_arena_over_layouts(layouts: Mapping[str, Mapping[str, Any]], agent_id: str) -> float | None:
+def _ratings_row(ratings: Mapping[str, Mapping[str, Any]]) -> dict[str, dict[str, Any]]:
+    """Ratings for WandB without the PFSP tables: one column per (owner, snapshot) would grow without bound;
+    they stay in metrics.jsonl and ratings.json."""
+    return {layout: {k: v for k, v in table.items() if k != "pfsp"} for layout, table in ratings.items()}
+
+
+def wr_arena_over_layouts(layouts: Mapping[str, Mapping[str, Any]], agent_id: str,
+                          opponents: Collection[str] | None = None) -> float | None:
     """Win rate of ``agent_id`` against other agents over all layouts, weighted by ``games``
-    (counted member pairs per opponent, not matches; see ``RatingBook``)."""
+    (counted member pairs per opponent, not matches; see ``RatingBook``). ``opponents`` limits the
+    opponents counted (the hub passes the trainable agents: anchors stay out of the arena win rate)."""
     total = games = 0.0
     for table in layouts.values():
         rates = table.get("win_rates", {}).get(agent_id, {})
         for other, n in table.get("games", {}).get(agent_id, {}).items():
-            if n:
+            if n and (opponents is None or other in opponents):
                 total += rates[other] * n
                 games += n
     return total / games if games else None
@@ -83,7 +91,8 @@ class MetricsHub:
     records (``ratings``: ``{"env_steps", "layouts"}`` with one table set per layout), rewrites
     ``ratings.json`` with the same content and prints one console line per agent (ratings
     aggregated over layouts). ``initial_env_steps`` / ``initial_train_steps`` are the counters
-    a resumed run continues from (rate baselines, see ``SystemStats``).
+    a resumed run continues from (rate baselines, see ``SystemStats``). ``agent_ids`` are the trainable
+    agents: one console line each, and the only opponents of the console's arena win rate (ruling P11).
     """
 
     def __init__(self, *, writer: MetricsWriter, ratings_path: str | Path, agent_ids: list[str],
@@ -142,7 +151,7 @@ class MetricsHub:
         write_json_atomic(self._ratings_path, {"env_steps": int(env_steps), "layouts": ratings})
         if self._wandb is not None:
             row = flatten("system", {k: v for k, v in system.items() if k != "env_steps"})
-            row.update(flatten("ratings", ratings))
+            row.update(flatten("ratings", _ratings_row(ratings)))
             for agent_id, ep in episodes.items():
                 row.update(flatten(f"episodes/{agent_id}", _episodes_row(ep)))
             self._wandb.log_global(row, int(env_steps))
@@ -162,7 +171,7 @@ class MetricsHub:
                 entropy=train.get("entropy"),
                 return_mean=self._last_returns.get(agent_id),
                 wr_vs_past=wr_vs_past_over_layouts(ratings, agent_id),
-                wr_arena=wr_arena_over_layouts(ratings, agent_id),
+                wr_arena=wr_arena_over_layouts(ratings, agent_id, opponents=self._agent_ids),
             ))
         self._console.emit(lines)
 

@@ -5,7 +5,8 @@ Manages:
   in config order and one ``Lineup`` per env (``LineupMatchmaker`` until T3.2);
 - checkpoint storage (learner checkpoint payloads -> ``CheckpointManager``; ``meta.json`` gets the
   agent's roles and their role signature);
-- match results and per-layout ratings (``RatingBook``).
+- match results, per-layout ratings of every player (``RatingBook``) and the PFSP statistics per player
+  (``PfspStats``).
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from colosseum.core.errors import ConfigError
 from colosseum.core.roles import agent_role_spec, role_signature
 from colosseum.core.types import Lineup, MatchResult
 from colosseum.envs.game import GameSpec
+from colosseum.league.pfsp import DEFAULT_HALFLIFE_GAMES, PfspStats
 
 logger = logging.getLogger(__name__)
 
@@ -50,11 +52,12 @@ class Coordinator:
         self._rng = random.Random(config.training.seed)
         ckpt = config.checkpoint
         self._evicted: dict[str, list[str]] = {}   # evicted since the last take_evictions(), per agent
+        self._pfsp = PfspStats({a: DEFAULT_HALFLIFE_GAMES for a in trainable})
         self._checkpoint_manager = CheckpointManager(
             base_dir=checkpoint_dir, keep_last=ckpt.keep_last, keep_every=ckpt.keep_every, interval=ckpt.interval,
             on_evict=self._on_evict,
         )
-        self._ratings = RatingBook(spec, trainable)
+        self._ratings = RatingBook(spec, players)   # every player is a rating entity
         self._role_signatures = {a: role_signature(agent_role_spec(spec, roles))
                                  for a, roles in self._agent_roles.items()}
         self._match_results: deque[MatchResult] = deque(maxlen=10000)
@@ -83,6 +86,11 @@ class Coordinator:
         return self._ratings
 
     @property
+    def pfsp(self) -> PfspStats:
+        """PFSP statistics per player (read by the matchmaker)."""
+        return self._pfsp
+
+    @property
     def matchmaker(self) -> LineupMatchmaker:
         return self._matchmaker
 
@@ -103,8 +111,10 @@ class Coordinator:
 
     def _on_evict(self, agent_id: str, checkpoint_id: str) -> None:
         """Storage evicted a snapshot (spec block 4): new lineups no longer draw it (the matchmaker's
-        candidates come from the store), and workers are told to unload it (``take_evictions``)."""
+        candidates come from the store), its PFSP statistics are dropped, and workers are told to unload it
+        (``take_evictions``)."""
         logger.debug(f"Snapshot {checkpoint_id} of {agent_id} evicted")
+        self._pfsp.forget((agent_id, checkpoint_id))
         bucket = self._evicted.setdefault(agent_id, [])
         if checkpoint_id not in bucket:
             bucket.append(checkpoint_id)
@@ -140,17 +150,22 @@ class Coordinator:
                 for e in range(num_envs)]
 
     def report_match_result(self, result: MatchResult) -> None:
-        """Keep the result and update the ratings of its layout."""
+        """Keep the result; update the ratings and the PFSP statistics of its layout."""
         self._match_results.append(result)
         self._ratings.update(result)
+        self._pfsp.update(result)
 
     @property
     def match_results(self) -> list[MatchResult]:
         return list(self._match_results)
 
     def ratings_snapshot(self) -> dict:
-        """``RatingBook.snapshot()``: JSON-serializable tables per layout."""
-        return self._ratings.snapshot()
+        """``RatingBook.snapshot()`` with each layout's PFSP table under ``"pfsp"`` (JSON-serializable)."""
+        snap = self._ratings.snapshot()
+        pfsp = self._pfsp.snapshot()
+        for layout, table in snap.items():
+            table["pfsp"] = pfsp.get(layout, {})
+        return snap
 
     def save_checkpoint_payload(self, payload: dict, meta_extra: dict | None = None) -> str:
         """Persist a learner checkpoint payload (see ``learner.make_checkpoint_payload``).

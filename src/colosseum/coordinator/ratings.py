@@ -1,10 +1,12 @@
 """Ratings per layout (spec block 7).
 
 Every layout of the game has its own tables; a result of a layout the game does not have is
-rejected (ValueError), never given new tables. Rating entities follow SP1's code (overview,
-"Deviations"): ELO and the win-rate matrix are keyed by the base ``agent_id``, so a checkpoint of
-X playing Y counts as X vs Y; "latest of X vs a checkpoint of X" feeds ``wr_vs_past``; two seats of the same
-agent that are both latest (or both checkpoints) carry no signal and are skipped.
+rejected (ValueError), never given new tables. Rating entities: ELO and the win-rate matrix are keyed by
+the base ``agent_id`` (SP2): a snapshot of X playing Y counts as X vs Y (snapshot ratings are SP4); scripted
+and frozen agents (network ``"fixed"``) are entities of their own (SP3). "Latest of X vs a snapshot of X"
+feeds ``wr_vs_past``; two seats of the same agent that are both latest (or both not latest) carry no signal
+and are skipped. Member pairs carry the network ids of both sides (PFSP statistics per player,
+``colosseum.league.pfsp``).
 
 Layouts with two or more teams (``wdl`` / ``rank``): every pair of teams (A, B) is one comparison
 by team rank (``pairwise_rank_score``). Its weight ``1 / (T - 1)`` (times ``k_factor`` for ELO) is
@@ -38,7 +40,8 @@ class MemberPair:
     """One counted comparison between seats of two different teams.
 
     ``cross``: different agents ``a`` and ``b``. ``past``: ``a`` is an agent's latest weights and
-    ``b`` (== ``a``) one of its checkpoints. ``score_a`` is from ``a``'s side.
+    ``b`` (== ``a``) one of its checkpoints. ``score_a`` is from ``a``'s side. ``net_a`` / ``net_b``: the
+    network ids of the two sides.
     """
 
     kind: Literal["cross", "past"]
@@ -48,17 +51,19 @@ class MemberPair:
     weight: float
     role_a: str = ""
     role_b: str = ""
+    net_a: str = ""
+    net_b: str = ""
 
 
 def _classify(sa: SeatResult, sb: SeatResult, score: float) -> tuple | None:
     if sa.agent_id != sb.agent_id:
-        return "cross", sa.agent_id, sb.agent_id, score, sa.role, sb.role
+        return "cross", sa.agent_id, sb.agent_id, score, sa.role, sb.role, sa.network_id, sb.network_id
     a_latest = sa.network_id == LATEST_NETWORK_ID
     b_latest = sb.network_id == LATEST_NETWORK_ID
     if a_latest and not b_latest:
-        return "past", sa.agent_id, sa.agent_id, score, sa.role, sb.role
+        return "past", sa.agent_id, sa.agent_id, score, sa.role, sb.role, sa.network_id, sb.network_id
     if b_latest and not a_latest:
-        return "past", sb.agent_id, sb.agent_id, 1.0 - score, sb.role, sa.role
+        return "past", sb.agent_id, sb.agent_id, 1.0 - score, sb.role, sa.role, sb.network_id, sa.network_id
     return None
 
 
@@ -78,8 +83,8 @@ def member_pairs(result: MatchResult) -> list[MemberPair]:
             score = pairwise_rank_score(ranks[team_a], ranks[team_b])
             counted = [c for sa in by_team[team_a] for sb in by_team[team_b]
                        if (c := _classify(sa, sb, score)) is not None]
-            for kind, a, b, s, role_a, role_b in counted:
-                pairs.append(MemberPair(kind, a, b, s, share / len(counted), role_a, role_b))
+            for kind, a, b, s, role_a, role_b, net_a, net_b in counted:
+                pairs.append(MemberPair(kind, a, b, s, share / len(counted), role_a, role_b, net_a, net_b))
     return pairs
 
 

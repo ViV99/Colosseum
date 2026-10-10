@@ -22,13 +22,14 @@ def test_metrics_jsonl_ratings_json_and_console(tmp_path):
     assert max(r["train_step"] for r in run.records("train") if r["agent"] == "agent_0") >= 1
     episodes = run.records("episodes")
     assert sum(r["episodes"] for r in episodes) > 0
-    assert set(episodes[0]["wdl"]) == {"latest", "past", "arena"} and "2p" in episodes[0]["by_layout"]
+    assert set(episodes[0]["wdl"]) == {"latest", "past", "arena", "anchor"} and "2p" in episodes[0]["by_layout"]
     systems = run.records("system")
     assert systems[-1]["env_steps"] >= BUDGET
     assert any(r["workers_reporting"] >= 1 for r in systems)
     ratings = run.ratings()
     assert set(ratings) == {"env_steps", "layouts"}
     assert set(ratings["layouts"]["2p"]) >= {"elo", "win_rates", "games", "wr_vs_past", "past_games"}
+    assert "pfsp" in ratings["layouts"]["2p"]
     last_ratings_record = run.records("ratings")[-1]
     assert set(last_ratings_record["layouts"]["2p"]) >= {"elo", "win_rates", "games", "wr_vs_past"}
     assert "[agent_0] step" in run.stderr  # console progress (main logs INFO to stderr)
