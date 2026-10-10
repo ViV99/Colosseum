@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import functools
 import os
-import re
 import time
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
@@ -28,7 +27,7 @@ import torch
 import torch.nn.functional as F
 
 import cli_runner
-from cli_runner import REPO_ROOT, read_ratings, read_records, run_train
+from cli_runner import REPO_ROOT, newest_checkpoint, read_ratings, read_records, run_train
 from colosseum.algorithms.appo import APPO
 from colosseum.core.config import AlgorithmConfig, ColosseumConfig, load_config
 from colosseum.core.registry import env_spec, make_env
@@ -49,7 +48,6 @@ LEARNING_SEED = int(os.environ.get("COLOSSEUM_LEARNING_SEED", "0"))
 EVAL_SEED = 12345
 POINT_LOGIT = 1.0e4          # logit gap of a point-mass categorical
 POINT_LOG_STD = -20.0        # log std of a point-mass Gaussian
-_CKPT_RE = re.compile(r"ckpt_v(\d+)")
 
 
 # ----- models ---------------------------------------------------------------------------------
@@ -177,18 +175,17 @@ def train_in_process(*, env_fn: Callable[[], MultiAgentEnv], agents: Mapping[str
 
     SP3: ``fixed_players`` seat scripted / frozen agents (their seats in ``lineups`` use
     ``FIXED_NETWORK_ID`` and never collect); ``teachers`` are scripted kickstart teachers per
-    trainable agent (the agent's weight payloads carry ``teacher_active=True``); ``on_chunk`` sees
-    every chunk after the payload round trip."""
+    trainable agent (the weight payloads carry the algorithm's ``teacher_active``, as the learner's
+    do); ``on_chunk`` sees every chunk after the payload round trip."""
     torch.manual_seed(seed)
     algos = {a: s.algorithm_fn() if s.algorithm_fn is not None else APPO(s.model_fn(), s.config, s.action_spec,
                                                                            device="cpu")
              for a, s in agents.items()}
-    teachers = dict(teachers or {})
 
     def payload(agent_id: str) -> WeightPayload:
         algo = algos[agent_id]
         return WeightPayload.from_model(agent_id, algo.policy_version, algo.model,
-                                        teacher_active=agent_id in teachers)
+                                        teacher_active=bool(getattr(algo, "teacher_active", False)))
 
     pending: dict[str, list[TrajectoryChunk]] = {a: [] for a in agents}
     latest = {a: payload(a) for a in agents}
@@ -204,7 +201,7 @@ def train_in_process(*, env_fn: Callable[[], MultiAgentEnv], agents: Mapping[str
                        agent_ids=list(agents), agent_roles={a: s.roles for a, s in agents.items()},
                        model_factories={a: s.model_fn for a, s in agents.items()}, io=io, lineups=list(lineups),
                        weight_sync_interval=0.0, seed=seed, fixed_players=fixed_players,
-                       teachers=teachers or None)
+                       teachers=dict(teachers) if teachers else None)
     try:
         for update in range(1, max_updates + 1):
             while any(len(chunks) < batch_chunks for chunks in pending.values()):
@@ -270,13 +267,6 @@ def train_example(name: str, tmp_path: Path, sets: Mapping[str, Any] | None = No
     run.elapsed = elapsed
     return run
 
-
-def newest_checkpoint(root: Path, agent_id: str) -> Path:
-    agent_dir = Path(root) / "checkpoints" / agent_id
-    versions = {int(m.group(1)): d for d in agent_dir.iterdir()
-                if d.is_dir() and (m := _CKPT_RE.fullmatch(d.name))} if agent_dir.is_dir() else {}
-    assert versions, f"no checkpoints for {agent_id} in {root}"
-    return versions[max(versions)]
 
 
 def load_agent(run: TrainedRun, agent_id: str) -> tuple[PolicyModel, RoleSpec, ActionSpec]:

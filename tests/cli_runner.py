@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -16,6 +17,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 TESTS_DIR = Path(__file__).resolve().parent
 TTT_CONFIG = REPO_ROOT / "configs" / "examples" / "tic_tac_toe.yaml"
 TTT_MULTI_CONFIG = REPO_ROOT / "configs" / "examples" / "tic_tac_toe_multi.yaml"
+_CKPT_RE = re.compile(r"ckpt_v(\d+)")
 
 # Small, fast settings for tic-tac-toe runs (about 10 s with 1 worker on CPU).
 TINY: dict[str, str] = {
@@ -83,6 +85,15 @@ class TrainRun:
 
     def ratings(self) -> dict:
         return read_ratings(self.root)
+
+
+def newest_checkpoint(root: Path, agent_id: str) -> Path:
+    """The ``ckpt_v<N>`` directory of ``agent_id`` with the largest N in the run at ``root``."""
+    agent_dir = Path(root) / "checkpoints" / agent_id
+    versions = {int(m.group(1)): d for d in agent_dir.iterdir()
+                if d.is_dir() and (m := _CKPT_RE.fullmatch(d.name))} if agent_dir.is_dir() else {}
+    assert versions, f"no checkpoints of {agent_id} in {root}"
+    return versions[max(versions)]
 
 
 def run_train(config: Path, tmp_path: Path, name: str = "run", overrides: Mapping[str, object] | None = None,

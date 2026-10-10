@@ -18,7 +18,6 @@ never meet (that would be a ConfigError).
 from __future__ import annotations
 
 import json
-import re
 import sys
 import time
 from collections.abc import Mapping, Sequence
@@ -28,7 +27,7 @@ from typing import Any
 
 import yaml
 
-from cli_runner import REPO_ROOT, TrainRun, run_in_session, run_train
+from cli_runner import REPO_ROOT, TrainRun, newest_checkpoint, run_in_session, run_train
 
 MAIN = "main"
 RANDOM = "random"
@@ -36,7 +35,6 @@ BC_NET = "bc_net"
 TRAINED = "trained"
 RANDOM_BOT_CLASS = "colosseum.players.RandomBot"
 SP2_MATCHMAKING_KNOBS = ("mode", "self_play_ratio", "latest_prob", "pfsp_exponent")
-_CKPT_RE = re.compile(r"ckpt_v(\d+)")
 
 # Short training of the fast smoke (cli_runner.TINY, with keep_last instead of SP2's pool_size).
 SMOKE_SETTINGS: dict[str, Any] = {
@@ -123,7 +121,10 @@ class CliResult:
 
 
 def cli(args: Sequence[Any], *, in_process: bool = False, timeout: float = 900.0) -> CliResult:
-    """``colosseum <args>``: in a subprocess (own session, killed on exit) or in-process."""
+    """``colosseum <args>``: in a subprocess (own session, killed on exit) or in-process.
+
+    ``in_process=True`` callers must restore root logging afterwards (the ``restore_root_logging``
+    fixture): the CLI commands call ``logging.basicConfig``."""
     args = [str(a) for a in args]
     if in_process:
         from click.testing import CliRunner
@@ -162,13 +163,6 @@ def train(config: Path, workdir: Path, name: str, sets: Mapping[str, Any], *, ti
     assert run.returncode == 0, run.stderr[-3000:]
     return run
 
-
-def newest_checkpoint(root: Path, agent_id: str) -> Path:
-    agent_dir = Path(root) / "checkpoints" / agent_id
-    versions = {int(m.group(1)): d for d in agent_dir.iterdir()
-                if d.is_dir() and (m := _CKPT_RE.fullmatch(d.name))} if agent_dir.is_dir() else {}
-    assert versions, f"no checkpoints of {agent_id} in {root}"
-    return versions[max(versions)]
 
 
 def evaluate(config: Path, checkpoint: Path, opponents: Sequence[str], out: Path, *, layout: str, num_matches: int,
