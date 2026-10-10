@@ -192,6 +192,7 @@ def test_build_algorithm_passes_the_agents_warmup():
     ({"networks": {"model_class": "test_sp3_critic_warmup.NoValueParams"}}, "value_parameters"),
     ({"algorithm": {"algorithm_class": "test_sp3_critic_warmup.OldAPPO"}}, "takes no critic_warmup_steps"),
     ({"algorithm": {"value_loss_coeff": 0.0}}, "value_loss_coeff"),
+    ({"algorithm": {"algorithm_class": "no_such_module.APPO"}}, "algorithm_class 'no_such_module.APPO'"),
 ])
 def test_validate_rejects_a_warmup_the_agent_cannot_do(sections, message):
     with pytest.raises(ConfigError, match=message):

@@ -123,6 +123,29 @@ def _check_spaces(spec: GameSpec, layout: str, result: StepResult, step: int) ->
                 _contains(role.global_state_space, global_state[seat], "final global_state", where(seat))
 
 
+def _reset_layout(env: Any, config: ColosseumConfig, layout: str) -> StepResult:
+    """``env.reset(seed=0, layout=layout)``; an env failure other than a contract error is a ConfigError."""
+    try:
+        return env.reset(seed=0, layout=layout)
+    except EnvContractError:
+        raise
+    except Exception as e:
+        raise ConfigError(f"env.reset(seed=0, layout={layout!r}) of {config.env.env_class!r} failed: "
+                          f"{type(e).__name__}: {e}") from e
+
+
+def _step_env(env: Any, config: ColosseumConfig, layout: str, actions: dict, step: int) -> StepResult:
+    """``env.step(actions)`` at episode step ``step``; an env failure other than a contract error is a
+    ConfigError."""
+    try:
+        return env.step(actions)
+    except EnvContractError:
+        raise
+    except Exception as e:
+        raise ConfigError(f"env.step of {config.env.env_class!r} failed in layout {layout!r} at "
+                          f"episode step {step}: {type(e).__name__}: {e}") from e
+
+
 def _exercise_env(config: ColosseumConfig, spec: GameSpec, layouts: Sequence[str]) -> dict[str, tuple]:
     """Reset every enabled layout and take up to ``VALIDATE_STEPS`` random legal steps under the
     contract checks (``EpisodeTracker``) and full ``space.contains`` checks.
@@ -137,13 +160,7 @@ def _exercise_env(config: ColosseumConfig, spec: GameSpec, layouts: Sequence[str
     try:
         for layout in layouts:
             tracker = EpisodeTracker(spec, max_idle_steps=config.env.max_idle_steps, context="validate")
-            try:
-                result = env.reset(seed=0, layout=layout)
-            except EnvContractError:
-                raise
-            except Exception as e:
-                raise ConfigError(f"env.reset(seed=0, layout={layout!r}) of {config.env.env_class!r} failed: "
-                                  f"{type(e).__name__}: {e}") from e
+            result = _reset_layout(env, config, layout)
             masks = tracker.on_reset(layout, result)
             for step in range(VALIDATE_STEPS + 1):
                 _check_spaces(spec, layout, result, step)
@@ -154,13 +171,7 @@ def _exercise_env(config: ColosseumConfig, spec: GameSpec, layouts: Sequence[str
                     break
                 actions = {seat: random_legal_action(spec.roles[spec.role_of(layout, seat)], masks[seat], rng)
                            for seat in sorted(result.acting)}
-                try:
-                    result = env.step(actions)
-                except EnvContractError:
-                    raise
-                except Exception as e:
-                    raise ConfigError(f"env.step of {config.env.env_class!r} failed in layout {layout!r} at "
-                                      f"episode step {step + 1}: {type(e).__name__}: {e}") from e
+                result = _step_env(env, config, layout, actions, step + 1)
                 masks = tracker.on_step(actions, result)
     finally:
         env.close()
@@ -393,13 +404,7 @@ def _check_scripted_players(config: ColosseumConfig, spec: GameSpec, fixed: Any,
         try:
             for layout in played:
                 tracker = EpisodeTracker(spec, max_idle_steps=config.env.max_idle_steps, context="validate")
-                try:
-                    result = env.reset(seed=0, layout=layout)
-                except EnvContractError:
-                    raise
-                except Exception as e:
-                    raise ConfigError(f"env.reset(seed=0, layout={layout!r}) of {config.env.env_class!r} failed: "
-                                      f"{type(e).__name__}: {e}") from e
+                result = _reset_layout(env, config, layout)
                 masks = tracker.on_reset(layout, result)
                 bots = {}
                 for seat, seat_spec in enumerate(spec.layouts[layout]):
@@ -432,13 +437,7 @@ def _check_scripted_players(config: ColosseumConfig, spec: GameSpec, fixed: Any,
                         except PlayerError as e:
                             raise ConfigError(str(e)) from e
                         decisions += 1
-                    try:
-                        result = env.step(actions)
-                    except EnvContractError:
-                        raise
-                    except Exception as e:
-                        raise ConfigError(f"env.step of {config.env.env_class!r} failed in layout {layout!r} at "
-                                          f"episode step {step + 1}: {type(e).__name__}: {e}") from e
+                    result = _step_env(env, config, layout, actions, step + 1)
                     masks = tracker.on_step(actions, result)
         finally:
             env.close()
@@ -518,7 +517,12 @@ def _check_critic_warmup(where: str, agent_config: ColosseumConfig, model: Any) 
     if not params:
         raise ConfigError(f"{where}: init.critic_warmup_steps={steps}: value_parameters() returned no parameters")
     path = agent_config.algorithm.algorithm_class
-    if "critic_warmup_steps" not in inspect.signature(import_class(path)).parameters:
+    try:
+        algorithm_cls = import_class(path)
+    except Exception as e:  # noqa: BLE001 - any import failure is a config problem
+        raise ConfigError(f"{where}: algorithm.algorithm_class {path!r} cannot be imported ({type(e).__name__}: "
+                          f"{e}); use a dotted path 'package.module.Class'") from e
+    if "critic_warmup_steps" not in inspect.signature(algorithm_cls).parameters:
         raise ConfigError(f"{where}: init.critic_warmup_steps={steps}, but algorithm.algorithm_class {path!r} takes "
                           f"no critic_warmup_steps argument; use colosseum.algorithms.appo.APPO (or a subclass that "
                           f"accepts it) or set critic_warmup_steps: 0")
