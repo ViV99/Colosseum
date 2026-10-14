@@ -63,7 +63,7 @@ metrics:
   console_interval_sec: 10.0
 
 agents:
-  main:                     # trainable; the pipeline sets init.from / kickstart.teacher with --set
+  main:                     # trainable; the pipeline sets init.from / kickstart.teacher in a copied config or with --set (header)
     init: {from: null, critic_warmup_steps: 0}
     kickstart: {teacher: null}
   greedy:

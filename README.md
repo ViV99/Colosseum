@@ -27,7 +27,7 @@ colosseum train -c configs/examples/tic_tac_toe.yaml --set run.name=ttt-quicksta
 
 Training prints its run directory and one progress line per agent every 10 seconds (log lines go to stderr; the
 same lines are in `runs/ttt-quickstart/logs/main.log`). On an 8-core CPU the run (2 workers × 16 envs, 600,000 env
-steps) takes about a minute (52–64 s over the six measured runs). Afterwards the latest checkpoint, played greedily, wins
+steps) takes about a minute (52–64 s over the seven measured runs). Afterwards the latest checkpoint, played greedily, wins
 86–94% of games against a random legal-move player (`tests/learning/test_demo_learning_slow.py` requires >= 80%).
 Re-running with the same `run.name` is refused; pick another name or delete `runs/ttt-quickstart`.
 
@@ -118,7 +118,8 @@ half of 4p games against three random cycles; each predator_prey role beats a ra
 coop_buttons agents' homogeneous teams reach `max(5 × random, 0.6 × scripted)` of the measured baselines. A further
 slow test runs the whole pipeline above on `unit_harvest_league.yaml` (win against `random` ≥ 0.95, score against
 `greedy` ≥ 0.40 and against the BC network ≥ 0.45). Numbers per seed are in
-`docs/superpowers/reports/2026-10-09-sp2-acceptance.md` and `docs/benchmarks.md`.
+`docs/superpowers/reports/2026-10-09-sp2-acceptance.md`, `docs/superpowers/reports/2026-10-10-sp3-acceptance.md` and
+`docs/benchmarks.md`.
 
 ## Writing your own game
 
@@ -261,21 +262,21 @@ failure logs one warning and disables WandB; it never stops training.
 - Ctrl-C (SIGINT) and SIGTERM stop the run: final checkpoints are saved within a shutdown grace of 7 seconds; no
   process is left after 10 seconds. The exit codes are 130 (SIGINT) and 143 (SIGTERM). Child processes ignore Ctrl-C
   themselves (the main process stops them) and die with the main process if it is killed.
-- A Ctrl-C always ends `train`, `eval`, `bc`, `validate`, `run-learner`, `run-workers` and `serve-weight-store` with
+- A Ctrl-C always ends `train`, `eval`, `record`, `bc`, `validate`, `run-learner`, `run-workers` and `serve-weight-store` with
   exit code 130 and `Interrupted` (or `Received SIGINT`), never a traceback, also when it arrives during startup.
   Rarely, Python loses a Ctrl-C that lands inside an import-time callback: `train` and the distributed roles then still
-  stop as on a normal Ctrl-C, while `eval`, `bc` and `validate` finish their work first and then exit 130 with
+  stop as on a normal Ctrl-C, while `eval`, `record`, `bc` and `validate` finish their work first and then exit 130 with
   `Interrupted` (`serve-weight-store` keeps serving until the next Ctrl-C, then exits 130).
 - An invalid config (or an env that breaks the contract at startup) exits with code 1 and a `Config error: ...`
   message without a traceback.
-- `colosseum eval` uses the same codes (0 / 1 / 130 / 143), plus 2 for bad command-line arguments; `colosseum bc`
-  uses 0 / 1 / 2 / 130.
+- `colosseum eval` uses the same codes (0 / 1 / 130 / 143), plus 2 for bad command-line arguments; `colosseum record` uses
+  0 / 1 / 2 / 130 / 143 and `colosseum bc` 0 / 1 / 2 / 130.
 
 ## Configuration reference
 
 Unknown keys are errors at every level. `--set key=value` accepts YAML values (`null`, numbers such as `1e-4`, lists,
-mappings; quote a value to keep it a string) and works for `train`, `validate`, `run-learner` and `run-workers`. A
-mapping value replaces the whole mapping (e.g. `env.kwargs`):
+mappings; quote a value to keep it a string) and works for `train`, `validate`, `record`, `bc`, `eval`, `run-learner`
+and `run-workers`. A mapping value replaces the whole mapping (e.g. `env.kwargs`):
 
 ```bash
 colosseum train -c configs/examples/tron.yaml --set run.name=tron-4p --set 'matchmaking.layouts={4p: 1.0}'
@@ -299,7 +300,7 @@ Inside a list, YAML 1.1 rules apply: `--set x=[1e-4,2]` keeps `1e-4` as a string
 | `metrics` | `log_interval` 10 (train steps), `console_interval_sec` 10, `use_wandb` (false), `wandb_project` (`colosseum`), `wandb_entity` |
 | `bc` | `seq_len` 64 (sequence length for stateful models in `colosseum bc`) |
 | `transport` | `grpc_max_message_mb` 64 (distributed mode); `mode` and `grpc_port` are unused until SP5 |
-| `agents` | `{agent_id: {kind: trainable (default) / scripted / frozen, ...}}`: trainable — `roles`, partial overrides `networks`, `algorithm`, `learner`, `matchmaking`, `init`, `kickstart` (deep-merged onto the global sections); scripted — `class`, `kwargs`, `roles`; frozen — `path` (plus `networks` and `roles` for a `.pt`) |
+| `agents` | `{agent_id: {kind: trainable (default) / scripted / frozen, ...}}`: trainable — `roles`, partial overrides `networks`, `algorithm`, `learner`, `matchmaking`, `init`, `kickstart` (deep-merged onto the global sections; in `matchmaking` only `opponents` / `pfsp` merge per key, the other keys replace the global value); scripted — `class`, `kwargs`, `roles`; frozen — `path` (plus `networks` and `roles` for a `.pt`) |
 
 **Agents, players and roles.** Every key of `agents` is an agent: `trainable` (the default kind) has its own learner;
 `scripted` is a `colosseum.players.ScriptedBot` subclass (`colosseum.players.RandomBot` is built in); `frozen` plays
@@ -411,8 +412,8 @@ weights with one warning.
 | ✔ | SP2 Game model | `GameSpec` / `MultiAgentEnv`, elimination, teams, roles, layouts, `Units`, Dict observations, bootstrap on the learner, centralized critic (accepted and merged 2026-10-09) |
 | ✔ | SP3 Players, league, warm start | scripted and frozen players, opponent mixes with PFSP over snapshots and anchors, snapshot retention, per-agent init / critic warm-up / kickstart (neural or DAgger), `colosseum record` (implemented on `sp3-league`; acceptance report `docs/superpowers/reports/2026-10-10-sp3-acceptance.md`; awaiting the owner's acceptance) |
 | | SP4 Selection and observability | match log, OpenSkill / Bradley–Terry ratings, `colosseum tournament`, dashboard, snapshot ratings, top-k snapshot storage |
-| | SP5 Distributed | hub and nodes, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images, distributed league, scripted/frozen players and SP3 warm start across machines |
-| | SP6 Speed and extensions | cuDNN RNN path, fast transformer unroll, GPU inference on workers, inference server, new algorithms |
+| | SP5 Distributed | hub and nodes, adding / removing agents and machines during a run, shared-memory weight store and trajectory ring buffer, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images, distributed league, scripted/frozen players and SP3 warm start across machines |
+| | SP6 Speed and extensions | vectorized fast path for array envs and hundreds of seats (Neural MMO), cuDNN RNN path, fast transformer unroll, GPU inference on workers, inference server, new algorithms |
 
 The table is a summary; the full scope of each sub-project and the parked items are in [`CLAUDE.md`](CLAUDE.md) («Roadmap»), which is authoritative.
 
