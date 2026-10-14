@@ -6,8 +6,8 @@
 # Usage: brief.sh TASK_ID   (e.g. T1.1) -> writes $WS/task-<ID>-brief.md
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-WS=${WS:-.superpowers/sdd/2026-10-08-sp2-game-model}
-P=${PLAN:-docs/superpowers/plans/2026-10-08-sp2-game-model}
+WS=${WS:-.superpowers/sdd/2026-10-10-sp3-league}
+P=${PLAN:-docs/superpowers/plans/2026-10-10-sp3-league}
 id=$1
 part=$(grep -l -E "^### Task ${id//./\\.}:" $P/0[1-4]-*.md | head -1)
 [ -n "$part" ] || { echo "task $id not found" >&2; exit 3; }
@@ -15,7 +15,7 @@ out=$WS/task-$id-brief.md
 {
   echo "# Brief for Task $id (from $part)"
   echo
-  echo "Also read: $WS/constraints.md (global constraints, shadow-package strategy, binding contract amendments)."
+  echo "Also read: $WS/constraints.md (global constraints, binding contract amendments, pre-flight rulings)."
   echo "The full interface contract is in $P/00-overview.md (section 'Interface contract'); grep it for names from other tasks."
   echo
   echo "## Part preamble"

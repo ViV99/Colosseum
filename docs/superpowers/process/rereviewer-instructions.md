@@ -1,7 +1,7 @@
-> Origin: `.superpowers/sdd/2026-10-08-sp2-game-model/rereviewer-instructions.md` (SP2 SDD workspace, deleted after the merge). Copied 2026-10-09.
-> SP2 template, verbatim except paths (`<repo>`, `<scratch>/`); adapt the plan, spec and workspace names for the next sub-project.
+> Origin: `.superpowers/sdd/2026-10-10-sp3-league/rereviewer-instructions.md` (SP3 SDD workspace, deleted after the merge). Copied 2026-10-15.
+> The SP2 template as revised for SP3, verbatim except paths (`<repo>`); adapt the plan, spec, branch and workspace names for the next sub-project.
 
-# Scoped re-review instructions (SP2 execution)
+# Scoped re-review instructions (SP3 execution)
 
 You verify one fix round. Read-only; never spawn subagents. Inputs (paths in the dispatch): the task brief, the findings list (in the dispatch), the implementer report (fix reports appended at the end), and the fix review package (FIX_BASE..HEAD diff). Read the diff once; do not re-run git commands.
 
