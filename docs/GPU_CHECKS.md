@@ -67,6 +67,31 @@ scripts/setup-dev.sh --gpu          # ставит сборку torch с CUDA в
 | `tests/unit/test_state.py::test_model_and_state_move_between_devices[lstm]` | то же для ядра LSTM | `.venv/bin/python -m pytest -v tests/unit/test_state.py -k test_model_and_state_move_between_devices` |
 | `tests/unit/test_state.py::test_model_and_state_move_between_devices[none]` | то же без ядра | `.venv/bin/python -m pytest -v tests/unit/test_state.py -k test_model_and_state_move_between_devices` |
 
+## Сквозная проверка на CUDA
+
+Тесты из таблицы проверяют части по отдельности; целиком обучение на CUDA ещё ни разу не запускалось. Во всех конфигах `configs/examples/` стоит `learner.device: auto`, и `colosseum bc` берёт устройство из того же поля, поэтому на машине с GPU лёрнеры и BC сами работают на CUDA (воркеры по-прежнему считают политику на CPU). Устройство лёрнера видно в его логе `runs/<run>/logs/learner-<agent>.log`: строка `starting on device=cuda`. AMP работает только на CUDA: на CPU `algorithm.use_amp` молча не действует.
+
+1. Быстрый набор `.venv/bin/python -m pytest -m "not gpu and not slow" -q -rw` должен пройти так же, как на машине разработки, без предупреждений. Интеграционные тесты, которые запускают `colosseum train` на конфигах из `configs/examples/`, учат лёрнер на CUDA.
+2. Медленный набор `.venv/bin/python -m pytest -m slow -v` (10 тестов, около 15 минут на 8 ядрах CPU): обучение семи демо-игр и пайплайн `unit_harvest` (record → bc → train → eval) с лёрнером и BC на CUDA. Пороги откалиброваны на CPU, а на CUDA вычисления не побитово те же: единичное падение по порогу — повод перезапустить тест, повторное — разбираться.
+3. Пайплайн из README с AMP (в остальных сквозных прогонах AMP выключен):
+
+```bash
+CFG=configs/examples/unit_harvest_league.yaml
+.venv/bin/colosseum record -c $CFG --player greedy --num-matches 300 --output gpu-check/data --seed 0
+.venv/bin/colosseum bc -c $CFG --agent main --data gpu-check/data --output gpu-check/bc.pt --epochs 5 --seed 0
+.venv/bin/colosseum train -c $CFG --set run.name=gpu-check-amp --set algorithm.use_amp=true \
+  --set agents.main.init.from=gpu-check/bc.pt --set agents.main.init.critic_warmup_steps=30 \
+  --set agents.main.kickstart.teacher=greedy
+NEW=$(ls -d runs/gpu-check-amp/checkpoints/main/ckpt_v* | sort -V | tail -1)
+.venv/bin/colosseum eval -c $CFG -a trained=$NEW -a greedy -a random --num-matches 100 --deterministic
+```
+
+Для `bfloat16` повторите `train` и `eval` с `--set algorithm.amp_dtype=bfloat16` и другим `run.name`.
+
+Ожидается: все команды завершаются с кодом 0; в логе лёрнера `device=cuda`; в записях `train` файла `runs/gpu-check-amp/metrics.jsonl` нет `NaN`/`inf`, `skipped_updates` почти всегда 0 (GradScaler изредка пропускает шаг при переполнении — это нормально), `critic_warmup` равен 1 только на первых 30 шагах лёрнера, `kickstart_lambda` после них убывает; в `eval` агент `trained` выигрывает у `random` не меньше 95 % игр и набирает против `greedy` не меньше 0,40 очка (пороги медленного теста пайплайна; на CPU при приёмке SP3 было 1,00 и 0,50).
+
+После проверки: `rm -rf gpu-check runs/gpu-check-amp`.
+
 ## Ручная проверка WandB (без GPU)
 
 Автотесты WandB используют подмену модуля `wandb`, поэтому настоящий WandB проверяется вручную, один раз, на любой машине.
