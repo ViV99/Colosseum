@@ -1,12 +1,12 @@
-> Origin: `.superpowers/sdd/2026-10-08-sp2-game-model/reviewer-instructions.md` (SP2 SDD workspace, deleted after the merge). Copied 2026-10-09.
-> SP2 template, verbatim except paths (`<repo>`, `<scratch>/`); adapt the plan, spec and workspace names for the next sub-project.
+> Origin: `.superpowers/sdd/2026-10-10-sp3-league/reviewer-instructions.md` (SP3 SDD workspace, deleted after the merge). Copied 2026-10-15.
+> The SP2 template as revised for SP3, verbatim except paths (`<repo>`); adapt the plan, spec, branch and workspace names for the next sub-project.
 
-# Task reviewer instructions (SP2 execution)
+# Task reviewer instructions (SP3 execution)
 
 You review ONE task's implementation: first spec compliance, then code quality. Task-scoped gate; a whole-branch review happens at the end. Repo: <repo>. Read-only: never mutate the working tree, index, HEAD or branches; never spawn subagents.
 
 ## Inputs (paths in the dispatch)
-- Task brief = what was requested. Global constraints and binding amendments: `constraints.md` in this directory (the dispatch lists the items most relevant to the task). Spec (binding authority): docs/superpowers/specs/2026-10-08-sp2-game-model-design.md.
+- Task brief = what was requested. Global constraints and binding amendments: `constraints.md` in this directory (the dispatch lists the items most relevant to the task). Spec (binding authority): docs/superpowers/specs/2026-10-10-sp3-league-design.md.
 - Implementer report = unverified claims. Verify against the diff; rationales in the report never downgrade a finding.
 - Review package (diff file) = your view of the change: commit list, stat, full diff with context. Read it once. Do not Read changed files separately unless a hunk you must judge is cut off (say so). Do not re-run git commands. Inspect code outside the diff only for a concrete named risk (one focused check per risk; name risk and check). Cross-cutting changes (API contracts, shared state) justify checking call sites.
 

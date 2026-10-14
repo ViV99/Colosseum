@@ -4,8 +4,8 @@ Each learner owns one trainable agent. It:
 1. collects exactly ``batch_chunks`` chunk payloads (numpy,
    ``TrajectoryChunk.to_payload()``) from its queue and decodes them;
 2. sets the algorithm's progress (share of the env-step budget) and trains;
-3. publishes new weights (numpy ``WeightPayload``) to every worker's size-1
-   mailbox (newest wins);
+3. publishes new weights (numpy ``WeightPayload``, with the scripted teacher's
+   ``teacher_active`` flag) to every worker's size-1 mailbox (newest wins);
 4. sends checkpoint payloads (numpy weights + trainer-state bytes, see
    ``make_checkpoint_payload``) and metrics to the main process, and a final
    snapshot when it stops.
@@ -370,7 +370,8 @@ def _push_weights(
     weight_queues: list,
 ) -> None:
     """Publish the current weights to every worker mailbox (newest wins)."""
-    payload = WeightPayload.from_model(agent_id, algorithm.policy_version, algorithm.model)
+    payload = WeightPayload.from_model(agent_id, algorithm.policy_version, algorithm.model,
+                                       teacher_active=bool(getattr(algorithm, "teacher_active", False)))
     for wq in weight_queues:
         if not put_latest(wq, payload):
             logger.debug(f"Learner [{agent_id}]: weight mailbox busy, v{payload.policy_version} not delivered")

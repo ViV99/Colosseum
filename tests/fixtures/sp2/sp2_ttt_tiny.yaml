@@ -1,0 +1,41 @@
+# SP2-format config of the SP2 checkpoint fixture (tests/fixtures/sp2/run): tic-tac-toe with a tiny MLP.
+# Written for SP2 and kept in its SP2 form (old knobs: matchmaking.mode / latest_prob, checkpoint.pool_size).
+run:
+  name: null
+  dir: "runs"
+env:
+  env_class: "examples.tic_tac_toe.game.TicTacToeGame"
+  kwargs: {}
+networks:
+  encoder_class: "examples.tic_tac_toe.models.TicTacToeEncoder"
+  core: null
+  policy_class: "examples.tic_tac_toe.models.TicTacToePolicy"
+  value_class: "examples.tic_tac_toe.models.TicTacToeValue"
+  kwargs: {hidden: 16, latent: 8}
+algorithm:
+  learning_rate: 1.0e-3
+  lr_schedule: "constant"
+rollout:
+  chunk_length: 16
+  num_workers: 1
+  envs_per_worker: 4
+  weight_sync_interval_sec: 0.5
+  match_refresh_interval_sec: 1.0
+learner:
+  device: "cpu"
+  queue_size: 16
+  batch_chunks: 2
+training:
+  total_timesteps: 3000
+  seed: 0
+matchmaking:
+  mode: self_play
+  latest_prob: 0.8
+checkpoint:
+  interval: 20
+  pool_size: 5
+  save_optimizer: true
+metrics:
+  use_wandb: false
+  log_interval: 1
+  console_interval_sec: 1.0

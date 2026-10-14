@@ -11,12 +11,13 @@
 | Соло | `examples/coin_grid` | `coin_grid.yaml` | `GameSpec.solo`, Dict-наблюдение с `uint8`, маски, обрыв по лимиту шагов (`truncated`, `final_obs`) |
 | 1v1 пошаговая | `examples/tic_tac_toe` | `tic_tac_toe.yaml` | ходит одно место из двух (`acting`), маски, награды ждущему месту |
 | Бот с юнитами | `examples/unit_harvest` | `unit_harvest.yaml` | `Units`, рождение и гибель юнитов, списки сущностей с маской, `Dict`-действие |
-| Команда на команду | `examples/team_tag` | `team_tag.yaml` | `GameSpec.teams_of`, локальное окно, `global_state` для критика, выбывший сокомандник |
+| Команда на команду | `examples/team_tag` | `team_tag.yaml` | `GameSpec.teams_of`, локальное окно, `global_state` для критика, выбывший сокомандник, якорь `RandomBot` (SP3) |
 | FFA с выбыванием | `examples/tron` | `tron.yaml` | `GameSpec.symmetric([2, 3, 4])`, `terminated`, ранги по порядку выбывания |
 | 1 vs N, асимметрия | `examples/predator_prey` | `predator_prey.yaml` | две роли с разными пространствами, два агента (`agents.<id>.roles`) |
 | Кооператив | `examples/coop_buttons` | `coop_buttons.yaml` | одна команда, исход `score`, `teammates: mixed`, cross-play |
 | Соревновательная игра «как на соревновании» | `examples/space_miners` | `space_miners.yaml` | `Units` с `Box`-компонентом, маски внутри юнитов, сущности, Box2D |
 | Дерево действий | `examples/composite_action` | `chase.yaml` | `Dict(direction=Discrete, speed=Box)` |
+| Скриптовые боты (SP3) | `examples/unit_harvest/bots.py`, `examples/tic_tac_toe/bots.py` | `unit_harvest_league.yaml` | `ScriptedBot` как якорь и учитель; что среда отдаёт ботам через `infos` — раздел 10, лига — `docs/LEAGUE_GUIDE.md` |
 
 ## 1. Минимальная среда
 
@@ -54,7 +55,8 @@ class Counter(MultiAgentEnv):
 запускайте `colosseum validate -c my_game.yaml`: он проверяет спеку и конфиг, делает `reset` каждого
 включённого варианта партии (`matchmaking.layouts`, по умолчанию все) и до 8 шагов случайными
 легальными действиями с проверкой контракта и полной проверкой пространств (`space.contains`), а
-затем прогоняет `step` и `unroll` модели каждого агента. Модуль `my_game` должен импортироваться:
+затем прогоняет `step` и `unroll` модели каждого агента; кроме того, он играет скриптовыми ботами,
+грузит frozen-агентов и проверяет `init` и kickstart (`docs/LEAGUE_GUIDE.md`, раздел 13). Модуль `my_game` должен импортироваться:
 текущая папка добавляется в `sys.path` (и в дочерних процессах), поэтому запускайте команды из папки,
 где лежит `my_game/`.
 
@@ -94,9 +96,10 @@ spec = GameSpec(roles={"hunter": hunter, "prey": prey},
                 layouts={"1v2": (SeatSpec("hunter", 0), SeatSpec("prey", 1), SeatSpec("prey", 1))})
 ```
 
-Один агент играет только роли с одинаковыми пространствами (наблюдение, действие и `global_state`):
-у агента одна сеть, а её входы и выходы задаются пространствами. Роли с разными пространствами —
-разные агенты:
+Обучаемый или frozen-агент играет только роли с одинаковыми пространствами (наблюдение, действие и
+`global_state`): у агента одна сеть, а её входы и выходы задаются пространствами. Роли с разными
+пространствами — разные агенты (скриптовый бот может играть и роли с разными пространствами; соперники
+в асимметричной игре — `docs/LEAGUE_GUIDE.md`, раздел 6):
 
 ```yaml
 agents:
@@ -349,6 +352,8 @@ networks:
 памяти), `LSTMCore` / `GRUCore` (`hidden_size`, `num_layers`), `WindowAttentionCore` (`d_model`,
 `window`, `num_heads`, `num_layers`; пример — `configs/examples/tic_tac_toe_attention.yaml`).
 
+Свой `model_class` с нормализаторами, переопределяющий `PolicyModel.update_normalizers(obs, global_state)`, должен принимать `obs=None`: во время прогрева критика (`agents.<id>.init.critic_warmup_steps`, `docs/LEAGUE_GUIDE.md` раздел 8) APPO вызывает `update_normalizers(None, global_state)`, чтобы обновлялись только нормализаторы пути value (глобального состояния), а статистика нормализаторов наблюдений не менялась. Базовая реализация пропускает нормализатор, у которого дерево-источник равно `None`. Для прогрева критика свой `model_class` должен также реализовать `value_parameters()` — параметры, которыми пользуется только путь value (value-голова, критик-энкодер); без него `critic_warmup_steps > 0` — ошибка конфига.
+
 ## 9. Проверка
 
 ```bash
@@ -361,4 +366,18 @@ colosseum train -c configs/examples/<game>.yaml --set training.total_timesteps=2
 нарушено. В `validate` контекст начинается с `validate`, порядок тот же, в том числе у полной
 проверки пространств (`space.contains`): `validate, seat 2, episode step 7, layout 4p`.
 Исключение из `reset`/`step` самой среды `validate` показывает одной строкой `Config error: ...` с
-вариантом и шагом.
+вариантом и шагом. Нелегальное действие или исключение скриптового бота — `PlayerError` с тем же
+контекстом плюс агент (`docs/LEAGUE_GUIDE.md`, раздел 3).
+
+## 10. `infos` для скриптовых ботов
+
+Скриптовый бот (`colosseum.players.ScriptedBot`, `docs/LEAGUE_GUIDE.md`) получает в `act(obs, mask, info)` наблюдение и маску своего места и `info = StepResult.infos.get(seat)` последнего шага (`None`, если среда ничего не положила). Через `infos` среда отдаёт боту «сырое» состояние, которое нейросети не нужно: координаты, ссылки на объекты движка, словари.
+
+```python
+return StepResult(acting={0, 1}, obs=..., action_masks=..., rewards=...,
+                  infos={s: {"enemy_base": self._bases[1 - s].copy()} for s in (0, 1)})
+```
+
+- Ключ — номер места, значение — что угодно (обычно `dict`). Фреймворк его не проверяет и не копирует; в чанки и BC-данные он не попадает. Читают его только места со скриптовыми ботами (игроки и учителя DAgger), в обучении, `eval` и `record` одинаково.
+- `rollout.vec_env: sync`: объект передаётся по ссылке, цены нет. Не меняйте его после `step`: бот может держать ссылку.
+- `rollout.vec_env: subprocess`: `StepResult` целиком пиклится из процесса среды в воркер на каждом шаге — вместе с `infos`, даже если ботов в партии нет. Цена — размер `infos`: крупные объекты (вся карта, история) на каждом шаге заметно замедляют воркер. Кладите туда только нужное ботам и компактно (numpy-массивы вместо списков словарей) или включайте их флагом среды в `env.kwargs`, который ставится только в конфигах с ботами.

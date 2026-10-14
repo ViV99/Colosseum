@@ -44,11 +44,15 @@ def test_learner_seed_streams_are_deterministic_and_distinct():
 
 
 def _learner_main(config: ColosseumConfig, agent_id: str = "agent_0", **kwargs) -> None:
+    from colosseum.core.registry import env_spec
     from colosseum.launcher import _learner_main as main
+    from colosseum.learner.factory import resolve_teacher
 
+    spec = env_spec(config)
     _roles, role = agent_role_of(config, agent_id)
-    main(agent_id=agent_id, config=config.get_agent_config(agent_id), role_spec=role, trajectory_queue=None,
-         weight_queues=[], stop_event=None, metrics_queue=None, **kwargs)
+    main(agent_id=agent_id, config=config.get_agent_config(agent_id), role_spec=role, spec=spec,
+         teacher=resolve_teacher(config, agent_id, spec), trajectory_queue=None, weight_queues=[], stop_event=None,
+         metrics_queue=None, **kwargs)
 
 
 def test_local_learner_weights_follow_training_seed(capture_learner_model, restore_global_rng):

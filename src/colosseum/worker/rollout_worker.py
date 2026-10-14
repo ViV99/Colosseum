@@ -22,6 +22,7 @@ from colosseum.core.types import Lineup, MatchResult, TrajectoryChunk, WeightPay
 from colosseum.envs.game import MultiAgentEnv
 from colosseum.metrics.aggregator import WORKER_STATS_INTERVAL_SEC
 from colosseum.networks.model import PolicyModel
+from colosseum.players.registry import BotSpec, FixedPlayers
 from colosseum.worker.rollout_loop import LATEST_NETWORK_ID, LoopIO, RolloutLoop
 
 __all__ = ["LATEST_NETWORK_ID", "report_worker_stats", "rollout_worker_process"]
@@ -33,11 +34,13 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
     """Newest WorkerCommand, merged over all drained ones.
 
     Checkpoints are sent to a worker only once (as deltas), so ``new_checkpoints`` of all
-    drained commands are merged. Lineups are merged per env: a later command's lineup wins,
-    and a ``None`` entry keeps the earlier command's lineup for that env.
+    drained commands are merged, and ``evict`` lists of all drained commands are merged (union,
+    first-seen order). Lineups are merged per env: a later command's lineup wins, and a ``None``
+    entry keeps the earlier command's lineup for that env.
     """
     latest: WorkerCommand | None = None
     merged: dict[str, dict[str, Any]] = {}
+    evict: dict[str, list[str]] = {}
     lineups: list[Lineup | None] = []
     while True:
         try:
@@ -46,6 +49,9 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
             break
         for aid, ckpts in cmd.new_checkpoints.items():
             merged.setdefault(aid, {}).update(ckpts)
+        for aid, ckpt_ids in cmd.evict.items():
+            bucket = evict.setdefault(aid, [])
+            bucket.extend(c for c in ckpt_ids if c not in bucket)
         if len(cmd.lineups) > len(lineups):
             lineups.extend([None] * (len(cmd.lineups) - len(lineups)))
         for e, lineup in enumerate(cmd.lineups):
@@ -54,7 +60,7 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
         latest = cmd
     if latest is None:
         return None
-    return WorkerCommand(lineups=lineups, new_checkpoints=merged)
+    return WorkerCommand(lineups=lineups, new_checkpoints=merged, evict=evict)
 
 
 def report_worker_stats(q, worker_id: int, stats: dict) -> None:
@@ -92,6 +98,8 @@ def rollout_worker_process(
     stats_queue: Any = None,
     stats_interval_sec: float = WORKER_STATS_INTERVAL_SEC,
     max_idle_steps: int = 1000,
+    fixed_players: FixedPlayers | None = None,
+    teachers: Mapping[str, BotSpec] | None = None,
 ) -> None:
     """Worker process entry point (see module docstring).
 
@@ -100,7 +108,9 @@ def rollout_worker_process(
     from ``weight_queues[agent_id]``; results are put non-blocking on ``results_queue``;
     commands are drained (merged) from ``command_queue``. ``max_env_steps`` limits this
     worker's env steps (0 = until stopped). Env steps are added to ``env_step_counter``
-    about every 0.5 s and once more on exit.
+    about every 0.5 s and once more on exit. ``fixed_players``: scripted and frozen agents, built
+    inside this process (served under ``FIXED_NETWORK_ID``; they never collect). ``teachers``: scripted
+    kickstart teachers by student agent (``BotSpec``, never instances; DAgger labels in the chunks).
     """
     configure_torch_threads(torch_threads)
 
@@ -136,7 +146,8 @@ def rollout_worker_process(
     )
     logger.info(
         f"Worker {worker_id}: starting with {num_envs} envs ({vec_env_kind}), "
-        f"chunk_length={chunk_length}, agents={agent_ids}, torch_threads={torch_threads}"
+        f"chunk_length={chunk_length}, agents={agent_ids}, torch_threads={torch_threads}, "
+        f"fixed players={sorted((fixed_players.bots | fixed_players.frozen) if fixed_players else {})}"
     )
     loop = RolloutLoop(
         worker_id=worker_id, env_fn=env_fn, num_envs=num_envs, chunk_length=chunk_length,
@@ -144,6 +155,7 @@ def rollout_worker_process(
         lineups=lineups, weight_sync_interval=weight_sync_interval,
         checkpoint_state_dicts_by_agent=checkpoint_state_dicts_by_agent, seed=seed,
         vec_env_kind=vec_env_kind, subproc_workers=subproc_workers, max_idle_steps=max_idle_steps,
+        fixed_players=fixed_players, teachers=teachers,
     )
     last_stats = [time.monotonic()]
 

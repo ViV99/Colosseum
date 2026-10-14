@@ -1,0 +1,52 @@
+# Coin grid: a solo game (Dict observation with a uint8 grid, masks, step-limit truncation).
+# tests/learning/test_demo_learning_slow.py: the greedy policy scores >= 2x random play.
+run:
+  name: null
+  dir: "runs"
+
+env:
+  env_class: "examples.coin_grid.game.CoinGridGame"
+  kwargs: {size: 7, num_coins: 5, max_steps: 50}
+
+networks:
+  encoder_class: "examples.coin_grid.models.CoinGridEncoder"
+  core: null
+  policy_class: "examples.coin_grid.models.CoinGridPolicy"
+  value_class: "examples.coin_grid.models.CoinGridValue"
+  kwargs: {}
+
+algorithm:
+  gamma: 0.97
+  vtrace_lambda: 0.95
+  entropy_coeff: 0.01
+  learning_rate: 1.0e-3
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 32
+  num_workers: 2
+  envs_per_worker: 16
+  weight_sync_interval_sec: 1.0
+  torch_threads: 1
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  total_timesteps: 300000   # global env steps
+  seed: null
+
+matchmaking:
+  mode: self_play
+
+checkpoint:
+  interval: 100           # train steps between snapshots
+  pool_size: 10
+  save_optimizer: true
+
+metrics:
+  use_wandb: false
+  log_interval: 10
+  console_interval_sec: 10.0

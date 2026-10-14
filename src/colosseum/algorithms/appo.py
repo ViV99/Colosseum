@@ -22,6 +22,16 @@
   honoured: rho = c = 1 is defined independently of ``K``.
 - Observation normalizers update once per train step from ACT slots and BOOT slots with
   ``reset_after`` (a chunk-end BOOT repeats the next chunk's first ACT).
+- Critic warm-up (``critic_warmup_steps``, spec block 6 of SP3): the first N train steps optimize only
+  ``value_loss_coeff * value_loss`` over ``PolicyModel.value_parameters()``; every other parameter has
+  ``requires_grad`` off for the step (no gradient, no Adam update or state), the statistics of the
+  observation normalizers are frozen (the policy stays bit-identical) while the value path's global-state
+  normalizers keep learning (the critic's inputs do not jump at the end of the warm-up), kickstart is off and
+  its decay waits; policy loss and entropy are still reported.
+- Kickstart from a scripted teacher (``KickstartLoss(None)``, DAgger): ``lambda * mean(-log pi(a_teacher))`` over
+  the labeled ACT slots, joint for one decider and the mean over valid deciders with ``Units``; metric
+  ``kickstart_label_frac`` = the labelled share of the ACT slots (reported during the warm-up too).
+  ``teacher_active`` (lambda > 0) goes to the workers with the weights.
 """
 
 from __future__ import annotations
@@ -35,13 +45,13 @@ from torch import Tensor
 
 from colosseum.algorithms.base import BaseAlgorithm, deep_cpu_copy
 from colosseum.algorithms.vtrace import compute_vtrace_slots
-from colosseum.bc.kickstart import KickstartLoss
+from colosseum.bc.kickstart import KickstartLoss, check_teacher_state_layout
 from colosseum.core.config import AlgorithmConfig, LRSchedule
 from colosseum.core.specs import ActionSpec
 from colosseum.core.tree import tree_map, tree_stack
 from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD, TrajectoryChunk
 from colosseum.networks.model import PolicyModel, UnrollOutput
-from colosseum.networks.state import cat_batch, slice_batch, state_to, tree_leaves
+from colosseum.networks.state import cat_batch, slice_batch, state_to
 
 logger = logging.getLogger(__name__)
 
@@ -80,22 +90,10 @@ def resolve_modes(config: AlgorithmConfig, action_spec: ActionSpec) -> tuple[Rat
     return ratio, trace, reduction
 
 
-def _check_teacher_state_layout(student: PolicyModel, teacher: PolicyModel) -> None:
-    """The teacher reuses the student's chunk initial states, so the layouts must match."""
-    student_shapes = [tuple(t.shape) for t in tree_leaves(student.initial_state(1))]
-    teacher_shapes = [tuple(t.shape) for t in tree_leaves(teacher.initial_state(1))]
-    if student_shapes != teacher_shapes:
-        raise ValueError(
-            "kickstart teacher must share the student's state layout "
-            f"(student state leaves {student_shapes}, teacher {teacher_shapes}); "
-            "build the teacher from the student's networks config"
-        )
-
-
 # Layout of every key ``APPO._prepare_batch`` produces (``_select_chunks`` rejects others).
 _TIME_MAJOR_KEYS = frozenset({
     "obs", "global_state", "actions", "action_masks", "kind", "reward", "terminal", "reset_after",
-    "behavior_logp", "behavior_unit_logp",
+    "behavior_logp", "behavior_unit_logp", "teacher_action", "has_teacher",
 })                                   # trees / tensors with leaves [S, B, ...]
 _STATE_KEY = "initial_state"         # State pytree, leaves [B, ...]
 
@@ -141,10 +139,12 @@ class APPO(BaseAlgorithm):
         device: str | torch.device = "cpu",
         pin_memory: bool = False,
         kickstart: KickstartLoss | None = None,
+        critic_warmup_steps: int = 0,
     ):
         self._model = model.to(device)
         if kickstart is not None:
-            _check_teacher_state_layout(self._model, kickstart.teacher)
+            if kickstart.teacher is not None:
+                check_teacher_state_layout(self._model, kickstart.teacher)
             kickstart.to(device)
         self._config = config
         self._action_spec = action_spec
@@ -162,6 +162,27 @@ class APPO(BaseAlgorithm):
         self._scaler = torch.amp.GradScaler("cuda") if self._use_amp else None
 
         self._optimizer = torch.optim.Adam(self._model.parameters(), lr=config.learning_rate)
+
+        # Critic warm-up (SP3 spec block 6): the first N train steps update only the value path.
+        if critic_warmup_steps < 0:
+            raise ValueError(f"critic_warmup_steps must be >= 0, got {critic_warmup_steps}")
+        self._critic_warmup_steps = int(critic_warmup_steps)
+        self._critic_warmup_done = 0
+        self._frozen_in_warmup: list[torch.nn.Parameter] = []
+        if self._critic_warmup_steps > 0:
+            if not config.value_loss_coeff > 0:
+                raise ValueError("critic_warmup_steps > 0 needs algorithm.value_loss_coeff > 0 "
+                                 "(the warm-up trains only the value loss)")
+            try:
+                value_params = list(self._model.value_parameters())
+            except NotImplementedError as e:
+                raise ValueError(f"critic_warmup_steps={critic_warmup_steps} needs "
+                                 f"PolicyModel.value_parameters(): {e}") from e
+            if not value_params:
+                raise ValueError(f"critic_warmup_steps={critic_warmup_steps}: "
+                                 f"{type(self._model).__name__}.value_parameters() returned no parameters")
+            value_ids = {id(p) for p in value_params}
+            self._frozen_in_warmup = [p for p in self._model.parameters() if id(p) not in value_ids]
         self._zero_loss = torch.tensor(0.0, device=device)
         self._compute_vtrace = (
             torch.compile(compute_vtrace_slots) if config.use_torch_compile else compute_vtrace_slots
@@ -189,6 +210,17 @@ class APPO(BaseAlgorithm):
     def modes(self) -> tuple[str, str, str]:
         """Resolved ``(ratio_mode, unit_trace, entropy_reduction)``."""
         return self._ratio_mode, self._unit_trace, self._entropy_reduction
+
+    @property
+    def teacher_active(self) -> bool:
+        """A scripted kickstart teacher with lambda > 0: the workers keep labelling decisions."""
+        k = self._kickstart
+        return k is not None and k.teacher is None and k.current_lambda > 0
+
+    @property
+    def critic_warming_up(self) -> bool:
+        """True during the first ``critic_warmup_steps`` train steps (value path only)."""
+        return self._critic_warmup_done < self._critic_warmup_steps
 
     def set_progress(self, progress: float) -> None:
         """Set the share (0..1) of the global env-step budget consumed so far (drives the LR)."""
@@ -220,6 +252,7 @@ class APPO(BaseAlgorithm):
                 return None
             return tree_stack([get(c) for c in chunks], axis=1)
 
+        teacher_action, has_teacher = self._stack_labels(chunks)
         batch_cpu = {
             "obs": stack(lambda c: c.obs),
             "global_state": stack(lambda c: c.global_state),
@@ -231,6 +264,8 @@ class APPO(BaseAlgorithm):
             "reset_after": stack(lambda c: c.reset_after),
             "behavior_logp": stack(lambda c: c.behavior_logp),
             "behavior_unit_logp": stack(lambda c: c.behavior_unit_logp),
+            "teacher_action": teacher_action,
+            "has_teacher": has_teacher,
         }
 
         def move(t: Tensor) -> Tensor:
@@ -241,6 +276,28 @@ class APPO(BaseAlgorithm):
         batch: dict[str, Any] = {k: None if v is None else tree_map(move, v) for k, v in batch_cpu.items()}
         batch["initial_state"] = state_to(cat_batch([c.initial_state for c in chunks]), device)
         return batch
+
+    @staticmethod
+    def _stack_labels(chunks: list[TrajectoryChunk]) -> tuple[Any, Tensor | None]:
+        """Teacher labels ``[S, B, ...]`` and ``has_teacher [S, B]`` (None if no chunk has labels). Chunks
+        without labels (parked buffers, the delay of the teacher flag) get zeros and False."""
+        template = next((c for c in chunks if c.has_teacher is not None), None)
+        if template is None:
+            return None, None
+        actions = [c.teacher_action if c.has_teacher is not None
+                   else tree_map(torch.zeros_like, template.teacher_action) for c in chunks]
+        flags = [c.has_teacher if c.has_teacher is not None else torch.zeros_like(template.has_teacher)
+                 for c in chunks]
+        return tree_stack(actions, axis=1), torch.stack(flags, dim=1)
+
+    def _label_actions(self, batch: dict) -> Any:
+        """Teacher actions ``[S*B, ...]`` where a slot is labeled, else the recorded action (always legal under
+        the slot's mask, so every log-prob is finite)."""
+        S, B = batch["kind"].shape
+        labeled = batch["has_teacher"].bool().reshape(S * B)
+        teacher = tree_map(lambda t: t.reshape(S * B, *t.shape[2:]), batch["teacher_action"])
+        return tree_map(lambda t, a: torch.where(labeled.reshape(-1, *([1] * (t.dim() - 1))), t, a),
+                        teacher, self._flat_actions(batch))
 
     def _autocast(self) -> torch.autocast:
         """AMP autocast context (a no-op unless AMP is enabled on CUDA)."""
@@ -292,9 +349,9 @@ class APPO(BaseAlgorithm):
 
     def compute_loss(self, chunks: list[TrajectoryChunk]) -> dict[str, Tensor]:
         """APPO loss and diagnostics for one minibatch of chunks (see ``_loss_from_batch``)."""
-        return self._loss_from_batch(self._prepare_batch(chunks))
+        return self._loss_from_batch(self._prepare_batch(chunks), warmup=self.critic_warming_up)
 
-    def _loss_from_batch(self, batch: dict) -> dict[str, Tensor]:
+    def _loss_from_batch(self, batch: dict, warmup: bool = False) -> dict[str, Tensor]:
         """APPO loss for one prepared minibatch (``_prepare_batch`` output or a slice of it).
 
         1. Unroll the model over every slot (``_evaluate``).
@@ -304,6 +361,8 @@ class APPO(BaseAlgorithm):
         4. Policy loss per ``ratio_mode``; value MSE; entropy per ``entropy_reduction``.
         5. Optional kickstart KL with the same reduction.
         6. Diagnostics over ACT slots.
+
+        ``warmup``: the critic warm-up's loss (value only, no kickstart).
         """
         cfg = self._config
         K = self._num_deciders
@@ -364,16 +423,33 @@ class APPO(BaseAlgorithm):
         if self._entropy_reduction == "mean_valid":
             unit_entropy = unit_entropy / n_valid_f
         entropy = _act_mean(unit_entropy, is_act, n_act)
-        total_loss = policy_loss + cfg.value_loss_coeff * value_loss - cfg.entropy_coeff * entropy
+        if warmup:                                   # critic warm-up: the value path only
+            total_loss = cfg.value_loss_coeff * value_loss
+        else:
+            total_loss = policy_loss + cfg.value_loss_coeff * value_loss - cfg.entropy_coeff * entropy
 
         kickstart_loss = self._zero_loss
-        if self._kickstart is not None and self._kickstart.current_lambda > 0:
-            with self._autocast():
-                kickstart_loss = self._kickstart.compute(
-                    student_dist=out.dist, obs=batch["obs"], reset_after=batch["reset_after"],
-                    state0=batch["initial_state"], action_mask=batch["action_masks"],
-                    actions=self._flat_actions(batch), is_act=is_act, reduction=self._entropy_reduction,
-                )
+        label_frac = self._zero_loss
+        kick = self._kickstart
+        if kick is not None and kick.teacher is None and batch["has_teacher"] is not None:
+            # the labelled share of ACT slots, whether or not the label loss is on (warm-up, lambda = 0)
+            label_frac = (batch["has_teacher"].bool() & is_act).sum().float() / n_act
+        if kick is not None and kick.current_lambda > 0 and not warmup:
+            if kick.teacher is None:                         # scripted teacher (DAgger): labels in the chunks
+                if batch["has_teacher"] is not None:
+                    with self._autocast():
+                        kickstart_loss = kick.compute_labels(
+                            student_dist=out.dist, teacher_actions=self._label_actions(batch),
+                            has_teacher=batch["has_teacher"], is_act=is_act,
+                            reduction="sum" if K == 1 else "mean_valid",
+                        )
+            else:
+                with self._autocast():
+                    kickstart_loss = kick.compute(
+                        student_dist=out.dist, obs=batch["obs"], reset_after=batch["reset_after"],
+                        state0=batch["initial_state"], action_mask=batch["action_masks"],
+                        actions=self._flat_actions(batch), is_act=is_act, reduction=self._entropy_reduction,
+                    )
             total_loss = total_loss + kickstart_loss
 
         result = {
@@ -384,9 +460,11 @@ class APPO(BaseAlgorithm):
             **self._diagnostics(batch, ev, is_act, n_act, valid, n_valid, unit_log_ratio, joint_log_ratio,
                                 trace_log_rho, vt.vs),
         }
-        if self._kickstart is not None:
+        if kick is not None:
             result["kickstart_loss"] = kickstart_loss.detach()
-            result["kickstart_lambda"] = torch.tensor(self._kickstart.current_lambda, device=total_loss.device)
+            result["kickstart_lambda"] = torch.tensor(kick.current_lambda, device=total_loss.device)
+            if kick.teacher is None:                         # every minibatch, so the step mean is right
+                result["kickstart_label_frac"] = label_frac.detach()
         return result
 
     @torch.no_grad()
@@ -436,12 +514,19 @@ class APPO(BaseAlgorithm):
         """Clip to ``max_grad_norm``; return the total gradient norm BEFORE clipping."""
         return torch.nn.utils.clip_grad_norm_(self._model.parameters(), self._config.max_grad_norm)
 
-    def _update_normalizers(self, batch: dict) -> None:
-        """Once per train step: observations of ACT slots and of BOOT slots with ``reset_after``."""
+    def _update_normalizers(self, batch: dict, value_path_only: bool = False) -> None:
+        """Once per train step: observations of ACT slots and of BOOT slots with ``reset_after``.
+
+        ``value_path_only`` (the critic warm-up): only the global-state normalizers, which feed the value path
+        alone; the observation normalizers (the policy's inputs) stay frozen."""
         kind = batch["kind"]
         sel = (kind == SLOT_ACT) | ((kind == SLOT_BOOT) & batch["reset_after"].bool())
-        obs = tree_map(lambda t: t[sel], batch["obs"])
         gs = None if batch["global_state"] is None else tree_map(lambda t: t[sel], batch["global_state"])
+        if value_path_only:
+            if gs is not None:
+                self._model.update_normalizers(None, gs)
+            return
+        obs = tree_map(lambda t: t[sel], batch["obs"])
         self._model.update_normalizers(obs, gs)
 
     def train_step(self, chunks: list[TrajectoryChunk]) -> dict[str, float]:
@@ -453,43 +538,56 @@ class APPO(BaseAlgorithm):
         counts the minibatches whose step the GradScaler skipped.
         """
         cfg = self._config
+        warmup = self.critic_warming_up
         sums: dict[str, Tensor] = {}
         num_updates = 0
 
         full_batch = self._prepare_batch(chunks)
         grad_norm_sum = torch.zeros((), dtype=torch.float64, device=full_batch["kind"].device)
         finite_updates = torch.zeros_like(grad_norm_sum)
-        self._update_normalizers(full_batch)
+        # During the warm-up only the value path's (global-state) normalizers learn: the workers' policy stays
+        # bit-identical, and the critic's inputs do not jump when the warm-up ends.
+        self._update_normalizers(full_batch, value_path_only=warmup)
+        frozen = [p for p in self._frozen_in_warmup if p.requires_grad] if warmup else []
+        for p in frozen:                 # no gradient: Adam updates neither them nor their state
+            p.requires_grad_(False)
 
         mb_size = cfg.minibatch_chunks if cfg.minibatch_chunks > 0 else len(chunks)
-        for _epoch in range(cfg.num_epochs):
-            indices = torch.randperm(len(chunks))
-            for start in range(0, len(chunks), mb_size):
-                losses = self._loss_from_batch(_select_chunks(full_batch, indices[start:start + mb_size]))
-                total_loss = losses["total_loss"]
+        try:
+            for _epoch in range(cfg.num_epochs):
+                indices = torch.randperm(len(chunks))
+                for start in range(0, len(chunks), mb_size):
+                    losses = self._loss_from_batch(_select_chunks(full_batch, indices[start:start + mb_size]),
+                                                   warmup=warmup)
+                    total_loss = losses["total_loss"]
 
-                self._optimizer.zero_grad()
-                if self._scaler is not None:
-                    self._scaler.scale(total_loss).backward()
-                    self._scaler.unscale_(self._optimizer)
-                    grad_norm = self._clip_gradients()
-                    self._scaler.step(self._optimizer)      # skipped if the gradients are not finite
-                    self._scaler.update()
-                else:
-                    total_loss.backward()
-                    grad_norm = self._clip_gradients()
-                    self._optimizer.step()
+                    self._optimizer.zero_grad()
+                    if self._scaler is not None:
+                        self._scaler.scale(total_loss).backward()
+                        self._scaler.unscale_(self._optimizer)
+                        grad_norm = self._clip_gradients()
+                        self._scaler.step(self._optimizer)      # skipped if the gradients are not finite
+                        self._scaler.update()
+                    else:
+                        total_loss.backward()
+                        grad_norm = self._clip_gradients()
+                        self._optimizer.step()
 
-                finite = torch.isfinite(grad_norm)
-                grad_norm_sum += torch.where(finite, grad_norm.detach().double(), 0.0)
-                finite_updates += finite
-                for key, value in losses.items():
-                    value = value.detach().double()
-                    sums[key] = sums[key] + value if key in sums else value
-                num_updates += 1
+                    finite = torch.isfinite(grad_norm)
+                    grad_norm_sum += torch.where(finite, grad_norm.detach().double(), 0.0)
+                    finite_updates += finite
+                    for key, value in losses.items():
+                        value = value.detach().double()
+                        sums[key] = sums[key] + value if key in sums else value
+                    num_updates += 1
+        finally:
+            for p in frozen:
+                p.requires_grad_(True)
 
-        if self._kickstart is not None:
-            self._kickstart.step()
+        if self._kickstart is not None and not warmup:
+            self._kickstart.step()           # the decay starts after the warm-up
+        if warmup:
+            self._critic_warmup_done += 1
         self._policy_version += 1
         self._consumed_samples += sum(c.num_acts for c in chunks)
 
@@ -502,6 +600,7 @@ class APPO(BaseAlgorithm):
         metrics["skipped_updates"] = float(num_updates - num_finite) if self._scaler is not None else 0.0
         metrics["policy_version"] = float(self._policy_version)
         metrics["lr"] = float(self._optimizer.param_groups[0]["lr"])
+        metrics["critic_warmup"] = 1.0 if warmup else 0.0
         return metrics
 
     # ------------------------------------------------------------------
@@ -512,7 +611,7 @@ class APPO(BaseAlgorithm):
         """Deep CPU copy of the training state (model weights excluded).
 
         Keys: ``optimizer``, ``progress``, ``scaler`` (None without AMP), ``kickstart`` (None
-        without kickstart), ``policy_version``, ``consumed_samples``.
+        without kickstart), ``policy_version``, ``consumed_samples``, ``critic_warmup_done``.
         """
         return deep_cpu_copy({
             "optimizer": self._optimizer.state_dict(),
@@ -521,6 +620,7 @@ class APPO(BaseAlgorithm):
             "kickstart": self._kickstart.state_dict() if self._kickstart is not None else None,
             "policy_version": int(self._policy_version),
             "consumed_samples": int(self._consumed_samples),
+            "critic_warmup_done": int(self._critic_warmup_done),
         })
 
     def load_state_dict(self, state: dict[str, Any]) -> None:
@@ -531,6 +631,8 @@ class APPO(BaseAlgorithm):
         self._load_optional_state("kickstart", self._kickstart, state["kickstart"])
         self._policy_version = int(state["policy_version"])
         self._consumed_samples = int(state["consumed_samples"])
+        # absent in trainer states written before SP3: the warm-up restarts with the fresh optimizer
+        self._critic_warmup_done = int(state.get("critic_warmup_done", 0))
         self.set_progress(float(state["progress"]))
 
     @staticmethod

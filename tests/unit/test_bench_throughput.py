@@ -118,3 +118,13 @@ def test_benchmark_config_builds_and_validates(tmp_path):
     assert cfg.networks.core is None and cfg.matchmaking.layouts == {"2p": 1.0}
     assert cfg.env.env_class == "examples.tic_tac_toe.game.TicTacToeGame"
     validate_config(cfg)
+
+
+def test_benchmark_workload_is_latest_only_self_play_without_fixed_players(tmp_path):
+    """Criterion 3.5 measures the SP2 workload: no scripted / frozen players, every seat latest."""
+    cfg = bench._make_config(1, str(tmp_path))
+    assert cfg.get_trainable_agent_ids() == ["agent_0"] and cfg.fixed_agent_ids() == []
+    opponents = cfg.matchmaking.opponents
+    assert (opponents.latest, opponents.snapshots, opponents.rivals, opponents.anchors) == (1.0, 0.0, 0.0, 0.0)
+    assert cfg.init.from_ is None and cfg.kickstart.teacher is None
+    assert cfg.checkpoint.interval >= 10**9                       # no snapshot is ever written

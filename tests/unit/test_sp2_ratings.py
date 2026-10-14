@@ -35,7 +35,7 @@ def result(layout, seats, ranks, scores=None, kind=None, length=5) -> MatchResul
 
 def test_one_vs_one_is_one_pair_of_weight_one():
     pairs = member_pairs(result("2p", [seat(0, 0, "a"), seat(1, 1, "b")], {0: 1, 1: 2}))
-    assert pairs == [MemberPair("cross", "a", "b", 1.0, 1.0, "player", "player")]
+    assert pairs == [MemberPair("cross", "a", "b", 1.0, 1.0, "player", "player", "latest", "latest")]
 
 
 def test_two_v_two_splits_the_team_pair_weight_between_member_pairs():
@@ -69,9 +69,10 @@ def test_teammates_are_not_compared_and_skipped_pairs_leave_the_divisor():
 
 def test_latest_vs_own_checkpoint_is_a_past_pair_from_the_latest_side():
     r = result("2p", [seat(0, 0, "a", "ckpt_v3"), seat(1, 1, "a")], {0: 1, 1: 2})
-    assert member_pairs(r) == [MemberPair("past", "a", "a", 0.0, 1.0, "player", "player")]
+    assert member_pairs(r) == [MemberPair("past", "a", "a", 0.0, 1.0, "player", "player", "latest", "ckpt_v3")]
     latest_first = result("2p", [seat(0, 0, "a"), seat(1, 1, "a", "ckpt_v3")], {0: 1, 1: 2})
-    assert member_pairs(latest_first) == [MemberPair("past", "a", "a", 1.0, 1.0, "player", "player")]
+    assert member_pairs(latest_first) == [
+        MemberPair("past", "a", "a", 1.0, 1.0, "player", "player", "latest", "ckpt_v3")]
     two_checkpoints = result("2p", [seat(0, 0, "a", "ckpt_v1"), seat(1, 1, "a", "ckpt_v2")], {0: 1, 1: 2})
     assert member_pairs(two_checkpoints) == []
     assert member_pairs(result("solo", [seat(0, 0, "a")], {0: 1})) == []
@@ -213,9 +214,10 @@ def test_rating_book_decisive_past_and_mixed_team_pairs():
                    {0: 1, 1: 2})
     third = pytest.approx(1 / 3)
     assert member_pairs(mixed) == [  # latest a vs latest a is skipped: 3 counted pairs share the weight
-        MemberPair("cross", "a", "b", 1.0, third, "player", "player"),
-        MemberPair("past", "a", "a", 0.0, third, "player", "player"),  # team 1's latest a lost to the checkpoint
-        MemberPair("cross", "a", "b", 1.0, third, "player", "player"),
+        MemberPair("cross", "a", "b", 1.0, third, "player", "player", "latest", "latest"),
+        # team 1's latest a lost to the checkpoint
+        MemberPair("past", "a", "a", 0.0, third, "player", "player", "latest", "ckpt_v1"),
+        MemberPair("cross", "a", "b", 1.0, third, "player", "player", "ckpt_v1", "latest"),
     ]
     book.update(mixed)
     snap = book.snapshot()["2v2"]

@@ -7,11 +7,14 @@ top-level classes, so ``functools.partial(Game, ...)`` or the class itself is a 
 
 from __future__ import annotations
 
+import functools
 import math
 import queue
+import shutil
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, field
-from typing import Any
+from pathlib import Path
+from typing import Any, ClassVar
 
 import gymnasium
 import numpy as np
@@ -25,6 +28,7 @@ from colosseum.core.ipc import assert_no_tensors
 from colosseum.core.specs import ActionSpec, ObsSpec
 from colosseum.core.tree import Tree, tree_get, tree_leaves, tree_map, tree_to_torch
 from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
+from colosseum.core.validation import random_legal_action
 from colosseum.envs.contract import EpisodeTracker
 from colosseum.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
 from colosseum.envs.spaces import Units
@@ -34,7 +38,9 @@ from colosseum.networks.cores import Core, GRUCore, LSTMCore, NoCore, WindowAtte
 from colosseum.networks.dist import Distribution, make_distribution
 from colosseum.networks.heads import UnitsHead
 from colosseum.networks.model import PolicyModel, PolicyStep, UnrollOutput
+from colosseum.players import ScriptedBot
 from colosseum.worker.buffers import BufferSpec, RolloutBuffer
+from colosseum.worker.match_runner import ScriptedPlayer
 
 
 def _vec(*values: float) -> np.ndarray:
@@ -687,7 +693,8 @@ class TickGame(MultiAgentEnv):
     ``global_state`` (if enabled) is ``[k, t + 0.5 * s]``. ``obs_dtype`` sets the observation
     Box dtype (e.g. ``np.uint8``). ``mask_fn(k, t, seat)`` gives the
     acting seats' masks (``None`` = no masks). ``log`` records ``(k, t, seed, actions)``
-    for every reset (``actions`` None) and step.
+    for every reset (``actions`` None) and step. With ``infos`` every acting seat gets
+    ``infos[seat] = {"k", "t", "seat"}``.
     """
 
     def __init__(
@@ -700,6 +707,7 @@ class TickGame(MultiAgentEnv):
         mask_fn: Callable[[int, int, int], Any] | None = None,
         tag: int = 0,
         obs_dtype: Any = np.float32,
+        infos: bool = False,
     ) -> None:
         self.scripts = [list(script)] if isinstance(script[0], Tick) else [list(s) for s in script]
         act = action_space if action_space is not None else gymnasium.spaces.Discrete(3)
@@ -714,6 +722,7 @@ class TickGame(MultiAgentEnv):
         self.layout = next(iter(self.spec.layouts))
         self.num_seats = num_seats
         self.global_state_enabled = global_state
+        self.infos_enabled = infos
         self.mask_fn = mask_fn
         self.tag = tag
         self.k = -1
@@ -734,6 +743,8 @@ class TickGame(MultiAgentEnv):
             res.action_masks = {s: self.mask_fn(self.k, self.t, s) for s in acting}
         if self.global_state_enabled:
             res.global_state = {s: self._gs(s) for s in acting}
+        if self.infos_enabled:
+            res.infos = {s: {"k": self.k, "t": self.t, "seat": s} for s in acting}
         return res
 
     def reset(self, seed: int | None, layout: str) -> StepResult:
@@ -763,7 +774,7 @@ class TickGame(MultiAgentEnv):
 
 
 class DictModelPool:
-    """ModelPool over a plain ``{(agent_id, network_id): model}`` dict."""
+    """PlayerPool over a plain ``{(agent_id, network_id): model}`` dict."""
 
     def __init__(self, models: Mapping[tuple[str, str], Any]) -> None:
         self.models = dict(models)
@@ -1016,6 +1027,9 @@ class GameTestModel(PolicyModel):
     def update_normalizers(self, obs, global_state=None):
         self.inner.update_normalizers(obs, global_state)
 
+    def value_parameters(self):
+        return self.inner.value_parameters()
+
     @property
     def is_stateful(self) -> bool:
         return self.inner.is_stateful
@@ -1046,7 +1060,7 @@ def make_test_config(game: str, **sections):
                     "weight_sync_interval_sec": 0.5, "match_refresh_interval_sec": 1.0},
         "learner": {"device": "cpu", "batch_chunks": 2, "queue_size": 16},
         "training": {"total_timesteps": 2000, "seed": 0},
-        "checkpoint": {"interval": 20, "pool_size": 5},
+        "checkpoint": {"interval": 20, "keep_last": 5, "keep_every": 0},
         "metrics": {"use_wandb": False, "log_interval": 1, "console_interval_sec": 1.0},
     }
     if agents is not None:
@@ -1061,8 +1075,6 @@ def make_test_config(game: str, **sections):
 
 def write_test_config(path, game: str, **sections):
     """``make_test_config`` written as YAML to ``path`` (for CLI runs); returns the path."""
-    from pathlib import Path
-
     import yaml
 
     path = Path(path)
@@ -1072,13 +1084,13 @@ def write_test_config(path, game: str, **sections):
 
 
 def make_coordinator(config, checkpoint_dir):
-    """``Coordinator`` for ``config`` with the env's spec and the resolved agent roles."""
+    """``Coordinator`` for ``config`` with the env's spec and the roles of every player."""
     from colosseum.coordinator.coordinator import Coordinator
     from colosseum.core.registry import env_spec
-    from colosseum.core.roles import resolve_agent_roles
+    from colosseum.players.registry import resolve_player_roles
 
     spec = env_spec(config)
-    return Coordinator(config, spec, resolve_agent_roles(config, spec), checkpoint_dir)
+    return Coordinator(config, spec, resolve_player_roles(config, spec), checkpoint_dir)
 
 
 def agent_role_of(config, agent_id: str):
@@ -1142,3 +1154,201 @@ class CrashingAPPO(APPO):
         if self._steps_seen >= self.crash_at_step:
             raise RuntimeError("injected train_step failure")
         return super().train_step(chunks)
+
+
+# ---------------------------------------------------------------------------
+# SP3 (T0.1): SP2 compatibility fixtures (read-only inputs; copy before writing)
+# ---------------------------------------------------------------------------
+
+
+SP2_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "sp2"
+SP2_CONFIGS = SP2_FIXTURES / "configs"
+SP2_CONFIG_NAMES = ("chase", "coin_grid", "coop_buttons", "predator_prey", "space_miners", "team_tag",
+                    "tic_tac_toe", "tic_tac_toe_attention", "tic_tac_toe_multi", "tron", "unit_harvest")
+SP2_TTT_TINY = SP2_FIXTURES / "sp2_ttt_tiny.yaml"
+SP2_RUN = SP2_FIXTURES / "run"
+SP2_CHECKPOINT = SP2_RUN / "checkpoints" / "agent_0" / "ckpt_v3"
+SP2_CHECKPOINT_VERSION = 3
+SP2_CHECKPOINT_ENV_STEPS = 1536
+
+
+def copy_sp2_run(tmp_path) -> Path:
+    """A writable copy of the SP2 fixture run dir under ``tmp_path`` (tests never write into tests/fixtures)."""
+    dst = Path(tmp_path) / "sp2_run"
+    shutil.copytree(SP2_RUN, dst)
+    return dst
+
+
+# ---------------------------------------------------------------------------
+# SP3 (T1.2): scripted bots and config entries for fixed players
+# ---------------------------------------------------------------------------
+
+
+class RecordingBot(ScriptedBot):
+    """Remembers every ``reset`` / ``act`` argument and plays a random legal action from its episode RNG.
+
+    ``RecordingBot.instances`` lists every bot constructed in this process, in order (tests clear it).
+    Each reset entry holds the first draw of the episode RNG (``draw``), so tests can compare RNGs.
+    """
+
+    instances: ClassVar[list[RecordingBot]] = []
+
+    def __init__(self) -> None:
+        self.resets: list[dict] = []
+        self.acts: list[dict] = []
+        self._role: RoleSpec | None = None
+        self._rng: np.random.Generator | None = None
+        RecordingBot.instances.append(self)
+
+    def reset(self, *, role, seat, layout, rng) -> None:
+        self.resets.append({"role": role, "seat": seat, "layout": layout, "draw": float(rng.random())})
+        self._role = self.game_spec.roles[role]
+        self._rng = rng
+
+    def act(self, obs, mask, info):
+        self.acts.append({"obs": obs, "mask": mask, "info": info})
+        return random_legal_action(self._role, mask, self._rng)
+
+
+class ConstantBot(ScriptedBot):
+    """Always the action ``value`` of a ``Discrete`` action space (DAgger and gate tests)."""
+
+    def __init__(self, value: int = 0) -> None:
+        self.value = int(value)
+
+    def act(self, obs, mask, info):
+        return np.int64(self.value)
+
+
+def scripted_agent(class_path: str = "colosseum.players.RandomBot", roles: list[str] | None = None,
+                   **kwargs) -> dict:
+    """An ``agents.<id>`` entry of a scripted agent (raw config dict)."""
+    entry: dict = {"kind": "scripted", "class": class_path, "kwargs": dict(kwargs)}
+    if roles is not None:
+        entry["roles"] = list(roles)
+    return entry
+
+
+def frozen_agent(path, roles: list[str] | None = None, networks: dict | None = None) -> dict:
+    """An ``agents.<id>`` entry of a frozen agent (raw config dict)."""
+    entry: dict = {"kind": "frozen", "path": str(path)}
+    if roles is not None:
+        entry["roles"] = list(roles)
+    if networks is not None:
+        entry["networks"] = dict(networks)
+    return entry
+
+
+def _bot_with_spec(cls, spec: GameSpec, kwargs: dict) -> ScriptedBot:
+    bot = cls(**kwargs)
+    bot.game_spec = spec
+    return bot
+
+
+def scripted_player(cls, spec: GameSpec, **kwargs):
+    """A ``ScriptedPlayer`` for a player pool: each instance is ``cls(**kwargs)`` with ``game_spec = spec``."""
+    return ScriptedPlayer(functools.partial(_bot_with_spec, cls, spec, kwargs))
+
+
+# ---------------------------------------------------------------------------
+# SP3 (T3.2): matchmaker contexts over plain dicts
+# ---------------------------------------------------------------------------
+
+
+class StepCounter:
+    """A settable env-step source (``MatchmakerContext.env_steps_fn``, ``Coordinator(env_steps=...)``)."""
+
+    def __init__(self, value: int = 0) -> None:
+        self.value = int(value)
+
+    def __call__(self) -> int:
+        return self.value
+
+
+def make_matchmaker_context(spec, roles, *, kinds=None, matchmaking=None, per_agent=None, snapshots=None,
+                            scores=None, env_steps=None, seed: int = 0):
+    """A ``MatchmakerContext`` over plain dicts.
+
+    ``roles``: ``{agent: [roles]}`` in config order; ``kinds``: ``{agent: kind}`` (default trainable);
+    ``matchmaking``: the raw global section; ``per_agent``: raw per-agent overrides;
+    ``snapshots``: ``{agent: [checkpoint ids]}``; ``scores``: ``{(owner, (agent, network)): PFSP score}``
+    (default 0.5); ``env_steps``: a callable (default 0).
+    """
+    import random as _random
+
+    from colosseum.core.config import MatchmakingConfig, merge_matchmaking
+    from colosseum.league.base import AgentView, MatchmakerContext
+
+    kinds = kinds or {}
+    agents = {a: AgentView(a, kinds.get(a, "trainable"), frozenset(r)) for a, r in roles.items()}
+    trainable = [a for a in roles if agents[a].kind == "trainable"]
+    base = MatchmakingConfig.model_validate(matchmaking or {}).model_dump(by_alias=True)
+    configs = {a: MatchmakingConfig.model_validate(merge_matchmaking(base, (per_agent or {}).get(a, {})))
+               for a in trainable}
+    return MatchmakerContext(
+        spec=spec, agents=agents, trainable=trainable, matchmaking=configs, rng=_random.Random(seed),
+        snapshots_fn=lambda agent_id: list((snapshots or {}).get(agent_id, [])),
+        pfsp_fn=lambda layout, owner, player: (scores or {}).get((owner, player), 0.5),
+        env_steps_fn=env_steps if env_steps is not None else StepCounter(0),
+    )
+
+
+# ---------------------------------------------------------------------------
+# SP3 (T4.1): checkpoint dirs for warm-start tests
+# ---------------------------------------------------------------------------
+
+
+def write_ckpt_dir(root, config, agent_id: str = "agent_0", *, model=None, policy_version: int = 5,
+                   networks: dict | None = None, seed: int = 0):
+    """``root/ckpt_v<policy_version>`` with ``model.pt`` and ``meta.json`` as the coordinator writes them, for
+    trainable ``agent_id`` of ``config``: its networks (or ``networks``), roles and role signature. ``model``
+    defaults to a fresh model of those networks (torch seed ``seed``). Returns the dir."""
+    import json
+
+    from colosseum.core.config import NetworkConfig
+    from colosseum.core.registry import build_model
+    from colosseum.core.roles import role_signature
+
+    roles, role = agent_role_of(config, agent_id)
+    agent_config = config.get_agent_config(agent_id)
+    net = NetworkConfig.model_validate(networks) if networks is not None else agent_config.networks
+    if model is None:
+        torch.manual_seed(seed)
+        model = build_model(agent_config.model_copy(update={"networks": net}), role)
+    path = Path(root) / f"ckpt_v{policy_version}"
+    path.mkdir(parents=True)
+    torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, path / "model.pt")
+    meta = {"agent_id": agent_id, "checkpoint_id": path.name, "policy_version": policy_version, "timestamp": 0.0,
+            "final": True, "env_steps": 100, "roles": list(roles), "role_signature": role_signature(role),
+            "networks": net.model_dump(mode="json", by_alias=True)}
+    (path / "meta.json").write_text(json.dumps(meta))
+    return path
+
+
+# ---------------------------------------------------------------------------
+# SP3 (T4.5): a scripted kickstart teacher for DAgger tests
+# ---------------------------------------------------------------------------
+
+
+class LabelBot(ScriptedBot):
+    """Always plays ``action`` (a discrete index); ``fail="raise"`` raises in ``act``.
+
+    Every call is appended to the class-level ``LabelBot.calls`` (tests clear it): ``("init", id)``,
+    ``("reset", id, role, seat, layout, first rng draw)``, ``("act", id, obs, info)``.
+    """
+
+    calls: ClassVar[list[tuple]] = []
+
+    def __init__(self, action: int = 1, fail: str = "") -> None:
+        super().__init__()
+        self.action, self.fail = int(action), fail
+        LabelBot.calls.append(("init", id(self)))
+
+    def reset(self, *, role, seat, layout, rng) -> None:
+        LabelBot.calls.append(("reset", id(self), role, seat, layout, float(rng.random())))
+
+    def act(self, obs, mask, info):
+        LabelBot.calls.append(("act", id(self), np.array(obs, copy=True), info))
+        if self.fail == "raise":
+            raise RuntimeError("teacher bot failure")
+        return np.int64(self.action)

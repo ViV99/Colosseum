@@ -1,0 +1,57 @@
+# Team tag: 2v2, each seat is its own bot with a local window; the value sees the whole map
+# (global_state) through the critic encoder. Frozen bots stay live and share the team reward.
+run:
+  name: null
+  dir: "runs"
+
+env:
+  env_class: "examples.team_tag.game.TeamTagGame"
+  # T8.3 calibration: size 6 / view_radius 3 (the class defaults 7 / 2 leave more self-play runs
+  # stuck in a passive, draw-seeking policy; see the SP2 acceptance report)
+  kwargs: {size: 6, view_radius: 3, max_steps: 30, tag_reward: 0.2, with_global_state: true}
+
+networks:
+  encoder_class: "examples.team_tag.models.TagEncoder"
+  critic_encoder_class: "examples.team_tag.models.TagCriticEncoder"   # needs with_global_state: true
+  core: null
+  policy_class: "examples.team_tag.models.TagPolicy"
+  value_class: "examples.team_tag.models.TagValue"
+  kwargs: {}
+
+algorithm:
+  gamma: 0.97
+  vtrace_lambda: 0.95
+  entropy_coeff: 0.003     # T8.3 calibration (was 0.01 with learning_rate 1e-3)
+  learning_rate: 2.0e-3
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 32
+  num_workers: 2
+  envs_per_worker: 16
+  weight_sync_interval_sec: 1.0
+  torch_threads: 1
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  total_timesteps: 400000   # global env steps; about 3 minutes of training on 8 cores (T8.3 calibration)
+  seed: null
+
+matchmaking:
+  mode: self_play
+  teammates: self           # homogeneous teams
+  latest_prob: 0.8
+
+checkpoint:
+  interval: 100           # train steps between snapshots
+  pool_size: 10
+  save_optimizer: true
+
+metrics:
+  use_wandb: false
+  log_interval: 10
+  console_interval_sec: 10.0

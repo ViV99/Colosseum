@@ -159,7 +159,7 @@ def test_kickstart_teacher_must_fit_every_agent(tmp_path):
 def test_one_global_teacher_cannot_serve_roles_with_different_spaces(tmp_path):
     teacher = tmp_path / "teacher.pt"
     teacher.write_bytes(b"never read")
-    with pytest.raises(ConfigError, match="kickstart_teacher"):
+    with pytest.raises(ConfigError, match="kickstart.teacher"):
         validate_config(make_test_config("asymmetric", training={"kickstart_teacher": str(teacher)}))
 
 

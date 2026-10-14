@@ -1,14 +1,14 @@
-> Origin: `.superpowers/sdd/2026-10-08-sp2-game-model/implementer-instructions.md` (SP2 SDD workspace, deleted after the merge). Copied 2026-10-09.
-> SP2 template, verbatim except paths (`<repo>`, `<scratch>/`); adapt the plan, spec and workspace names for the next sub-project.
+> Origin: `.superpowers/sdd/2026-10-10-sp3-league/implementer-instructions.md` (SP3 SDD workspace, deleted after the merge). Copied 2026-10-15.
+> The SP2 template as revised for SP3, verbatim except paths (`<repo>`); adapt the plan, spec, branch and workspace names for the next sub-project.
 
-# Implementer instructions (SP2 execution; binding for every task)
+# Implementer instructions (SP3 execution; binding for every task)
 
-You implement ONE task of the SP2 plan for the Colosseum repo (<repo>, branch `sp2-game-model`, already checked out).
+You implement ONE task of the SP3 plan for the Colosseum repo (<repo>, branch `sp3-league`, already checked out).
 
 ## Inputs
 - Your task brief (path given in the dispatch) = your requirements, with exact values to use verbatim. It contains the part preamble, the task text and the part's contract notes.
-- `constraints.md` in this directory: global constraints, the shadow-package strategy (`colosseum.sp2`), the BINDING contract amendments R1–R18 and plan-stage rulings. Amendments override the brief where they conflict; the dispatch names the ones that apply to your task.
-- Spec (binding authority): docs/superpowers/specs/2026-10-08-sp2-game-model-design.md (Russian). The full interface contract: docs/superpowers/plans/2026-10-08-sp2-game-model/00-overview.md ("Interface contract"); grep it for names from other tasks. Do not read the whole plan parts.
+- `constraints.md` in this directory: global constraints, the BINDING contract amendments (A1, A2, ...) and pre-flight rulings (P1, P2, ...). Amendments and rulings override the brief where they conflict; the dispatch names the ones that apply to your task.
+- Spec (binding authority): docs/superpowers/specs/2026-10-10-sp3-league-design.md (Russian). The full interface contract: docs/superpowers/plans/2026-10-10-sp3-league/00-overview.md ("Interface contract"); grep it for names from other tasks. Do not read the whole plan parts.
 
 ## Before you begin
 If anything is unclear or the brief's "before" code does not match the repo, keep the intent, the contract and the task's tests, adapt the edit, and say so in the commit body. If you cannot resolve it safely, stop and report NEEDS_CONTEXT with specifics.

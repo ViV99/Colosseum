@@ -2,7 +2,8 @@
 ``colosseum train`` on its example config (about 3 minutes or less on 8 cores, 2 workers), then
 the newest checkpoint plays greedily against uniformly random legal players through the in-process
 eval API (``play_lineups``). Thresholds are the spec's; changing one needs a ruling with
-measurements (T8.3 Step 9), never a silent edit. ``test_tic_tac_toe_beats_random_80_percent`` is
+measurements (SP2 T8.3 Step 9, SP3 T6.3/T6.4), never a silent edit. team_tag trains once since SP3
+(RandomBot anchor, spec block 9). ``test_tic_tac_toe_beats_random_80_percent`` is
 the port of SP1's ``test_ttt_slow.py``."""
 from __future__ import annotations
 
@@ -14,7 +15,6 @@ from colosseum.core.registry import env_spec
 from colosseum.core.types import Lineup, SeatAssignment
 from colosseum.eval import summarize
 from demo_learning import (
-    LEARNING_SEED,
     greedy_agent,
     mean_team_score,
     play,
@@ -68,38 +68,20 @@ def test_unit_harvest_beats_random_80_percent(tmp_path):
     assert rate >= 0.80
 
 
-TEAM_TAG_RETRY_SEED_OFFSET = 1000
-
-
-def _team_tag_win_rate(tmp_path, seed_offset: int) -> float:
-    sets = {**TWO_WORKERS, "training.seed": LEARNING_SEED + seed_offset}
-    run = train_example("team_tag", tmp_path, sets)
+def test_team_tag_team_beats_random_team_80_percent(tmp_path):
+    """One run (SP3 spec block 9, criterion 4): the example config trains against a RandomBot anchor
+    (share: T6.3 ruling), which removes SP2's passive, draw-seeking failure mode, so the SP2
+    best-of-two retry is gone. The threshold is the spec's."""
+    run = train_example("team_tag", tmp_path, TWO_WORKERS)
     trained, role = greedy_agent(run, "agent_0")
     spec = env_spec(run.config)
     results = play(run.env_fn(), {"trained": trained, "random": random_model(role)},
                    team_lineups(spec.teams("2v2"), "2v2", "trained", "random", 200))
     rate = win_rate(results, "trained")
-    _report(f"team_tag seed+{seed_offset}", run, win_rate=rate)
-    return rate
-
-
-@pytest.mark.timeout(2400)
-def test_team_tag_team_beats_random_team_80_percent(tmp_path):
-    """Best of two independent runs (controller ruling, T8.3 fix round 2): about 2 of 9 single runs
-    (the T8.3 record in the SP2 acceptance report) settle into a passive draw-seeking policy (0 losses,
-    many draws), and async training is not reproducible per seed. If the first run misses the
-    threshold, train once more from scratch (new run dir, seed offset ``TEAM_TAG_RETRY_SEED_OFFSET``).
-    The threshold itself is the spec's. No other test retries."""
-    first_dir = tmp_path / "run1"
-    first_dir.mkdir()
-    first = _team_tag_win_rate(first_dir, 0)
-    if first >= 0.80:
-        return
-    retry_dir = tmp_path / "run2"
-    retry_dir.mkdir()
-    second = _team_tag_win_rate(retry_dir, TEAM_TAG_RETRY_SEED_OFFSET)
-    print(f"[team_tag] best of two: first run {first:.3f}, retry {second:.3f}")
-    assert second >= 0.80, f"both runs below 0.80: {first:.3f}, {second:.3f}"
+    draws = sum(len({t.rank for t in r.teams}) == 1 for r in results) / len(results)
+    mean_len = sum(r.episode_length for r in results) / len(results)
+    _report("team_tag", run, win_rate=rate, draws=draws, mean_len=mean_len)
+    assert rate >= 0.80
 
 
 def test_tron_wins_2p_and_takes_first_place_in_4p(tmp_path):

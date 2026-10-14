@@ -38,13 +38,14 @@ training:
   seed: null
 
 matchmaking:
-  mode: self_play
+  # SP2 form: mode self_play, latest_prob 0.8 (translated exactly; see docs/LEAGUE_GUIDE.md)
+  opponents: {latest: 0.8, snapshots: 0.2, rivals: 0.0, anchors: 0.0}
+  pfsp: {weighting: hard, exponent: 1.0}
   layouts: {2p: 0.4, 3p: 0.2, 4p: 0.4}   # weights of the layouts the matchmaker picks
-  latest_prob: 0.8
 
 checkpoint:
   interval: 100           # train steps between snapshots
-  pool_size: 10
+  keep_last: 10
   save_optimizer: true
 
 metrics:

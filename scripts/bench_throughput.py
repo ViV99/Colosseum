@@ -149,16 +149,23 @@ def _make_config(num_workers: int, run_parent: str):
             "seed": 0,
         },
         matchmaking={
-            "mode": "self_play",
+            "opponents": {"latest": 1.0, "snapshots": 0.0, "rivals": 0.0, "anchors": 0.0},  # SP2 workload: latest only
+            "anchors": [],
+            "pfsp": {"weighting": "hard", "exponent": 1.0, "halflife_games": 200.0},
             "layouts": {LAYOUT: 1.0},
-            "latest_prob": 0.5,
+            "teammates": "self",
+            "teammate_self_prob": 0.5,
             "shuffle_seats": True,  # one agent, every seat latest+collect: shuffling is a no-op
+            "matchmaker_class": None,
         },
         checkpoint={
             "interval": 10**9,  # no checkpoints: every seat collects
-            "pool_size": 10,
+            "keep_last": 10,
+            "keep_every": 0,
             "save_optimizer": True,
         },
+        init={"from": None, "strict": True, "critic_warmup_steps": 0},
+        kickstart={"teacher": None, "lambda": 1.0, "decay_steps": 50_000, "kl": "forward"},
         run={"dir": run_parent, "name": f"bench-w{num_workers}"},
         metrics={"use_wandb": False, "log_interval": 1, "console_interval_sec": SYSTEM_RECORD_INTERVAL_S},
         transport={"mode": "local"},

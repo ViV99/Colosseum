@@ -74,14 +74,17 @@ def main() -> None:
 
 @contextmanager
 def _config_errors() -> Iterator[None]:
-    """A config (or env contract, or input data) problem found at startup: one line on stderr,
-    exit code 1, no traceback."""
-    from colosseum.core.errors import ConfigError, EnvContractError
+    """A config (or env contract, or input data) problem found at startup, or a scripted player's error:
+    one line on stderr, exit code 1, no traceback."""
+    from colosseum.core.errors import ConfigError, EnvContractError, PlayerError
 
     try:
         yield
     except (ConfigError, EnvContractError) as e:
         click.echo(f"Config error: {e}", err=True)
+        sys.exit(1)
+    except PlayerError as e:
+        click.echo(f"Player error: {e}", err=True)
         sys.exit(1)
 
 
@@ -105,12 +108,12 @@ def _parse_overrides(overrides: tuple[str, ...]) -> dict:
     return result
 
 
-def _parse_agent_spec(spec: str) -> tuple[str, str]:
-    """``name=path`` -> (name, path)."""
+def _parse_agent_spec(spec: str) -> tuple[str, str | None]:
+    """``name=path`` -> (name, path); ``name`` -> (name, None): a scripted or frozen agent of the config."""
     name, sep, path = spec.partition("=")
-    if not sep or not name or not path:
-        raise click.BadParameter(f"expected name=path, got {spec!r}", param_hint="'--agent'")
-    return name, path
+    if not name or (sep and not path):
+        raise click.BadParameter(f"expected name or name=path, got {spec!r}", param_hint="'--agent'")
+    return name, (path if sep else None)
 
 
 @main.command()
@@ -134,15 +137,18 @@ def train(config: str, overrides: tuple[str, ...]) -> None:
 @click.option("--set", "overrides", multiple=True,
               help="Override config values (e.g., --set env.max_idle_steps=200)." + _SET_HELP_YAML)
 def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
-    """Validate a config: GameSpec, roles, matchmaking, env steps under the contract, every agent's model."""
+    """Validate a config: GameSpec, roles, matchmaking, env steps under the contract, every agent's model,
+    every scripted agent played under the legality gate, every frozen agent loaded."""
     with _config_errors():
         from colosseum.core.config import load_config
         from colosseum.core.registry import validate_config
 
         cfg = load_config(config, _parse_overrides(overrides) or None)
-        validate_config(cfg)
-        for aid in cfg.get_trainable_agent_ids():
-            click.echo(f"  OK: agent '{aid}'")
+        report = validate_config(cfg)
+        for aid in cfg.agent_ids():
+            click.echo(f"  OK: agent '{aid}' ({cfg.agent_kind(aid)})")
+        for line in report.lines:
+            click.echo(f"  {line}")
     click.echo("Config is valid.")
 
 
@@ -150,9 +156,9 @@ def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
 @click.option("--config", "-c", required=True, type=click.Path(exists=True),
               help="Config YAML: its env is used for every match; agents.<name> / networks build .pt agents")
 @click.option("--agent", "-a", "agents", required=True, multiple=True,
-              help="name=path. path is a checkpoint dir (architecture and roles from its meta.json) or a "
-                   ".pt state_dict (architecture and roles of agents.<name>, else the global networks "
-                   "playing every role). Repeatable.")
+              help="name=path or name. path is a checkpoint dir (architecture and roles from its meta.json) or "
+                   "a .pt state_dict (architecture and roles of agents.<name>, else the global networks playing "
+                   "every role). A bare name is a scripted or frozen agent of the config. Repeatable.")
 @click.option("--layout", "layouts", multiple=True,
               help="Layout to evaluate (repeatable). Default: every layout the agents can fill.")
 @click.option("--num-matches", "-n", default=100, type=click.IntRange(min=1), show_default=True,
@@ -164,6 +170,8 @@ def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
 @click.option("--seed", default=None, type=int, help="Seed for env resets and sampling")
 @click.option("--output", "-o", default=None, type=click.Path(dir_okay=False),
               help="Write the machine-readable result as JSON")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set env.max_idle_steps=200)." + _SET_HELP_YAML)
 def eval_cmd(
     config: str,
     agents: tuple[str, ...],
@@ -173,8 +181,12 @@ def eval_cmd(
     deterministic: bool,
     seed: int | None,
     output: str | None,
+    overrides: tuple[str, ...],
 ) -> None:
     """Evaluate agents/checkpoints against each other (no training).
+
+    The config is checked for what eval uses: the env, the trainable agents' models and the scripted /
+    frozen agents named with -a (warm-start sources and other fixed agents are not read).
 
     Exit code: 0 done, 1 config error (also a malformed checkpoint, a role signature or weights
     that do not fit), 2 bad command-line arguments, 130 SIGINT (Ctrl+C), 143 SIGTERM.
@@ -191,14 +203,19 @@ def eval_cmd(
         from colosseum.core.registry import env_spec, validate_config
         from colosseum.eval import evaluate
 
-        cfg = load_config(config)
-        validate_config(cfg)
+        cfg = load_config(config, _parse_overrides(overrides) or None)
         specs = [_parse_agent_spec(spec) for spec in agents]
+        validate_config(cfg, scope="play", players=[name for name, path in specs if path is None])
         names = [name for name, _ in specs]
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
             raise click.BadParameter(f"duplicate agent names {duplicates}", param_hint="'--agent'")
-        for _name, path in specs:
+        for name, path in specs:
+            if path is None:
+                if name not in cfg.agent_ids():
+                    raise click.BadParameter(f"{name!r} is not an agent of the config; use name=path for a "
+                                             f"checkpoint dir or a .pt file", param_hint="'--agent'")
+                continue
             p = Path(path)
             if not (p.is_dir() or (p.is_file() and p.suffix == ".pt")):
                 raise click.BadParameter(f"{p}: expected a checkpoint directory or a .pt file",
@@ -218,11 +235,72 @@ def eval_cmd(
         click.echo(f"Result written to {output}")
 
 
+@main.command("record")
+@click.option("--config", "-c", required=True, type=click.Path(exists=True),
+              help="Config YAML: its env is used for every match; its scripted/frozen agents can be named")
+@click.option("--player", "-p", required=True,
+              help="Who is recorded: a scripted or frozen agent of the config, or name=path (checkpoint dir or .pt)")
+@click.option("--against", "against", multiple=True,
+              help="Opponent (same forms as --player; repeatable): each one plays the player in eval's pair "
+                   "rotation and only the player's seats are recorded. Without --against the player takes every "
+                   "seat and every seat is recorded.")
+@click.option("--layout", "layouts", multiple=True,
+              help="Layout to play (repeatable). Default: every layout the players can fill.")
+@click.option("--num-matches", "-n", default=100, type=click.IntRange(min=1), show_default=True,
+              help="Matches per layout (with --against: per opponent and layout). With --against and a layout "
+                   "of two or more teams an odd count is rounded up, so the player plays every side equally "
+                   "often.")
+@click.option("--output", "-o", required=True, type=click.Path(file_okay=False),
+              help="New or empty directory: <output>/<role>/part-NNNNN.pt (BC data) and record.json")
+@click.option("--num-envs", default=8, type=click.IntRange(min=1), show_default=True, help="Parallel environments")
+@click.option("--seed", default=None, type=int, help="Seed for env resets, bots and sampling")
+@click.option("--deterministic", is_flag=True, default=False,
+              help="Neural players act greedily (scripted bots are unaffected)")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set env.max_idle_steps=200)." + _SET_HELP_YAML)
+def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tuple[str, ...], num_matches: int,
+               output: str, num_envs: int, seed: int | None, deterministic: bool, overrides: tuple[str, ...]) -> None:
+    """Record a player's decisions as behavioural-cloning data (read by 'colosseum bc --data <output>').
+
+    The config is checked for what record uses: the env, the trainable agents' models and the scripted /
+    frozen agents named by --player / --against (warm-start sources and other fixed agents are not read).
+
+    Exit code: 0 done, 1 config error (unknown player, a layout the player cannot fill without
+    --against, a non-empty output directory) or a scripted player's illegal action, 2 bad
+    command-line arguments, 130 SIGINT, 143 SIGTERM.
+    """
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    with _config_errors():  # also a scripted player's error (PlayerError)
+        from colosseum.core.config import load_config
+        from colosseum.core.registry import validate_config
+        from colosseum.eval import EvalReport
+        from colosseum.record import RECORD_FILE, parse_player, record
+
+        cfg = load_config(config, _parse_overrides(overrides) or None)
+        named = [parse_player(text) for text in (player, *against)]
+        validate_config(cfg, scope="play", players=[name for name, path in named if path is None])
+        content = record(cfg, player, list(against), layouts=list(layouts) or None, num_matches=num_matches,
+                         output=output, num_envs=num_envs, seed=seed, deterministic=deterministic)
+    summary = content["summary"]
+    report = EvalReport(agents=summary["agents"], num_matches=summary["num_matches"],
+                        deterministic=summary["deterministic"], layouts=summary["layouts"])
+    click.echo("\n" + report.text())
+    click.echo(f"Recorded {content['decisions']} decisions ({content['seat_episodes']} seat-episodes of "
+               f"{content['matches']} matches) into {output}:")
+    for role, cell in content["roles"].items():
+        click.echo(f"  {role}: {cell['seat_episodes']} seat-episodes, {cell['decisions']} decisions, "
+                   f"{len(cell['files'])} file(s)")
+    click.echo(f"Description: {output}/{RECORD_FILE}")
+
+
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
-@click.option("--data", "-d", required=True, type=click.Path(exists=True),
-              help="BC data: a .pt file or a directory of .pt files (keys: observations, actions, "
-                   "optional action_masks, dones; trees in the agent's spaces)")
+@click.option("--data", "-d", "data", required=True, multiple=True, type=click.Path(exists=True),
+              help="BC data, repeatable: a .pt file, a directory of .pt files (keys: observations, actions, "
+                   "optional action_masks, dones; trees in the agent's spaces), or a 'colosseum record' output "
+                   "directory (its record.json selects the folders of the agent's roles)")
 @click.option("--output", "-o", required=True, type=click.Path(), help="Where to save the trained state_dict (.pt)")
 @click.option("--agent", "-a", "agent", default=None,
               help="Agent whose networks and roles are trained (default: the config's only trainable agent)")
@@ -232,17 +310,27 @@ def eval_cmd(
 @click.option("--lr", default=1e-3, type=float, show_default=True, help="Adam learning rate")
 @click.option("--seq-len", default=None, type=click.IntRange(min=1),
               help="Window length for stateful models (default: bc.seq_len from the config, 64)")
+@click.option("--seed", default=None, type=int,
+              help="Seed for the model's initial weights and the minibatch order (torch and numpy)")
+@click.option("--set", "overrides", multiple=True,
+              help="Override config values (e.g., --set bc.seq_len=32)." + _SET_HELP_YAML)
 def bc(
     config: str,
-    data: str,
+    data: tuple[str, ...],
     output: str,
     agent: str | None,
     epochs: int,
     batch_size: int,
     lr: float,
     seq_len: int | None,
+    seed: int | None,
+    overrides: tuple[str, ...],
 ) -> None:
     """Train one agent's policy by offline behavioral cloning (loss = -log pi(a|s), masks applied).
+
+    The config is checked for what bc uses: the env and the trainable agents' models (warm-start sources and
+    scripted / frozen agents are not read), so the config may already name the output (init.from, a frozen
+    agent with path: <output>).
 
     Exit code: 0 done, 1 config or data error, 2 bad command-line arguments, 130 SIGINT.
     """
@@ -260,8 +348,8 @@ def bc(
         from colosseum.core.roles import agent_role_spec, resolve_agent_roles
         from colosseum.core.specs import ActionSpec, ObsSpec
 
-        cfg = load_config(config)
-        validate_config(cfg)
+        cfg = load_config(config, _parse_overrides(overrides) or None)
+        validate_config(cfg, scope="play")
         agent_ids = cfg.get_trainable_agent_ids()
         if agent is None:
             if len(agent_ids) != 1:
@@ -271,8 +359,14 @@ def bc(
         elif agent not in agent_ids:
             raise ConfigError(f"--agent {agent!r} is not a trainable agent of the config ({agent_ids})")
         spec = env_spec(cfg)
-        role = agent_role_spec(spec, resolve_agent_roles(cfg, spec)[agent])
+        roles = resolve_agent_roles(cfg, spec)[agent]
+        role = agent_role_spec(spec, roles)
         agent_cfg = cfg.get_agent_config(agent)
+        if seed is not None:              # initial weights, window offsets and minibatch order
+            import numpy as np
+
+            torch.manual_seed(seed)
+            np.random.seed(seed)
         model = build_model(agent_cfg, role)
     device = agent_cfg.learner.device
     if device == "auto":
@@ -282,11 +376,15 @@ def bc(
         lr=lr, device=device, seq_len=seq_len if seq_len is not None else agent_cfg.bc.seq_len,
     )
     with _config_errors():  # unreadable or malformed data, actions that do not fit the policy (DataError)
-        trainer.load_data(data)
+        from colosseum.bc.offline_bc import bc_data_sources
+
+        for source in bc_data_sources(data, roles):
+            trainer.load_data(source)
         metrics = trainer.train(num_epochs=epochs, batch_size=batch_size)
 
     torch.save({k: v.detach().cpu() for k, v in model.state_dict().items()}, output)
-    message = f"BC training complete ({agent}): final-epoch NLL={metrics['bc_loss']:.4f}"
+    message = (f"BC training complete ({agent}): {int(metrics['num_samples'])} decisions, "
+               f"final-epoch NLL={metrics['bc_loss']:.4f}")
     if "accuracy" in metrics:
         message += f", accuracy={metrics['accuracy']:.3f}"
     click.echo(message)

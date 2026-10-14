@@ -12,6 +12,7 @@ this module enforces the invariants they rely on:
   last reset;
 - BOOT and PAD slots carry ``ActionSpec.boot_mask()`` and zero actions; a PAD copies the
   previous slot's observation and ``global_state`` (zeros could produce NaN in user encoders);
+- a teacher label (``has_teacher``) only on ACT slots; BOOT and PAD carry zero labels;
 - a buffer is parked only at an episode boundary (empty, or ending with a terminal ACT or
   a BOOT with ``reset_after``), never full (full buffers are sealed at once).
 
@@ -38,11 +39,16 @@ from colosseum.networks.state import tree_map as state_tree_map
 
 @dataclass(frozen=True)
 class BufferSpec:
-    """Shapes of one agent's slots: its role's observation, action and global-state specs."""
+    """Shapes of one agent's slots: its role's observation, action and global-state specs.
+
+    ``teacher``: the agent has a scripted kickstart teacher; its chunks carry ``teacher_action`` /
+    ``has_teacher``.
+    """
 
     obs: ObsSpec
     action: ActionSpec
     global_state: ObsSpec | None
+    teacher: bool = False
 
 
 def put_row(dst: Tree, idx: Any, src: Tree) -> None:
@@ -82,6 +88,8 @@ class RolloutBuffer:
         self._unit_logp = (
             np.zeros((S, self._num_deciders), dtype=np.float32) if self._num_deciders > 1 else None
         )
+        self._teacher_actions = spec.action.allocate_actions((S,)) if spec.teacher else None
+        self._has_teacher = np.zeros(S, dtype=np.bool_) if spec.teacher else None
         self._cursor = 0
         self._num_acts = 0
         self._begun = False
@@ -150,8 +158,13 @@ class RolloutBuffer:
         log_prob: float,
         unit_log_probs: np.ndarray | None,
         reward: float,
+        teacher_action: Tree | None = None,
     ) -> None:
-        """Append an open ACT carrying ``reward`` (the seat's pending reward)."""
+        """Append an open ACT carrying ``reward`` (the seat's pending reward). ``teacher_action``: the scripted
+        kickstart teacher's action for this decision, if it was asked."""
+        if teacher_action is not None and self._teacher_actions is None:
+            raise ValueError("teacher_action given, but this agent's buffers carry no teacher labels "
+                             "(BufferSpec.teacher)")
         if self.free_slots < 2:
             raise RuntimeError(
                 f"write_act() with {self.free_slots} free slot(s): an ACT never takes the last slot"
@@ -172,6 +185,9 @@ class RolloutBuffer:
             if unit_log_probs is None:
                 raise ValueError(f"unit_log_probs is required: the action has {self._num_deciders} deciders")
             self._unit_logp[i] = unit_log_probs
+        if self._teacher_actions is not None:
+            put_row(self._teacher_actions, i, self._zero_action if teacher_action is None else teacher_action)
+            self._has_teacher[i] = teacher_action is not None
         self._cursor += 1
         self._num_acts += 1
 
@@ -236,6 +252,9 @@ class RolloutBuffer:
         self._logp[i] = 0.0
         if self._unit_logp is not None:
             self._unit_logp[i] = 0.0
+        if self._teacher_actions is not None:
+            put_row(self._teacher_actions, i, self._zero_action)
+            self._has_teacher[i] = False
         self._cursor += 1
 
     def _require_open(self, what: str) -> None:
@@ -261,6 +280,8 @@ class RolloutBuffer:
             reset_after=torch.from_numpy(self._reset_after.copy()),
             behavior_logp=torch.from_numpy(self._logp.copy()),
             behavior_unit_logp=None if self._unit_logp is None else torch.from_numpy(self._unit_logp.copy()),
+            teacher_action=None if self._teacher_actions is None else _to_torch(self._teacher_actions),
+            has_teacher=None if self._has_teacher is None else torch.from_numpy(self._has_teacher.copy()),
         )
 
     def reset(self) -> None:

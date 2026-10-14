@@ -68,3 +68,10 @@ class ComposedModel(PolicyModel):
 
     def reset_state(self, state: State, done: Tensor) -> State:
         return self.core.reset_state(state, done)
+
+    def value_parameters(self) -> list[torch.nn.Parameter]:
+        """The value head and the critic encoder (the encoder and the core feed the policy too)."""
+        params = list(self.value.parameters())
+        if self.critic_encoder is not None:
+            params += list(self.critic_encoder.parameters())
+        return params

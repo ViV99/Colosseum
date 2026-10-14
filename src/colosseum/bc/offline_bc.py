@@ -12,6 +12,8 @@ Data format: one or more ``.pt`` files (``torch.save`` of a dict of tensors) wit
 - ``action_masks`` (optional): the mask tree (``ActionSpec.full_mask`` layout) with a leading
   ``[N]``, bool, True = legal;
 - ``dones`` (optional): ``[N]`` bool, True when decision t ends its episode.
+A ``colosseum record`` output directory (``record.json`` plus one folder of part files per role)
+is read through ``bc_data_sources``.
 
 Loss = minus log-prob of the expert action: the joint log-prob when the action has one decider
 (K = 1); with K > 1 (``Units``) the mean of ``unit_log_prob`` over the valid deciders, so a
@@ -38,8 +40,10 @@ the first epoch.
 
 from __future__ import annotations
 
+import json
 import logging
 import pickle
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -89,6 +93,36 @@ def per_sample_nll(dist: Distribution, actions: Any, num_deciders: int) -> tuple
     count = unit_valid.sum(dim=-1)
     total = torch.where(unit_valid, unit_lp, torch.zeros_like(unit_lp)).sum(dim=-1)
     return -total / count.clamp(min=1).to(total.dtype), count > 0
+
+
+def bc_data_sources(paths: Sequence[str | Path], roles: Sequence[str]) -> list[Path]:
+    """Expand ``colosseum bc --data`` paths for an agent playing ``roles``.
+
+    A ``colosseum record`` output directory (it contains ``record.json``) becomes its folders of
+    ``roles`` that hold data, in the order of ``roles``; any other path (a ``.pt`` file or a
+    directory of ``.pt`` files) is returned unchanged. ``DataError`` if a record directory has an
+    unreadable ``record.json`` or no data for any of ``roles``.
+    """
+    from colosseum.record import RECORD_FILE
+
+    sources: list[Path] = []
+    for raw in paths:
+        path = Path(raw)
+        meta = path / RECORD_FILE
+        if not (path.is_dir() and meta.is_file()):
+            sources.append(path)
+            continue
+        try:
+            recorded = json.loads(meta.read_text())["roles"]
+            recorded_roles = set(recorded)
+        except (OSError, ValueError, KeyError, TypeError) as e:
+            raise DataError(f"{meta}: not a readable {RECORD_FILE} ({type(e).__name__}: {e})") from e
+        found = [path / role for role in roles if role in recorded_roles and (path / role).is_dir()]
+        if not found:
+            raise DataError(f"{path}: the record has data for the roles {sorted(recorded_roles)}, the agent plays "
+                            f"{list(roles)}; record one of the agent's roles or choose another --agent")
+        sources.extend(found)
+    return sources
 
 
 def _fmt(path: tuple[str, ...]) -> str:

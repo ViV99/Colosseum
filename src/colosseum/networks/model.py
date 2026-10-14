@@ -73,12 +73,21 @@ class PolicyModel(nn.Module, ABC):
         device = tree_leaves(state)[0].device
         return where_done(done, self.initial_state(batch, device), state)
 
+    def value_parameters(self) -> list[nn.Parameter]:
+        """Parameters only the value path uses (critic warm-up, ``init.critic_warmup_steps``): the value head and
+        e.g. a critic encoder, never a parameter the policy uses. Models that support the warm-up override it."""
+        raise NotImplementedError(
+            f"{type(self).__name__} does not implement value_parameters(); return the value head's parameters "
+            f"(and a critic encoder's) to use init.critic_warmup_steps"
+        )
+
     @torch.no_grad()
-    def update_normalizers(self, obs: Tree, global_state: Tree | None = None) -> None:
+    def update_normalizers(self, obs: Tree | None, global_state: Tree | None = None) -> None:
         """Update every ``NormalizeObs`` submodule from the leaf at its path of its source tree.
 
-        Called once per train step with all fresh observations (leaves ``[N, ...]``). A
-        global-state normalizer is skipped when ``global_state`` is None.
+        Called once per train step with all fresh observations (leaves ``[N, ...]``). A normalizer
+        is skipped when its source tree is None: ``obs=None`` updates only the global-state
+        normalizers (the value path; APPO's critic warm-up).
         """
         for module in self.modules():
             if isinstance(module, NormalizeObs):

@@ -10,12 +10,15 @@ from __future__ import annotations
 
 import importlib
 import inspect
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from colosseum.core.errors import ConfigError
 
 if TYPE_CHECKING:
-    from colosseum.core.config import ColosseumConfig
+    from collections.abc import Collection
+
+    from colosseum.core.config import ColosseumConfig, NetworkConfig
+    from colosseum.core.validation import ValidationReport
     from colosseum.envs.game import GameSpec, MultiAgentEnv, RoleSpec
     from colosseum.networks.model import PolicyModel
 
@@ -98,7 +101,12 @@ def env_spec(config: ColosseumConfig) -> GameSpec:
 
 
 def build_model(agent_config: ColosseumConfig, role: RoleSpec) -> PolicyModel:
-    """Build the agent's ``PolicyModel`` for ``role``'s spaces from ``agent_config.networks``.
+    """Build the agent's ``PolicyModel`` for ``role``'s spaces from ``agent_config.networks`` (``build_network``)."""
+    return build_network(agent_config.networks, role)
+
+
+def build_network(net: NetworkConfig, role: RoleSpec) -> PolicyModel:
+    """Build a ``PolicyModel`` for ``role``'s spaces from a ``networks`` section.
 
     - ``model_class``: ``cls(**inject, **networks.kwargs)``; it must be a ``PolicyModel``.
     - otherwise a ``ComposedModel``: ``encoder(**inject, **kwargs)``;
@@ -113,7 +121,6 @@ def build_model(agent_config: ColosseumConfig, role: RoleSpec) -> PolicyModel:
     from colosseum.networks.cores import Core, NoCore
     from colosseum.networks.model import PolicyModel
 
-    net = agent_config.networks
     kwargs = dict(net.kwargs)
     if net.model_class:
         model_cls = import_class(net.model_class)
@@ -150,11 +157,13 @@ def build_model(agent_config: ColosseumConfig, role: RoleSpec) -> PolicyModel:
     return ComposedModel(encoder, core, policy, value, critic)
 
 
-def validate_config(config: ColosseumConfig) -> None:
-    """Every check that can run before a run starts (spec block 9); see ``colosseum.core.validation``.
-
-    Callers use this name (``registry.validate_config``), so tests can monkeypatch it here.
-    """
+def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] = "train",
+                    players: Collection[str] | None = None) -> ValidationReport:
+    """Every check that can run before a run starts; see ``colosseum.core.validation``. Returns the report
+    ``colosseum validate`` prints. ``scope`` / ``players``: the full "train" check (``train``, ``validate``,
+    distributed roles) or the "play" check of ``record`` / ``bc`` / ``eval`` (``players``: the scripted /
+    frozen agents the command seats). Callers use this name (``registry.validate_config``), so tests can
+    monkeypatch it here."""
     from colosseum.core.validation import validate_config as _validate_config
 
-    _validate_config(config)
+    return _validate_config(config, scope=scope, players=players)

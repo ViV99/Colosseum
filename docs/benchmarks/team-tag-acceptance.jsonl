@@ -1,0 +1,6 @@
+{"anchors": 0.2, "draw_reward": null, "seed": 10, "win": 0.925, "draw": 0.075, "loss": 0.0, "mean_len": 8.985, "train_sec": 170.5, "env_steps_per_s": 2409, "wall_sec": 173.6}
+{"anchors": 0.2, "draw_reward": null, "seed": 11, "win": 0.905, "draw": 0.095, "loss": 0.0, "mean_len": 9.275, "train_sec": 174.3, "env_steps_per_s": 2358, "wall_sec": 176.5}
+{"anchors": 0.2, "draw_reward": null, "seed": 12, "win": 0.96, "draw": 0.04, "loss": 0.0, "mean_len": 7.435, "train_sec": 175.5, "env_steps_per_s": 2345, "wall_sec": 177.1}
+{"anchors": 0.2, "draw_reward": null, "seed": 13, "win": 0.91, "draw": 0.09, "loss": 0.0, "mean_len": 10.48, "train_sec": 172.6, "env_steps_per_s": 2386, "wall_sec": 174.8}
+{"anchors": 0.2, "draw_reward": null, "seed": 14, "win": 0.97, "draw": 0.03, "loss": 0.0, "mean_len": 6.54, "train_sec": 180.9, "env_steps_per_s": 2268, "wall_sec": 182.4}
+{"anchors": 0.2, "draw_reward": null, "seed": 15, "win": 0.98, "draw": 0.02, "loss": 0.0, "mean_len": 7.42, "train_sec": 162.8, "env_steps_per_s": 2539, "wall_sec": 164.5}

@@ -1,4 +1,4 @@
-"""Pydantic v2 configuration models for the Colosseum framework (config v2, SP2).
+"""Pydantic v2 configuration models for the Colosseum framework (config v3, SP3; v2 = SP2).
 
 Every section of the training pipeline (algorithm, environment, network,
 rollout, learner, matchmaking, checkpointing, metrics, transport, run) has its own
@@ -11,6 +11,11 @@ section are gone (the game structure comes from the env's ``GameSpec``); new are
 ``agents.<id>.roles``, ``algorithm.ratio_mode`` / ``unit_trace`` /
 ``entropy_reduction`` and ``networks.critic_encoder_class``; ``rollout.chunk_length``
 is at least 2.
+
+SP3: ``agents.<id>.kind`` (trainable / scripted / frozen) and the implicit trainable ``agent_0``.
+SP3: ``checkpoint.keep_last`` / ``keep_every`` (``pool_size`` is read as ``keep_last``).
+SP3: ``init`` and ``kickstart`` sections (global + per agent); ``training.kickstart_*`` are translated
+into ``kickstart``.
 """
 
 from __future__ import annotations
@@ -19,17 +24,29 @@ import copy
 import datetime
 import hashlib
 import json
+import logging
 import re
 import types
 import typing
 from enum import Enum
 from pathlib import Path
-from typing import Any, Literal
+from typing import Annotated, Any, Literal
 
 import yaml
-from pydantic import BaseModel, ConfigDict, Field, ValidationError, field_validator, model_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    ValidationError,
+    field_validator,
+    model_validator,
+)
 
 from colosseum.core.errors import ConfigError
+from colosseum.league.schedule import ScheduleValue, parse_schedule
+
+logger = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # Ids used as path components
@@ -99,9 +116,24 @@ class TransportMode(str, Enum):
 
 
 class StrictModel(BaseModel):
-    """Base for every config model: unknown keys are errors, not silently ignored (R5-07)."""
+    """Base for every config model: unknown keys are errors, not silently ignored (R5-07). Fields with an
+    alias (``class``, ``from``, ``lambda``) accept their field name too (a ``model_dump()`` without aliases
+    validates again)."""
 
-    model_config = ConfigDict(extra="forbid")
+    model_config = ConfigDict(extra="forbid", populate_by_name=True)
+
+
+# Matchmaking keys an agent may override (spec block 5); shuffle_seats and matchmaker_class stay global.
+AGENT_MATCHMAKING_KEYS = frozenset({"opponents", "anchors", "pfsp", "layouts", "teammates", "teammate_self_prob"})
+# SP2 matchmaking knobs: accepted only in the raw global matchmaking section, translated, never stored.
+SP2_MATCHMAKING_KNOBS = ("mode", "self_play_ratio", "latest_prob", "pfsp_exponent")
+_SP2_MATCHMAKING_DEFAULTS = {"mode": "self_play", "self_play_ratio": 0.5, "latest_prob": 0.5, "pfsp_exponent": 1.0}
+# SP2 kickstart knobs of the training section -> keys of the top-level kickstart section.
+SP2_KICKSTART_KNOBS = {"kickstart_teacher": "teacher", "kickstart_lambda": "lambda",
+                       "kickstart_decay_steps": "decay_steps", "kickstart_kl": "kl"}
+
+# A share or an anchor weight: a number or {step: value} points over the run's global env steps.
+ScheduleField = Annotated[ScheduleValue, BeforeValidator(parse_schedule)]
 
 
 class AlgorithmConfig(StrictModel):
@@ -331,47 +363,57 @@ class TrainingConfig(StrictModel):
                     "state_dict (e.g. a BC output; weights only, policy_version 0). Policy versions "
                     "and the global env-step counter continue from the checkpoint.",
     )
-    kickstart_teacher: str | None = Field(
-        default=None,
-        description="Path to a frozen teacher .pt state_dict (e.g. a BC model), built from this "
-                    "agent's networks config. When set, a decaying KL term between teacher and "
-                    "student is added to the RL loss (direction: kickstart_kl). None disables it.",
-    )
-    kickstart_lambda: float = Field(
-        default=1.0, ge=0.0, description="Initial weight of the kickstart KL term (decays to 0).",
-    )
-    kickstart_decay_steps: int = Field(
-        default=50_000, ge=1, description="Training steps over which the kickstart lambda decays to 0.",
-    )
-    kickstart_kl: Literal["forward", "reverse"] = Field(
-        default="forward",
-        description="Kickstart KL direction: 'forward' = KL(teacher || student) (Kickstarting / "
-                    "AlphaStar / VPT, mode-covering); 'reverse' = KL(student || teacher).",
-    )
+
+
+class OpponentShares(StrictModel):
+    """Shares of the opponent categories, drawn independently for every opposing team (spec block 5).
+
+    Each is a number or a schedule ``{env_step: value}``. Empty categories pass their share to the
+    others in proportion; ``rivals`` counts as ``latest`` for a team the owner cannot play.
+    """
+
+    latest: ScheduleField = Field(default=0.7, description="The owner's latest weights (self-play); for a team "
+                                                            "the owner cannot play, another agent's latest by PFSP.")
+    snapshots: ScheduleField = Field(default=0.2, description="Stored snapshots of the agents that play the team "
+                                                               "(own, the opponent's in asymmetric games, others'), "
+                                                               "by PFSP.")
+    rivals: ScheduleField = Field(default=0.0, description="Latest weights of the other trainable agents that play "
+                                                            "the team (arena; they collect too), by PFSP.")
+    anchors: ScheduleField = Field(default=0.1, description="The owner's anchors (scripted / frozen agents) that "
+                                                             "play the team, by their weights.")
+
+
+class PfspConfig(StrictModel):
+    """Prioritized fictitious self-play over candidates of a category (spec block 5)."""
+
+    weighting: Literal["hard", "balanced", "uniform"] = Field(
+        default="hard", description="hard: (1 - x)^exponent; balanced: x(1 - x); uniform: 1 (x = the owner's EMA "
+                                    "score against the candidate; floor 1e-6).")
+    exponent: float = Field(default=2.0, ge=0.0, allow_inf_nan=False, description="Exponent of the hard weighting.")
+    halflife_games: float = Field(default=200.0, gt=0.0, allow_inf_nan=False,
+                                  description="EMA half-life of the PFSP score, in games.")
 
 
 class MatchmakingConfig(StrictModel):
-    """How the coordinator builds lineups (layout, match type, team cores, teammates, seats)."""
+    """How the coordinator builds lineups (spec block 5).
 
-    mode: Literal["self_play", "league"] = Field(
-        default="self_play",
-        description="'self_play' = every match is self-play (self_play_ratio is treated as 1); "
-                    "'league' = self-play with probability self_play_ratio, else an arena match.",
+    ``opponents``, ``anchors``, ``pfsp``, ``layouts``, ``teammates`` and ``teammate_self_prob`` may be
+    overridden per agent (``agents.<id>.matchmaking``); ``shuffle_seats`` and ``matchmaker_class``
+    are global only. The SP2 knobs (``mode``, ``self_play_ratio``, ``latest_prob``,
+    ``pfsp_exponent``) are translated from the raw global section (``translate_sp2_matchmaking``).
+    """
+
+    opponents: OpponentShares = Field(default_factory=OpponentShares)
+    anchors: list[str] | dict[str, ScheduleField] | None = Field(
+        default=None,
+        description="Scripted / frozen agents the owner meets as anchors: null = every scripted and frozen agent "
+                    "(weight 1 each); [] = none; a list of names (weight 1 each) or {name: weight or schedule}.",
     )
-    layouts: dict[str, float] = Field(
+    pfsp: PfspConfig = Field(default_factory=PfspConfig)
+    layouts: dict[str, Annotated[float, Field(allow_inf_nan=False)]] = Field(
         default_factory=dict,
         description="Layout weights, e.g. {2p: 0.5, 4p: 0.5}. Empty = every layout with equal weight. Only "
                     "layouts with a seat for the data owner's role are drawn.",
-    )
-    self_play_ratio: float = Field(
-        default=0.5, ge=0.0, le=1.0,
-        description="Probability of a self-play match in 'league' mode (the rest are arena matches).",
-    )
-    pfsp_exponent: float = Field(default=1.0, ge=0.0, description="Exponent p in PFSP priority: f(wr) = (1 - wr)^p.")
-    latest_prob: float = Field(
-        default=0.5, ge=0.0, le=1.0,
-        description="Self-play: probability that an opposing team core is the owner's latest policy "
-                    "(else one of its checkpoints).",
     )
     teammates: Literal["self", "mixed"] = Field(
         default="self",
@@ -383,8 +425,25 @@ class MatchmakingConfig(StrictModel):
     )
     shuffle_seats: bool = Field(
         default=True,
-        description="Permute teams with equal role composition and seats of the same role within a team.",
+        description="Permute teams with equal role composition and seats of the same role within a team (global).",
     )
+    matchmaker_class: str | None = Field(
+        default=None,
+        description="Dotted path to a colosseum.league.BaseMatchmaker subclass that replaces the built-in "
+                    "mixture (global).",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _reject_sp2_knobs(cls, data: Any) -> Any:
+        if isinstance(data, dict):
+            knobs = [k for k in SP2_MATCHMAKING_KNOBS if k in data]
+            if knobs:
+                raise ValueError(
+                    f"{knobs} are SP2 matchmaking knobs: they are accepted only in the global matchmaking section "
+                    f"of the input config (translated into opponents and pfsp); write opponents/pfsp here"
+                )
+        return data
 
     @field_validator("layouts")
     @classmethod
@@ -394,23 +453,194 @@ class MatchmakingConfig(StrictModel):
             raise ValueError(f"matchmaking.layouts weights must be > 0, got {bad}")
         return layouts
 
+    @field_validator("anchors")
+    @classmethod
+    def _check_anchor_names(cls, anchors: Any) -> Any:
+        names = list(anchors) if anchors is not None else []
+        if any(not isinstance(name, str) or not name for name in names):
+            raise ValueError(f"matchmaking.anchors: names must be non-empty strings, got {names}")
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        if duplicates:
+            raise ValueError(f"matchmaking.anchors lists {duplicates} more than once")
+        return anchors
+
+    @field_validator("matchmaker_class")
+    @classmethod
+    def _check_matchmaker_class(cls, path: str | None) -> str | None:
+        if path is not None and "." not in path:
+            raise ValueError(f"matchmaking.matchmaker_class must be a dotted path 'module.Class', got {path!r}")
+        return path
+
+
+def translate_sp2_matchmaking(raw: dict) -> dict:
+    """Pure translation of SP2 matchmaking knobs in a raw global section (spec block 5).
+
+    Without knobs: a deep copy. With at least one: missing knobs take SP2's defaults
+    (``mode: self_play``, ``self_play_ratio: 0.5``, ``latest_prob: 0.5``, ``pfsp_exponent: 1.0``);
+    ``spr = 1`` under ``self_play``, else ``self_play_ratio``; ``latest = spr * latest_prob``,
+    ``snapshots = spr * (1 - latest_prob)``, ``rivals = 1 - spr``, ``anchors = 0``, each rounded to
+    12 decimals; ``pfsp = {weighting: hard, exponent: pfsp_exponent}``. Knobs together with
+    ``opponents`` or ``pfsp``, or a knob out of range, raise ConfigError.
+    """
+    present = [k for k in SP2_MATCHMAKING_KNOBS if k in raw]
+    if not present:
+        return copy.deepcopy(raw)
+    clash = [k for k in ("opponents", "pfsp") if k in raw]
+    if clash:
+        raise ConfigError(
+            f"matchmaking: the SP2 knobs {present} cannot be combined with {clash}; drop the knobs and set "
+            f"matchmaking.opponents / matchmaking.pfsp only"
+        )
+    knobs = {**_SP2_MATCHMAKING_DEFAULTS, **{k: raw[k] for k in present}}
+
+    def number(name: str, low: float, high: float | None) -> float:
+        value = knobs[name]
+        if isinstance(value, bool) or not isinstance(value, (int, float)) or not (
+                low <= value and (high is None or value <= high)):
+            bound = f"[{low}, {high}]" if high is not None else f">= {low}"
+            raise ConfigError(f"matchmaking.{name}={value!r} (SP2 knob) must be a number {bound}")
+        return float(value)
+
+    if knobs["mode"] not in ("self_play", "league"):
+        raise ConfigError(f"matchmaking.mode={knobs['mode']!r} (SP2 knob) must be 'self_play' or 'league'")
+    self_play_ratio = number("self_play_ratio", 0.0, 1.0)        # checked even where mode makes it unused
+    spr = 1.0 if knobs["mode"] == "self_play" else self_play_ratio
+    latest_prob = number("latest_prob", 0.0, 1.0)
+    exponent = number("pfsp_exponent", 0.0, None)
+    out = {k: copy.deepcopy(v) for k, v in raw.items() if k not in SP2_MATCHMAKING_KNOBS}
+    shares = {"latest": spr * latest_prob, "snapshots": spr * (1.0 - latest_prob), "rivals": 1.0 - spr,
+              "anchors": 0.0}
+    out["opponents"] = {name: round(share, 12) for name, share in shares.items()}  # 0.4 * 0.75 -> 0.3, not 0.30..04
+    out["pfsp"] = {"weighting": "hard", "exponent": exponent}
+    return out
+
+
+def translate_sp2_kickstart(raw: dict) -> dict:
+    """Move SP2's ``training.kickstart_*`` of a raw config into a top-level ``kickstart`` section.
+
+    Returns ``raw`` itself when there is nothing to translate, else a new dict (inputs are not
+    mutated). Old knobs together with a top-level ``kickstart`` raise ConfigError.
+    """
+    training = raw.get("training")
+    if not isinstance(training, dict):
+        return raw
+    present = [k for k in SP2_KICKSTART_KNOBS if k in training]
+    if not present:
+        return raw
+    if raw.get("kickstart") is not None:
+        raise ConfigError(
+            f"training.{', training.'.join(present)} (SP2 knobs) cannot be combined with a top-level kickstart "
+            f"section; move them into kickstart: {{teacher, lambda, decay_steps, kl}}"
+        )
+    out = dict(raw)
+    out["training"] = {k: v for k, v in training.items() if k not in SP2_KICKSTART_KNOBS}
+    out["kickstart"] = {SP2_KICKSTART_KNOBS[k]: copy.deepcopy(training[k]) for k in present}
+    return out
+
+
+def merge_matchmaking(base: dict, override: dict) -> dict:
+    """A per-agent matchmaking override on the global section (spec block 5).
+
+    ``opponents`` and ``pfsp`` merge key by key (one share's schedule is replaced whole, never merged
+    point by point); every other key (``anchors``, ``layouts``, ...) replaces the global value.
+    Inputs are not mutated.
+    """
+    out = copy.deepcopy(base)
+    for key, value in override.items():
+        if key in ("opponents", "pfsp") and isinstance(value, dict) and isinstance(out.get(key), dict):
+            out[key] = {**out[key], **copy.deepcopy(value)}
+        else:
+            out[key] = copy.deepcopy(value)
+    return out
+
 
 class CheckpointConfig(StrictModel):
-    """Checkpoint settings. Checkpoints are stored in the run dir (``<run>/checkpoints/``)."""
+    """Snapshot storage (SP3 spec block 4). Snapshots live in the run dir (``<run>/checkpoints/``).
+
+    Kept: the newest ``keep_last`` (with ``trainer_state.pt``), every snapshot whose version is a multiple of
+    ``interval * keep_every`` (``model.pt`` + ``meta.json``), and every final snapshot. ``pool_size`` (SP2) is
+    read as ``keep_last`` with a warning.
+    """
 
     interval: int = Field(
         default=1000, ge=1,
         description="Save a checkpoint every N TRAINING steps (optimizer updates / policy versions), not env "
                     "steps (was self_play.checkpoint_interval).",
     )
-    pool_size: int = Field(
-        default=20, ge=1, description="Max checkpoints kept in the FIFO pool per agent (was self_play.pool_size).",
+    keep_last: int = Field(
+        default=20, ge=1,
+        description="The newest N snapshots per agent are kept, with trainer_state.pt (was pool_size, a FIFO pool).",
+    )
+    keep_every: int = Field(
+        default=10, ge=0,
+        description="Also keep every snapshot whose version is a multiple of interval * keep_every (model.pt and "
+                    "meta.json only); 0 = off.",
     )
     save_optimizer: bool = Field(
         default=True,
         description="Whether checkpoints include the trainer state (optimizer, LR progress, AMP scaler, "
                     "kickstart, counters) as trainer_state.pt. Without it a resume restores weights and "
                     "policy_version only.",
+    )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _translate_pool_size(cls, data: Any) -> Any:
+        """SP2's ``pool_size`` is ``keep_last`` (one warning); both together are an error."""
+        if not isinstance(data, dict) or "pool_size" not in data:
+            return data
+        if "keep_last" in data:
+            raise ValueError("checkpoint.pool_size (SP2) and checkpoint.keep_last are both set; keep only keep_last "
+                             "(pool_size is its old name)")
+        data = dict(data)
+        data["keep_last"] = data.pop("pool_size")
+        logger.warning(f"checkpoint.pool_size is the SP2 name of checkpoint.keep_last; read as keep_last: "
+                       f"{data['keep_last']} (rename it in the config)")
+        return data
+
+
+class InitConfig(StrictModel):
+    """Warm start of a trainable agent's weights (spec block 6). The top-level section is the default of
+    every trainable agent; ``agents.<id>.init`` deep-merges onto it."""
+
+    from_: str | None = Field(
+        default=None, alias="from",
+        description=".pt state_dict | checkpoint dir (model.pt, role signature checked) | run dir (the agent's "
+                    "latest checkpoint there) | name of a frozen agent. Weights only: policy version 0, a fresh "
+                    "optimizer, counters from zero. Ignored for agents restored by training.resume_from.",
+    )
+    strict: bool = Field(
+        default=True,
+        description="false: load only the tensors whose name and shape match; the rest are listed by validate "
+                    "and in the log (no matching tensor at all is an error).",
+    )
+    critic_warmup_steps: int = Field(
+        default=0, ge=0,
+        description="The first N learner train steps update only the value path (PolicyModel.value_parameters()): "
+                    "policy, entropy and kickstart losses off, observation-normalizer statistics frozen (the "
+                    "critic's global-state normalizers keep learning), kickstart decay starts afterwards.",
+    )
+
+
+class KickstartConfig(StrictModel):
+    """A decaying pull of the student towards a teacher (spec block 6). The top-level section is the default
+    of every trainable agent; ``agents.<id>.kickstart`` deep-merges onto it."""
+
+    teacher: str | None = Field(
+        default=None,
+        description="Name of a frozen or scripted agent, or a path: a .pt (the student's architecture) or a "
+                    "checkpoint dir (its own architecture from meta.json). None = no kickstart.",
+    )
+    lambda_: float = Field(
+        default=1.0, ge=0.0, alias="lambda",
+        description="Initial weight of the kickstart term; decays linearly to 0 over decay_steps train steps "
+                    "(after the critic warm-up).",
+    )
+    decay_steps: int = Field(default=50_000, ge=1, description="Train steps over which lambda decays to 0.")
+    kl: Literal["forward", "reverse"] = Field(
+        default="forward",
+        description="Neural teachers: 'forward' = KL(teacher || student), 'reverse' = KL(student || teacher). "
+                    "Scripted teachers use the label loss -log pi(a_teacher) instead.",
     )
 
 
@@ -471,15 +701,57 @@ class TransportConfig(StrictModel):
 
 
 # ---------------------------------------------------------------------------
-# Per-agent config overrides
+# Agents (SP3 spec block 1): trainable, scripted and frozen
 # ---------------------------------------------------------------------------
 
 
-class AgentOverride(StrictModel):
-    """Per-agent overrides as partial dicts.
+AgentKind = Literal["trainable", "scripted", "frozen"]
 
-    They are deep-merged onto the global section before validation (R5-08), so an
-    override that sets only ``learning_rate`` keeps every other global algorithm value.
+# Without any trainable agent in ``agents`` this trainable agent (global settings) exists implicitly.
+IMPLICIT_AGENT_ID = "agent_0"
+
+
+def _check_roles_list(roles: list[str] | None) -> list[str] | None:
+    if roles is not None:
+        if not roles:
+            raise ValueError("roles must not be empty (omit it to play every role)")
+        duplicates = sorted({r for r in roles if roles.count(r) > 1})
+        if duplicates:
+            raise ValueError(f"roles lists {duplicates} more than once")
+    return roles
+
+
+class _AgentEntry(StrictModel):
+    """Base of the three agent kinds: an unknown field is named together with the kind's fields."""
+
+    @model_validator(mode="before")
+    @classmethod
+    def _name_unknown_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        fields = cls.model_fields
+        allowed = set(fields) | {f.alias for f in fields.values() if f.alias}
+        unknown = sorted(str(key) for key in data if key not in allowed)
+        if unknown:
+            kind = data.get("kind", "trainable")
+            names = sorted(f.alias or name for name, f in fields.items())
+            hint = ""
+            if kind == "trainable" and {"class", "kwargs"} & set(unknown):
+                hint = "; a rule-based bot needs kind: scripted"
+            elif kind == "trainable" and "path" in unknown:
+                hint = "; fixed weights from a file need kind: frozen"
+            raise ValueError(f"unknown field(s) {unknown} for a {kind} agent (its fields: {names}){hint}")
+        return data
+
+
+class TrainableAgent(_AgentEntry):
+    """A trainable agent (``kind: trainable``, the default): partial per-agent overrides of ``networks``,
+    ``algorithm``, ``learner``, ``matchmaking``, ``init`` and ``kickstart``.
+
+    The section overrides are merged onto the global sections before validation (R5-08), so an
+    override that sets only ``learning_rate`` keeps every other global algorithm value. Every section is
+    deep-merged except ``matchmaking`` (``merge_matchmaking``: ``opponents`` and ``pfsp`` per key, while
+    ``anchors``, ``layouts`` and any schedule replace the global value whole).
 
     Caveat for ``networks``: the merge is key by key, so an override that switches to
     ``model_class`` still inherits the global ``encoder_class`` / ``policy_class`` /
@@ -488,28 +760,87 @@ class AgentOverride(StrictModel):
     ``kwargs`` explicitly if the new classes take different arguments).
     """
 
-    networks: dict[str, Any] | None = None
-    algorithm: dict[str, Any] | None = None
-    learner: dict[str, Any] | None = None
+    kind: Literal["trainable"] = "trainable"
     roles: list[str] | None = Field(
         default=None,
         description="Roles this agent plays (all must have the same spaces). Omitted = every role of the game, "
                     "which then must all have the same spaces.",
     )
+    networks: dict[str, Any] | None = None
+    algorithm: dict[str, Any] | None = None
+    learner: dict[str, Any] | None = None
+    matchmaking: dict[str, Any] | None = Field(default=None, description="Per-agent matchmaking override.")
+    init: dict[str, Any] | None = Field(default=None, description="Per-agent warm start (init) override.")
+    kickstart: dict[str, Any] | None = Field(default=None, description="Per-agent kickstart override.")
 
     @field_validator("roles")
     @classmethod
     def _check_roles(cls, roles: list[str] | None) -> list[str] | None:
-        if roles is not None:
-            if not roles:
-                raise ValueError("roles must not be empty (omit it to play every role)")
-            duplicates = sorted({r for r in roles if roles.count(r) > 1})
-            if duplicates:
-                raise ValueError(f"roles lists {duplicates} more than once")
-        return roles
+        return _check_roles_list(roles)
+
+    @field_validator("matchmaking")
+    @classmethod
+    def _check_matchmaking_override(cls, value: dict[str, Any] | None) -> dict[str, Any] | None:
+        if value is None:
+            return value
+        knobs = sorted(set(value) & set(SP2_MATCHMAKING_KNOBS))
+        if knobs:
+            raise ValueError(f"matchmaking: {knobs} are SP2 knobs, accepted only in the global matchmaking "
+                             f"section; set opponents / pfsp in agents.<id>.matchmaking")
+        global_only = sorted(set(value) & {"shuffle_seats", "matchmaker_class"})
+        if global_only:
+            raise ValueError(f"matchmaking: {global_only} are global only; set them in the top-level "
+                             f"matchmaking section")
+        unknown = sorted(set(value) - AGENT_MATCHMAKING_KEYS)
+        if unknown:
+            raise ValueError(f"matchmaking: unknown keys {unknown}; an agent may override "
+                             f"{sorted(AGENT_MATCHMAKING_KEYS)}")
+        return value
 
 
-_AGENT_SECTIONS = ("networks", "algorithm", "learner")
+class ScriptedAgent(_AgentEntry):
+    """A rule-based bot (``kind: scripted``): a ``colosseum.players.ScriptedBot`` subclass built with ``kwargs``."""
+
+    kind: Literal["scripted"]
+    class_path: str = Field(..., alias="class",
+                            description="Dotted path to a colosseum.players.ScriptedBot subclass.")
+    kwargs: dict[str, Any] = Field(default_factory=dict, description="Constructor kwargs of the bot.")
+    roles: list[str] | None = Field(
+        default=None, description="Roles the bot plays (their spaces may differ). Omitted = every role of the game.",
+    )
+
+    @field_validator("class_path")
+    @classmethod
+    def _check_class_path(cls, value: str) -> str:
+        if "." not in value:
+            raise ValueError(f"class must be a dotted path 'package.module.Class', got {value!r}")
+        return value
+
+    @field_validator("roles")
+    @classmethod
+    def _check_roles(cls, roles: list[str] | None) -> list[str] | None:
+        return _check_roles_list(roles)
+
+
+class FrozenAgent(_AgentEntry):
+    """Fixed weights from a file (``kind: frozen``): a checkpoint dir (roles and networks from its
+    ``meta.json``) or a ``.pt`` state_dict (``networks``: partial override onto the global networks;
+    ``roles``: default every role of the game, which then must share one set of spaces)."""
+
+    kind: Literal["frozen"]
+    path: str = Field(..., min_length=1, description="Checkpoint dir or .pt state_dict.")
+    networks: dict[str, Any] | None = Field(default=None, description="Only with a .pt path.")
+    roles: list[str] | None = Field(default=None, description="Only with a .pt path.")
+
+    @field_validator("roles")
+    @classmethod
+    def _check_roles(cls, roles: list[str] | None) -> list[str] | None:
+        return _check_roles_list(roles)
+
+
+AgentEntry = Annotated[TrainableAgent | ScriptedAgent | FrozenAgent, Field(discriminator="kind")]
+
+_AGENT_SECTIONS = ("networks", "algorithm", "learner", "matchmaking", "init", "kickstart")
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -552,26 +883,69 @@ class ColosseumConfig(StrictModel):
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     matchmaking: MatchmakingConfig = Field(default_factory=MatchmakingConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    init: InitConfig = Field(default_factory=InitConfig)
+    kickstart: KickstartConfig = Field(default_factory=KickstartConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     bc: BCConfig = Field(default_factory=BCConfig)
     transport: TransportConfig = Field(default_factory=TransportConfig)
     run: RunConfig = Field(default_factory=RunConfig)
-    agents: dict[str, AgentOverride] = Field(
+    agents: dict[str, AgentEntry] = Field(
         default_factory=dict,
-        description="Per-agent config overrides. Keys are agent IDs. "
-                    "Empty = single agent_0 using global config.",
+        description="Agents by id. kind: trainable (default; roles and partial overrides of networks / "
+                    "algorithm / learner / matchmaking / init / kickstart), scripted (a ScriptedBot class with "
+                    "kwargs and roles) or frozen (fixed weights from a checkpoint dir or a .pt). Without a "
+                    "trainable agent an implicit trainable 'agent_0' with the global settings exists.",
     )
+
+    @model_validator(mode="before")
+    @classmethod
+    def _translate_sp2_matchmaking_knobs(cls, data: Any) -> Any:
+        """SP2 knobs in the raw global matchmaking section -> opponents + pfsp, with one warning."""
+        if not isinstance(data, dict):
+            return data
+        raw = data.get("matchmaking")
+        if not isinstance(raw, dict) or not any(k in raw for k in SP2_MATCHMAKING_KNOBS):
+            return data
+        translated = translate_sp2_matchmaking(raw)
+        logger.warning(
+            f"SP2 matchmaking knobs {[k for k in SP2_MATCHMAKING_KNOBS if k in raw]} translated to "
+            f"opponents={translated['opponents']}, pfsp={translated['pfsp']}; write these in the config "
+            f"(the old knobs are not kept in config.resolved.yaml)"
+        )
+        return {**data, "matchmaking": translated}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _translate_sp2_kickstart_knobs(cls, data: Any) -> Any:
+        """SP2's training.kickstart_* -> the top-level kickstart section, with one warning."""
+        if not isinstance(data, dict):
+            return data
+        translated = translate_sp2_kickstart(data)
+        if translated is not data:
+            logger.warning(
+                f"training.kickstart_* are SP2 knobs; translated to kickstart: {translated['kickstart']} (write that "
+                f"section instead; the old keys are not kept in config.resolved.yaml)"
+            )
+        return translated
 
     @field_validator("agents", mode="before")
     @classmethod
-    def _null_agent_means_no_override(cls, value: Any) -> Any:
-        if isinstance(value, dict):
-            return {k: ({} if v is None else v) for k, v in value.items()}
-        return value
+    def _default_kind(cls, value: Any) -> Any:
+        """``null`` = a trainable agent with no overrides; an entry without ``kind`` is trainable."""
+        if not isinstance(value, dict):
+            return value
+        out = {}
+        for agent_id, entry in value.items():
+            if entry is None:
+                entry = {}
+            if isinstance(entry, dict) and "kind" not in entry:
+                entry = {**entry, "kind": "trainable"}
+            out[agent_id] = entry
+        return out
 
     @field_validator("agents")
     @classmethod
-    def _check_agent_ids(cls, agents: dict[str, AgentOverride]) -> dict[str, AgentOverride]:
+    def _check_agent_ids(cls, agents: dict[str, Any]) -> dict[str, Any]:
         for agent_id in agents:
             try:
                 check_agent_id(agent_id)
@@ -581,52 +955,81 @@ class ColosseumConfig(StrictModel):
 
     @model_validator(mode="after")
     def _validate_agent_overrides(self) -> ColosseumConfig:
-        for agent_id in self.agents:
+        if self._has_implicit_agent() and IMPLICIT_AGENT_ID in self.agents:
+            raise ValueError(
+                f"agents.{IMPLICIT_AGENT_ID} is a {self.agents[IMPLICIT_AGENT_ID].kind} agent, but the config has no "
+                f"trainable agent, so '{IMPLICIT_AGENT_ID}' is the implicit trainable agent; rename the "
+                f"{self.agents[IMPLICIT_AGENT_ID].kind} agent or add a trainable agent"
+            )
+        for agent_id, entry in self.agents.items():
+            if entry.kind != "trainable":
+                continue
             try:
                 self.get_agent_config(agent_id)
             except ValidationError as e:
                 raise ValueError(f"agents.{agent_id}: invalid override:\n{e}") from None
         return self
 
+    def _has_implicit_agent(self) -> bool:
+        return not any(entry.kind == "trainable" for entry in self.agents.values())
+
+    def agent_ids(self) -> list[str]:
+        """Every agent in config order; the implicit trainable ``agent_0`` (if any) comes first."""
+        ids = list(self.agents)
+        return [IMPLICIT_AGENT_ID, *ids] if self._has_implicit_agent() else ids
+
     def _require_known_agent(self, agent_id: str) -> None:
-        """Raise ConfigError unless ``agent_id`` is a configured agent (or ``agent_0`` without ``agents``)."""
-        if self.agents and agent_id not in self.agents:
-            raise ConfigError(f"Unknown agent '{agent_id}'. Known agents: {sorted(self.agents)}")
-        if not self.agents and agent_id != "agent_0":
-            raise ConfigError(
-                f"Unknown agent '{agent_id}': without an 'agents' section the only agent is 'agent_0'"
-            )
+        """Raise ConfigError unless ``agent_id`` is a configured agent or the implicit ``agent_0``."""
+        if agent_id in self.agents or (agent_id == IMPLICIT_AGENT_ID and self._has_implicit_agent()):
+            return
+        if not self.agents:
+            raise ConfigError(f"Unknown agent '{agent_id}': without an 'agents' section the only agent is "
+                              f"'{IMPLICIT_AGENT_ID}'")
+        raise ConfigError(f"Unknown agent '{agent_id}'. Known agents: {self.agent_ids()}")
+
+    def agent_entry(self, agent_id: str) -> TrainableAgent | ScriptedAgent | FrozenAgent:
+        """The agent's config entry (the implicit ``agent_0`` is ``TrainableAgent()``)."""
+        self._require_known_agent(agent_id)
+        entry = self.agents.get(agent_id)
+        return entry if entry is not None else TrainableAgent()
+
+    def agent_kind(self, agent_id: str) -> AgentKind:
+        return self.agent_entry(agent_id).kind
 
     def get_agent_config(self, agent_id: str) -> ColosseumConfig:
-        """Effective config of one agent: global sections deep-merged with its override."""
-        self._require_known_agent(agent_id)
+        """Effective config of one TRAINABLE agent: the global sections merged with its overrides (``networks``,
+        ``algorithm``, ``learner``, ``init``, ``kickstart`` deep-merged; ``matchmaking`` by ``merge_matchmaking``)."""
+        entry = self.agent_entry(agent_id)
+        if entry.kind != "trainable":
+            raise ConfigError(
+                f"agent '{agent_id}' is a {entry.kind} agent: only trainable agents have a training config "
+                f"(networks / algorithm / learner / matchmaking / init / kickstart)"
+            )
         data = self.model_dump(by_alias=True)
-        override = self.agents.get(agent_id)
-        if override is not None:
-            for section in _AGENT_SECTIONS:
-                part = getattr(override, section)
-                if part:
-                    data[section] = deep_merge(data[section], part)
+        for section in _AGENT_SECTIONS:
+            part = getattr(entry, section)
+            if part:
+                merge = merge_matchmaking if section == "matchmaking" else deep_merge
+                data[section] = merge(data[section], part)
         data["agents"] = {}
         return ColosseumConfig.model_validate(data)
 
     def agent_roles(self, agent_id: str) -> list[str] | None:
-        """``agents.<id>.roles`` (None when omitted: the agent plays every role).
+        """``agents.<id>.roles`` of any kind (None when omitted).
 
         Call it on the top-level config, not on a ``get_agent_config()`` result (which has ``agents == {}``).
         """
-        self._require_known_agent(agent_id)
-        override = self.agents.get(agent_id)
-        return None if override is None or override.roles is None else list(override.roles)
+        roles = self.agent_entry(agent_id).roles
+        return None if roles is None else list(roles)
 
     def get_trainable_agent_ids(self) -> list[str]:
-        """Return list of trainable agent IDs.
+        """Trainable agent ids in config order (owner rotation order); ``["agent_0"]`` without any."""
+        ids = [agent_id for agent_id, entry in self.agents.items() if entry.kind == "trainable"]
+        return ids or [IMPLICIT_AGENT_ID]
 
-        If agents dict is empty, defaults to ``["agent_0"]`` (single-agent mode).
-        """
-        if not self.agents:
-            return ["agent_0"]
-        return list(self.agents.keys())
+    def fixed_agent_ids(self) -> list[str]:
+        """Scripted and frozen agent ids in config order."""
+        return [agent_id for agent_id, entry in self.agents.items() if entry.kind != "trainable"]
 
 
 # ---------------------------------------------------------------------------
@@ -661,6 +1064,14 @@ def parse_override_value(raw: str, key: str | None = None) -> Any:
     return value
 
 
+def _holds_map(tp: Any) -> bool:
+    """True for an annotation that may hold a dict value (``{name: weight}`` anchors, schedules)."""
+    if typing.get_origin(tp) is Annotated:
+        tp = typing.get_args(tp)[0]
+    options = typing.get_args(tp) if typing.get_origin(tp) in (typing.Union, types.UnionType) else (tp,)
+    return any(option is dict or typing.get_origin(option) is dict for option in options)
+
+
 def _unwrap_optional(tp: Any) -> Any:
     if typing.get_origin(tp) in (typing.Union, types.UnionType):
         args = [a for a in typing.get_args(tp) if a is not type(None)]
@@ -669,24 +1080,60 @@ def _unwrap_optional(tp: Any) -> Any:
     return tp
 
 
+def _model_members(tp: Any) -> list[type[BaseModel]] | None:
+    """The config models an annotation stands for: a model, an optional model or a union of models
+    (``Annotated`` discriminated unions included, e.g. agent entries); None for anything else."""
+    if typing.get_origin(tp) is typing.Annotated:
+        tp = typing.get_args(tp)[0]
+    tp = _unwrap_optional(tp)
+    if isinstance(tp, type) and issubclass(tp, BaseModel):
+        return [tp]
+    if typing.get_origin(tp) in (typing.Union, types.UnionType):
+        members = [a for a in typing.get_args(tp) if a is not type(None)]
+        if members and all(isinstance(m, type) and issubclass(m, BaseModel) for m in members):
+            return members
+    return None
+
+
 def _check_override_path(parts: list[str]) -> None:
-    """Walk the schema of ColosseumConfig along ``parts``; raise ConfigError on an unknown key."""
+    """Walk the schema of ColosseumConfig along ``parts``; raise ConfigError on an unknown key.
+
+    At a union of models (an agent entry) a key is valid if one of the members has it.
+    """
     tp: Any = ColosseumConfig
     for i, part in enumerate(parts):
-        tp = _unwrap_optional(tp)
         where = ".".join(parts[: i + 1])
-        if isinstance(tp, type) and issubclass(tp, BaseModel):
-            fields = tp.model_fields
-            name = next((n for n, f in fields.items() if part in (n, f.alias)), None)
-            if name is None:
-                raise ConfigError(f"Unknown config key '{where}' (valid keys here: {sorted(fields)})")
-            tp = fields[name].annotation
-        elif typing.get_origin(tp) is dict:
+        members = _model_members(tp)
+        if members is not None:
+            found = None
+            for model in members:
+                name = next((n for n, f in model.model_fields.items() if part in (n, f.alias)), None)
+                if name is not None:
+                    found = model.model_fields[name].annotation
+                    break
+            if found is None:
+                valid = sorted({f.alias or n for model in members for n, f in model.model_fields.items()})
+                raise ConfigError(f"Unknown config key '{where}' (valid keys here: {valid})")
+            tp = found
+            continue
+        tp = _unwrap_optional(tp)
+        if typing.get_origin(tp) is dict:
             tp = typing.get_args(tp)[1]
         elif tp is Any:
             return  # free-form dict (env.kwargs, agent override bodies): checked at validation
         else:
-            raise ConfigError(f"Cannot set '{'.'.join(parts)}': '{'.'.join(parts[:i])}' is not a section")
+            parent = ".".join(parts[:i])
+            if _holds_map(tp):   # an anchor map or a schedule: --set cannot reach inside it
+                raise ConfigError(f"Cannot set '{'.'.join(parts)}': '{parent}' is a map or a schedule, not a "
+                                  f"section; set the whole value, e.g. --set {parent}={{{part}: ...}}")
+            raise ConfigError(f"Cannot set '{'.'.join(parts)}': '{parent}' is not a section")
+
+
+# Old (SP2) knobs that ``--set`` accepts although they are not in the schema: the config models translate
+# them (one warning each) and never store them.
+LEGACY_OVERRIDE_KEYS: set[str] = {"checkpoint.pool_size"}
+LEGACY_OVERRIDE_KEYS.update(f"matchmaking.{knob}" for knob in SP2_MATCHMAKING_KNOBS)
+LEGACY_OVERRIDE_KEYS.update(f"training.{knob}" for knob in SP2_KICKSTART_KNOBS)
 
 
 def apply_overrides(data: dict, overrides: dict[str, Any]) -> dict:
@@ -700,7 +1147,8 @@ def apply_overrides(data: dict, overrides: dict[str, Any]) -> dict:
         parts = key.split(".")
         if not all(parts):
             raise ConfigError(f"Malformed override key '{key}'")
-        _check_override_path(parts)
+        if key not in LEGACY_OVERRIDE_KEYS:
+            _check_override_path(parts)
         node = out
         for part in parts[:-1]:
             child = node.get(part)

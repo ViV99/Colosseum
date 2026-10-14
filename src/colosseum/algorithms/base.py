@@ -93,6 +93,12 @@ class BaseAlgorithm(ABC):
         raise NotImplementedError(f"{type(self).__name__} does not implement load_state_dict()")
 
     @property
+    def teacher_active(self) -> bool:
+        """True while a scripted kickstart teacher should label the workers' decisions (DAgger); the learner
+        sends it with the weights (``WeightPayload.teacher_active``). Default: False."""
+        return False
+
+    @property
     def is_off_policy(self) -> bool:
         """If True, learner adds chunks to a replay buffer instead of training directly."""
         return False

@@ -23,21 +23,24 @@ import queue
 import signal
 import time
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
-from typing import Any
+from dataclasses import dataclass, replace
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
-import torch
 
 from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.ipc import QueueReader, SharedCounter, queue_depths, release_command_queues
 from colosseum.core.run_dir import RunDir
-from colosseum.core.types import LATEST_NETWORK_ID, Lineup, SeatAssignment
+from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, Lineup, SeatAssignment
 from colosseum.envs.game import GameSpec, RoleSpec
 from colosseum.metrics.wandb_logger import WandBLogger
+from colosseum.players.registry import BotSpec, FixedPlayers
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, run_child, start_process
+
+if TYPE_CHECKING:
+    from colosseum.learner.factory import InitState, TeacherSpec
 
 logger = logging.getLogger(__name__)
 
@@ -88,13 +91,17 @@ def warn_static_ownership_skew(config: ColosseumConfig) -> None:
 
 @dataclass(frozen=True)
 class RunSetup:
-    """What a run needs before any process starts: the game's spec, every trainable agent's
-    roles, effective config (overrides merged) and role spec (the spaces its model is built for)."""
+    """What a run needs before any process starts: the game's spec, every agent's roles
+    (``player_roles``), the trainable agents' roles, effective configs (overrides merged) and role
+    specs (the spaces their models are built for), and the fixed players (loaded once in the main
+    process)."""
 
     spec: GameSpec
     agent_roles: dict[str, list[str]]
     agent_configs: dict[str, ColosseumConfig]
     role_specs: dict[str, RoleSpec]
+    player_roles: dict[str, list[str]]
+    fixed: FixedPlayers
 
 
 def validate_run_config(config: ColosseumConfig) -> None:
@@ -108,18 +115,21 @@ def validate_run_config(config: ColosseumConfig) -> None:
 def setup_run(config: ColosseumConfig, validate: bool = True) -> RunSetup:
     """``RunSetup`` of ``config``; ``validate`` first runs ``validate_run_config``."""
     from colosseum.core.registry import env_spec
-    from colosseum.core.roles import agent_role_spec, resolve_agent_roles
+    from colosseum.core.roles import agent_role_spec
+    from colosseum.players.registry import load_fixed_players, resolve_player_roles
 
     if validate:
         validate_run_config(config)
     spec = env_spec(config)
-    agent_roles = resolve_agent_roles(config, spec)
+    player_roles = resolve_player_roles(config, spec)
     agent_ids = config.get_trainable_agent_ids()
     return RunSetup(
         spec=spec,
-        agent_roles={aid: list(agent_roles[aid]) for aid in agent_ids},
+        agent_roles={aid: list(player_roles[aid]) for aid in agent_ids},
         agent_configs={aid: config.get_agent_config(aid) for aid in agent_ids},
-        role_specs={aid: agent_role_spec(spec, agent_roles[aid]) for aid in agent_ids},
+        role_specs={aid: agent_role_spec(spec, player_roles[aid]) for aid in agent_ids},
+        player_roles=player_roles,
+        fixed=load_fixed_players(config, spec),
     )
 
 
@@ -149,12 +159,16 @@ def _worker_main(
     results_queue: mp.Queue | None = None,
     command_queue: mp.Queue | None = None,
     metrics_queue: mp.Queue | None = None,
+    fixed_players: FixedPlayers | None = None,
+    teachers: Mapping[str, BotSpec] | None = None,
 ) -> None:
     """Worker process body (see ``_worker_target``).
 
     Env and model factories are built INSIDE the process (``functools.partial`` over top-level
     functions is picklable under spawn, which the subprocess vector env needs to ship ``env_fn``
-    to its children). Models are built for each agent's role spec.
+    to its children). Models are built for each agent's role spec. ``fixed_players`` (numpy and
+    ``BotSpec`` data from the main process) become this worker's bots and frozen models; ``teachers``
+    (``BotSpec`` by student agent) its scripted kickstart teachers (DAgger).
     """
     from functools import partial
 
@@ -188,6 +202,8 @@ def _worker_main(
         vec_env_kind=config.rollout.vec_env,
         subproc_workers=config.rollout.subproc_workers,
         max_idle_steps=config.env.max_idle_steps,
+        fixed_players=fixed_players,
+        teachers=teachers,
     )
 
 
@@ -212,17 +228,21 @@ def _learner_main(
     total_timesteps: int = 0,
     num_learners: int = 1,
     seed: int | None = None,
+    spec: GameSpec | None = None,
+    teacher: TeacherSpec | None = None,
+    init_state: InitState | None = None,
 ) -> None:
     """Learner process body (see ``_learner_target``).
 
     ``num_learners`` (learner processes on this machine) feeds the automatic torch thread count
     when ``learner.torch_threads`` is unset. ``seed`` (from ``utils.seeding.learner_seed``) seeds
-    this process before the model is built. The model (and a kickstart teacher) is built for
-    ``role_spec``, the spaces of the agent's roles.
+    this process before the model is built. The model is built for ``role_spec``, the spaces of the
+    agent's roles. The algorithm (and a kickstart teacher resolved by the main process) is built by
+    ``learner.factory.build_algorithm``; ``init_state`` (resolved by the main process) is loaded into the
+    fresh model: weights only, so policy version 0, a fresh optimizer and zero counters.
     """
-    from colosseum.core.registry import build_model, import_class
-    from colosseum.core.specs import ActionSpec
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
+    from colosseum.learner.factory import apply_init, build_algorithm
     from colosseum.learner.learner import learner_process, resolve_device
     from colosseum.utils.seeding import apply_global_seed
 
@@ -234,35 +254,11 @@ def _learner_main(
         config.rollout.torch_threads, num_learners,
     ))
 
-    algo_class_path = config.algorithm.algorithm_class
-    if not algo_class_path:
-        raise ValueError(
-            "algorithm.algorithm_class is not set. "
-            "Provide a dotted import path (e.g. 'colosseum.algorithms.appo.APPO')."
-        )
-    algo_cls = import_class(algo_class_path)
-    action_spec = ActionSpec.from_space(role_spec.action_space)
-    teacher_path = config.training.kickstart_teacher
-
     def algorithm_factory():
-        model = build_model(config, role_spec)
-        kickstart = None
-        if teacher_path:
-            from colosseum.bc.kickstart import KickstartLoss
-            teacher = build_model(config, role_spec)
-            teacher.load_state_dict(torch.load(teacher_path, weights_only=True, map_location=device))
-            teacher.to(device)
-            kickstart = KickstartLoss(
-                teacher,
-                initial_lambda=config.training.kickstart_lambda,
-                decay_steps=config.training.kickstart_decay_steps,
-                direction=config.training.kickstart_kl,
-            )
-            logger.info(f"Kickstart enabled for {agent_id} from {teacher_path}")
-        kwargs = {"device": device, "pin_memory": config.learner.pin_memory}
-        if kickstart is not None:
-            kwargs["kickstart"] = kickstart
-        return algo_cls(model, config.algorithm, action_spec, **kwargs)
+        algorithm = build_algorithm(config, role_spec, spec, device=device, teacher=teacher)
+        if init_state is not None:
+            apply_init(algorithm.model, init_state)   # weights only: version 0, fresh optimizer
+        return algorithm
 
     learner_process(
         agent_id=agent_id,
@@ -297,7 +293,8 @@ def _resolve_lineups(
     ``WorkerCommand.new_checkpoints``), so they are numpy, never torch. Checkpoints listed in
     ``already_sent[agent]`` are referenced but not reloaded. A checkpoint that cannot be loaded
     (evicted or missing) is replaced by the latest weights with ``collect=True`` and a warning
-    (SP1 rule, R4-19).
+    (SP1 rule, R4-19). Latest and fixed seats (scripted / frozen agents, ``FIXED_NETWORK_ID``) pass
+    unchanged; every seat keeps its ``source``.
     """
     already_sent = already_sent or {}
     new_ckpts: dict[str, dict[str, dict[str, np.ndarray]]] = {aid: {} for aid in agent_ids}
@@ -306,8 +303,8 @@ def _resolve_lineups(
     for lineup in lineups:
         seats: list[SeatAssignment] = []
         for seat in lineup.seats:
-            if seat.network_id == LATEST_NETWORK_ID:
-                seats.append(SeatAssignment(seat.agent_id, LATEST_NETWORK_ID, seat.collect))
+            if seat.network_id in (LATEST_NETWORK_ID, FIXED_NETWORK_ID):
+                seats.append(replace(seat))
                 continue
             agent_new = new_ckpts.setdefault(seat.agent_id, {})
             ckpt_id = seat.network_id
@@ -321,9 +318,9 @@ def _resolve_lineups(
                     logger.warning(f"Checkpoint {ckpt_id} of {seat.agent_id} is missing; that seat plays "
                                    f"the latest weights and collects trajectories")
             if available:
-                seats.append(SeatAssignment(seat.agent_id, ckpt_id, seat.collect))
+                seats.append(replace(seat))
             else:
-                seats.append(SeatAssignment(seat.agent_id, LATEST_NETWORK_ID, True))
+                seats.append(replace(seat, network_id=LATEST_NETWORK_ID, collect=True))
         resolved.append(Lineup(layout=lineup.layout, seats=seats))
     return new_ckpts, resolved
 
@@ -361,6 +358,12 @@ class Launcher:
         self._agent_ids: list[str] = []
         self._checkpoint_queues: dict[str, mp.Queue] = {}
         self._checkpoint_meta: dict[str, dict] = {}
+        # Set by launch(): every trainable agent's kickstart teacher, resolved in this process (numpy specs).
+        self._teachers: dict[str, TeacherSpec | None] = {}
+        # Set by launch(): every trainable agent's init weights (numpy), None when absent or resumed.
+        self._init_states: dict[str, InitState | None] = {}
+        # Per worker: snapshots evicted by the storage that are still to be delivered ({agent: ids}).
+        self._worker_evictions: list[dict[str, set[str]]] = []
         # Set by launch(): the main process's single metrics sink (T6.3) and its queue-depth source.
         self._hub = None
         self._metrics_writer = None
@@ -374,6 +377,11 @@ class Launcher:
     def env_steps_done(self) -> int:
         """Env steps taken by all workers so far (the global budget counter)."""
         return self._env_step_counter.value
+
+    def _build_coordinator(self, setup: RunSetup) -> Coordinator:
+        """The run's coordinator; its matchmaker reads the global env-step counter (share schedules)."""
+        return Coordinator(self._config, setup.spec, setup.player_roles, checkpoint_dir=self._run_dir.checkpoints,
+                           env_steps=lambda: int(self._env_step_counter.value))
 
     def launch(self) -> int:
         """Run the full training pipeline; returns the process exit code.
@@ -396,12 +404,18 @@ class Launcher:
         setup = setup_run(cfg, validate=not self._validated)
         self._setup = setup
         logger.info(f"  Roles: {setup.agent_roles}; layouts: {sorted(setup.spec.layouts)}")
+        logger.info(f"  Fixed players: {cfg.fixed_agent_ids() or 'none'}")
         warn_static_ownership_skew(cfg)
 
-        coordinator = Coordinator(cfg, setup.spec, setup.agent_roles, checkpoint_dir=self._run_dir.checkpoints)
+        coordinator = self._build_coordinator(setup)
 
         # Resume (before any process starts: a bad resume source fails fast).
         resume_states = self._resolve_resume(setup.agent_configs, setup.role_specs)
+        self._import_snapshot_pool(coordinator)
+        from colosseum.learner.factory import resolve_teacher
+        # Kickstart teachers are resolved here (ConfigError before any process starts) into numpy specs.
+        self._teachers = {aid: resolve_teacher(cfg, aid, setup.spec) for aid in trainable_agents}
+        self._init_states = self._resolve_init(setup.spec, resume_states)
 
         from colosseum.core.config import config_hash
         cfg_hash = config_hash(cfg)
@@ -431,6 +445,7 @@ class Launcher:
         worker_sent_ckpts: list[dict[str, set]] = [
             {aid: set() for aid in trainable_agents} for _ in range(cfg.rollout.num_workers)
         ]
+        self._worker_evictions = [{} for _ in range(cfg.rollout.num_workers)]
         # Track every queue so shutdown can cancel feeder threads and avoid the interpreter
         # blocking on unflushed data when consumers have exited.
         self._all_queues = [metrics_queue, results_queue, *command_queues]
@@ -558,6 +573,9 @@ class Launcher:
                     total_timesteps=cfg.training.total_timesteps,
                     num_learners=len(trainable_agents),
                     seed=learner_seed(cfg.training.seed, agent_index),
+                    spec=setup.spec,
+                    teacher=self._teachers.get(aid),
+                    init_state=self._init_states.get(aid),
                 ),
                 daemon=True,
             )
@@ -567,6 +585,8 @@ class Launcher:
             self._supervisor.add(f"learner-{aid}", learner_proc)
             logger.info(f"Learner started for agent {aid}")
 
+        # Scripted kickstart teachers (DAgger) run on the workers; they travel as BotSpec data.
+        scripted_teachers = {aid: t.bot for aid, t in self._teachers.items() if t is not None and t.kind == "scripted"}
         for worker_id in range(cfg.rollout.num_workers):
             lineups = coordinator.generate_lineups(
                 cfg.rollout.envs_per_worker, env_offset=worker_id * cfg.rollout.envs_per_worker,
@@ -598,6 +618,8 @@ class Launcher:
                     checkpoint_state_dicts_by_agent=ckpt_dicts_by_agent,
                     results_queue=results_queue,
                     command_queue=command_queues[worker_id],
+                    fixed_players=setup.fixed,
+                    teachers=scripted_teachers,
                     metrics_queue=metrics_queue,
                 ),
                 daemon=worker_daemon,
@@ -652,7 +674,8 @@ class Launcher:
                 self._reported_failures.add(failure.name)
                 return 1
             if refresh_interval > 0 and time.monotonic() - last_refresh >= refresh_interval:
-                self._refresh_worker_matches(coordinator, agent_ids, command_queues, worker_sent_ckpts)
+                self._refresh_worker_matches(coordinator, agent_ids, command_queues, worker_sent_ckpts,
+                                             self._worker_evictions)
                 last_refresh = time.monotonic()
             time.sleep(0.2)
 
@@ -750,8 +773,15 @@ class Launcher:
         the checkpoint otherwise); every resumed agent's weights are checked against its
         architecture (ConfigError before any process starts); the global env-step counter
         continues from the largest resumed ``env_steps``, so the budget and LR progress continue.
+        A checkpoint without ``trainer_state.pt`` (e.g. an imported or ``keep_every`` snapshot) while
+        ``checkpoint.save_optimizer`` is on is announced by a WARNING: the optimizer / LR state starts fresh.
         """
-        from colosseum.coordinator.checkpoint_manager import check_model_state, resolve_resume
+        from colosseum.coordinator.checkpoint_manager import (
+            RESUME_PT_FILE,
+            check_model_state,
+            classify_resume_source,
+            resolve_resume,
+        )
         from colosseum.core.registry import build_model
         from colosseum.core.roles import role_signature
 
@@ -764,12 +794,47 @@ class Launcher:
             if state is not None:
                 check_model_state(build_model(acfg, role_specs[aid]), state["model_state"], state["source"])
                 logger.info(f"Resume [{aid}]: {state['source']} (policy_version {state['policy_version']})")
+                if (state.get("trainer_state") is None and self._config.checkpoint.save_optimizer
+                        and classify_resume_source(resume_from) != RESUME_PT_FILE):
+                    logger.warning(
+                        f"Resume [{aid}]: checkpoint {state['source']} has no trainer_state.pt; the weights and "
+                        f"policy_version are restored, the optimizer / LR state and trainer counters start fresh"
+                    )
             resume_states[aid] = state
         start_env_steps = max((s["env_steps"] for s in resume_states.values() if s), default=0)
         if start_env_steps > 0:
             self._env_step_counter.add(start_env_steps)
             logger.info(f"Resume: env-step counter continues from {start_env_steps}")
         return resume_states
+
+    def _resolve_init(self, spec: GameSpec, resume_states: Mapping[str, dict | None]) -> dict[str, InitState | None]:
+        """``init`` weights per trainable agent (spec block 6). An agent restored by ``training.resume_from``
+        ignores ``init`` (logged), so a run continues with the same config."""
+        from colosseum.learner.factory import resolve_init
+
+        states: dict[str, InitState | None] = {}
+        for aid in self._config.get_trainable_agent_ids():
+            resumed = resume_states.get(aid)
+            if resumed is not None:
+                if self._config.get_agent_config(aid).init.from_ is not None:
+                    logger.info(f"Agent '{aid}' resumes from {resumed['source']}; its init.from is ignored")
+                states[aid] = None
+                continue
+            state = resolve_init(self._config, aid, spec)
+            if state is not None:
+                for line in state.report:
+                    logger.info(line)
+            states[aid] = state
+        return states
+
+    def _import_snapshot_pool(self, coordinator: Coordinator) -> None:
+        """A resume from a run dir carries its snapshot pool into this run (spec block 4), before the first
+        lineups are drawn; a resume from a checkpoint dir or a .pt starts with an empty pool."""
+        from colosseum.coordinator.checkpoint_manager import RESUME_RUN_DIR, classify_resume_source
+
+        resume_from = self._config.training.resume_from
+        if resume_from and classify_resume_source(resume_from) == RESUME_RUN_DIR:
+            coordinator.import_snapshots(resume_from)
 
     def _save_checkpoint(self, payload: dict) -> None:
         aid = payload["agent_id"]
@@ -802,23 +867,33 @@ class Launcher:
         agent_ids: list[str],
         command_queues: list[mp.Queue],
         worker_sent_ckpts: list[dict[str, set]],
+        worker_evictions: list[dict[str, set[str]]] | None = None,
     ) -> None:
         """Advance the owner rotation and send every worker fresh lineups.
 
         Lineups for worker ``w`` are generated at global env offset ``w * envs_per_worker``. Each
-        command carries only checkpoints that the worker does not have yet. A checkpoint counts as
-        delivered only after its command was put successfully; a full command queue means the
-        worker skips this round and gets the deltas with the next refresh.
+        command carries only checkpoints that the worker does not have yet, and the snapshots evicted
+        since they were last delivered to it (``worker_evictions[w]``; ``None`` = no retry state). A
+        delivery counts only after its command was put successfully; a full command queue means the
+        worker skips this round and gets the deltas and evictions with the next refresh.
         """
         from colosseum.core.types import WorkerCommand
 
         num_envs = self._config.rollout.envs_per_worker
+        if worker_evictions is None:
+            worker_evictions = [{} for _ in command_queues]
+        for aid, ckpt_ids in coordinator.take_evictions().items():
+            for pending in worker_evictions:
+                pending.setdefault(aid, set()).update(ckpt_ids)
         coordinator.next_round()
         for worker_id, cq in enumerate(command_queues):
             sent = worker_sent_ckpts[worker_id]
+            pending = worker_evictions[worker_id]
             lineups = coordinator.generate_lineups(num_envs, env_offset=worker_id * num_envs)
             new_ckpts, lineups = _resolve_lineups(lineups, coordinator, agent_ids, already_sent=sent)
-            cmd = WorkerCommand(lineups=list(lineups), new_checkpoints={aid: c for aid, c in new_ckpts.items() if c})
+            evict = {aid: sorted(ids) for aid, ids in pending.items() if ids}
+            cmd = WorkerCommand(lineups=list(lineups), new_checkpoints={aid: c for aid, c in new_ckpts.items() if c},
+                                evict=evict)
             try:
                 cq.put_nowait(cmd)
             except queue.Full:
@@ -826,6 +901,9 @@ class Launcher:
                 continue
             for aid, ckpts in new_ckpts.items():
                 sent.setdefault(aid, set()).update(ckpts)
+            for aid, ids in evict.items():
+                sent.get(aid, set()).difference_update(ids)
+                pending[aid].difference_update(ids)
 
     def _shutdown(self) -> list[str]:
         """Stop every child within SHUTDOWN_GRACE_SEC; returns the names that had to be terminated.

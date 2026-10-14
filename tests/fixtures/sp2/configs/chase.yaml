@@ -1,0 +1,53 @@
+# Chase: 1v1 with a tree action, Dict(direction: Discrete(4), speed: Box(1)). A reference example
+# without a learning threshold.
+run:
+  name: null
+  dir: "runs"
+
+env:
+  env_class: "examples.composite_action.game.ChaseGame"
+  kwargs: {}
+
+networks:
+  encoder_class: "examples.composite_action.models.ChaseEncoder"
+  core: null
+  policy_class: "examples.composite_action.models.ChasePolicy"
+  value_class: "examples.composite_action.models.ChaseValue"
+  kwargs: {}
+
+algorithm:
+  gamma: 0.99
+  vtrace_lambda: 1.0
+  entropy_coeff: 0.01
+  learning_rate: 3.0e-4
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 20
+  num_workers: 2
+  envs_per_worker: 4
+  weight_sync_interval_sec: 2.0
+  torch_threads: 1
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  total_timesteps: 50000
+  seed: null
+
+matchmaking:
+  mode: self_play
+  latest_prob: 0.5
+
+checkpoint:
+  interval: 10
+  pool_size: 5
+  save_optimizer: true
+
+metrics:
+  use_wandb: false
+  log_interval: 10
+  console_interval_sec: 10.0
