@@ -144,7 +144,7 @@ def measure(role_name: str, role, log_std: float, core: str, hidden: int) -> lis
             "unit": _stats((unit - beh_unit)[valid]),
             "joint": _stats((ev["log_probs"].cpu() - beh_joint)[is_act]),
             "vs_fp32": None if ref is None else _stats((unit - ref)[valid]),
-            "diagnostics": {k: float(metrics[k]) for k in DIAGNOSTICS if k in metrics},
+            "diagnostics": {k: float(metrics[k]) for k in DIAGNOSTICS},
         }
         ref = unit if ref is None else ref
         line = f"  {mode}: unit log-ratio {_fmt(row['unit'])} | joint {_fmt(row['joint'])}"
@@ -165,7 +165,7 @@ def _summary(rows: list[dict]) -> str:
              "|---|---|---|---|---|---|---|"]
     for (role, core, log_std), m in by_key.items():
         cells = [f"{m[k]['unit']['p95']:.2e} / {m[k]['unit']['max']:.2e}" for k in MODES]
-        clip = m["bf16"]["diagnostics"].get("clip_fraction", float("nan"))
+        clip = m["bf16"]["diagnostics"]["clip_fraction"]
         lines.append(f"| {role} | {core} | {log_std} | " + " | ".join(cells) + f" | {clip:.4g} |")
     return "\n".join(lines)
 
