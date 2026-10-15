@@ -16,6 +16,21 @@ scripts/setup-dev.sh --gpu          # ставит сборку torch с CUDA в
 
 Один тест (вместе со всеми его параметризациями) запускается командой из колонки «Команда». Без `-m gpu` эти команды тоже работают: маркер только исключает тесты из обычного прогона.
 
+Машина с ROS. Если в окружении задан `PYTHONPATH` от ROS (например, `~/.bashrc` подключает ROS iron: `PYTHONPATH=/opt/ros/iron/lib/python3.10/site-packages`), pytest падает при старте: точка входа `pytest11` пакета ROS `launch_testing` → `ModuleNotFoundError: No module named 'lark'`. ROS не подменяет ни одной зависимости проекта, ломается только автозагрузка плагинов pytest. Обход — префикс `env -u PYTHONPATH` у каждой команды `.venv/bin/python` / `.venv/bin/colosseum` / `.venv/bin/ruff`, например `env -u PYTHONPATH .venv/bin/python -m pytest -m gpu -v`.
+
+## Результаты 2026-10-15 (RTX 4070 Ti)
+
+Первый прогон на машине с CUDA: WSL2, 20 ядер, RTX 4070 Ti (12 ГБ, sm_89), torch 2.14.1+cu130, cuDNN 9.24.0. Подробности, команды и все числа — в отчёте [`superpowers/reports/2026-10-15-gpu-checks.md`](superpowers/reports/2026-10-15-gpu-checks.md).
+
+| Проверка | Результат |
+|---|---|
+| 22 `gpu`-теста | 22 passed после исправления теста `test_state.py` (до него 2 падения `[lstm]`, `[gru]` из-за TF32 в cuDNN RNN, см. «TF32» ниже) |
+| Быстрый набор | 1689 passed за 311.65 с, без предупреждений; интеграционные тесты на `configs/examples/` учат лёрнер на CUDA |
+| Медленный набор, лёрнеры на CUDA | 10 passed за 423.96 с; все пороги пройдены, значения в пределах разброса CPU |
+| Пайплайн README под AMP float16 и bfloat16 | все команды exit 0, нет NaN/inf, прогрев только 30 шагов, λ убывает; trained против random 1.000, против greedy 0.500 |
+| M-6 (log-ratio при нулевом лаге под AMP) | fp16 p95 до 2.51e-2, clip_fraction 0; bf16 до 0.19 p95 и 4.4 % клипа при σ = e^−4 (см. «AMP и гауссовы действия» ниже) |
+| Resume AMP-прогона, CUDA-чекпоинты без CUDA, распределённый лёрнер на CUDA, WandB | всё работает (exit 0; распределённый лёрнер — 143 по SIGTERM) |
+
 ## Что проверяется
 
 - AMP: шаг обучения APPO в `float16` (с GradScaler) и `bfloat16`, без NaN/inf в метриках и весах, веса остаются float32;
@@ -30,7 +45,32 @@ scripts/setup-dev.sh --gpu          # ставит сборку torch с CUDA в
 - BC на CUDA с деревьями наблюдений (`uint8`), включая обучение по последовательностям для модели с состоянием.
 - тёплый старт SP3 под AMP: прогрев критика (`critic_warmup_steps`) — у параметров пути политики нет градиентов, `GradScaler.unscale_` / `step` должны их пропускать, политика остаётся побитово прежней, обновляется только value-путь (с `critic_encoder`); DAgger-лосс скриптового учителя (`λ · mean(−log π(a_учителя))`) под autocast конечен и обучает политику. CPU-варианты этих тестов (без AMP) идут в обычном прогоне.
 
-Что стоит сравнить вручную (финальное ревью SP2, область A, M-6): `gaussian_log_prob` / `gaussian_entropy` (в том числе для `Box` внутри `Units`) под AMP `float16` считаются в fp16, потому что записанные float32-действия приводятся к `mean.dtype`. Тестом это не покрыто: на шаге AMP с `Box` в `Units` сравните per-decider log-ratio при нулевом лаге с прогоном в fp32.
+### TF32
+
+По умолчанию torch на GPU Ampere и новее включает TF32 для cuDNN conv и cuDNN RNN (`torch.backends.cudnn.allow_tf32 == True`), а матричные умножения cuBLAS оставляет в IEEE fp32 (`torch.backends.cuda.matmul.allow_tf32 == False`). Ядра LSTM/GRU идут через cuDNN RNN, поэтому их выходы на CUDA отличаются от CPU fp32 примерно на 1e-4 (у TF32 мантисса 10 бит); ядра `none` и `attention` (обычные matmul) проходят строгое сравнение и с TF32 по умолчанию. С выключенным TF32 разница состояния LSTM / GRU — 2.53e-06 / 1.88e-06. Тест `test_model_and_state_move_between_devices` поэтому сравнивает строго (rtol 1e-4, atol 1e-5) с выключенным TF32 (`torch.backends.cudnn.flags(enabled=True, allow_tf32=False)`) и отдельно закрепляет поведение по умолчанию с допуском TF32 (rtol 1e-2, atol 1e-3). Решение G-R1: фреймворк оставляет умолчания torch (своей настройки точности у лёрнера нет) — TF32 ускоряет cuDNN RNN/conv, а его влияние на log-prob лёрнера намного меньше диапазона клипа PPO (при нулевом лаге per-decider |log-ratio| p95 1.4e-5–3e-5 с ядром LSTM, до 1.7e-3 для `Box` с `log_std` −4; `eps_clip` 0.2).
+
+### AMP и гауссовы действия (M-6)
+
+Финальное ревью SP2 (область A, M-6): `gaussian_log_prob` / `gaussian_entropy` (в том числе для `Box` внутри `Units`) под AMP считаются в fp16/bf16, потому что записанные float32-действия приводятся к `mean.dtype`. Это больше не ручной пункт, а скрипт:
+
+```bash
+env -u PYTHONPATH .venv/bin/python scripts/measure_amp_logratio.py [--fp32-head] [--fp32-gauss] [--json out.json]
+```
+
+Он сравнивает per-decider log-ratio лёрнера на CUDA (fp32 / AMP fp16 / AMP bf16) с log-prob поведения от CPU fp32 модели при нулевом лаге. Результат 2026-10-15 (RTX 4070 Ti), per-decider |log-ratio| p95, `Units(6, Box(4))` (полная таблица со всеми ролями — в отчёте):
+
+| ядро | log_std | fp32 | fp16 | bf16 | bf16 clip_fraction | fp16 / bf16 с головой в fp32 |
+|---|---|---|---|---|---|---|
+| lstm | 0 | 3.05e-05 | 2.12e-03 | 1.76e-02 | 0 | 6.39e-05 / 3.04e-04 |
+| lstm | −4 | 1.68e-03 | 1.96e-02 | 1.37e-01 | 0.0107 | 3.51e-03 / 1.66e-02 |
+| none | 0 | 4.77e-07 | 2.17e-03 | 1.78e-02 | 0 | 2.36e-04 / 1.84e-03 |
+| none | −4 | 9.54e-06 | 2.51e-02 | 1.94e-01 | 0.0441 | 1.29e-02 / 1.00e-01 |
+
+Для `Units(6, Discrete(5))` fp16 p95 не больше 2.01e-4, bf16 не больше 1.44e-3; `clip_fraction` у fp16 везде 0. Колонка fp32 у LSTM — эффект TF32 (выше).
+
+Вывод: главная ошибка — `mean`, который голова политики считает под autocast в fp16/bf16, а не сам `gaussian_log_prob`: повышение точности внутри `gaussian_log_prob` (`--fp32-gauss`) почти ничего не меняет (2.51e-02 → 2.48e-02); голова в fp32 (`--fp32-head`) уменьшает шум в 2–10×, но не до нуля, потому что входные признаки головы тоже округлены. bf16 примерно в 8× шумнее fp16; шум растёт как 1/σ (множитель (x − μ)/σ²). Решение G-R2: код пока не меняется (AMP включается явно), голова в fp32 — вопрос владельцу.
+
+Практически: с `Box`-действиями и малым σ предпочитайте fp16, а не bf16; следите за `log_rho_abs_p95` в начале обучения — при нулевом лаге он показывает численный пол. `rho_clip_frac` на GPU при нулевом лаге читается 0.13–0.54 и в fp32 тоже: метрика считает любой ρ > ρ̄ = 1, то есть и численный шум.
 
 Замечание о памяти: `train_step` переносит на устройство весь батч шага сразу, а не по минибатчу. Пиковая память GPU под данные батча равна полному батчу шага (`batch_chunks × chunk_length` слотов, включая `global_state`, если он есть); обычно это мало по сравнению с активациями, но при больших наблюдениях стоит смотреть на неё.
 
@@ -62,14 +102,14 @@ scripts/setup-dev.sh --gpu          # ставит сборку torch с CUDA в
 | `tests/unit/test_sp3_gpu_warmstart.py::test_critic_warmup_under_amp_updates_only_the_value_path[cuda-bfloat16]` | то же с AMP `bfloat16` | `.venv/bin/python -m pytest -v tests/unit/test_sp3_gpu_warmstart.py -k test_critic_warmup_under_amp_updates_only_the_value_path` |
 | `tests/unit/test_sp3_gpu_warmstart.py::test_dagger_label_loss_under_amp_is_finite_and_trains[cuda-float16]` | DAgger-лосс (метки учителя на всех ACT-слотах) под AMP `float16`: `kickstart_loss` > 0 и конечен, `kickstart_label_frac` = 1, остальные метрики конечны, веса политики изменились (если шаг не пропущен), λ убывает | `.venv/bin/python -m pytest -v tests/unit/test_sp3_gpu_warmstart.py -k test_dagger_label_loss_under_amp_is_finite_and_trains` |
 | `tests/unit/test_sp3_gpu_warmstart.py::test_dagger_label_loss_under_amp_is_finite_and_trains[cuda-bfloat16]` | то же с AMP `bfloat16` | `.venv/bin/python -m pytest -v tests/unit/test_sp3_gpu_warmstart.py -k test_dagger_label_loss_under_amp_is_finite_and_trains` |
-| `tests/unit/test_state.py::test_model_and_state_move_between_devices[attention]` | модель и `State` (ядро окна внимания): CPU → CUDA → CPU, все тензоры состояния на нужном устройстве, log-prob на CUDA совпадают с CPU (rtol 1e-4) | `.venv/bin/python -m pytest -v tests/unit/test_state.py -k test_model_and_state_move_between_devices` |
+| `tests/unit/test_state.py::test_model_and_state_move_between_devices[attention]` | модель и `State` (ядро окна внимания): CPU → CUDA → CPU, все тензоры состояния на нужном устройстве, log-prob и состояние на CUDA с выключенным TF32 cuDNN совпадают с CPU (rtol 1e-4, atol 1e-5), с TF32 по умолчанию — в допуске TF32 (rtol 1e-2, atol 1e-3) | `.venv/bin/python -m pytest -v tests/unit/test_state.py -k test_model_and_state_move_between_devices` |
 | `tests/unit/test_state.py::test_model_and_state_move_between_devices[gru]` | то же для ядра GRU | `.venv/bin/python -m pytest -v tests/unit/test_state.py -k test_model_and_state_move_between_devices` |
 | `tests/unit/test_state.py::test_model_and_state_move_between_devices[lstm]` | то же для ядра LSTM | `.venv/bin/python -m pytest -v tests/unit/test_state.py -k test_model_and_state_move_between_devices` |
 | `tests/unit/test_state.py::test_model_and_state_move_between_devices[none]` | то же без ядра | `.venv/bin/python -m pytest -v tests/unit/test_state.py -k test_model_and_state_move_between_devices` |
 
 ## Сквозная проверка на CUDA
 
-Тесты из таблицы проверяют части по отдельности; целиком обучение на CUDA ещё ни разу не запускалось. Во всех конфигах `configs/examples/` стоит `learner.device: auto`, и `colosseum bc` берёт устройство из того же поля, поэтому на машине с GPU лёрнеры и BC сами работают на CUDA (воркеры по-прежнему считают политику на CPU). Устройство лёрнера видно в его логе `runs/<run>/logs/learner-<agent>.log`: строка `starting on device=cuda`. AMP работает только на CUDA: на CPU `algorithm.use_amp` молча не действует.
+Тесты из таблицы проверяют части по отдельности; целиком обучение на CUDA впервые прогнано 2026-10-15 по этой процедуре (все пункты пройдены, [отчёт](superpowers/reports/2026-10-15-gpu-checks.md)). Во всех конфигах `configs/examples/` стоит `learner.device: auto`, и `colosseum bc` берёт устройство из того же поля, поэтому на машине с GPU лёрнеры и BC сами работают на CUDA (воркеры по-прежнему считают политику на CPU). Устройство лёрнера видно в его логе `runs/<run>/logs/learner-<agent>.log`: строка `starting on device=cuda`. AMP работает только на CUDA: на CPU `algorithm.use_amp` молча не действует.
 
 1. Быстрый набор `.venv/bin/python -m pytest -m "not gpu and not slow" -q -rw` должен пройти так же, как на машине разработки, без предупреждений. Интеграционные тесты, которые запускают `colosseum train` на конфигах из `configs/examples/`, учат лёрнер на CUDA.
 2. Медленный набор `.venv/bin/python -m pytest -m slow -v` (10 тестов, около 15 минут на 8 ядрах CPU): обучение семи демо-игр и пайплайн `unit_harvest` (record → bc → train → eval) с лёрнером и BC на CUDA. Пороги откалиброваны на CPU, а на CUDA вычисления не побитово те же: единичное падение по порогу — повод перезапустить тест, повторное — разбираться.
@@ -104,13 +144,15 @@ WANDB_MODE=offline .venv/bin/colosseum train -c configs/examples/tic_tac_toe_mul
 
 `WANDB_MODE=offline` пишет run в `./wandb/` без входа в аккаунт. Для отправки в облако: `wandb sync wandb/offline-run-*` (нужен `WANDB_API_KEY` или `wandb login`). Можно сразу запускать без `WANDB_MODE=offline`, если задан `WANDB_API_KEY`.
 
-На что смотреть (в веб-интерфейсе после `wandb sync`, либо в `wandb/offline-run-*/files/wandb-summary.json` и в определениях метрик run):
+На что смотреть (в веб-интерфейсе после `wandb sync`, либо в файле `wandb/offline-run-*/run-*.wandb` и в определениях метрик run; wandb 0.30 в offline-режиме не пишет `files/wandb-summary.json`):
 
 - один run на всю тренировку, его имя — имя папки запуска (`wandb-check`);
 - метрики обучения каждого агента названы `<agent>/<metric>` (`agent_alpha/total_loss`, `agent_beta/lr`, ...) и строятся по своей оси `<agent>/train_step`; графики обоих агентов есть и не обрезаны, хотя агенты учатся с разной скоростью;
 - `ratings/*` (вложенные ключи по вариантам партии, вида `ratings/<layout>/elo/<agent>`, `ratings/<layout>/wr_vs_past/<agent>`), `system/*` (`system/env_steps_per_sec`, `system/queue_depths/<agent>`, ...) и `episodes/*` (`episodes/<agent>/return_mean`, ...) строятся по оси `env_steps`;
 - в консоли нет предупреждений `WandB ... disabled`, код выхода 0;
 - те же значения есть в `runs/wandb-check/metrics.jsonl` (это источник истины; WandB только показывает их).
+
+В `tic_tac_toe_multi.yaml` (соперники `rivals: 1.0`) агент никогда не играет со своими снимками, поэтому `ratings/<layout>/wr_vs_past/<agent>` там не появляется (значения None не пишутся). Чтобы увидеть этот ключ, запустите `configs/examples/tic_tac_toe.yaml` с `--set rollout.match_refresh_interval_sec=5 --set training.total_timesteps=400000` (проверено 2026-10-15: `ratings/2p/wr_vs_past/agent_0` = 0.718 по оси `env_steps`, как в `metrics.jsonl`).
 
 После проверки: `rm -rf runs/wandb-check wandb`.
 

@@ -23,7 +23,8 @@ colosseum validate -c configs/examples/tic_tac_toe.yaml
 colosseum train -c configs/examples/tic_tac_toe.yaml --set run.name=ttt-quickstart
 ```
 
-`scripts/setup-dev.sh --gpu` installs the CUDA build of torch instead of the CPU one.
+`scripts/setup-dev.sh --gpu` installs the CUDA build of torch instead of the CPU one. If ROS (or anything else) sets
+`PYTHONPATH`, run the commands under `env -u PYTHONPATH` (ROS's pytest plugin breaks pytest at startup).
 
 Training prints its run directory and one progress line per agent every 10 seconds (log lines go to stderr; the
 same lines are in `runs/ttt-quickstart/logs/main.log`). On an 8-core CPU the run (2 workers × 16 envs, 600,000 env
@@ -427,8 +428,10 @@ Known limitations today:
   need SP6's vectorized path); recurrent and attention cores unroll step by step on the learner; worker inference is
   CPU only.
 - **Distributed:** see above.
-- **GPU:** not run on CUDA yet. All CUDA paths are covered only by `gpu`-marked tests; see
-  [`docs/GPU_CHECKS.md`](docs/GPU_CHECKS.md).
+- **GPU:** the GPU checks were run on 2026-10-15 on an RTX 4070 Ti: all 22 `gpu` tests, the fast and slow suites
+  with CUDA learners, the README pipeline under AMP float16 and bfloat16, and the distributed learner on CUDA; see
+  [`docs/GPU_CHECKS.md`](docs/GPU_CHECKS.md) and the
+  [report](docs/superpowers/reports/2026-10-15-gpu-checks.md). Workers still infer on CPU.
 
 ## Tests
 
@@ -470,7 +473,7 @@ examples/       coin_grid, tic_tac_toe, unit_harvest, team_tag, tron, predator_p
                 space_miners (Box2D), composite_action (chase)
 configs/examples/
 scripts/        setup-dev.sh, bench_throughput.py, units_experiment.py, measure_global_state.py,
-                team_tag_anchors.py, pipeline_vs_scratch.py
+                measure_amp_logratio.py, team_tag_anchors.py, pipeline_vs_scratch.py
 docs/           ENV_GUIDE.md, LEAGUE_GUIDE.md, benchmarks.md, GPU_CHECKS.md
 deployment/     Dockerfiles, docker-compose, k8s (untested)
 ```
