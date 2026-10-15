@@ -26,7 +26,7 @@ scripts/setup-dev.sh --gpu          # ставит сборку torch с CUDA в
 |---|---|
 | 22 `gpu`-теста | 22 passed после исправления теста `test_state.py` (до него 2 падения `[lstm]`, `[gru]` из-за TF32 в cuDNN RNN, см. «TF32» ниже) |
 | Быстрый набор | 1689 passed за 311.65 с, без предупреждений; интеграционные тесты на `configs/examples/` учат лёрнер на CUDA |
-| Медленный набор, лёрнеры на CUDA | 10 passed за 423.96 с; все пороги пройдены, значения в пределах разброса CPU |
+| Медленный набор, лёрнеры на CUDA | 10 passed за 423.96 с; все пороги пройдены, значения близки к CPU при приёмке SP3 |
 | Пайплайн README под AMP float16 и bfloat16 | все команды exit 0, нет NaN/inf, прогрев только 30 шагов, λ убывает; trained против random 1.000, против greedy 0.500 |
 | M-6 (log-ratio при нулевом лаге под AMP) | fp16 p95 до 2.51e-2, clip_fraction 0; bf16 до 0.19 p95 и 4.4 % клипа при σ = e^−4 (см. «AMP и гауссовы действия» ниже) |
 | Resume AMP-прогона, CUDA-чекпоинты без CUDA, распределённый лёрнер на CUDA, WandB | всё работает (exit 0; распределённый лёрнер — 143 по SIGTERM) |
@@ -68,7 +68,7 @@ env -u PYTHONPATH .venv/bin/python scripts/measure_amp_logratio.py [--fp32-head]
 
 Для `Units(6, Discrete(5))` fp16 p95 не больше 2.01e-4, bf16 не больше 1.44e-3; `clip_fraction` у fp16 везде 0. Колонка fp32 у LSTM — эффект TF32 (выше).
 
-Вывод: главная ошибка — `mean`, который голова политики считает под autocast в fp16/bf16, а не сам `gaussian_log_prob`: повышение точности внутри `gaussian_log_prob` (`--fp32-gauss`) почти ничего не меняет (2.51e-02 → 2.48e-02); голова в fp32 (`--fp32-head`) уменьшает шум в 2–10×, но не до нуля, потому что входные признаки головы тоже округлены. bf16 примерно в 8× шумнее fp16; шум растёт как 1/σ (множитель (x − μ)/σ²). Решение G-R2: код пока не меняется (AMP включается явно), голова в fp32 — вопрос владельцу.
+Вывод: главная ошибка — `mean`, который голова политики считает под autocast в fp16/bf16, а не сам `gaussian_log_prob`: повышение точности внутри `gaussian_log_prob` (`--fp32-gauss`) почти ничего не меняет (2.51e-02 → 2.48e-02); голова в fp32 (`--fp32-head`) уменьшает шум в 1.9–58× для `Box` (меньше всего без ядра при малом σ: ≈2×), но не до нуля, потому что входные признаки головы тоже округлены. bf16 в 6–8× шумнее fp16; при малом σ шум растёт почти как 1/σ (множитель (x − μ)/σ²; от σ = e^−2 до e^−4 — в 5.3–6.5 раза). Решение G-R2: код пока не меняется (AMP включается явно), голова в fp32 — вопрос владельцу.
 
 Практически: с `Box`-действиями и малым σ предпочитайте fp16, а не bf16; следите за `log_rho_abs_p95` в начале обучения — при нулевом лаге он показывает численный пол. `rho_clip_frac` на GPU при нулевом лаге читается 0.13–0.54 и в fp32 тоже: метрика считает любой ρ > ρ̄ = 1, то есть и численный шум.
 
@@ -152,8 +152,8 @@ WANDB_MODE=offline .venv/bin/colosseum train -c configs/examples/tic_tac_toe_mul
 - в консоли нет предупреждений `WandB ... disabled`, код выхода 0;
 - те же значения есть в `runs/wandb-check/metrics.jsonl` (это источник истины; WandB только показывает их).
 
-В `tic_tac_toe_multi.yaml` (соперники `rivals: 1.0`) агент никогда не играет со своими снимками, поэтому `ratings/<layout>/wr_vs_past/<agent>` там не появляется (значения None не пишутся). Чтобы увидеть этот ключ, запустите `configs/examples/tic_tac_toe.yaml` с `--set rollout.match_refresh_interval_sec=5 --set training.total_timesteps=400000` (проверено 2026-10-15: `ratings/2p/wr_vs_past/agent_0` = 0.718 по оси `env_steps`, как в `metrics.jsonl`).
+В `tic_tac_toe_multi.yaml` (соперники `rivals: 1.0`) агент никогда не играет со своими снимками, поэтому `ratings/<layout>/wr_vs_past/<agent>` там не появляется (значения None не пишутся). Чтобы увидеть этот ключ, запустите `WANDB_MODE=offline .venv/bin/colosseum train -c configs/examples/tic_tac_toe.yaml --set run.name=wandb-check-past --set metrics.use_wandb=true --set rollout.match_refresh_interval_sec=5 --set training.total_timesteps=400000` (проверено 2026-10-15: `ratings/2p/wr_vs_past/agent_0` = 0.718 по оси `env_steps`, как в `metrics.jsonl`).
 
-После проверки: `rm -rf runs/wandb-check wandb`.
+После проверки: `rm -rf runs/wandb-check runs/wandb-check-past wandb`.
 
 Распределённые роли (`run-learner`, `run-workers`) до SP5 не пишут ни в WandB, ни в `metrics.jsonl`: у них есть только логи процессов.

@@ -23,8 +23,9 @@ colosseum validate -c configs/examples/tic_tac_toe.yaml
 colosseum train -c configs/examples/tic_tac_toe.yaml --set run.name=ttt-quickstart
 ```
 
-`scripts/setup-dev.sh --gpu` installs the CUDA build of torch instead of the CPU one. If ROS (or anything else) sets
-`PYTHONPATH`, run the commands under `env -u PYTHONPATH` (ROS's pytest plugin breaks pytest at startup).
+`scripts/setup-dev.sh --gpu` installs the CUDA build of torch instead of the CPU one. If ROS puts its packages on
+`PYTHONPATH` (e.g. sourced in `~/.bashrc`), run the commands under `env -u PYTHONPATH` (ROS's `launch_testing` pytest
+plugin breaks pytest at startup).
 
 Training prints its run directory and one progress line per agent every 10 seconds (log lines go to stderr; the
 same lines are in `runs/ttt-quickstart/logs/main.log`). On an 8-core CPU the run (2 workers × 16 envs, 600,000 env
@@ -428,9 +429,10 @@ Known limitations today:
   need SP6's vectorized path); recurrent and attention cores unroll step by step on the learner; worker inference is
   CPU only.
 - **Distributed:** see above.
-- **GPU:** the GPU checks were run on 2026-10-15 on an RTX 4070 Ti: all 22 `gpu` tests, the fast and slow suites
-  with CUDA learners, the README pipeline under AMP float16 and bfloat16, and the distributed learner on CUDA; see
-  [`docs/GPU_CHECKS.md`](docs/GPU_CHECKS.md) and the
+- **GPU:** the GPU checks were run on 2026-10-15 on an RTX 4070 Ti: all 22 `gpu` tests, the fast suite on the CUDA
+  machine (its `configs/examples/` integration tests train a CUDA learner; most test configs pin a CPU learner), the
+  slow suite with CUDA learners, the README pipeline under AMP float16 and bfloat16, and the distributed learner on
+  CUDA; see [`docs/GPU_CHECKS.md`](docs/GPU_CHECKS.md) and the
   [report](docs/superpowers/reports/2026-10-15-gpu-checks.md). Workers still infer on CPU.
 
 ## Tests
