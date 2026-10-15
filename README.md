@@ -429,19 +429,20 @@ Known limitations today:
   need SP6's vectorized path); recurrent and attention cores unroll step by step on the learner; worker inference is
   CPU only.
 - **Distributed:** see above.
-- **GPU:** the GPU checks were run on 2026-10-15 on an RTX 4070 Ti: all 22 `gpu` tests, the fast suite on the CUDA
+- **GPU:** the GPU checks were run on 2026-10-15 on an RTX 4070 Ti: all `gpu` tests, the fast suite on the CUDA
   machine (its `configs/examples/` integration tests train a CUDA learner; most test configs pin a CPU learner), the
   slow suite with CUDA learners, the README pipeline under AMP float16 and bfloat16, and the distributed learner on
   CUDA; see [`docs/GPU_CHECKS.md`](docs/GPU_CHECKS.md) and the
-  [report](docs/superpowers/reports/2026-10-15-gpu-checks.md). Workers still infer on CPU.
+  [report](docs/superpowers/reports/2026-10-15-gpu-checks.md). Under AMP the policy head runs in float32; AMP is not
+  faster than fp32 for small models on the RTX 4070 Ti (keep `algorithm.use_amp: false`). Workers still infer on CPU.
 
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 1689 tests
+.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 1690 tests
 .venv/bin/python -m pytest -m slow -v                       # 10 tests, about 15 min: the 7 demo-game learning tests,
                                                             # the unit_harvest pipeline test, 2 torch.compile checks
-.venv/bin/python -m pytest -m gpu -v                        # 22 tests, CUDA machine only, see docs/GPU_CHECKS.md
+.venv/bin/python -m pytest -m gpu -v                        # 25 tests, CUDA machine only, see docs/GPU_CHECKS.md
 ```
 
 Layout:

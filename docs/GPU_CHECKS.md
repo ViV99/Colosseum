@@ -24,11 +24,11 @@ scripts/setup-dev.sh --gpu          # ставит сборку torch с CUDA в
 
 | Проверка | Результат |
 |---|---|
-| 22 `gpu`-теста | 22 passed после исправления теста `test_state.py` (до него 2 падения `[lstm]`, `[gru]` из-за TF32 в cuDNN RNN, см. «TF32» ниже) |
-| Быстрый набор | 1689 passed за 311.65 с, без предупреждений; интеграционные тесты на `configs/examples/` учат лёрнер на CUDA |
+| `gpu`-тесты | 22 passed после исправления теста `test_state.py` (до него 2 падения `[lstm]`, `[gru]` из-за TF32 в cuDNN RNN, см. «TF32» ниже); с тестами головы в fp32 — 25 passed |
+| Быстрый набор | 1689 passed за 311.65 с (с тестом головы в fp32 — 1690 passed за 297.74 с), без предупреждений; интеграционные тесты на `configs/examples/` учат лёрнер на CUDA |
 | Медленный набор, лёрнеры на CUDA | 10 passed за 423.96 с; все пороги пройдены, значения близки к CPU при приёмке SP3 |
-| Пайплайн README под AMP float16 и bfloat16 | все команды exit 0, нет NaN/inf, прогрев только 30 шагов, λ убывает; trained против random 1.000, против greedy 0.500 |
-| M-6 (log-ratio при нулевом лаге под AMP) | fp16 p95 до 2.51e-2, clip_fraction 0; bf16 до 0.19 p95 и 4.4 % клипа при σ = e^−4 (см. «AMP и гауссовы действия» ниже) |
+| Пайплайн README под AMP float16 и bfloat16 | все команды exit 0, нет NaN/inf, прогрев только 30 шагов, λ убывает; trained против random 1.000, против greedy 0.500 (то же после перевода головы политики в fp32) |
+| M-6 (log-ratio при нулевом лаге под AMP) | исправлено в коде: голова политики под autocast считается в fp32 (G-R6); было bf16 до 0.19 p95 и 4.4 % клипа при σ = e^−4, стало до 0.10 и 0.2 %; fp16 до 1.29e-2, клипа нет (см. «AMP и гауссовы действия» ниже) |
 | Resume AMP-прогона, CUDA-чекпоинты без CUDA, распределённый лёрнер на CUDA, WandB | всё работает (exit 0; распределённый лёрнер — 143 по SIGTERM) |
 
 ## Что проверяется
@@ -51,26 +51,34 @@ scripts/setup-dev.sh --gpu          # ставит сборку torch с CUDA в
 
 ### AMP и гауссовы действия (M-6)
 
-Финальное ревью SP2 (область A, M-6): `gaussian_log_prob` / `gaussian_entropy` (в том числе для `Box` внутри `Units`) под AMP считаются в fp16/bf16, потому что записанные float32-действия приводятся к `mean.dtype`. Это больше не ручной пункт, а скрипт:
+Финальное ревью SP2 (область A, M-6): под AMP голова политики выдаёт параметры распределения (например, `mean` гауссова действия) в fp16/bf16, и `gaussian_log_prob` / `gaussian_entropy` (в том числе для `Box` внутри `Units`) считаются в той же точности, потому что записанные float32-действия приводятся к `mean.dtype`. При нулевом лаге это даёт численный шум в log-ratio лёрнера, который растёт при уменьшении σ.
+
+Исправление встроено (решение G-R6, ответ владельца на Q1): `ComposedModel` вызывает голову политики через `_policy_head`, и пока на CUDA включён autocast, голова работает с выключенным autocast на float32-признаках (вещественные листья `aux` тоже приводятся к float32, целые не трогаются). Энкодер, ядро и голова value по-прежнему работают под autocast; без autocast (воркеры на CPU, BC, лёрнер без AMP) голова получает те же самые тензоры, ничего не меняется. Свой `PolicyModel` (не `ComposedModel`) стоит устроить так же: голову — под `torch.autocast(device_type="cuda", enabled=False)` на float32-входах (см. `ComposedModel._policy_head`).
+
+Замер — скрипт (по умолчанию меряет фреймворк как есть; `--amp-head` возвращает прежнее поведение, когда голова тоже работала под autocast):
 
 ```bash
-env -u PYTHONPATH .venv/bin/python scripts/measure_amp_logratio.py [--fp32-head] [--fp32-gauss] [--json out.json]
+env -u PYTHONPATH .venv/bin/python scripts/measure_amp_logratio.py [--amp-head] [--fp32-gauss] [--json out.json]
 ```
 
-Он сравнивает per-decider log-ratio лёрнера на CUDA (fp32 / AMP fp16 / AMP bf16) с log-prob поведения от CPU fp32 модели при нулевом лаге. Результат 2026-10-15 (RTX 4070 Ti), per-decider |log-ratio| p95, `Units(6, Box(4))` (полная таблица со всеми ролями — в отчёте):
+Он сравнивает per-decider log-ratio лёрнера на CUDA (fp32 / AMP fp16 / AMP bf16) с log-prob поведения от CPU fp32 модели при нулевом лаге. Результат 2026-10-15 (RTX 4070 Ti), per-decider |log-ratio| p95, `Units(6, Box(4))` (полные таблицы со всеми ролями — в отчёте):
 
-| ядро | log_std | fp32 | fp16 | bf16 | bf16 clip_fraction | fp16 / bf16 с головой в fp32 |
+| ядро | log_std | fp32 | fp16 | bf16 | bf16 clip_fraction | до исправления (`--amp-head`): fp16 / bf16 |
 |---|---|---|---|---|---|---|
-| lstm | 0 | 3.05e-05 | 2.12e-03 | 1.76e-02 | 0 | 6.39e-05 / 3.04e-04 |
-| lstm | −4 | 1.68e-03 | 1.96e-02 | 1.37e-01 | 0.0107 | 3.51e-03 / 1.66e-02 |
-| none | 0 | 4.77e-07 | 2.17e-03 | 1.78e-02 | 0 | 2.36e-04 / 1.84e-03 |
-| none | −4 | 9.54e-06 | 2.51e-02 | 1.94e-01 | 0.0441 | 1.29e-02 / 1.00e-01 |
+| lstm | 0 | 3.05e-05 | 6.39e-05 | 3.04e-04 | 0 | 2.12e-03 / 1.76e-02 |
+| lstm | −4 | 1.68e-03 | 3.51e-03 | 1.66e-02 | 0 | 1.96e-02 / 1.37e-01 |
+| none | 0 | 4.77e-07 | 2.36e-04 | 1.84e-03 | 0 | 2.17e-03 / 1.78e-02 |
+| none | −4 | 9.54e-06 | 1.29e-02 | 1.00e-01 | 0.0022 | 2.51e-02 / 1.94e-01 |
 
-Для `Units(6, Discrete(5))` fp16 p95 не больше 2.01e-4, bf16 не больше 1.44e-3; `clip_fraction` у fp16 везде 0. Колонка fp32 у LSTM — эффект TF32 (выше).
+Для `Units(6, Discrete(5))` теперь fp16 p95 не больше 1.05e-4, bf16 не больше 8.31e-4; `clip_fraction` у fp16 везде 0, у bf16 до исправления доходил до 0.0441. Колонка fp32 у LSTM — эффект TF32 (выше). Повышение точности внутри самого `gaussian_log_prob` (`--fp32-gauss`) почти ничего не меняет (2.51e-02 → 2.48e-02 без исправления головы).
 
-Вывод: главная ошибка — `mean`, который голова политики считает под autocast в fp16/bf16, а не сам `gaussian_log_prob`: повышение точности внутри `gaussian_log_prob` (`--fp32-gauss`) почти ничего не меняет (2.51e-02 → 2.48e-02); голова в fp32 (`--fp32-head`) уменьшает шум в 1.9–58× для `Box` (меньше всего без ядра при малом σ: ≈2×), но не до нуля, потому что входные признаки головы тоже округлены. bf16 в 6–8× шумнее fp16; при малом σ шум растёт почти как 1/σ (множитель (x − μ)/σ²; от σ = e^−2 до e^−4 — в 5.3–6.5 раза). Решение G-R2: код пока не меняется (AMP включается явно), голова в fp32 — вопрос владельцу.
+Откуда шум (разложение контроллера, `Units(6, Box(4))`, `log_std` −4): если в fp32 считать и голову, и энкодер, шум падает до пола fp32 (9.54e-06 без ядра), то есть источников ровно два — собственный выход головы в низкой точности и признаки, которые энкодер выдаёт под autocast. С ядром LSTM главный источник — голова (bf16: 0.137 → 0.0166, в 8 раз), без ядра — примерно половина (0.194 → 0.100); остаток с LSTM (2.99e-03 при голове и энкодере в fp32) — cuDNN (TF32 и LSTM в float16 под autocast).
 
-Практически: с `Box`-действиями и малым σ предпочитайте fp16, а не bf16; следите за `log_rho_abs_p95` в начале обучения — при нулевом лаге он показывает численный пол. `rho_clip_frac` на GPU при нулевом лаге читается 0.13–0.54 и в fp32 тоже: метрика считает любой ρ > ρ̄ = 1, то есть и численный шум.
+Остаток после исправления — округление признаков энкодера и ядра: это и есть AMP (их matmul в низкой точности), поэтому он остаётся; bf16 без ядра при малом σ всё ещё даёт p95 ≈ 0.10. bf16 в 6–8× шумнее fp16; при малом σ шум растёт почти как 1/σ (множитель (x − μ)/σ²).
+
+Скорость: голова в fp32 стоит около +1–3 % шага AMP-лёрнера (+7.8 % в одном шумном случае). Но на RTX 4070 Ti AMP вообще не быстрее обычного fp32 ни для одной из проверенных моделей: на моделях примеров на 1–13 % медленнее, на синтетической LSTM-512 — примерно на 50 % (fp32 уже использует TF32 в cuDNN, AMP добавляет приведения типов и GradScaler, развёртка LSTM упирается в запуск ядер; таблица — в `docs/benchmarks.md`).
+
+Практически: оставляйте `algorithm.use_amp: false` (по умолчанию), если AMP заметно не ускоряет вашу модель. С AMP, `Box`-действиями и малым σ предпочитайте fp16, а не bf16; следите за `log_rho_abs_p95` в начале обучения — при нулевом лаге он показывает численный пол. `rho_clip_frac` на GPU при нулевом лаге читается 0.13–0.54 и в fp32 тоже: метрика считает любой ρ > ρ̄ = 1, то есть и численный шум.
 
 Замечание о памяти: `train_step` переносит на устройство весь батч шага сразу, а не по минибатчу. Пиковая память GPU под данные батча равна полному батчу шага (`batch_chunks × chunk_length` слотов, включая `global_state`, если он есть); обычно это мало по сравнению с активациями, но при больших наблюдениях стоит смотреть на неё.
 
@@ -94,6 +102,9 @@ env -u PYTHONPATH .venv/bin/python scripts/measure_amp_logratio.py [--fp32-head]
 | `tests/unit/test_appo_v2.py::test_pin_memory_batch_preparation_on_cuda[lstm]` | `pin_memory=True` (ядро LSTM, `Units`): батч чанков v2 на CUDA (все слоты `act`/`boot`/`pad`) совпадает с батчем без закрепления памяти по устройству, dtype и значениям; шаг обучения даёт конечные метрики | `.venv/bin/python -m pytest -v tests/unit/test_appo_v2.py -k test_pin_memory_batch_preparation_on_cuda` |
 | `tests/unit/test_appo_v2.py::test_pin_memory_batch_preparation_on_cuda[none]` | то же без ядра | `.venv/bin/python -m pytest -v tests/unit/test_appo_v2.py -k test_pin_memory_batch_preparation_on_cuda` |
 | `tests/unit/test_appo_v2.py::test_state_dict_round_trip_with_model_on_cuda` | `APPO.state_dict()` с LSTM-моделью и `Units` на CUDA: сохранённые тензоры на CPU, после загрузки состояние оптимизатора снова на CUDA, LR/версия/`consumed_samples` совпадают, следующий шаг даёт версию 2 и те же веса | `.venv/bin/python -m pytest -v tests/unit/test_appo_v2.py -k test_state_dict_round_trip_with_model_on_cuda` |
+| `tests/unit/test_fp32_policy_head.py::test_bf16_zero_lag_log_ratio_with_a_small_sigma_stays_small` | регрессия M-6: `Units(6, Box(4))`, ядро LSTM 256, все `log_std` = −4, AMP `bfloat16`, нулевой лаг: p95 per-decider \|log-ratio\| лёрнера на CUDA < 0.05 (с головой под autocast было 0.137, с головой в fp32 — 0.0166) | `.venv/bin/python -m pytest -v tests/unit/test_fp32_policy_head.py -k test_bf16_zero_lag_log_ratio_with_a_small_sigma_stays_small` |
+| `tests/unit/test_fp32_policy_head.py::test_under_cuda_autocast_the_policy_head_runs_in_float32[bfloat16]` | под `torch.autocast("cuda", bfloat16)` в `step` и `unroll` голова политики получает float32-признаки и float32-листья `aux` (целый лист сохраняет dtype), внутри головы autocast выключен, после неё снова включён (выход головы value в bfloat16), параметры распределения float32 | `.venv/bin/python -m pytest -v tests/unit/test_fp32_policy_head.py -k test_under_cuda_autocast_the_policy_head_runs_in_float32` |
+| `tests/unit/test_fp32_policy_head.py::test_under_cuda_autocast_the_policy_head_runs_in_float32[float16]` | то же с `float16` | `.venv/bin/python -m pytest -v tests/unit/test_fp32_policy_head.py -k test_under_cuda_autocast_the_policy_head_runs_in_float32` |
 | `tests/unit/test_kickstart_v2.py::test_kickstart_on_cuda_with_masks_and_an_lstm_core[False]` | kickstart (forward KL) на CUDA с LSTM, `Units` и масками, AMP выключен: учитель и студент на CUDA, `kickstart_loss` > 0, метрики конечны, λ убывает | `.venv/bin/python -m pytest -v tests/unit/test_kickstart_v2.py -k test_kickstart_on_cuda_with_masks_and_an_lstm_core` |
 | `tests/unit/test_kickstart_v2.py::test_kickstart_on_cuda_with_masks_and_an_lstm_core[True]` | то же с AMP | `.venv/bin/python -m pytest -v tests/unit/test_kickstart_v2.py -k test_kickstart_on_cuda_with_masks_and_an_lstm_core` |
 | `tests/unit/test_sp2_bc_trainer.py::test_bc_with_tree_data_on_cuda[lstm]` | BC на CUDA (ядро LSTM, окна по 8 шагов со сбросом на `dones`): Dict-наблюдение с `uint8`-листом, маски; параметры на CUDA, энкодер получает `uint8` и `float32`, `bc_loss` конечен, accuracy в [0, 1] | `.venv/bin/python -m pytest -v tests/unit/test_sp2_bc_trainer.py -k test_bc_with_tree_data_on_cuda` |
