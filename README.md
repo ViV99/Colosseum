@@ -434,7 +434,8 @@ Known limitations today:
   slow suite with CUDA learners, the README pipeline under AMP float16 and bfloat16, and the distributed learner on
   CUDA; see [`docs/GPU_CHECKS.md`](docs/GPU_CHECKS.md) and the
   [report](docs/superpowers/reports/2026-10-15-gpu-checks.md). Under AMP the policy head runs in float32; AMP is not
-  faster than fp32 for small models on the RTX 4070 Ti (keep `algorithm.use_amp: false`). Workers still infer on CPU.
+  faster than fp32 for small models on the RTX 4070 Ti (keep `algorithm.use_amp: false` unless AMP measurably
+  speeds up your model). Workers still infer on CPU.
 
 ## Tests
 

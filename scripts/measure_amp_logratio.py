@@ -1,8 +1,8 @@
 """Zero-lag log-ratio of the CUDA learner under AMP (docs/GPU_CHECKS.md, final SP2 review, area A, M-6).
 
-Under AMP ``float16`` / ``bfloat16`` the Gaussian log-prob and entropy (also for ``Box`` inside ``Units``)
-run in low precision: the recorded float32 actions are cast to ``mean.dtype``. The script measures what
-that does to the importance ratio at zero policy lag:
+Under AMP float16 / bfloat16 a policy head running under autocast emits low-precision distribution
+parameters (e.g. the Gaussian mean), so the log-prob and entropy run in low precision (before ruling G-R6;
+see below). The script measures what AMP does to the importance ratio at zero policy lag:
 
 - roles: observation ``Box(-1, 1, (16,))``; actions ``Units(6, Box(-1, 1, (4,)))`` (``units_box4``),
   ``Units(6, Dict(move=Discrete(5), aim=Box(-1, 1, (2,))))`` (``units_dict``) and ``Units(6, Discrete(5))``
