@@ -99,7 +99,7 @@ def test_under_cuda_autocast_the_policy_head_runs_in_float32(amp_dtype):
     with torch.autocast("cuda", dtype=amp_dtype):
         step = model.step(torch.randn(2, 8, device="cuda"), model.initial_state(2, "cuda"))
         out = _unroll(model, "cuda")
-        assert torch.is_autocast_enabled("cuda")
+    assert len(model.policy.calls) == 2  # step + unroll
     for call in model.policy.calls:
         assert call["features"].dtype == torch.float32 and call["autocast"] is False
         assert call["aux"]["emb"].dtype == torch.float32 and call["aux"]["idx"].dtype == torch.long

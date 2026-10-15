@@ -78,7 +78,7 @@ class ComposedModel(PolicyModel):
         """
         if not torch.is_autocast_enabled("cuda"):
             return self.policy(features, aux)
-        aux32 = tree_map(lambda x: x.float() if torch.is_floating_point(x) else x, aux)
+        aux32 = tree_map(lambda x: x.float() if isinstance(x, Tensor) and x.is_floating_point() else x, aux)
         with torch.autocast(device_type="cuda", enabled=False):
             return self.policy(features.float(), aux32)
 
