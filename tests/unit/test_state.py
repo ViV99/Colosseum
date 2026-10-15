@@ -261,7 +261,10 @@ def test_state_to_device():
 @pytest.mark.gpu
 @pytest.mark.parametrize("core", CORE_KINDS)
 def test_model_and_state_move_between_devices(core):
-    """Model + State pytree: CPU -> CUDA -> CPU keeps devices consistent and log-probs equal."""
+    """Model + State pytree: CPU -> CUDA -> CPU keeps devices consistent and log-probs equal.
+
+    The strict comparison runs with cuDNN TF32 off: torch's default TF32 on cuDNN RNN (Ampere+) moves LSTM/GRU by ~1e-4.
+    """
     torch.manual_seed(0)
     role = RoleSpec(gymnasium.spaces.Box(-5.0, 5.0, (8,), np.float32), gymnasium.spaces.Discrete(4))
     model = make_test_model(role, core=core)
@@ -273,10 +276,19 @@ def test_model_and_state_move_between_devices(core):
     model.to("cuda")
     state_cuda = state_to(state, "cuda")
     assert all(t.device.type == "cuda" for t in tree_leaves(state_cuda))
-    out_cuda = model.step(obs.to("cuda"), state_cuda)
+    with torch.backends.cudnn.flags(enabled=True, allow_tf32=False):
+        out_cuda = model.step(obs.to("cuda"), state_cuda)
     assert all(t.device.type == "cuda" for t in tree_leaves(out_cuda.state))
     torch.testing.assert_close(out_cuda.dist.log_prob(actions.to("cuda")).cpu(), out_cpu.dist.log_prob(actions),
                                rtol=1e-4, atol=1e-5)
+
+    # torch's default flags (TF32 on cuDNN RNN/conv): a TF32 product keeps a 10-bit mantissa (relative error ~1e-3);
+    # the observed max abs diff of the LSTM/GRU state is ~1e-4, so rtol 1e-2 / atol 1e-3 leave a 10x margin.
+    out_tf32 = model.step(obs.to("cuda"), state_cuda)
+    torch.testing.assert_close(out_tf32.dist.log_prob(actions.to("cuda")).cpu(), out_cpu.dist.log_prob(actions),
+                               rtol=1e-2, atol=1e-3)
+    for x, y in zip(tree_leaves(out_tf32.state), tree_leaves(out_cpu.state), strict=True):
+        torch.testing.assert_close(x.cpu(), y, rtol=1e-2, atol=1e-3)
 
     model.to("cpu")
     back = state_to(out_cuda.state, "cpu")

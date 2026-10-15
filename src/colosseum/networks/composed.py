@@ -8,6 +8,7 @@ from torch import Tensor
 from colosseum.core.tree import Tree, tree_leaves, tree_map
 from colosseum.networks.base import BaseCriticEncoder, BaseEncoder, BasePolicy, BaseValue, EncoderOutput
 from colosseum.networks.cores import Core
+from colosseum.networks.dist import Distribution
 from colosseum.networks.model import PolicyModel, PolicyStep, UnrollOutput
 from colosseum.networks.state import State
 
@@ -25,6 +26,7 @@ class ComposedModel(PolicyModel):
     """``encoder(obs) -> core -> policy(features, aux)``; ``value(features ⊕ critic_encoder(global_state))``.
 
     Submodules: ``encoder``, ``core``, ``policy``, ``value`` and ``critic_encoder`` (None if unused).
+    Under CUDA autocast the policy head runs in float32 (``_policy_head``); everything else stays under autocast.
     """
 
     def __init__(self, encoder: BaseEncoder, core: Core, policy_head: BasePolicy, value_head: BaseValue,
@@ -42,7 +44,7 @@ class ComposedModel(PolicyModel):
     def step(self, obs: Tree, state: State, action_mask: Tree | None = None) -> PolicyStep:
         enc = _encode(self.encoder, obs)
         features, next_state = self.core.step(enc.latent, state)
-        dist = self.policy(features, enc.aux)
+        dist = self._policy_head(features, enc.aux)
         if action_mask is not None:
             dist = dist.apply_mask(action_mask)
         return PolicyStep(dist=dist, state=next_state)
@@ -56,7 +58,7 @@ class ComposedModel(PolicyModel):
         enc = _encode(self.encoder, _flatten_time(obs, S, B))
         latent = enc.latent.reshape(S, B, -1)
         features = self.core.unroll(latent, state0, reset_after).reshape(S * B, -1)
-        dist = self.policy(features, enc.aux)
+        dist = self._policy_head(features, enc.aux)
         if action_mask is not None:
             dist = dist.apply_mask(_flatten_time(action_mask, S, B))
         if not with_value:
@@ -65,6 +67,20 @@ class ComposedModel(PolicyModel):
         if self.critic_encoder is not None:
             value_in = torch.cat([features, self.critic_encoder(_flatten_time(global_state, S, B))], dim=-1)
         return UnrollOutput(dist=dist, value=self.value(value_in))
+
+    def _policy_head(self, features: Tensor, aux: dict[str, Tensor]) -> Distribution:
+        """The policy head; in float32 (autocast off, floating inputs upcast) while CUDA autocast is on.
+
+        Under AMP a head's low-precision output (e.g. a Gaussian ``mean``) puts numeric noise into the learner's
+        log-probs at zero policy lag, growing as sigma shrinks (M-6, docs/superpowers/reports/2026-10-15-gpu-checks.md).
+        The encoder, the core and the value head still run under autocast. Without autocast (CPU workers, BC,
+        fp32 learners) the head gets the very same tensors.
+        """
+        if not torch.is_autocast_enabled("cuda"):
+            return self.policy(features, aux)
+        aux32 = tree_map(lambda x: x.float() if isinstance(x, Tensor) and x.is_floating_point() else x, aux)
+        with torch.autocast(device_type="cuda", enabled=False):
+            return self.policy(features.float(), aux32)
 
     def reset_state(self, state: State, done: Tensor) -> State:
         return self.core.reset_state(state, done)
