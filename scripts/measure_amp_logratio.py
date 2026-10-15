@@ -22,15 +22,19 @@ At zero lag every log-ratio would be 0 in exact arithmetic; the spread is pure n
 of the LSTM core includes cuDNN TF32 (torch's default for cuDNN RNN on Ampere+, ruling G-R1); the fp32
 column of the ``none`` core is plain fp32 noise.
 
-Flags (candidate fixes, measured, not applied in the framework):
-- ``--fp32-head``: the policy head (``game_helpers.TreePolicyHead``) runs in float32 under autocast
-  (autocast off inside the head, float inputs upcast);
+Since ruling G-R6 ``ComposedModel`` runs the policy head in float32 under CUDA autocast
+(``ComposedModel._policy_head``), so the default run measures the framework as it is: the remaining AMP
+noise comes from the encoder's and the core's low-precision features.
+
+Flags:
+- ``--amp-head``: the pre-G-R6 behaviour for comparison: ``ComposedModel`` calls the policy head directly,
+  so the head runs under autocast too;
 - ``--fp32-gauss``: ``colosseum.networks.dist.units.gaussian_log_prob`` upcasts mean, log_std and the
-  actions to float32.
+  actions to float32 (a candidate fix that turned out to change almost nothing).
 
 Usage (needs CUDA; imports the test kit, so it puts ``tests/`` on ``sys.path``)::
 
-    .venv/bin/python scripts/measure_amp_logratio.py [--fp32-head] [--fp32-gauss] [--json out.json]
+    .venv/bin/python scripts/measure_amp_logratio.py [--amp-head] [--fp32-gauss] [--json out.json]
 """
 from __future__ import annotations
 
@@ -75,18 +79,11 @@ def _roles() -> dict:
     }
 
 
-def patch_fp32_head() -> None:
-    """Run the test kit's policy head in float32 under autocast (candidate fix for M-6)."""
-    import game_helpers
+def patch_amp_head() -> None:
+    """Restore the pre-G-R6 behaviour: the policy head runs under autocast like the rest of the model."""
+    from colosseum.networks.composed import ComposedModel
 
-    orig = game_helpers.TreePolicyHead.forward
-
-    def forward32(self, features, aux):
-        with torch.autocast("cuda", enabled=False):
-            aux32 = {k: (v.float() if v.is_floating_point() else v) for k, v in aux.items()}
-            return orig(self, features.float(), aux32)
-
-    game_helpers.TreePolicyHead.forward = forward32
+    ComposedModel._policy_head = lambda self, features, aux: self.policy(features, aux)
 
 
 def patch_fp32_gauss() -> None:
@@ -172,16 +169,17 @@ def _summary(rows: list[dict]) -> str:
 
 def main(argv: list[str] | None = None) -> int:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    ap.add_argument("--fp32-head", action="store_true", help="run the policy head in float32 under autocast")
+    ap.add_argument("--amp-head", action="store_true",
+                    help="run the policy head under autocast (the behaviour before ruling G-R6)")
     ap.add_argument("--fp32-gauss", action="store_true", help="upcast inside the Units gaussian_log_prob")
     ap.add_argument("--json", type=Path, default=None, help="write every measured number to this file")
     args = ap.parse_args(argv)
     if not torch.cuda.is_available():
         print("measure_amp_logratio.py needs CUDA: torch.cuda.is_available() is False", file=sys.stderr)
         return 2
-    if args.fp32_head:
-        patch_fp32_head()
-        print("policy head forced to float32 under autocast")
+    if args.amp_head:
+        patch_amp_head()
+        print("policy head runs under autocast (pre-G-R6 behaviour)")
     if args.fp32_gauss:
         patch_fp32_gauss()
         print("Units Gaussian log-prob forced to float32")
@@ -196,7 +194,7 @@ def main(argv: list[str] | None = None) -> int:
     print(_summary(rows))
     if args.json is not None:
         payload = {"device": torch.cuda.get_device_name(0), "torch": torch.__version__,
-                   "fp32_head": args.fp32_head, "fp32_gauss": args.fp32_gauss, "rows": rows}
+                   "amp_head": args.amp_head, "fp32_gauss": args.fp32_gauss, "rows": rows}
         args.json.write_text(json.dumps(payload, indent=2) + "\n")
         print(f"\nwrote {args.json}")
     return 0
