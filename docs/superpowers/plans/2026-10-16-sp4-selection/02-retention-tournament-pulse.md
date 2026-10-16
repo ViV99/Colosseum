@@ -27,11 +27,11 @@
 - Durations and timeouts: `time.monotonic()`; data order by counters (versions, block indices, row ids), never by `ts`.
 
 **Cross-task notes.**
-- **Part 1 through the contract only.** This part uses `colosseum.core.types` (T1.1: `Lineup.seed/block/uid`, `MatchResult.uid/source/seed/env_steps/block`, `SeatResult.version_start/version_end`), `MatchRunner(version_fn, source, uid_prefix)` (T1.1), `arena.entities`, `arena.comparisons`, `arena.matchlog` (T1.2, T1.3), `arena.bt` (T2.1), `arena.live` (T2.2), `RunDir.run_id` / `matches_path` (T1.3), and a handful of names the contract lacks; those are requirements **R1–R12** in the Contract notes. If a requirement was met under another name, the implementer uses that name and reports it.
+- **Part 1 through the contract only.** This part uses `colosseum.core.types` (T1.1: `Lineup.seed/block/uid`, `MatchResult.uid/source/seed/env_steps/block`, `SeatResult.version_start/version_end`), `MatchRunner(version_fn, source, uid_prefix)` (T1.1), `arena.entities`, `arena.comparisons`, `arena.matchlog` (T1.2, T1.3), `arena.bt` (T2.1), `arena.live` (T2.2), `RunDir.run_id` / `ensure_run_id()` (T1.1) / `matches_path` (T1.3), and a handful of names the contract lacks; those are requirements **R1–R12** in the Contract notes. If a requirement was met under another name, the implementer uses that name and reports it.
 - **Provisional constants.** Tournament defaults (`DEFAULT_BLOCKS = 50`, `DEFAULT_HALVING_BLOCKS = 8`, `DEFAULT_CONFIRM_BLOCKS = 100`, `DEFAULT_FINALISTS = 3`) and `PAIRED_BOOTSTRAP_SAMPLES = 2000` are provisional; T8.2 measures them on the bot ladder and the controller fixes them as rulings. Their docstrings say so.
 - **Import direction.** `colosseum.arena.tournament.*` imports `colosseum.eval` (`play_lineups`, `wilson_interval`, the shared loaders); `colosseum.eval` never imports `colosseum.arena`. `colosseum.arena.pulse` imports `arena.tournament.schedule` and `colosseum.eval`. `colosseum.arena.retention` imports nothing from torch and nothing from `arena.bt` at module level (duck-typed fits), so the distributed learner and SP5's hub can call it.
 - **Seats of tournament players.** A run snapshot plays as `SeatAssignment(agent_id=<[alias/]agent>, network_id="ckpt_v<N>")`, every other player as `(<name>, "fixed")`. The journal therefore computes exactly the tournament entity names of spec block 2 (`main@v1200`, `b/main@v3`, `greedy`, `prev#1a2b3c4d`) from `entity_key(agent_id, rating_version)`, and `SeatResult.version_start == N` for snapshots (T1.1's rule "`ckpt_vN`: N").
-- **Block ids.** `"<prefix>/<stage>/<layout>/<candidate>/<composition>/<index>"`; a match uid is `"<block id>/r<rotation>"`. The prefix is the tournament name (a path component, no `/`) or `pulse-<run id 12 hex>`. Part 1 keys `MatchLog.comparison_table(tournament=T)` and `MatchLogReader.blocks(T)` on that prefix (R4).
+- **Block ids.** `"<prefix>/<stage>/<layout>/<candidate>/<composition>/<index>"`; a match uid is `"<block id>/r<rotation>"`. The prefix is the tournament name (a path component, no `/`) or `pulse-<run id 12 hex>`. The tournament id is passed explicitly: `MatchLog.append(block_results, tournament=<prefix>)` stores it (Part 1's `matches.tournament` column), and `MatchLog.comparison_table(tournament=T)`, `MatchLogReader.blocks(T)` / `match_results(source=..., tournament=T)` select by it (contract amendment A9; pulse matches carry no tournament id).
 - **Shared helpers this part adds to `tests/game_helpers.py`:** `CrashBot`, `PlayerErrorBot`, `write_fake_run` (T5.1; `biases=` and `biased_model` in T5.4), `SyntheticSource`, `SyntheticPlayer`, `synthetic_players` (T5.2), `FakeArena` (T5.3), `PulseFailBot` (T6.1).
 
 ---
@@ -64,13 +64,13 @@ then the cap `max_snapshots`: keep_every-only (FIFO when `keep_top_k == 0`, else
 - Test: `tests/unit/test_sp4_retention.py`, `tests/unit/test_sp4_snapshot_store.py`, `tests/integration/test_sp4_retention_runs.py`
 
 **Interfaces:**
-- Consumes: `RunDir.run_id` (T1.3, R1); `LiveRatings.latest() -> RatingsSnapshot | None`, `RatingsSnapshot.version / fits / uncertainty / scores` (T2.2); `BTFit.rating / games` and `Uncertainty.lcb` (T2.1) plus `Uncertainty.draws` and `ScoreSummary.by_entity` (R5, R6); `MatchLogWriter.note_evicted(entities)` (T1.3); `entities.entity_key`, `entities.snapshot_version` (T1.2); the launcher attributes `self._match_log_writer` (T1.3) and `self._live_ratings` (T2.2) (R2); `match_log.enabled` (T1.1).
+- Consumes: `Launcher._run_id` / `RunDir.ensure_run_id()` (T1.1, R1); `LiveRatings.latest() -> RatingsSnapshot | None`, `RatingsSnapshot.version / fits / uncertainty / scores` (T2.2); `BTFit.rating / games` and `Uncertainty.lcb` (T2.1) plus `Uncertainty.contrast_samples` and `ScoreSummary.by_entity` (R5, R6); `Coordinator.add_evict_listener` and the launcher's evict listener `_on_snapshot_evicted` → `MatchLogWriter.note_evicted(entities)` (T1.3); `entities.entity_key`, `entities.snapshot_version` (T1.1); the launcher attributes `self._match_log_writer` (T1.3) and `self._live_ratings` with `_open_live_ratings` (T2.2) (R2); `match_log.enabled` (T1.1).
 - Produces (contract T4.1, additions marked *):
   - `arena.retention`: `SnapshotInfo`, `SnapshotScore`, `RetentionPolicy`, `RetentionDecision`, `retain(entries, scores, policy, *, protect=None)`; *`combine_scores(agent_id, *, fits, uncertainty, scores, layout_weights, quantile) -> dict[str, SnapshotScore]`; *`snapshot_scores(snapshot, agent_id, *, layout_weights, quantile)`; *`describe_retention(checkpoint) -> str`;
   - `CheckpointConfig.keep_top_k / top_k_quantile / top_k_min_games / max_snapshots`;
   - `CheckpointManager(..., run_id=None, keep_top_k=0, top_k_min_games=200, max_snapshots=None, scores_fn=None)`; `pin(agent_id, checkpoint_id, pinned=True)`, `pinned(agent_id)`, `reapply_retention(agent_id) -> list[str]`;
   - *`checkpoint_manager.set_pinned(ckpt_dir, pinned) -> dict` (atomic `meta.json` rewrite; read-only callers' tool: `colosseum pin`, `tournament --pin`); *`read_snapshots(agent_dir) -> list[CheckpointInfo]` (read-only listing, never cleans); *`link_or_copy(src, dst)` (the former `_link_or_copy`, now public; the old name stays an alias);
-  - *`Coordinator(..., run_id=None)`; *`Coordinator.set_ratings_source(fn)`; *`Coordinator.add_evict_listener(fn)`; *`Coordinator.snapshot_scores(agent_id)`;
+  - *`Coordinator(..., run_id=None)`; *`Coordinator.set_ratings_source(fn)`; *`Coordinator.snapshot_scores(agent_id)` (`add_evict_listener` is T1.3's);
   - *`Launcher._wire_retention()`, *`Launcher._reapply_retention()`;
   - *`distributed_checkpoint_manager(config, base_dir, run_id=None)`.
 
@@ -78,14 +78,14 @@ then the cap `max_snapshots`: keep_every-only (FIFO when `keep_top_k == 0`, else
 
 ```bash
 ls src/colosseum/arena/ && grep -n "class LiveRatings\|def latest\|class RatingsSnapshot" src/colosseum/arena/live.py
-grep -n "class Uncertainty\|draws\|class ScoreSummary\|by_entity" src/colosseum/arena/bt.py
+grep -n "class Uncertainty\|contrast_samples\|class ScoreSummary\|by_entity" src/colosseum/arena/bt.py
 grep -n "_match_log_writer\|_live_ratings\|def note_evicted" src/colosseum/launcher.py src/colosseum/arena/matchlog.py
 grep -n "def run_id\|run_id" src/colosseum/core/run_dir.py
 grep -n "keep_top_k\|max_snapshots" src/colosseum/core/config.py scripts/bench_throughput.py
 grep -rn "final" tests/integration/test_sp4_*.py tests/unit/test_sp4_*.py 2>/dev/null | grep -i "import\|carried\|resume" | head
 ```
 
-Expected: `arena/` has `entities.py`, `comparisons.py`, `matchlog.py`, `bt.py`, `live.py`; `LiveRatings.latest`, `RatingsSnapshot`, `Uncertainty`, `ScoreSummary`, `note_evicted` exist; `RunDir.run_id` exists. If `Uncertainty.draws`, `ScoreSummary.by_entity`, `Launcher._match_log_writer` or `Launcher._live_ratings` carry other names, use those names everywhere below and report them (R2, R5, R6). If an earlier task added `keep_top_k` with a "not supported yet" rejection, this task removes that rejection (overview cross-part note). The last grep lists T0.1/T1.x tests that assert an imported final survives a resume: Step 3 updates them like the SP2 ones.
+Expected: `arena/` has `entities.py`, `comparisons.py`, `matchlog.py`, `bt.py`, `live.py`; `LiveRatings.latest`, `RatingsSnapshot`, `Uncertainty`, `ScoreSummary`, `note_evicted` exist; `RunDir.run_id` exists. If `Uncertainty.contrast_samples`, `ScoreSummary.by_entity`, `Launcher._match_log_writer` or `Launcher._live_ratings` carry other names, use those names everywhere below and report them (R2, R5, R6). If an earlier task added `keep_top_k` with a "not supported yet" rejection, this task removes that rejection (overview cross-part note). The last grep lists T0.1/T1.x tests that assert an imported final survives a resume: Step 3 updates them like the SP2 ones.
 
 - [ ] **Step 2: Write the failing tests**
 
@@ -216,7 +216,7 @@ class _Fit:            # the BTFit fields combine_scores reads
 @dataclass
 class _Unc:            # the Uncertainty fields combine_scores reads
     lcb: dict
-    draws: dict = field(default_factory=dict)
+    contrast_samples: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -433,7 +433,7 @@ class _Fit:
 @dataclass
 class _Unc:
     lcb: dict
-    draws: dict = field(default_factory=dict)
+    contrast_samples: dict = field(default_factory=dict)
 
 
 @dataclass
@@ -757,7 +757,7 @@ def combine_scores(agent_id: str, *, fits: Mapping[str, Any], uncertainty: Mappi
 
     - Pairwise layouts (``fits``: layout -> ``BTFit``; ``uncertainty``: layout -> ``Uncertainty``): an entity
       rated in one layout gets that layout's ``Uncertainty.lcb``; rated in several, the ``quantile`` of the
-      layout-weighted mean of its ``Uncertainty.draws`` (the same draw index across layouts; layouts are
+      layout-weighted mean of its ``Uncertainty.contrast_samples`` (the same draw index across layouts; layouts are
       independent fits). ``games``: ``BTFit.games`` summed over the layouts (self-play excluded there).
     - Only when no fit names the agent's snapshots: ``score`` layouts (``scores``: layout -> ``ScoreSummary``
       with ``by_entity[entity] = (n, mean, se)``): the weighted mean and its standard error,
@@ -781,7 +781,7 @@ def combine_scores(agent_id: str, *, fits: Mapping[str, Any], uncertainty: Mappi
                 lcb = float(unc[0].lcb[entity])
             else:
                 w = _weights(layouts, layout_weights)
-                draws = [np.asarray(u.draws[entity], dtype=np.float64) for u in unc]
+                draws = [np.asarray(u.contrast_samples[entity], dtype=np.float64) for u in unc]
                 n = min(len(d) for d in draws)
                 mixed = sum(wi * d[:n] for wi, d in zip(w, draws, strict=True)) / w.sum()
                 lcb = float(np.quantile(mixed, quantile))
@@ -940,8 +940,9 @@ def set_pinned(ckpt_dir: str | Path, pinned: bool) -> dict:
                  scores_fn: Callable[[str], Mapping[str, SnapshotScore]] | None = None) -> None:
         if keep_last < 1 or keep_every < 0 or interval < 1 or keep_top_k < 0 or top_k_min_games < 0 \
                 or (max_snapshots is not None and max_snapshots < keep_last):
-            raise ValueError(f"CheckpointManager: need keep_last >= 1, keep_every >= 0, interval >= 1, keep_top_k >= 0, "
-                             f"top_k_min_games >= 0 and max_snapshots >= keep_last; got {keep_last}, {keep_every}, "
+            raise ValueError(f"CheckpointManager: need keep_last >= 1, keep_every >= 0, interval >= 1, "
+                             f"keep_top_k >= 0, top_k_min_games >= 0 and max_snapshots >= keep_last; got {keep_last}, "
+                             f"{keep_every}, "
                              f"{interval}, {keep_top_k}, {top_k_min_games}, {max_snapshots}")
         self._base_dir = Path(base_dir)
         self._keep_last = int(keep_last)
@@ -1057,36 +1058,19 @@ def set_pinned(ckpt_dir: str | Path, pinned: bool) -> dict:
 2. `__init__(self, config, spec, player_roles, checkpoint_dir, env_steps=lambda: 0, run_id: str | None = None)`; before building the manager:
 ```python
         self._ratings_source: Callable[[], object | None] | None = None
-        self._evict_listeners: list[Callable[[str, str], None]] = []
         self._checkpoint_manager = CheckpointManager(
             base_dir=checkpoint_dir, keep_last=ckpt.keep_last, keep_every=ckpt.keep_every, interval=ckpt.interval,
             on_evict=self._on_evict, run_id=run_id, keep_top_k=ckpt.keep_top_k,
             top_k_min_games=ckpt.top_k_min_games, max_snapshots=ckpt.max_snapshots, scores_fn=self.snapshot_scores,
         )
 ```
-3. `_on_evict`: after the buffering block (and also when nothing is buffered), call every listener:
-```python
-    def _on_evict(self, agent_id: str, checkpoint_id: str) -> None:
-        """... (docstring as before, plus:) Listeners (``add_evict_listener``: the journal) are told last."""
-        logger.debug(f"Snapshot {checkpoint_id} of {agent_id} evicted")
-        self._pfsp.forget((agent_id, checkpoint_id))
-        if self._buffer_evictions:
-            bucket = self._evicted.setdefault(agent_id, [])
-            if checkpoint_id not in bucket:
-                bucket.append(checkpoint_id)
-        for listener in self._evict_listeners:
-            listener(agent_id, checkpoint_id)
-```
+3. `_on_evict` and `add_evict_listener` stay as T1.3 made them (T1.3 creates `self._evict_listeners` before the manager is built and calls every listener right after `self._pfsp.forget(...)`, before the buffering early return; contract amendment A19).
 4. New methods:
 ```python
     def set_ratings_source(self, fn: Callable[[], object | None]) -> None:
         """Where top-k retention reads ratings from: a callable returning the latest immutable
         ``RatingsSnapshot`` (``LiveRatings.latest``) or None. Main loop only."""
         self._ratings_source = fn
-
-    def add_evict_listener(self, fn: Callable[[str, str], None]) -> None:
-        """``fn(agent_id, checkpoint_id)`` after every eviction (after PFSP forgot it)."""
-        self._evict_listeners.append(fn)
 
     def snapshot_scores(self, agent_id: str) -> dict[str, SnapshotScore]:
         """Live-rating scores of ``agent_id``'s snapshots (``arena.retention.snapshot_scores``): layout weights from
@@ -1100,25 +1084,17 @@ def set_pinned(ckpt_dir: str | Path, pinned: bool) -> dict:
 ```
 
 `src/colosseum/launcher.py`:
-1. `_build_coordinator`: `Coordinator(..., env_steps=..., run_id=self._run_dir.run_id)`.
+1. `_build_coordinator`: `Coordinator(..., env_steps=..., run_id=self._run_id)` (set by T1.1 at the start of `launch()`, before the coordinator is built). `_open_live_ratings` (T2.2): `top_k=cfg.checkpoint.keep_top_k, quantile=cfg.checkpoint.top_k_quantile` instead of `top_k=0, quantile=0.1` (the lower bounds are computed at the configured quantile), and its docstring drops "``top_k`` is 0 until ... (T4.1)".
 2. `__init__`: `self._retention_version: int | None = None`.
 3. New methods:
 ```python
     def _wire_retention(self) -> None:
-        """T4.1: top-k retention reads the live ratings; every eviction reaches the journal, whose next compaction
-        pass folds the evicted entity's detailed matches into counts (spec blocks 1, 4)."""
-        from colosseum.arena.entities import entity_key, snapshot_version
-
+        """T4.1: top-k retention reads the live ratings (spec block 4). Evictions already reach the journal through
+        T1.3's evict listener (``_on_snapshot_evicted``), whose next compaction pass folds the evicted entity's
+        detailed matches into counts."""
         live = getattr(self, "_live_ratings", None)
         if live is not None:
             self._coordinator.set_ratings_source(live.latest)
-
-        def note(agent_id: str, checkpoint_id: str) -> None:
-            writer = getattr(self, "_match_log_writer", None)
-            if writer is not None:
-                writer.note_evicted([entity_key(agent_id, snapshot_version(checkpoint_id))])
-
-        self._coordinator.add_evict_listener(note)
 
     def _reapply_retention(self) -> None:
         """After every live refit (a new ``RatingsSnapshot.version``), rerun retention for every trainable agent;
@@ -1133,7 +1109,7 @@ def set_pinned(ckpt_dir: str | Path, pinned: bool) -> dict:
         for aid in self._agent_ids:
             self._coordinator.checkpoint_manager.reapply_retention(aid)
 ```
-4. `launch`: call `self._wire_retention()` right after T1.3 / T2.2 create the journal writer and the live ratings (both exist before `_start_children`; if T2.2 builds `self._live_ratings` inside `_open_metrics`, call `_wire_retention()` right after `self._open_metrics(resume_states)`).
+4. `launch`: call `self._wire_retention()` right after `self._open_live_ratings()` (T2.2 calls it right after T1.3's `self._open_match_log(coordinator)`, which follows `self._open_metrics(resume_states)`; all before `_start_children`).
 5. `_monitor_loop`: call `self._reapply_retention()` after `self._drain_all_checkpoints()` (both run on the main loop; the refit thread never touches the coordinator).
 
 - [ ] **Step 9: `validate` printout and the distributed guard**
@@ -1188,7 +1164,7 @@ def _describe_retention(config: ColosseumConfig, report: ValidationReport) -> No
                              interval=ckpt.interval, run_id=run_id, max_snapshots=ckpt.max_snapshots)
 ```
    and its docstring: "... the final snapshot of this learner's run (``run_id``) ...; ``max_snapshots`` with FIFO order (no ratings: spec block 8)."
-3. `run_distributed_learner`: `coordinator_ckpt = distributed_checkpoint_manager(config, run_dir.checkpoints, run_id=run_dir.run_id)`.
+3. `run_distributed_learner`: `coordinator_ckpt = distributed_checkpoint_manager(config, run_dir.checkpoints, run_id=run_dir.ensure_run_id())` (the distributed learner never runs `Launcher.launch`, so it creates its run's `run.json` itself; R1).
 
 - [ ] **Step 10: Run the new and the touched tests**
 
@@ -1449,7 +1425,7 @@ Three pieces:
 - Test: `tests/unit/test_sp4_eval_dedup.py`, `tests/unit/test_sp4_tournament_players.py`, `tests/integration/test_sp4_tournament_engine.py`
 
 **Interfaces:**
-- Consumes: `Lineup.seed/block/uid`, `MatchResult.uid/source/seed/block`, `SeatResult.version_start`, `MatchRunner(source=...)` (T1.1); `MatchLog`, `RunInfo`, `MATCH_LOG_FILE`, `MatchLog.open_readonly(...).comparison_table`, `MatchLogReader.close` (T1.2, R3); `bt.fit`, `bt.bootstrap`, `bt.score_summary` (T2.1), `bt.default_options`, `bt.BootstrapData.from_table` (R7, R8); `retention.combine_scores` (T4.1); `checkpoint_manager.read_snapshots`, `read_weights_file`, `read_checkpoint_meta`; `players.registry.load_frozen`, `build_frozen_model`, `make_bot`, `FixedPlayers`, `FrozenSpec`, `BotSpec`; `utils.process.run_child`, `start_process`, `ProcessSupervisor`; `core.threads.configure_torch_threads`.
+- Consumes: `Lineup.seed/block/uid`, `MatchResult.uid/source/seed/block`, `SeatResult.version_start`, `MatchRunner(source=...)` (T1.1); `MatchLog`, `RunInfo`, `MATCH_LOG_FILE`, `MatchLog.open_readonly(...).comparison_table`, `MatchLogReader.close` (T1.2, R3); `bt.fit`, `bt.bootstrap`, `bt.score_summary`, `bt.bootstrap_data` (T2.1, R7), `live.rating_inputs` (T2.2), `MatchLogReader` as a context manager (T1.2, R3); `retention.combine_scores` (T4.1); `checkpoint_manager.read_snapshots`, `read_weights_file`, `read_checkpoint_meta`; `players.registry.load_frozen`, `build_frozen_model`, `make_bot`, `FixedPlayers`, `FrozenSpec`, `BotSpec`; `utils.process.run_child`, `start_process`, `ProcessSupervisor`; `core.threads.configure_torch_threads`.
 - Produces (contract T5.1, additions marked *):
   - `players.TournamentPlayer` (`name`, `display`, `kind`, `agent_id`*, `network_id`*, `roles`, `lineage`, `source`*, `version`*, `run`*, `run_agent`*); *`PlayerSource(kind, origin, weights=None, networks=None, bot=None)`; *`RunSelection(path, alias=None, agent=None, snapshots="all")`; *`PlayerRequest(user, runs, field)`; `resolve_candidates` / `resolve_field` are one function here: *`resolve_players(config, spec, request, *, fixed, link=None, rng=None, allow_empty_field=False) -> tuple[list[TournamentPlayer], list[TournamentPlayer]]`; *`entity_hash`, `user_player`, `config_player`, `snapshot_player`, `parse_snapshots`, `select_snapshots`, `top_snapshot_lcb`, `player_to_dict`, `player_from_dict`;
   - `engine.play_blocks(config, spec, players, blocks, *, num_workers, num_envs, deterministic, on_block, log_dir=None, source="tournament") -> None`; *`engine.LazyPlayerPool`, `engine.make_tasks`, `engine.TournamentError`, `MODEL_CACHE_SIZE`, `TASK_MATCHES`;
@@ -1691,7 +1667,9 @@ def test_user_and_config_players_have_the_entity_names_of_block_2(tmp_path):
 def test_snapshot_selection_rules(tmp_path):
     root, _cfg_ = write_fake_run(tmp_path / "run", versions=(10, 20, 30, 40, 50))
     infos = read_snapshots(root / "checkpoints" / "main")
-    pick = lambda text, lcb=None: [c.policy_version for c in select_snapshots(infos, *parse_snapshots(text), lcb=lcb)]  # noqa: E731
+    def pick(text, lcb=None):
+        return [c.policy_version for c in select_snapshots(infos, *parse_snapshots(text), lcb=lcb)]
+
     assert pick("all") == [10, 20, 30, 40, 50] and pick("last:2") == [40, 50] and pick("every:2") == [10, 30, 50]
     assert pick("top:2", {"ckpt_v20": 3.0, "ckpt_v40": 9.0, "ckpt_v10": 1.0}) == [20, 40]
     for bad in ("last", "last:0", "top:x", "first:2"):
@@ -1867,7 +1845,8 @@ Expected: `ImportError: cannot import name 'balanced_match_count'` / `No module 
 2. `load_frozen(config, agent_id, path, spec, *, use_entry: bool = True)`: after `entry = ...` add
 ```python
     if not use_entry and isinstance(entry, FrozenAgent):
-        entry = None    # a user path (eval/record/tournament -a name=path): the frozen entry's .pt settings do not apply
+        entry = None    # a user path (-a name=path in eval / record / tournament): the frozen entry's .pt settings
+                        # do not apply
 ```
    and extend the docstring: "``use_entry=False`` (a path given on the command line): a frozen entry of the same name is ignored (SP4 §8); a trainable entry's architecture still applies to a ``.pt``."
 
@@ -2362,26 +2341,11 @@ def select_snapshots(infos: Sequence[CheckpointInfo], kind: str, n: int, *,
     return [c for c in ordered if c.checkpoint_id in best]
 
 
-def _random_bot(config: ColosseumConfig) -> str | None:
-    """The first scripted agent of ``config`` whose class is ``colosseum.players.RandomBot`` (BT anchor rule)."""
-    from colosseum.core.registry import import_class
-    from colosseum.players import RandomBot
-
-    for name in config.fixed_agent_ids():
-        entry = config.agent_entry(name)
-        if entry.kind == "scripted":
-            try:
-                if import_class(entry.class_path) is RandomBot:
-                    return name
-            except Exception:  # noqa: BLE001 - validate reports bad classes; here it only means "not RandomBot"
-                continue
-    return None
-
-
 def top_snapshot_lcb(run: Path, agent: str, run_config: ColosseumConfig, spec: GameSpec, *,
                      rng: np.random.Generator) -> dict[str, float]:
     """``{checkpoint id: lower bound}`` of ``agent``'s rated snapshots from the run's journal: BT per competitive
-    layout (``source`` train and pulse, ``bt.bootstrap`` rows), combined with the agent's layout weights
+    layout (``RUN_SOURCES``; ``bt.bootstrap`` over ``bt.bootstrap_data``: matches and pulse blocks; the fit inputs of
+    ``live.rating_inputs``), combined with the agent's layout weights
     (``retention.combine_scores``, quantile ``checkpoint.top_k_quantile``); ``score``-only games use the mean
     score. ConfigError without a journal."""
     from colosseum.arena import bt
@@ -2393,26 +2357,27 @@ def top_snapshot_lcb(run: Path, agent: str, run_config: ColosseumConfig, spec: G
     if not db.is_file():
         raise ConfigError(f"--snapshots top:N needs the run's match log {db}; this run has none (an SP3 run dir, or "
                           f"match_log.enabled was false): use all, last:N or every:K")
-    sources = ("train", "pulse")
-    reader = MatchLog.open_readonly(db)
-    try:
-        table = reader.comparison_table(sources=sources)
-    finally:
-        reader.close()
-    options = bt.default_options(anchor=run_config.ratings.anchor)
-    fixed_agents, random_bot = run_config.fixed_agent_ids(), _random_bot(run_config)
+    from colosseum.arena.live import rating_inputs
+    from colosseum.arena.matchlog import RUN_SOURCES
+
+    sources = RUN_SOURCES
+    options, fixed_agents, random_bot = rating_inputs(run_config)
     fits, uncertainty, scores = {}, {}, {}
-    for layout in table.layouts():
-        if layout not in spec.layouts:
-            continue
-        if spec.num_teams(layout) == 1:
-            scores[layout] = bt.score_summary(table, layout, sources=sources)
-            continue
-        fit = bt.fit(table, layout, sources=sources, options=options, fixed_agents=fixed_agents, random_bot=random_bot)
-        fits[layout] = fit
-        uncertainty[layout] = bt.bootstrap(fit, bt.BootstrapData.from_table(table, layout, sources=sources),
-                                           samples=run_config.ratings.bootstrap_samples, rng=rng,
-                                           quantile=run_config.checkpoint.top_k_quantile)
+    with MatchLog.open_readonly(db) as reader:
+        table = reader.comparison_table(sources=sources)
+        for layout in table.layouts():
+            if layout not in spec.layouts:
+                continue
+            if spec.num_teams(layout) == 1:
+                scores[layout] = bt.score_summary(table, layout, sources=sources)
+                continue
+            fit = bt.fit(table, layout, sources=sources, options=options, fixed_agents=fixed_agents,
+                         random_bot=random_bot)
+            fits[layout] = fit
+            # spec block 2: bootstrap by matches (training) and by blocks (pulse), from the same reader
+            uncertainty[layout] = bt.bootstrap(fit, bt.bootstrap_data(reader, layout, sources=sources),
+                                               samples=run_config.ratings.bootstrap_samples, rng=rng,
+                                               quantile=run_config.checkpoint.top_k_quantile)
     weights = enabled_layouts(spec, run_config.get_agent_config(agent).matchmaking)
     combined = combine_scores(agent, fits=fits, uncertainty=uncertainty, scores=scores, layout_weights=weights,
                               quantile=run_config.checkpoint.top_k_quantile)
@@ -2816,6 +2781,8 @@ Run: `env -u PYTHONPATH .venv/bin/python -m pytest tests/unit/test_sp4_eval_dedu
 Expected: all pass. If an SP3 test asserted the removed `.pt` overlay on `-a name=path`, change it to the new rule (the entry applies only to the agent's own `path`) and say so in the task report.
 
 - [ ] **Step 10: Full fast suite + ruff**
+
+The task changes `MatchRunner` (the worker's engine): also run the slow suite once (`env -u PYTHONPATH .venv/bin/python -m pytest -m slow -v`, about 7 min; every SP2/SP3 threshold unchanged) and report its durations (global constraint; pre-flight ruling P9).
 
 - [ ] **Step 11: Commit and push**
 
@@ -3365,12 +3332,12 @@ Ratings are in Elo units (T2.1); scores in [0, 1] for pairwise layouts, team-sco
 - Test: `tests/unit/test_sp4_tournament_stats.py`, `tests/unit/test_sp4_tournament_modes.py`
 
 **Interfaces:**
-- Consumes: `schedule.*` (T5.2); `MatchResult.uid / block / teams / seats` (T1.1); `core.outcomes.pairwise_rank_score`; `eval.wilson_interval`; `arena.bt.fit`, `bt.bootstrap`, `bt.transitivity_test`, `BTFit.rating / games / groups / converged`, `Uncertainty.ci95 / p_best_group` (T2.1), `bt.default_options`, `bt.BootstrapData.from_blocks` (R7, R8); `arena.comparisons.ComparisonTable.add_result` (T1.2); `arena.entities.snapshot_version` (T1.2).
+- Consumes: `schedule.*` (T5.2); `MatchResult.uid / block / teams / seats` (T1.1); `core.outcomes.pairwise_rank_score`; `eval.wilson_interval`; `arena.bt.fit`, `bt.bootstrap`, `bt.transitivity_test`, `BTFit.rating / games / groups / converged`, `Uncertainty.ci95 / p_best_group` (T2.1), `bt.default_options`, `bt.BootstrapData.from_blocks`, `TransitivityResult.to_dict()` (T2.1; R8, R9, R11); `arena.comparisons.ComparisonTable.add_result` (T1.2); `arena.entities.snapshot_version` (T1.1).
 - Produces (contract T5.3; the contract names `candidate_scores`, `paired_bootstrap`, `confirmed`, `repeated_pairs`, `modes.run`, `TournamentReport.to_dict()/.text()` map as follows, additions marked *):
   - `stats.candidate_scores(blocks, results_by_block, *, names, lineage, group_of, metric_of, deterministic=False) -> dict[(stage, layout, group), CandidateTable]` (deviation: blocks and lookup maps instead of `candidates, field, lineage`; Contract notes C5);
   - `stats.CandidateTable` with `cells()`, `scores()`, `weights`, `bootstrap_cells(samples, rng)` and `bootstrap_scores(samples, rng)` (= the contract's `paired_bootstrap`), `repeated` (= `repeated_pairs`), `blocks_of(column)`;
   - `stats.confirmed(diff_replicates, *, level=0.95, conflict=False) -> bool` (deviation: takes the difference replicates; `select_winner` computes them); *`stats.select_winner(combined, tables, *, level=0.95) -> Selection`, *`stats.combine(tables, weights, *, samples, rng) -> Combined`, *`stats.repeated_conflict`, *`stats.cell_interval`, *`stats.block_values`, *`stats.quantiles`, *`SELF`, *`PAIRED_BOOTSTRAP_SAMPLES`;
-  - `modes.run(mode, *, spec, players, candidates, field, settings, play, bt_fn=None) -> TournamentReport`; *`modes.TournamentSettings`, *`modes.MODES`, *`modes.DEFAULT_BLOCKS / DEFAULT_HALVING_BLOCKS / DEFAULT_CONFIRM_BLOCKS / DEFAULT_FINALISTS`, *`modes.bt_section(layout, results, blocks, *, players, anchor=None, samples=200, seed=0) -> dict`, *`modes.report_text(data)`, *`modes.REPORT_FORMAT`.
+  - `modes.run(mode, *, spec, players, candidates, field, settings, play, bt_fn=None) -> TournamentReport`; *`modes.TournamentSettings`, *`modes.MODES`, *`modes.DEFAULT_BLOCKS / DEFAULT_HALVING_BLOCKS / DEFAULT_CONFIRM_BLOCKS / DEFAULT_FINALISTS`, *`modes.bt_section(layout, results, blocks, *, players, anchor=None, samples=200, seed=0) -> dict`, *`modes.report_text(data)`, *`modes.report_view(data)` (the per-layout / per-group view Part 3 reads; contract amendment A26), *`modes.REPORT_FORMAT`.
 
 Proposed rulings in this task (Contract notes D5–D9): repeated deterministic pairs count as one block by (a) a per-cell interval of one observation and (b) never letting `confirmed` rest on a column where winner and runner-up differ and either repeats; stage A tables of `halving` / `select` show the finalists over the blocks they all played (eliminated candidates appear in `rounds` with their scores); `round-robin` only on two-team layouts; the stage A table rows of `select` carry no selection.
 
@@ -3666,6 +3633,33 @@ def test_the_report_text_names_tables_and_the_selection():
               play=FakeArena(spec, players, LADDER))
     text = rep.text()
     assert "stage B" in text and "winner main@v5 (confirmed" in text and "halving player round 0" in text
+
+
+def test_the_report_view_by_layout_and_role_group():
+    """Contract amendment A26: ``report_view`` gives Part 3's per-layout / per-group view of the report."""
+    import functools
+
+    from colosseum.arena.tournament.modes import bt_section, report_view
+
+    spec = TurnTakingGame().spec
+    players = synthetic_players(LADDER)
+    data = run("select", spec=spec, players=players, candidates=CANDIDATES, field=["greedy"], settings=settings(),
+               play=FakeArena(spec, players, LADDER),
+               bt_fn=functools.partial(bt_section, players=players, samples=50)).to_dict()
+    view = report_view(data)
+    (group,) = view["layouts"]["2p"]["groups"].values()
+    sel = data["selection"]["player"]
+    assert view["winner"] == sel["winner"] == group["select"]["winner"] == group["ranking"][0]
+    assert view["confirmed"] is sel["confirmed"] and sorted(group["ranking"]) == sorted(CANDIDATES)
+    rows = {r["name"]: r for r in group["candidates"]}
+    assert set(rows) == set(CANDIDATES) and all(r["bt_ci"] is not None for r in rows.values())
+    out = [r for r in rows.values() if r["eliminated_round"] is not None]
+    assert len(out) == len(CANDIDATES) - settings().finalists and all(r["score_ci"] is None for r in out)
+    assert [r["blocks"] for r in group["rounds"]] == [r["blocks_per_composition"] for r in data["rounds"]]
+    assert report_view({"name": "t", "mode": "gauntlet"}) == {"name": "t", "mode": "gauntlet", "seed": None,
+                                                              "layouts": {}}
+    assert report_view(view) == view                       # idempotent
+    json.dumps(view)
 
 
 def test_bt_section_rates_the_tournament_matches_with_block_intervals():
@@ -4380,14 +4374,75 @@ def report_text(data: Mapping[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def _jsonable(value: Any) -> Any:
-    if isinstance(value, dict):
-        return {str(k): _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    if isinstance(value, np.generic):
-        return value.item()
-    return value
+def report_view(data: Mapping[str, Any]) -> dict[str, Any]:
+    """The report by layout and role group (contract amendment A26; Part 3's page, kits and slow tests read it):
+    ``{name, mode, seed, [winner, confirmed], layouts: {layout: {outcome_kind, groups: {group: {candidates, ranking,
+    matrix, rounds, select, transitivity, repeated_pairs}}}}}``.
+
+    - ``candidates``: the rows of the group's last-stage table (B, else A), then the candidates halving eliminated
+      (their last round's score, no interval); each ``{name, display, lineage, score, score_ci, worst, bt, bt_ci,
+      p_best, games, eliminated_round}`` (``bt*`` from the layout's BT section, None without one);
+    - ``ranking``: the last stage's order, then the eliminated by later round and higher score;
+    - ``matrix``: ``{candidate: {column: {score, ci, games}}}`` of that table; ``rounds``: ``{round, blocks,
+      survivors, eliminated}``; ``select``: the group's selection (``winner``, ``runner_up``, ``confirmed``,
+      ``diff``, ``diff_ci``, ``indistinguishable``) or None;
+    - ``winner`` / ``confirmed`` at the top only when one group was selected.
+    A partial report (e.g. ``{"name", "mode"}``) gives the view of what it has; a view (``layouts`` is already a
+    mapping) is returned as it is."""
+    if isinstance(data.get("layouts"), Mapping):
+        return dict(data)
+    players = {p["name"]: p for p in [*(data.get("candidates") or []), *(data.get("field") or [])]}
+    selection = data.get("selection") or {}
+    flags = (data.get("flags") or {}).get("repeated_pairs") or []
+    kinds = {e["layout"]: e.get("outcome_kind") for e in data.get("layouts") or []}
+    last: dict[tuple[str, str], dict] = {}
+    for t in data.get("tables") or []:
+        if t["layout"] == "*":
+            continue
+        key = (t["layout"], t["group"])
+        if key not in last or t["stage"] > last[key]["stage"]:
+            last[key] = t
+    layouts: dict[str, dict] = {}
+    for (layout, group), t in last.items():
+        section = (data.get("bt") or {}).get(layout) or {}
+        rated = {e["name"]: e for e in section.get("entities") or []}
+
+        def row(name: str, score, ci, worst, games, out_round, rated=rated) -> dict:
+            e = rated.get(name)
+            p = players.get(name, {})
+            return {"name": name, "display": p.get("display", name), "lineage": p.get("lineage", name),
+                    "score": score, "score_ci": ci, "worst": worst, "bt": None if e is None else e["rating"],
+                    "bt_ci": None if e is None else e["ci95"], "p_best": None if e is None else e["p_best"],
+                    "games": games if games is not None else (None if e is None else e["games"]),
+                    "eliminated_round": out_round}
+
+        candidates = [row(r["name"], r["score"], r.get("ci95"), r.get("worst"), r.get("games"), None)
+                      for r in t["rows"]]
+        rounds = [r for r in data.get("rounds") or [] if r["group"] == group]
+        eliminated = sorted(((r["round"], r["scores"][n], n) for r in rounds for n in r["eliminated"]),
+                            key=lambda x: (-x[0], -x[1]))
+        candidates += [row(n, score, None, None, None, rnd) for rnd, score, n in eliminated]
+        sel = selection.get(group)
+        layouts.setdefault(layout, {"outcome_kind": kinds.get(layout), "groups": {}})["groups"][group] = {
+            "candidates": candidates,
+            "ranking": [r["name"] for r in t["rows"]] + [n for _, _, n in eliminated],
+            "matrix": {c: {col: {"score": cell["score"], "ci": cell.get("ci95"), "games": cell.get("games")}
+                           for col, cell in cols.items()} for c, cols in (t.get("matrix") or {}).items()},
+            "rounds": [{"round": r["round"], "blocks": r["blocks_per_composition"],
+                        "survivors": [n for n in r["active"] if n not in r["eliminated"]],
+                        "eliminated": list(r["eliminated"])} for r in rounds],
+            "select": None if sel is None else {
+                "winner": sel["winner"], "runner_up": sel.get("runner_up"), "confirmed": sel["confirmed"],
+                "diff": sel.get("diff"), "diff_ci": sel.get("diff_ci95"),
+                "indistinguishable": list(sel.get("indistinguishable") or [])},
+            "transitivity": section.get("transitivity"),
+            "repeated_pairs": [[c, col] for L, c, col in flags if L == layout],
+        }
+    out = {"name": data.get("name"), "mode": data.get("mode"), "seed": data.get("seed"), "layouts": layouts}
+    if len(selection) == 1:
+        (sel,) = selection.values()
+        out["winner"], out["confirmed"] = sel["winner"], sel["confirmed"]
+    return out
 
 
 def _is_random_bot(class_path: str) -> bool:
@@ -4435,7 +4490,7 @@ def bt_section(layout: str, results: Sequence[MatchResult], blocks: Sequence[Blo
                       "p_best": float(unc.p_best_group.get(e, 0.0)), "games": int(fit.games.get(e, 0))}
                      for e in entities],
         "transitivity": {"p_value": p_value, "flag": p_value is not None and p_value < 0.01,
-                         "worst_pairs": _jsonable(tt.worst_pairs)},
+                         "worst_pairs": tt.to_dict()["worst_pairs"]},
         "converged": bool(fit.converged),
     }
 ```
@@ -4466,12 +4521,12 @@ Spec block 3 («Исполнение», «Куда пишет», «Закреп�
 **Files:**
 - Create: `src/colosseum/arena/tournament/run.py`
 - Modify: `src/colosseum/cli.py` (the `tournament` command)
-- Modify: `src/colosseum/core/run_dir.py` (`tournaments_dir`, if T7.1 has not added it yet)
+- Modify: `src/colosseum/core/run_dir.py` (`tournaments_dir`; T7.1 relies on it)
 - Modify: `tests/game_helpers.py` (`write_fake_run(..., biases=...)`)
 - Test: `tests/integration/test_sp4_tournament_cli.py`
 
 **Interfaces:**
-- Consumes: `players.resolve_players`, `PlayerRequest`, `RunSelection`, `player_to_dict` / `player_from_dict`, `load_run_config` (T5.1); `engine.play_blocks`, `TournamentError` (T5.1); `schedule.stage_seed` (T5.1); `modes.run`, `bt_section`, `TournamentSettings`, `DEFAULT_*` (T5.3); `MatchLog(path, run, *, min_free_disk_mb)`, `MatchLog.append`, `MatchLog.close`, `MatchLog.open_readonly(...).blocks(name)` / `.runs()` / `.close()`, `RunInfo`, `MATCH_LOG_FILE` (T1.2), `MatchLogReader.match_results(source=, tournament=)` (R4); `RunDir.open(root).run_id` (R1); `pin_snapshot` (T4.2); `link_or_copy` (T4.1); `validate_config(scope="play", players=...)` with `ValidationReport.fixed` (T5.1); `enabled_layouts`; Part 3's `render_tournament_html` (R12, optional until T7.2).
+- Consumes: `players.resolve_players`, `PlayerRequest`, `RunSelection`, `player_to_dict` / `player_from_dict`, `load_run_config` (T5.1); `engine.play_blocks`, `TournamentError` (T5.1); `schedule.stage_seed` (T5.1); `modes.run`, `bt_section`, `TournamentSettings`, `DEFAULT_*` (T5.3); `MatchLog(path, run, *, min_free_disk_mb)`, `MatchLog.append`, `MatchLog.close`, `MatchLog.open_readonly(...).blocks(name)` / `.runs()` / `.close()`, `RunInfo`, `MATCH_LOG_FILE` (T1.2), `MatchLog.append(results, tournament=)`, `MatchLogReader.match_results(source=, tournament=)` (R4); `RunDir.open(root).ensure_run_id()` (T1.1, R1); `pin_snapshot` (T4.2); `link_or_copy` (T4.1); `validate_config(scope="play", players=...)` with `ValidationReport.fixed` (T5.1); `enabled_layouts`; Part 3's `write_tournament_html(tournament_dir)` (R12, optional until T7.2).
 - Produces:
   - CLI `colosseum tournament [-c CFG] [-a NAME[=PATH] ...] [--run [ALIAS=]DIR [--agent A] [--snapshots all|last:N|top:N|every:K] ...] [--field a,b,...] [--mode gauntlet|round-robin|halving|select] [--layout L ...] [--blocks N] [--halving-blocks N] [--confirm-blocks N] [--finalists N] [--num-workers W] [--num-envs E] [--deterministic] [--seed S] [--name NAME] [--output DIR] [--pin] [--set k=v ...]`; exit codes 0 / 1 (config, player or env error; a worker died) / 2 (bad arguments) / 130 (SIGINT);
   - *`run.TournamentOptions`, *`run.run_tournament(options) -> TournamentOutcome`, *`run.TournamentDir(path)` with `yaml_path`, `snapshots`, `logs`, `report_paths`, `load()`, `write(data)`, `check(stored, request)`, `write_reports(report)`; *`run.BlockRunner`; *`run.diff_fields(a, b)`; *`run.TOURNAMENT_FILE`, *`run.TOURNAMENT_FORMAT`;
@@ -4638,7 +4693,7 @@ def test_several_runs_with_aliases_and_snapshot_references_in_the_field(tmp_path
     assert (first / MATCH_LOG_FILE).is_file() and not (second / MATCH_LOG_FILE).exists()
 
 
-def test_output_dir_without_a_run_and_scripted_teammates_in_a_score_layout(tmp_path):
+def test_output_dir_without_a_run_and_scripted_and_frozen_teammates_in_a_score_layout(tmp_path):
     root, cfg_ = fake_run(tmp_path, game="coop", versions=(1,))
     cfg = write_test_config(tmp_path / "coop.yaml", "coop", agents=AGENTS)
     ckpt = root / "checkpoints" / "main" / "ckpt_v1"
@@ -4651,6 +4706,14 @@ def test_output_dir_without_a_run_and_scripted_teammates_in_a_score_layout(tmp_p
     assert table["metric"] == "score" and table["columns"] == ["(self)", "ones"]
     assert table["rows"][0]["name"] == f"prev#{entity_hash(ckpt)}"
     assert (out / MATCH_LOG_FILE).is_file()
+    # a frozen teammate (spec section 6, SP3 item): a checkpoint given with -a and named in --field
+    mate = invoke("-c", cfg, "-a", f"prev={ckpt}", "-a", f"mate={ckpt}", "--field", "mate", "--blocks", 2,
+                  "--num-envs", 2, "--output", out, "--name", "coop-frozen")
+    assert mate.exit_code == 0, mate.output
+    data = json.loads((out / "tournaments" / "coop-frozen" / "report.json").read_text())
+    (table,) = data["tables"]
+    assert table["columns"][0] == "(self)" and table["columns"][1].startswith("mate")
+    assert data["field"][0]["kind"] != "scripted"
 
 
 def test_sp3_run_dirs_play_as_runs_and_their_checkpoints_as_frozen_agents(tmp_path):
@@ -4855,12 +4918,12 @@ class TournamentDir:
         data = report.to_dict()
         written = [write_text_atomic(self.path / REPORT_JSON, json.dumps(data, indent=2, sort_keys=False) + "\n"),
                    write_text_atomic(self.path / REPORT_TXT, report.text() + "\n")]
-        try:   # T7.2 provides the renderer; until then the HTML report is skipped (Contract notes R12)
-            from colosseum.arena.report.render import render_tournament_html
+        try:   # T7.2 provides the renderer and removes this guard (contract amendment A27)
+            from colosseum.arena.report.render import write_tournament_html
         except ImportError:
             logger.info("report.html is not written yet: colosseum.arena.report.render arrives with SP4 T7.2")
             return written
-        written.append(write_text_atomic(self.path / REPORT_HTML, render_tournament_html(data)))
+        written.append(write_tournament_html(self.path))       # report.html (REPORT_HTML) next to report.json
         return written
 
 
@@ -4879,7 +4942,8 @@ class BlockRunner:
         self.reused = 0
 
     def _store(self, block_id: str, results: list[MatchResult]) -> None:
-        self._log.append(results)            # one transaction: a block is in the journal whole or not at all
+        # one transaction: a block is in the journal whole or not at all; the tournament id is the block-id prefix
+        self._log.append(results, tournament=block_id.split("/", 1)[0])
         self._done[block_id] = list(results)
         self.played += 1
 
@@ -4967,7 +5031,7 @@ def _journal_run(options: TournamentOptions, config: ColosseumConfig, db: Path, 
                        game=config.env.env_class, config_hash=config_hash(config),
                        checkpoint_interval=config.checkpoint.interval)
     first = Path(options.runs[0].path)
-    run_id = RunDir.open(first).run_id
+    run_id = RunDir.open(first).ensure_run_id()     # an SP3 run dir gets its run.json here (R1)
     if db.is_file():
         reader = MatchLog.open_readonly(db)
         try:
@@ -5257,7 +5321,7 @@ def tournament_cmd(config: str | None, candidates: tuple[str, ...], runs: tuple[
         click.echo(f"Pinned {winner}")
 ```
 
-`src/colosseum/core/run_dir.py`: add (if T7.1 did not) the property `tournaments_dir -> self.root / "tournaments"` and the module docstring line `tournaments/<name>/  colosseum tournament dirs (SP4 T5.4)`.
+`src/colosseum/core/run_dir.py`: add the property `tournaments_dir -> self.root / "tournaments"` and the module docstring line `tournaments/<name>/  colosseum tournament dirs (SP4 T5.4)`.
 
 - [ ] **Step 5: Run the tests**
 
@@ -5288,19 +5352,21 @@ The launcher starts one `pulse` child (worker lifecycle: `run_child` → `logs/p
 - Modify: `src/colosseum/core/validation.py` (`_check_evaluation`: field, agents, layouts, role coverage, printout)
 - Modify: `src/colosseum/launcher.py` (feeder, queues, the `pulse` child, offers after saves, the pump in the monitor loop and the shutdown poll, `pulse_state.json`, system values)
 - Modify: `src/colosseum/core/run_dir.py` (`pulse_state_path`)
+- Modify: `src/colosseum/metrics/hub.py` (`set_system_value`, R10: Part 1 has no such hook; contract amendment A29)
 - Modify: `scripts/bench_throughput.py::_make_config` (the `evaluation` section, explicit and off)
 - Modify: `tests/game_helpers.py` (`PulseFailBot`)
 - Test: `tests/unit/test_sp4_pulse.py`, `tests/integration/test_sp4_pulse_runs.py`
 
 **Interfaces:**
-- Consumes: `schedule.gauntlet_blocks` / `score_blocks` (T5.2, stage `P`); `engine.make_tasks`, `LazyPlayerPool`-free pool (here: `_PulsePool`), `players.config_player`, `TournamentPlayer`, `PlayerSource` (T5.1); `eval.play_lineups(pool=, source="pulse")` (T5.1); `FixedPlayers`, `FrozenSpec`, `build_frozen_model`, `make_bot`; `MatchLogWriter.submit` (T1.3) via `Launcher._match_log_writer` (R2); `RunDir.run_id` (R1); `MetricsHub.set_system_value` (R10); `utils.process.run_child`, `start_process`; `core.ipc.release_command_queues`; `league.lineups.playable_layouts`.
+- Consumes: `schedule.gauntlet_blocks` / `score_blocks` (T5.2, stage `P`); `engine.make_tasks`, `LazyPlayerPool`-free pool (here: `_PulsePool`), `players.config_player`, `TournamentPlayer`, `PlayerSource` (T5.1); `eval.play_lineups(pool=, source="pulse")` (T5.1); `FixedPlayers`, `FrozenSpec`, `build_frozen_model`, `make_bot`; `MatchLogWriter.submit` (T1.3) via `Launcher._match_log_writer` (R2); `Launcher._run_id` (T1.1, R1); `utils.process.run_child`, `start_process`; `core.ipc.release_command_queues`; `league.lineups.playable_layouts`.
 - Produces (contract T6.1, additions marked *):
   - `EvaluationConfig(enabled=False, agents=None, field=None, layouts=None, every=1, blocks=25, num_envs=8, deterministic=False, max_backlog=4)`, `ColosseumConfig.evaluation`;
   - `pulse.PulseRequest(agent_id, checkpoint_id, version, env_steps, state_dict, final=False*)`;
   - `pulse.pulse_main(config, *, requests, results, stop_event, field_specs, field*, agents*, run_id*)`; *`pulse.pulse_target(*, log_dir, **kwargs)`;
   - *`pulse.PulseAgent(roles, networks, layouts)`, *`pulse.PulsePlan(agents, field)`, *`pulse.pulse_plan(config, spec, player_roles) -> PulsePlan`, *`pulse.describe_pulse(plan, config, spec, player_roles) -> str`, *`pulse.pulse_blocks(...)`, *`pulse.PulseResults`, *`pulse.PulseFeeder`, *`PULSE_STATE_FILE = "pulse_state.json"`;
   - *`RunDir.pulse_state_path`;
-  - `system` record values (through R10): `pulse_skipped_snapshots`, `pulse_evaluated_snapshots`, `pulse_pending_snapshots`.
+  - *`MetricsHub.set_system_value(key, value)` (R10; created here);
+  - `system` record values (top-level keys, through R10): `pulse_skipped_snapshots`, `pulse_evaluated_snapshots`, `pulse_pending_snapshots` (cumulative per run except `pending`).
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5426,6 +5492,22 @@ def test_the_feeder_bookkeeping_adds_up():
     rest = set(state["skipped"]["main"]) | set(state["unevaluated"]["main"])
     assert evaluated == {1} and offered == evaluated | rest and not evaluated & rest
     assert state["unevaluated"]["main"] == [3] and feeder.unevaluated_final() == [("main", "ckpt_v3")]
+
+
+def test_system_values_reach_every_later_system_record(tmp_path):
+    import json
+
+    from colosseum.metrics.hub import MetricsHub
+    from colosseum.metrics.jsonl import MetricsWriter
+
+    hub = MetricsHub(writer=MetricsWriter(tmp_path / "m.jsonl"), ratings_path=tmp_path / "r.json", agent_ids=["a"],
+                     total_timesteps=10, log_interval=1, console_interval_sec=0.0)
+    hub.set_system_value("pulse_skipped_snapshots", 2)
+    hub.maybe_tick(env_steps=1, ratings={}, queue_depths={}, force=True)
+    hub.set_system_value("pulse_skipped_snapshots", 3)
+    hub.close(env_steps=2, ratings={}, queue_depths={})
+    records = [json.loads(line) for line in (tmp_path / "m.jsonl").read_text().splitlines()]
+    assert [r["pulse_skipped_snapshots"] for r in records if r["kind"] == "system"] == [2, 3]
 
 
 def test_the_pulse_process_plays_every_snapshot_on_the_same_seeds(tmp_path):
@@ -5982,7 +6064,7 @@ def _check_evaluation(config: ColosseumConfig, spec: GameSpec, player_roles: dic
             pulse_proc = mp.Process(target=pulse_target, name="pulse", daemon=True, kwargs=dict(
                 log_dir=str(self._run_dir.logs), config=cfg, requests=self._pulse_requests,
                 results=self._pulse_results, stop_event=self._stop_event, field_specs=field_specs, field=list(names),
-                agents=self._pulse_plan.agents, run_id=self._run_dir.run_id))
+                agents=self._pulse_plan.agents, run_id=self._run_id))
             start_process(pulse_proc)
             self._supervisor.add("pulse", pulse_proc)
             logger.info(f"Pulse started for {list(self._pulse_plan.agents)} against {names}")
@@ -6037,7 +6119,14 @@ def _check_evaluation(config: ColosseumConfig, spec: GameSpec, player_roles: dic
                         f"stopped first); evaluate it with colosseum tournament")
         self._write_pulse_state()
 ```
-7. Call `self._pump_pulse()` in `_monitor_loop` right after `self._drain_results()`; in `_shutdown`'s `poll`, add `self._pump_pulse` to the drains tuple; in `_finish_metrics`, call `self._pump_pulse()` after `self._drain_results()` and `self._finish_pulse()` before `self._hub.close(...)`.
+7. Call `self._pump_pulse()` in `_monitor_loop` right after `self._drain_results()`; in `_shutdown`'s `poll`, add `self._pump_pulse` to the drains tuple; in `_finish_metrics`, call `self._pump_pulse()` after `self._drain_results()` and before T1.3's `self._stop_match_log()` (the last pulse results must reach the writer before it flushes and stops; contract amendment A20), and `self._finish_pulse()` before `self._hub.close(...)`.
+9. `src/colosseum/metrics/hub.py` (R10): in `MetricsHub.__init__` add `self._system_values: dict[str, Any] = {}   # merged into every system record (SP4 T6.1)`; after `on_worker_stats` add
+```python
+    def set_system_value(self, key: str, value: Any) -> None:
+        """A value merged at the top level of every later ``system`` record (SP4 T6.1: the pulse counters)."""
+        self._system_values[key] = value
+```
+   and in `maybe_tick`, right after `system = self._system.snapshot(...)`, add `system.update(self._system_values)` (WandB gets them through the existing `flatten`).
 8. `_shutdown`: `produced_here = {id(q) for q in self._main_produced_queues()}`; `_release_queues`: `produced_here = {id(q) for q in self._main_produced_queues()}` and `release_command_queues(self._main_produced_queues(), _QUEUE_RELEASE_SEC)`; at its end also `self._pulse_requests = self._pulse_results = None`.
 
 The pulse process is in the supervisor, so `first_failure` stops the run when it dies ("pulse died (exit 1), see <run>/logs/pulse.log"), `wait_all` / `kill_remaining` stop it with the rest, and `_exit_code_after_shutdown` treats it like a worker.
@@ -6055,7 +6144,8 @@ The pulse touches the launcher's process lifecycle: also run the slow suite once
 
 ```bash
 git add src/colosseum/arena/pulse.py src/colosseum/core/config.py src/colosseum/core/validation.py \
-        src/colosseum/launcher.py src/colosseum/core/run_dir.py scripts/bench_throughput.py tests/game_helpers.py \
+        src/colosseum/launcher.py src/colosseum/core/run_dir.py src/colosseum/metrics/hub.py \
+        scripts/bench_throughput.py tests/game_helpers.py \
         tests/unit/test_sp4_pulse.py tests/integration/test_sp4_pulse_runs.py
 git commit -m "feat: pulse (evaluate new snapshots against a fixed field during training)"
 git push
@@ -6063,6 +6153,8 @@ git push
 
 ---
 ## Contract notes
+
+> **Reconciled (pre-flight, 2026-10-16).** These notes are folded into `00-overview.md` «Contract amendments» A1–A33; the pre-flight rulings P1… are in the SDD workspace `constraints.md`. Where a note below differs from an amendment (for example a requirement met under another name), the amendment wins.
 
 Requirements on other parts, additions and deviations against the overview contract, and proposed rulings ("what — why — cost if wrong"). The controller folds accepted items into `00-overview.md` («Contract amendments») before execution.
 

@@ -1301,7 +1301,7 @@ Expected: all pass.
 
 - [ ] **Step 10: Full fast suite + ruff**
 
-Run the full fast suite and ruff. Expected: green, zero warnings. (The suite also exercises the worker's exit flush through every `colosseum train` integration test.)
+Run the full fast suite and ruff. Expected: green, zero warnings. (The suite also exercises the worker's exit flush through every `colosseum train` integration test.) The task changes the worker (`rollout_loop`, `rollout_worker`, `match_runner`): also run the slow suite once (`env -u PYTHONPATH .venv/bin/python -m pytest -m slow -v`, about 7 min; every SP2/SP3 threshold unchanged) and report its durations (global constraint; pre-flight ruling P9).
 
 - [ ] **Step 11: Commit and push**
 
@@ -1329,7 +1329,7 @@ Spec block 1 ("Хранилище", "Своевременная чистка", "
 - Consumes: `colosseum.arena.entities` (T1.1), `MatchResult` / `SeatResult` / `TeamResult` / `MATCH_SOURCES` (T1.1), `colosseum.core.outcomes.pairwise_rank_score` (`core/outcomes.py:67`).
 - Produces (contract T1.2, plus additions marked *):
   - `colosseum.arena.comparisons`: `TeamKey(team, members)` (frozen, ordered; *`TeamKey.of(team, members)`, *`entities()`, *`encode()` / *`decode()`), `PairStat(n, sw, swy)` (*`add`), *`ScoreStat(n, total, total_sq)` (the contract's "ScoreStat … n, sum, sumsq"), `ComparisonTable` (`add_result`, `add`, *`add_score`, `merge`, *`copy`, *`version`, `layouts`, *`sources`, `pairs`, `scores`, `entity_games`, *`as_dict`), `match_pairs(result, rating_versions)`, *`match_score`, *`team_keys`, *`pairs_of(keys, ranks)`, *`score_of(keys, scores)`, *`coefficients(a, b)`, *`Pair`;
-  - `colosseum.arena.matchlog`: `MATCH_LOG_FILE`, `SCHEMA_VERSION`, `RunInfo`, `MatchLog(path, run, *, disk_free_fn, min_free_disk_mb)` with `append(results, *, tournament=None)` (*keyword `tournament`), `compact(*, window_bytes, max_batch=10_000, evicted=(), should_stop=...)` (*keyword `should_stop`), `import_parent`, `comparison_table`, `sizes`, `close`, `open_readonly`, *`rating_versions(result)`, *`degraded`; `MatchLogReader(path)` with `matches(*, agent, version, layout, source, tournament, outcome, env_steps, limit)` (*`version`, *`outcome`, *`env_steps`), `comparison_table`, `blocks`, `runs`, `sizes`, *`close`; *`AppendStats`, *`CompactStats`, *`ImportStats`, *`LogSizes`, *`MatchRow`, *`SeatRow`, *`MatchLogError`, *`estimated_size`, *`default_disk_free`;
+  - `colosseum.arena.matchlog`: `MATCH_LOG_FILE`, `SCHEMA_VERSION`, `RunInfo`, `MatchLog(path, run, *, disk_free_fn, min_free_disk_mb)` with `append(results, *, tournament=None)` (*keyword `tournament`), `compact(*, window_bytes, max_batch=10_000, evicted=(), should_stop=...)` (*keyword `should_stop`), `import_parent`, `comparison_table`, `sizes`, `close`, `open_readonly`, *`rating_versions(result)`, *`degraded`; `MatchLogReader(path)` with `matches(*, agent, version, layout, source, tournament, outcome, env_steps, limit)` (*`version`, *`outcome`, *`env_steps`; *`limit=None` = every row), `comparison_table`, `blocks`, `runs`, `sizes`, *`close`, *context manager, *`match_results(*, source, tournament=None)`; *`bootstrap_units(layout, sources)` (on both `MatchLog` and `MatchLogReader`; the input of T2.1's `bt.bootstrap_data`); *`AppendStats`, *`CompactStats`, *`ImportStats`, *`LogSizes`, *`MatchRow` (*`replay`, *`to_dict()`, *`to_result()`), *`SeatRow`, *`MatchLogError`, *`estimated_size`, *`default_disk_free` (contract amendments A6–A8);
   - test support: *`make_match_result(seats, ranks=None, *, layout, uid, source, scores, ...)`, *`synthetic_journal_results(n, *, seed, prefix, source, layout, interval, first)`.
 
 - [ ] **Step 1: Add the record builders to `tests/game_helpers.py`**
@@ -1823,6 +1823,35 @@ def test_matches_filters(tmp_path):
     log.close()
 
 
+def test_rows_round_trip_results_and_bootstrap_units(tmp_path):
+    """Contract amendments A6-A8: ``MatchRow.to_dict`` / ``to_result``, ``limit=None``, ``match_results`` in row
+    order, the reader as a context manager, and ``bootstrap_units`` (counts rows + detailed contributions)."""
+    log = _log(tmp_path)
+    train = synthetic_journal_results(40)
+    pulse = [make_match_result([(0, "main", "ckpt_v10", "player", 10), (1, "random", "fixed")], uid=f"p/{i}",
+                               source="pulse", block=f"pulse-x/P/2p/main@v10/random/{i // 2}", seed=i)
+             for i in range(6)]
+    log.append(train + pulse)
+    log.compact(window_bytes=estimated_size(train[0]) * 10)
+    with MatchLogReader(log.path) as reader:
+        rows = reader.matches(limit=None)
+        assert len(rows) == len(reader.matches(source="train", limit=None)) + 6 and rows[0].uid == "p/5"
+        row = reader.matches(source="pulse", limit=1)[0]
+        d = row.to_dict()
+        assert d["uid"] == "p/5" and d["block"].endswith("/2") and d["replay"] is None and "ts" not in d
+        assert d["seats"][0]["rating_version"] == 10 and d["seats"][0]["entity"] == "main@v10"
+        result, versions = row.to_result()
+        assert (result.uid, result.source, result.seed, versions) == ("p/5", "pulse", 5, [10, None])
+        assert [r.uid for r in reader.match_results(source="pulse")] == [f"p/{i}" for i in range(6)]
+        counts, details = reader.bootstrap_units("2p", ("train", "pulse"))
+        assert counts and all(stat.n > 0 for _, _, stat in counts)
+        blocks = [b for b, _ in details if b is not None]
+        assert len(blocks) == 6 and all(len(contribs) == 1 for _, contribs in details)
+        assert sum(stat.n for _, _, stat in counts) + len(details) == len(train) + len(pulse)
+        assert reader.bootstrap_units("9p", ("train",)) == ([], [])
+    log.close()
+
+
 def test_a_missing_journal_reads_as_empty_and_other_schemas_are_refused(tmp_path):
     empty = MatchLogReader(tmp_path / "missing.db")
     assert empty.comparison_table().layouts() == [] and empty.matches() == [] and empty.runs() == []
@@ -2217,7 +2246,7 @@ from colosseum.arena.comparisons import (
     team_keys,
 )
 from colosseum.arena.entities import EntityKey, entity_key, rating_version
-from colosseum.core.types import MATCH_SOURCES, MatchResult
+from colosseum.core.types import MATCH_SOURCES, MatchResult, SeatResult, TeamResult
 
 logger = logging.getLogger(__name__)
 
@@ -2356,6 +2385,33 @@ class MatchRow:
     ts: float
     seats: tuple[SeatRow, ...]
     teams: tuple[tuple[int, float, float], ...]     # (team, rank, score)
+    replay: str | None = None                        # a replay link, when the env gave one (spec block 5)
+
+    def to_dict(self) -> dict:
+        """JSON-ready form (report, dashboard; contract amendment A7): the match's columns (no ``ts``: order is by
+        row id), its seats and its teams."""
+        return {"uid": self.uid, "run_id": self.run_id, "source": self.source, "layout": self.layout,
+                "outcome_kind": self.outcome_kind, "episode_length": self.length, "seed": self.seed,
+                "env_steps": self.env_steps, "block": self.block, "tournament": self.tournament,
+                "worker": self.worker, "replay": self.replay,
+                "seats": [{"seat": s.seat, "team": s.team, "role": s.role, "agent_id": s.agent_id,
+                           "network_id": s.network_id, "entity": s.entity, "category": s.category,
+                           "version_start": s.version_start, "version_end": s.version_end,
+                           "rating_version": s.rating_version, "reward": s.reward,
+                           "eliminated_step": s.eliminated_step} for s in self.seats],
+                "teams": [{"team": t, "rank": r, "score": sc} for t, r, sc in self.teams]}
+
+    def to_result(self) -> tuple[MatchResult, list[int | None]]:
+        """The ``MatchResult`` back (``match_id`` = ``uid``; a seat's ``source`` = its opponent category) and the
+        seats' rating versions in seat order (``ComparisonTable.add_result`` / ``match_pairs`` take both)."""
+        seats = [SeatResult(seat=s.seat, role=s.role, team=s.team, agent_id=s.agent_id, network_id=s.network_id,
+                            reward=s.reward, eliminated_step=s.eliminated_step, source=s.category,
+                            version_start=s.version_start, version_end=s.version_end) for s in self.seats]
+        result = MatchResult(match_id=self.uid, layout=self.layout, outcome_kind=self.outcome_kind, seats=seats,
+                             teams=[TeamResult(team=t, rank=r, score=sc) for t, r, sc in self.teams],
+                             episode_length=self.length, uid=self.uid, source=self.source, seed=self.seed,
+                             env_steps=self.env_steps, block=self.block)
+        return result, [s.rating_version for s in self.seats]
 
 
 def default_disk_free(directory: Path) -> int:
@@ -2529,6 +2585,32 @@ class _Store:
         for _, layout, source, keys, ranks, scores in self._iter_detail(where, args):
             _add_detail(table, layout, source, keys, ranks, scores)
         return table
+
+    def bootstrap_units(self, layout: str, sources: Collection[str]) -> tuple[
+            list[tuple[TeamKey, TeamKey, PairStat]],
+            list[tuple[str | None, list[tuple[TeamKey, TeamKey, float, float]]]]]:
+        """The resampling units of ``layout`` outside tournaments (T2.1's ``bt.bootstrap_data``, spec block 2): the
+        ``counts`` rows of ``sources`` and, per detailed match of ``sources`` in id order, its block id (None in
+        training) and its team-pair contributions ``(a, b, weight, outcome of a)``."""
+        lid = self._lookup("layout", layout)
+        src_ids = [i for s in sources if (i := self._lookup("source", s)) is not None]
+        if lid is None or not src_ids:
+            return [], []
+        marks = ",".join("?" * len(src_ids))
+        counts = [(self._decode_key(key_a), self._decode_key(key_b), PairStat(int(n), float(s1), float(s2)))
+                  for key_a, key_b, n, s1, s2 in self._conn.execute(
+                      f"SELECT key_a, key_b, n, s1, s2 FROM counts WHERE kind = ? AND layout = ? "
+                      f"AND source IN ({marks}) ORDER BY id", (_PAIR, lid, *src_ids))]
+        where = f"layout = ? AND source IN ({marks}) AND tournament IS NULL"
+        args = (lid, *src_ids)
+        blocks = {int(i): str(b) for i, b in self._conn.execute(
+            f"SELECT id, block FROM matches WHERE {where} AND block IS NOT NULL", args)}
+        details = []
+        for match, _, _, keys, ranks, _ in self._iter_detail(where, args):
+            pairs = pairs_of(keys, ranks)
+            if pairs:
+                details.append((blocks.get(match), pairs))
+        return counts, details
 
     def _sizes(self, path: Path, free: int, degraded: bool) -> LogSizes:
         wal = Path(f"{path}-wal")
@@ -2972,10 +3054,23 @@ class MatchLogReader(_Store):
             self._conn.close()
             raise MatchLogError(f"{self.path} is a match log of schema version {version}, not {SCHEMA_VERSION}")
 
+    def __enter__(self) -> MatchLogReader:
+        return self
+
+    def __exit__(self, *exc) -> None:
+        self.close()
+
     def comparison_table(self, sources: Collection[str] = ("train", "pulse"),
                          tournament: str | None = None) -> ComparisonTable:
         """As ``MatchLog.comparison_table``."""
         return self._table(sources, tournament)
+
+    def match_results(self, *, source: str, tournament: str | None = None) -> list[MatchResult]:
+        """Every detailed match of ``source`` (and ``tournament``, when given) as a ``MatchResult``, oldest first
+        (row ids): tournament resume (T5.4) and pulse tests (T6.1). Tournament and pulse matches are never
+        compacted, so they are complete."""
+        rows = self.matches(source=source, tournament=tournament, limit=None)
+        return [row.to_result()[0] for row in reversed(rows)]
 
     def blocks(self, tournament: str) -> set[str]:
         """Block ids of ``tournament`` in the journal (blocks are written whole, one transaction each)."""
@@ -2998,10 +3093,10 @@ class MatchLogReader(_Store):
 
     def matches(self, *, agent: str | None = None, version: int | None = None, layout: str | None = None,
                 source: str | None = None, tournament: str | None = None, outcome: str | None = None,
-                env_steps: tuple[int, int] | None = None, limit: int = 1000) -> list[MatchRow]:
+                env_steps: tuple[int, int] | None = None, limit: int | None = 1000) -> list[MatchRow]:
         """Detailed matches, newest first. ``agent`` (with ``version``: a rating version) selects matches with such
         a seat; ``outcome`` (``win`` / ``draw`` / ``loss``; needs ``agent``) is that agent's team result against the
-        best other team; ``env_steps`` is an inclusive range."""
+        best other team; ``env_steps`` is an inclusive range; ``limit=None`` returns every matching row."""
         if outcome is not None and agent is None:
             raise ValueError("an outcome filter needs an agent")
         clauses: list[str] = []
@@ -3029,12 +3124,13 @@ class MatchLogReader(_Store):
         where = " AND ".join(clauses) or "1"
         out: list[MatchRow] = []
         last: int | None = None
-        while len(out) < limit:
+        page_size = READ_BATCH if limit is None else max(limit, 100)
+        while limit is None or len(out) < limit:
             page = self._conn.execute(
                 f"SELECT m.id, m.uid, r.run_id, m.source, m.layout, m.outcome_kind, m.length, m.seed, m.env_steps, "
-                f"m.block, m.tournament, m.worker, m.ts FROM matches m LEFT JOIN runs r ON r.id = m.run "
+                f"m.block, m.tournament, m.worker, m.ts, m.replay FROM matches m LEFT JOIN runs r ON r.id = m.run "
                 f"WHERE {where}{'' if last is None else ' AND m.id < ?'} ORDER BY m.id DESC LIMIT ?",
-                (*args, *(() if last is None else (last,)), max(limit, 100))).fetchall()
+                (*args, *(() if last is None else (last,)), page_size)).fetchall()
             if not page:
                 break
             last = page[-1][0]
@@ -3043,7 +3139,7 @@ class MatchLogReader(_Store):
                 if outcome is not None and _outcome_for(match, agent) != outcome:
                     continue
                 out.append(match)
-                if len(out) >= limit:
+                if limit is not None and len(out) >= limit:
                     break
         return out
 
@@ -3058,7 +3154,8 @@ class MatchLogReader(_Store):
             "SELECT team, rank, score FROM teams WHERE match = ? ORDER BY team", (mid,)))
         return MatchRow(id=mid, uid=row[1], run_id=row[2], source=self._name(row[3]), layout=self._name(row[4]),
                         outcome_kind=row[5], length=int(row[6]), seed=row[7], env_steps=row[8], block=row[9],
-                        tournament=self._name(row[10]), worker=row[11], ts=float(row[12]), seats=seats, teams=teams)
+                        tournament=self._name(row[10]), worker=row[11], ts=float(row[12]), seats=seats, teams=teams,
+                        replay=row[13])
 
     def close(self) -> None:
         self._conn.close()
@@ -3910,14 +4007,14 @@ Spec block 2 ("Сущности", "Модель", "Подгонка"), criterion
 **Interfaces:**
 - Consumes: `ComparisonTable`, `PairStat`, `TeamKey`, `coefficients`, `match_pairs` (T1.2); `entity_version`, `lineage` (T1.1); `MatchLog` (T1.2, in the journal test).
 - Produces (contract T2.1, plus additions marked *):
-  - `BTOptions(prior_sigma=PRIOR_SIGMA, smoothness=SMOOTHNESS, anchor=None, max_iter=50, tol=1e-8, dense_limit=DENSE_LIMIT)` (*defaults from the module constants, *`dense_limit`), *`DEFAULT_OPTIONS`;
+  - `BTOptions(prior_sigma=PRIOR_SIGMA, smoothness=SMOOTHNESS, anchor=None, max_iter=50, tol=1e-8, dense_limit=DENSE_LIMIT, agent_order=())` (*defaults from the module constants, *`dense_limit`, *`agent_order`: the config order for the "first trainable agent" anchor rule, used when `fit` gets no `agent_order`), *`DEFAULT_OPTIONS`, *`default_options(anchor=None)` (contract amendment A10);
   - `BTGroup(layout, group, component, entities, anchor, *anchor_members, *rule, *note)`;
   - `BTFit(layout, groups, rating, se, bias, *bias_se, games, iterations, converged, *approximate, ...)` with *`group_of(entity)`;
   - `fit(table, layout, *, sources, options=DEFAULT_OPTIONS, fixed_agents=(), random_bot=None, *agent_order=(), warm=None)`;
   - `laplace(fit_, *, samples=1000, rng, top_k=0, quantile=0.1)`, `bootstrap(fit_, data, *, samples, rng, top_k=0, quantile=0.1)` → `Uncertainty(ci95, lcb, p_best_lineage, p_best_group, p_top_k, *p_top_k_group, *contrast_samples)`;
-  - *`BootstrapData(counts, matches, blocks)`, *`Contribution` — the interface T5.3 builds for paired stratified bootstrap (`blocks = {stratum: {key: [contributions]}}`, the same key for every candidate's block on one seed);
-  - `transitivity_test(table, fit_, *, sources, min_games=20)` → *`TransitivityResult(g2, dof, p_value, flagged, pairs_tested, worst_pairs)`; *`chi2_sf(x, dof)`;
-  - `score_summary(table, layout, *, sources)` → *`ScoreSummary(layout, entities, compositions, homogeneous)`, *`ScoreCell(n, mean, ci_low, ci_high)`;
+  - *`BootstrapData(counts, matches, blocks)`, *`Contribution` — the interface T5.3 builds for paired stratified bootstrap (`blocks = {stratum: {key: [contributions]}}`, the same key for every candidate's block on one seed); *`BootstrapData.from_table(table, layout, *, sources)` (rows only), *`BootstrapData.from_blocks(results_by_block, *, strata=None)` (whole blocks; with strata the key is the block id's last component), *`bootstrap_data(reader, layout, *, sources)` (a journal's units: counts rows, detailed training matches, pulse blocks; via `MatchLogReader.bootstrap_units`) (contract amendment A11);
+  - `transitivity_test(table, fit_, *, sources, min_games=20)` → *`TransitivityResult(g2, dof, p_value, flagged, pairs_tested, worst_pairs)` (`worst_pairs`: `(a, b, residual, matches)`), *`TransitivityResult.to_dict()`; *`chi2_sf(x, dof)`;
+  - `score_summary(table, layout, *, sources)` → *`ScoreSummary(layout, entities, compositions, homogeneous)` with *`to_dict()` and *`by_entity` (`{entity: (n, mean, standard error)}`), *`ScoreCell(n, mean, ci_low, ci_high)` (contract amendment A12);
   - constants *`ELO_PER_LOGIT`, *`Z_95`, *`PRIOR_SIGMA = 4.0`, *`SMOOTHNESS = 0.5`, *`DENSE_LIMIT = 2000`, *`MEAN_OF_FIXED = "mean-of-fixed"`, *`TRANSITIVITY_P = 0.01`;
   - test support: *`synthetic_bt_matches(strengths, *, n_matches, rng, team_size, num_teams, bias, draw, roles, layout, choose, source, uid_prefix)`, *`bt_table(results, interval=1)`.
 
@@ -4287,6 +4384,41 @@ def test_chi2_survival_function():
     assert chi2_sf(0.0, 3) == 1.0 and chi2_sf(1e4, 3) < 1e-300 + 1e-12
 
 
+def test_json_forms_options_and_bootstrap_inputs(tmp_path):
+    """Contract amendments A10-A12: ``default_options``, ``BTOptions.agent_order``, ``TransitivityResult.to_dict``,
+    ``ScoreSummary.to_dict`` / ``by_entity``, ``BootstrapData.from_table`` / ``from_blocks`` and
+    ``bootstrap_data`` over a journal."""
+    import json
+
+    from colosseum.arena.bt import bootstrap_data, default_options
+
+    assert default_options("rnd") == BTOptions(anchor="rnd")
+    duels = _duels({("main@v0", "main@v10"): (30, 30), ("main@v10", "main@v20"): (30, 30)})
+    (group,) = fit(duels, "2p", sources=TRAIN, options=BTOptions(agent_order=("main",))).groups
+    assert (group.anchor, group.rule) == ("main@v0", "first_trainable")
+    cycle = _duels({("A", "B"): (240, 60), ("B", "C"): (240, 60), ("C", "A"): (240, 60)})
+    d = transitivity_test(cycle, fit(cycle, "2p", sources=TRAIN), sources=TRAIN).to_dict()
+    assert d["flag"] and d["worst_pairs"][0]["games"] == 150 and json.dumps(d)
+    table = ComparisonTable()
+    for k, score in enumerate((1.0, 3.0)):
+        table.add_result(make_match_result([(0, "a", "fixed")], scores=[score], layout="coop", uid=f"c{k}"), [None])
+    summary = score_summary(table, "coop", sources=TRAIN)
+    n, mean, se = summary.by_entity["a"]
+    assert (n, mean) == (2, 2.0) and se == pytest.approx(math.sqrt(2.0) / math.sqrt(2.0))
+    assert summary.to_dict()["entities"]["a"]["n"] == 2 and json.dumps(summary.to_dict())
+    assert len(BootstrapData.from_table(cycle, "2p", sources=TRAIN).counts) == len(cycle.pairs("2p", TRAIN))
+    block = [make_match_result([(0, "main", "ckpt_v10"), (1, "rnd", "fixed")], uid=f"t/A/2p/main@v10/rnd/{i}/r0",
+                               block=f"t/A/2p/main@v10/rnd/{i}", source="tournament") for i in range(3)]
+    by_block = {r.block: [r] for r in block}
+    data = BootstrapData.from_blocks(by_block, strata={b: "A/rnd" for b in by_block})
+    assert set(data.blocks) == {"A/rnd"} and sorted(data.blocks["A/rnd"]) == ["0", "1", "2"]
+    log = MatchLog(tmp_path / "m.db", RunInfo("R", "run", None, "ttt", "h", 10))
+    log.append(synthetic_journal_results(30))
+    units = bootstrap_data(log, "2p", sources=TRAIN)
+    assert len(units.matches) == 30 and units.counts == [] and units.blocks == {}
+    log.close()
+
+
 def test_score_layouts_summarize_entities_and_compositions():
     table = ComparisonTable()
     for k, (members, score) in enumerate([(("a", "a"), 1.0), (("a", "a"), 3.0), (("a", "b"), 5.0), (("a", "b"), 7.0)]):
@@ -4438,13 +4570,17 @@ the anchor's uncertainty does not reorder the snapshots of one agent).
 from __future__ import annotations
 
 import math
-from collections.abc import Callable, Collection, Iterable, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from colosseum.arena.comparisons import ComparisonTable, PairStat, TeamKey, coefficients
-from colosseum.arena.entities import EntityKey, entity_version, lineage
+from colosseum.arena.comparisons import ComparisonTable, PairStat, TeamKey, coefficients, match_pairs
+from colosseum.arena.entities import EntityKey, entity_version, lineage, snapshot_version
+
+if TYPE_CHECKING:
+    from colosseum.core.types import MatchResult
 
 ELO_PER_LOGIT = 400.0 / math.log(10.0)
 Z_95 = 1.959963984540054
@@ -4463,9 +4599,15 @@ class BTOptions:
     max_iter: int = 50
     tol: float = 1e-8
     dense_limit: int = DENSE_LIMIT
+    agent_order: tuple[str, ...] = ()   # every agent in config order; ``fit(agent_order=...)`` takes precedence
 
 
 DEFAULT_OPTIONS = BTOptions()
+
+
+def default_options(anchor: str | None = None) -> BTOptions:
+    """The module's prior and smoothness (``PRIOR_SIGMA``, ``SMOOTHNESS``; T8.2 fixes them) with ``anchor``."""
+    return BTOptions(anchor=anchor)
 
 
 @dataclass
@@ -4561,6 +4703,44 @@ class BootstrapData:
     matches: list[list[Contribution]] = field(default_factory=list)
     blocks: dict[str, dict[str, list[Contribution]]] = field(default_factory=dict)
 
+    @classmethod
+    def from_table(cls, table: ComparisonTable, layout: str, *, sources: Collection[str]) -> BootstrapData:
+        """Every team-pair row of ``layout`` as a ``counts`` row (Poisson by row; a detailed FFA match's pairs no
+        longer move together: an approximation, e.g. for measurements)."""
+        return cls(counts=list(table.pairs(layout, sources)))
+
+    @classmethod
+    def from_blocks(cls, results_by_block: Mapping[str, Sequence[MatchResult]], *,
+                    strata: Mapping[str, str] | None = None) -> BootstrapData:
+        """Whole blocks (tournament, pulse; spec block 2), rating versions from the network ids
+        (``snapshot_version``). With ``strata`` (block id -> stratum) a block's key is its id's last ``/``
+        component, the seed index that every candidate's block on that seed shares (paired, stratified); without,
+        one stratum and every block its own key."""
+        blocks: dict[str, dict[str, list[Contribution]]] = {}
+        for block_id, results in sorted(results_by_block.items()):
+            stratum = "" if strata is None else strata[block_id]
+            key = block_id if strata is None else block_id.rsplit("/", 1)[-1]
+            bucket = blocks.setdefault(stratum, {}).setdefault(key, [])
+            for result in results:
+                bucket.extend(match_pairs(result, [snapshot_version(s.network_id) for s in result.seats]))
+        return cls(blocks=blocks)
+
+
+def bootstrap_data(reader: Any, layout: str, *, sources: Collection[str]) -> BootstrapData:
+    """The resampling units of a run journal's ``layout`` (spec block 2; ``reader``: a ``MatchLogReader`` or
+    ``MatchLog``, through ``bootstrap_units``): compacted ``counts`` rows (Poisson by row), detailed training
+    matches (one Poisson weight per match), matches with a block id (pulse) as whole blocks (stratum: the block id
+    without its last component; key: that component)."""
+    counts, details = reader.bootstrap_units(layout, sources)
+    data = BootstrapData(counts=list(counts))
+    for block, contributions in details:
+        if block is None:
+            data.matches.append(list(contributions))
+        else:
+            stratum, _, key = block.rpartition("/")
+            data.blocks.setdefault(stratum, {}).setdefault(key, []).extend(contributions)
+    return data
+
 
 @dataclass
 class TransitivityResult:
@@ -4569,7 +4749,14 @@ class TransitivityResult:
     p_value: float | None            # None: not testable (no pair with min_games, or dof <= 0)
     flagged: bool                    # p_value < TRANSITIVITY_P
     pairs_tested: int
-    worst_pairs: list[tuple[TeamKey, TeamKey, float]]   # (a, b, signed deviance residual), largest |r| first
+    worst_pairs: list[tuple[TeamKey, TeamKey, float, int]]   # (a, b, signed deviance residual, matches), largest |r|
+
+    def to_dict(self) -> dict:
+        """JSON-ready form (``ratings.json``, reports): teams as ``"+"``-joined member entities."""
+        return {"flag": self.flagged, "g2": self.g2, "dof": self.dof, "p_value": self.p_value,
+                "pairs_tested": self.pairs_tested,
+                "worst_pairs": [{"a": "+".join(a.entities()), "b": "+".join(b.entities()), "team_a": a.team,
+                                 "team_b": b.team, "residual": r, "games": n} for a, b, r, n in self.worst_pairs]}
 
 
 @dataclass
@@ -4586,6 +4773,20 @@ class ScoreSummary:
     entities: dict[EntityKey, ScoreCell]
     compositions: dict[str, ScoreCell]          # "a+a+b": sorted member entities
     homogeneous: dict[str, bool]
+
+    @property
+    def by_entity(self) -> dict[EntityKey, tuple[int, float, float]]:
+        """``(n, mean, standard error)`` of every entity (every match it sat in; T4.1's top-k in games with
+        score layouts only)."""
+        return {e: (c.n, c.mean, (c.ci_high - c.ci_low) / (2.0 * Z_95)) for e, c in self.entities.items()}
+
+    def to_dict(self) -> dict:
+        """JSON-ready form (reports)."""
+        return {"layout": self.layout,
+                "entities": {e: {"n": c.n, "mean": c.mean, "ci_low": c.ci_low, "ci_high": c.ci_high}
+                             for e, c in self.entities.items()},
+                "compositions": {k: {"n": c.n, "mean": c.mean, "ci_low": c.ci_low, "ci_high": c.ci_high,
+                                     "homogeneous": self.homogeneous[k]} for k, c in self.compositions.items()}}
 
 
 # ---------------------------------------------------------------------------
@@ -4887,7 +5088,8 @@ def fit(table: ComparisonTable, layout: str, *, sources: Collection[str], option
     hessian = _dense_hessian(design, w) if design.prior is not None else None
     groups = []
     for label, component, members in _cells(rows, design.entities):
-        anchor, anchor_members, rule, note = _anchor(members, options, fixed_agents, random_bot, agent_order)
+        anchor, anchor_members, rule, note = _anchor(members, options, fixed_agents, random_bot,
+                                                     agent_order or options.agent_order)
         groups.append(BTGroup(layout, label, component, members, anchor, anchor_members, rule, note))
     if hessian is not None:
         cov = np.linalg.inv(hessian)
@@ -5109,7 +5311,7 @@ def transitivity_test(table: ComparisonTable, fit_: BTFit, *, sources: Collectio
         return TransitivityResult(0.0, 0, None, False, 0, [])
     eta = _eta(design, fit_.params)
     g2 = 0.0
-    residuals: list[tuple[TeamKey, TeamKey, float]] = []
+    residuals: list[tuple[TeamKey, TeamKey, float, int]] = []
     involved: set[EntityKey] = set()
     tested = 0
     for a, b, stat in table.pairs(fit_.layout, sources):
@@ -5127,7 +5329,7 @@ def transitivity_test(table: ComparisonTable, fit_: BTFit, *, sources: Collectio
             dev += (n - y) * math.log(((n - y) / n) / (1.0 - p))
         dev = max(2.0 * dev, 0.0)
         g2 += dev
-        residuals.append((a, b, math.copysign(math.sqrt(dev), y / n - p)))
+        residuals.append((a, b, math.copysign(math.sqrt(dev), y / n - p), int(stat.n)))
     cells = {(g.group, g.component) for g in fit_.groups if set(g.entities) & involved}
     dof = tested - (len(involved) - len(cells)) - (design.num_teams - 1)
     p_value = chi2_sf(g2, dof) if tested and dof > 0 else None
@@ -5215,12 +5417,12 @@ Spec block 2 ("Живой рейтинг", "Конфиг") and block 7.3. A `Liv
 - Produces (contract T2.2, plus additions marked *):
   - `RatingsSnapshot(version, env_steps, fits, uncertainty, scores, *transitivity, *refit_sec)`;
   - `LiveRatings(table, *, interval_sec, options=DEFAULT_OPTIONS, fixed_agents=(), random_bot=None, *agent_order=(), top_k=0, quantile=0.1, env_steps_fn, *samples=LAPLACE_SAMPLES, *seed=0)` with `start`, `stop(timeout)`, `latest()`, *`refit_now()`, *`last_refit_sec`;
-  - `bt_section(snapshot)`, `bt_summary(snapshot, agents)`, *`console_bt(agent_summary)`, *`compute_snapshot(table, *, version, env_steps, ...)`, *`random_bot_agent(config)`, *`LAPLACE_SAMPLES = 1000`, *`FINAL_REFIT_MAX_SEC = 2.0`;
+  - `bt_section(snapshot)`, `bt_summary(snapshot, agents)`, *`console_bt(agent_summary)`, *`compute_snapshot(table, *, version, env_steps, ...)`, *`random_bot_agent(config)`, *`rating_inputs(config) -> (BTOptions, fixed agents, random bot)` (contract amendment A13), *`LAPLACE_SAMPLES = 1000`, *`FINAL_REFIT_MAX_SEC = 2.0`;
   - `RatingsConfig(anchor=None, refit_interval_sec=60.0, bootstrap_samples=200)`, `ColosseumConfig.ratings`;
   - `Coordinator.ratings_snapshot(*, compact=False)`; *`colosseum.league.pfsp.pfsp_summary(table)`, *`compact_ratings(layouts)`;
   - *`MetricsHub.maybe_tick(..., ratings: dict | Callable[[], dict], ..., bt=None)`, *`MetricsHub.close(..., bt=None)`; *`ConsoleReporter.format_line(..., bt=None)`;
   - *`colosseum.utils.process.BLAS_THREAD_VARS`, *`limit_main_blas_threads() -> bool`.
-  - `ratings.json` = `{"env_steps", "layouts", "bt"}`; `bt[layout][<role group>]` = rows `{entity, lineage, version, rating, se, ci_low, ci_high, lcb, games, p_best, p_best_lineage, [p_top_k], component, anchor}` sorted by rating; per-layout extras under keys starting with `@` (`@bias`, `@anchors`, `@transitivity`, `@fit`, `@score`). The `ratings` record of `metrics.jsonl` = `{"env_steps", "layouts" (with pfsp_summary), "bt"?}`.
+  - `ratings.json` = `{"env_steps", "layouts", "bt"}`; `bt[layout][<role group>]` = rows `{entity, lineage, version, rating, se, ci_low, ci_high, lcb, games, p_best, p_best_lineage, [p_top_k], component, anchor}` sorted by rating; per-layout extras under keys starting with `@` (`@bias`, `@anchors`, `@transitivity` = `TransitivityResult.to_dict()`, `@fit`, `@score`) (contract amendment A14). The `ratings` record of `metrics.jsonl` = `{"env_steps", "layouts" (with pfsp_summary), "bt"?}`.
 
 - [ ] **Step 1: Write the failing tests**
 
@@ -5251,6 +5453,7 @@ from colosseum.arena.live import (
     compute_snapshot,
     console_bt,
     random_bot_agent,
+    rating_inputs,
 )
 from colosseum.core.config import ColosseumConfig, RatingsConfig
 from colosseum.core.errors import ConfigError
@@ -5457,6 +5660,9 @@ def test_the_ratings_section_its_validation_and_the_random_bot_rule():
     league = make_test_config("turns", agents={"main": {}, "greedy": scripted_agent("game_helpers.ConstantBot"),
                                                "rnd": scripted_agent()})
     assert random_bot_agent(league) == "rnd"
+    options, fixed, random_bot = rating_inputs(league)
+    assert (options.anchor, options.agent_order, fixed, random_bot) == (None, ("main", "greedy", "rnd"),
+                                                                         ["greedy", "rnd"], "rnd")
     report = validate_config(league)
     assert any("anchor 'rnd' (the first RandomBot agent)" in line for line in report.lines)
     assert any(line.startswith("match log: on") for line in report.lines)
@@ -5634,6 +5840,15 @@ class RatingsSnapshot:
     refit_sec: float = 0.0                         # how long the refit took (monotonic)
 
 
+def rating_inputs(config) -> tuple[BTOptions, list[str], str | None]:
+    """A config's fit inputs, the one place that turns a config into them (live ratings, report, tournament
+    ``top:N``, scripts; contract amendment A13): the options (module constants, ``ratings.anchor``, the config's
+    agent order for the "first trainable agent" anchor rule), the scripted / frozen agents and the first
+    ``RandomBot`` agent."""
+    options = BTOptions(anchor=config.ratings.anchor, agent_order=tuple(config.agent_ids()))
+    return options, list(config.fixed_agent_ids()), random_bot_agent(config)
+
+
 def random_bot_agent(config) -> str | None:
     """The config's first scripted agent whose class is ``colosseum.players.RandomBot`` (config order), or None."""
     from colosseum.core.registry import import_class
@@ -5786,10 +6001,7 @@ def bt_section(snapshot: RatingsSnapshot | None) -> dict:
                                                             "rule": g.rule} for g in fitted.groups}
         test = snapshot.transitivity.get(layout)
         if test is not None:
-            section["@transitivity"] = {"g2": test.g2, "dof": test.dof, "p_value": test.p_value,
-                                        "flagged": test.flagged, "pairs_tested": test.pairs_tested,
-                                        "worst_pairs": [{"a": a.encode(), "b": b.encode(), "residual": r}
-                                                        for a, b, r in test.worst_pairs]}
+            section["@transitivity"] = test.to_dict()
         section["@fit"] = {"converged": fitted.converged, "iterations": fitted.iterations,
                            "approximate": fitted.approximate}
         out[layout] = section
@@ -6010,14 +6222,14 @@ def compact_ratings(layouts: Mapping[str, Mapping]) -> dict[str, dict]:
         journal. ``top_k`` is 0 until snapshot retention by rating exists (T4.1)."""
         if self._comparison_table is None:
             return
-        from colosseum.arena.bt import BTOptions
-        from colosseum.arena.live import LiveRatings, random_bot_agent
+        from colosseum.arena.live import LiveRatings, rating_inputs
 
         cfg = self._config
+        options, fixed_agents, random_bot = rating_inputs(cfg)
         self._live_ratings = LiveRatings(
             self._comparison_table, interval_sec=cfg.ratings.refit_interval_sec,
-            options=BTOptions(anchor=cfg.ratings.anchor), fixed_agents=cfg.fixed_agent_ids(),
-            random_bot=random_bot_agent(cfg), agent_order=cfg.agent_ids(), top_k=0, quantile=0.1,
+            options=options, fixed_agents=fixed_agents,
+            random_bot=random_bot, agent_order=cfg.agent_ids(), top_k=0, quantile=0.1,
             env_steps_fn=lambda: int(self._env_step_counter.value), seed=cfg.training.seed or 0)
         self._live_ratings.start()
         logger.info(f"Live ratings: Bradley-Terry refit every {cfg.ratings.refit_interval_sec:g} s")
@@ -6790,6 +7002,8 @@ git push
 ---
 
 ## Contract notes
+
+> **Reconciled (pre-flight, 2026-10-16).** These notes are folded into `00-overview.md` «Contract amendments» A1–A33; the pre-flight rulings P1… are in the SDD workspace `constraints.md`. Where a note below differs from an amendment (for example a requirement met under another name), the amendment wins.
 
 **Dry run.** While writing this part, every task's code and tests were applied in order to a scratch copy of the branch (`sp4-selection` at `0b1422f`, docs only before T0.1), as an implementer would: each task's own tests passed, and the full fast suite passed with zero warnings after T1.1 (1737 tests), T1.3 (1775), T2.2 (1811, once the `test_sp2_game_runs.py` key check found by that run was updated) and T3.2 (1823), with `ruff check .` clean; the slow suite after T3.2: 10 passed in 408 s, every SP2/SP3 threshold unchanged. Findings of the dry run that are built into the tasks: two SP2 tests pin the `ratings.json` keys (`test_sp2_metrics_outputs.py`, `test_sp2_game_runs.py`, both updated in T2.2); `test_sp2_launcher_lifecycle.py` queues a string as a fake result (T1.1 makes it a `MatchResult`, because results are now stamped); `tests/conftest.py` fails the suite if anything is written into the repo root; `PRAGMA incremental_vacuum` needs `.fetchall()`; the per-match size estimate needed an index factor of 1.2 and the uid counted twice; `LogRecord.exc_info` is `False`, not `None`, when `exc_info=False`.
 

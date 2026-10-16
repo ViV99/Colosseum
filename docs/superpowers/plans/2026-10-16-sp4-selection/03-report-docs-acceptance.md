@@ -40,18 +40,18 @@ Spec block 5 («Разделы страницы», «Состояние запу
 **Files:**
 - Create: `src/colosseum/core/run_state.py`
 - Create: `src/colosseum/arena/report/__init__.py`, `src/colosseum/arena/report/data.py`
-- Modify: `src/colosseum/core/run_dir.py` (properties `run_state_path`, `report_path`, `tournaments_dir` if T1.3 / T3.2 did not add them; module docstring lists `run_state.json`, `report.html`, `tournaments/`)
+- Modify: `src/colosseum/core/run_dir.py` (properties `run_state_path`, `report_path`; `tournaments_dir` exists since T5.4; module docstring lists `run_state.json`, `report.html`)
 - Modify: `src/colosseum/launcher.py` (`run_training` writes `run_state.json`)
 - Create: `tests/report_kit.py` (support module); modify `pyproject.toml` (`known-first-party` += `report_kit`)
 - Test: `tests/unit/test_sp4_run_state.py`, `tests/unit/test_sp4_report_data.py`
 
 **Interfaces:**
 - Consumes (contract): `MatchLog`, `MatchLog.open_readonly`, `MatchLogReader.matches / comparison_table / runs / sizes`, `RunInfo`, `MATCH_LOG_FILE` (T1.2/T1.3); `ComparisonTable.pairs / layouts`, `TeamKey.team / members`, `PairStat.n / sw / swy` (T1.2); `arena.entities.lineage` (T1.2); `bt.fit`, `bt.laplace`, `bt.bootstrap`, `bt.transitivity_test`, `bt.score_summary`, `BTFit.groups / rating / se / bias / games / iterations / converged`, `BTGroup.group / component / entities / anchor`, `Uncertainty.ci95 / lcb / p_best_lineage / p_best_group` (T2.1); the `bt` section of `ratings.json` (T2.2); `RatingsConfig.bootstrap_samples`, `EvaluationConfig.enabled / field` (T2.2, T6.1); `SeatResult.version_start / version_end`, `MatchResult.uid / source / seed / env_steps / block` (T1.1); `copy_sp3_run` (T0.1); `wr_vs_past_over_layouts` (`metrics/hub.py:53`); `write_text_atomic` (`utils/fs.py:9`); `load_config` (`core/config.py:1164`), `ColosseumConfig.agent_ids / agent_kind / fixed_agent_ids` (`core/config.py:976, 996, 1030`).
-- Consumes (requirements, Contract notes): R-P1-1 `MatchLogReader.matches(..., outcome=, limit=None)` newest first and `MatchRow.to_dict()` / `to_result()`; R-P1-2 `MatchLogReader.close()`; R-P1-3 `bt.bootstrap_data(reader, layout, *, sources)`; R-P1-4 `TransitivityResult.to_dict()`, `ScoreSummary.to_dict()`; R-P1-5 `live.rating_inputs(config)`; R-P1-6 the `bt` section shape of `ratings.json`; R-P1-7 `LogSizes` field names.
+- Consumes (requirements, Contract notes): R-P1-1 `MatchLogReader.matches(..., outcome=, limit=None)` newest first and `MatchRow.to_dict()` / `to_result()`; R-P1-2 `MatchLogReader.close()`; R-P1-3 `bt.bootstrap_data(reader, layout, *, sources)`; R-P1-4 `TransitivityResult.to_dict()`, `ScoreSummary.to_dict()`; R-P1-5 `live.rating_inputs(config)`; R-P1-6 the `bt` section shape of `ratings.json` (Part 1's `bt_section`: a list of rows per group label, `@`-keyed extras; contract amendment A14); R-P1-7 `LogSizes` field names; R-P2-1 `arena.tournament.modes.report_view(report)` (contract amendment A26).
 - Produces (contract + additions marked `*`):
   - `colosseum.core.run_state`: `RUN_STATE_FILE = "run_state.json"`, `STATUSES`, `RunState(status, pid, exit_code=None, proc_start=None, extra={})`, `write_run_state(run_dir, status, pid, *, exit_code=None) -> Path`, `read_run_state(run_dir) -> RunState | None`, `*process_start_ticks(pid)`, `*process_alive(state)`, `*effective_status(state) -> (status, detail)`;
   - `colosseum.arena.report.data`: `build_report_data(run_dir, *, include_tournaments=True, limits=None) -> dict`, `section(run_dir, name, **filters) -> dict`, `*ReportBuilder(run_dir, *, limits=None, include_tournaments=True, seed=0, table_min_age_sec=0.0)` with `build()`, `section(name, **filters)`, `close()`, `*ReportLimits(series_points=2000, entity_rows=2000, matches=1000, snapshot_matrix=100)`, `*SECTIONS`, `*FILTERS`, `*REPORT_FORMAT = 1`, `*RUN_SOURCES = ("train", "pulse")`, `*MIN_CELL_GAMES = 20`, `*MetricsTail`, `*thin`, `*entity_version`, `*wilson`;
-  - `RunDir.run_state_path`, `RunDir.report_path`, `RunDir.tournaments_dir`;
+  - `RunDir.run_state_path`, `RunDir.report_path` (`RunDir.tournaments_dir` is T5.4's);
   - `tests/report_kit.py`: `INTERVAL`, `VERSIONS`, `KINDS`, `make_results`, `write_run_dir`, `SyntheticRun`, `sample_report_data`.
 
 **Report data shape** (`REPORT_FORMAT = 1`; the contract between `data.py` and `page.js`):
@@ -317,7 +317,7 @@ def effective_status(state: RunState | None) -> tuple[str, str]:
     return state.status, code
 ```
 
-In `src/colosseum/core/run_dir.py` add (skip any property T1.3 / T3.2 already added) and list the files in the module docstring:
+In `src/colosseum/core/run_dir.py` add (`tournaments_dir` exists since T5.4) and list the files in the module docstring:
 
 ```python
     @property
@@ -327,10 +327,6 @@ In `src/colosseum/core/run_dir.py` add (skip any property T1.3 / T3.2 already ad
     @property
     def report_path(self) -> Path:
         return self.root / "report.html"
-
-    @property
-    def tournaments_dir(self) -> Path:
-        return self.root / "tournaments"
 ```
 
 In `src/colosseum/launcher.py::run_training` (`launcher.py:1009-1034`), replace the last lines from `print(f"Run directory: ...")` with:
@@ -553,13 +549,21 @@ def write_run_dir(tmp_path: Path, kind: str = "wdl", *, name: str = "synthetic",
                                "main@ckpt_v180": {"score": 0.6, "games": 40.0}}}}
     ratings = {"env_steps": 39000, "layouts": {layout: table}}
     if live_bt:
-        ratings["bt"] = {layout: {"default": {"component": 0, "anchor": "random", "entities": [
-            {"entity": "main@v200", "rating": 123.0, "ci_low": 100.0, "ci_high": 146.0, "games": 70, "lcb": 105.0,
-             "p_best_lineage": 0.9, "p_best_group": 0.6},
-            {"entity": "greedy", "rating": 80.0, "ci_low": 60.0, "ci_high": 100.0, "games": 700, "lcb": 64.0,
-             "p_best_lineage": 1.0, "p_best_group": 0.4},
-            {"entity": "random", "rating": 0.0, "ci_low": 0.0, "ci_high": 0.0, "games": 700, "lcb": 0.0,
-             "p_best_lineage": 1.0, "p_best_group": 0.0}]}}}
+        # the shape of T2.2's live.bt_section (contract amendment A14): rows per role-group label, '@' extras
+        def bt_row(entity, version, rating, lo, hi, games, lcb, p_lin, p_grp, anchor=False):
+            return {"entity": entity, "lineage": entity.split("@v")[0], "version": version, "rating": rating,
+                    "se": (hi - lo) / 3.92, "ci_low": lo, "ci_high": hi, "lcb": lcb, "games": games, "p_best": p_grp,
+                    "p_best_lineage": p_lin, "component": 0, "anchor": anchor}
+
+        ratings["bt"] = {layout: {
+            "player": [bt_row("main@v200", 200, 123.0, 100.0, 146.0, 70, 105.0, 0.9, 0.6),
+                       bt_row("greedy", None, 80.0, 60.0, 100.0, 700, 64.0, 1.0, 0.4),
+                       bt_row("random", None, 0.0, 0.0, 0.0, 700, 0.0, 1.0, 0.0, anchor=True)],
+            "@bias": {"0": 12.0, "1": -12.0},
+            "@anchors": {"player/0": {"anchor": "random", "members": ["random"], "rule": "random_bot"}},
+            "@transitivity": {"flag": False, "g2": 1.2, "dof": 1, "p_value": 0.27, "pairs_tested": 2,
+                              "worst_pairs": []},
+            "@fit": {"converged": True, "iterations": 5, "approximate": False}}}
     (root / "ratings.json").write_text(json.dumps(ratings))
     for v in stored_versions:
         (root / "checkpoints" / "main" / f"ckpt_v{v}").mkdir(parents=True)
@@ -825,8 +829,12 @@ def test_live_ratings_come_from_ratings_json_while_running(tmp_path):
     run = write_run_dir(tmp_path, "wdl", status="running", live_bt=True)
     ratings = build_report_data(run.root)["sections"]["ratings"]
     assert ratings["source"] == "live" and ratings["uncertainty"] == "laplace"
-    rows = {r["entity"]: r for r in ratings["layouts"]["2p"]["groups"][0]["entities"]}
+    (group,) = ratings["layouts"]["2p"]["groups"]                  # the '@' extras are not groups
+    rows = {r["entity"]: r for r in group["entities"]}
     assert rows["main@v200"]["rating"] == 123.0 and rows["main@v200"]["ci"] == [100.0, 146.0]
+    assert rows["main@v200"]["p_best_group"] == 0.6 and group["anchor"] == "random" and group["label"] == "player"
+    assert ratings["layouts"]["2p"]["bias"] == {"0": 12.0, "1": -12.0}
+    assert ratings["layouts"]["2p"]["transitivity"]["flag"] is False
 
 
 def test_a_dead_running_process_is_stopped_and_rated_from_the_journal(tmp_path):
@@ -960,6 +968,8 @@ from typing import Any
 
 import numpy as np
 
+from colosseum.arena.entities import entity_version
+from colosseum.arena.matchlog import RUN_SOURCES
 from colosseum.core.run_state import effective_status, read_run_state
 
 logger = logging.getLogger(__name__)
@@ -967,7 +977,6 @@ logger = logging.getLogger(__name__)
 REPORT_FORMAT = 1
 SECTIONS = ("summary", "ratings", "matrix", "anchors", "opponents", "training", "system", "matches",
             "tournaments")
-RUN_SOURCES = ("train", "pulse")
 MIN_CELL_GAMES = 20           # heat-map cells with fewer comparisons are drawn hatched ("few games")
 PFSP_TOP = 20                 # rows of each owner's PFSP table in "opponents"
 FILTERS = {"ratings": ("agent", "layout"), "matrix": ("agent", "layout"),
@@ -976,7 +985,6 @@ TRAIN_DEFAULT = ("total_loss", "policy_loss", "value_loss", "entropy", "approx_k
                  "explained_variance", "rho_trunc_mass", "ess", "lr", "kickstart_loss", "kickstart_lambda")
 SYSTEM_DEFAULT = ("env_steps_per_sec", "dropped_match_results", "dropped_reward_episodes")
 _RECORD_META = ("ts", "kind", "agent", "train_step", "env_steps")
-_VERSION_RE = re.compile(r"@v(\d+)$")
 _Z95 = 1.959963984540054
 
 
@@ -995,12 +1003,6 @@ def thin(n: int, limit: int) -> list[int]:
     if limit <= 1:
         return [n - 1]
     return sorted({round(i * (n - 1) / (limit - 1)) for i in range(limit)})
-
-
-def entity_version(entity: str) -> int | None:
-    """``"main@v1200"`` -> 1200; entities without a version (scripted / frozen agents) -> None."""
-    m = _VERSION_RE.search(entity)
-    return int(m.group(1)) if m else None
 
 
 def wilson(p: float, n: float) -> list[float]:
@@ -1379,21 +1381,27 @@ class ReportBuilder:
                 "lcb": _finite(lcb)}
 
     def _live_layout(self, layout: str, payload: Mapping) -> dict:
-        """ratings.json ``bt[layout]``: ``{group label: [entries] | {"component", "anchor", "entities": [...]}}``,
-        entries ``{"entity", "rating", "ci_low", "ci_high" | "ci", "games", "lcb", "p_best_lineage",
-        "p_best_group"}`` (T2.2's ``bt_section``)."""
+        """ratings.json ``bt[layout]`` (T2.2's ``bt_section``, contract amendment A14): ``{group label: [rows]}``,
+        rows ``{"entity", "rating", "ci_low", "ci_high", "games", "lcb", "p_best" (within the cell),
+        "p_best_lineage", "component", ...}``, plus extras under keys starting with ``@`` (``@bias``, ``@anchors``
+        keyed ``"<label>/<component>"``, ``@transitivity``). One payload group per (label, component)."""
+        anchors = payload.get("@anchors") or {}
         groups = []
-        for label, group in payload.items():
-            entries = group if isinstance(group, list) else group.get("entities", [])
-            meta = group if isinstance(group, Mapping) else {}
-            rows = []
+        for label, entries in payload.items():
+            if str(label).startswith("@") or not isinstance(entries, list):
+                continue
+            by_component: dict[int, list[dict]] = defaultdict(list)
             for d in entries:
                 ci = d.get("ci") or [d.get("ci_low"), d.get("ci_high")]
-                rows.append(self._row(str(d["entity"]), d.get("rating"), ci, d.get("games", 0),
-                                      p_lin=d.get("p_best_lineage"), p_grp=d.get("p_best_group"), lcb=d.get("lcb")))
-            groups.append(self._group_payload(str(label), int(meta.get("component", 0)),
-                                              str(meta.get("anchor", "")), rows))
-        return {"kind": "bt", "groups": groups, "bias": {}, "transitivity": None}
+                by_component[int(d.get("component", 0))].append(self._row(
+                    str(d["entity"]), d.get("rating"), ci, d.get("games", 0), p_lin=d.get("p_best_lineage"),
+                    p_grp=d.get("p_best_group", d.get("p_best")), lcb=d.get("lcb")))
+            for component, rows in sorted(by_component.items()):
+                anchor = (anchors.get(f"{label}/{component}") or {}).get("anchor", "")
+                groups.append(self._group_payload(str(label), component, str(anchor), rows))
+        trans = payload.get("@transitivity")
+        return {"kind": "bt", "groups": groups, "bias": dict(payload.get("@bias") or {}),
+                "transitivity": dict(trans) if isinstance(trans, Mapping) else None}
 
     def _fit(self, layout: str):
         """(fit, uncertainty, transitivity dict | None), cached until the journal changes."""
@@ -1709,7 +1717,9 @@ class ReportBuilder:
                 notes.append(f"{d.name}: no report.json yet (running or interrupted).")
                 continue
             try:
-                items.append({"name": d.name, "path": str(d), "report": json.loads(path.read_text())})
+                from colosseum.arena.tournament.modes import report_view  # Part 2's schema -> per layout / group
+
+                items.append({"name": d.name, "path": str(d), "report": report_view(json.loads(path.read_text()))})
             except (OSError, ValueError) as e:
                 notes.append(f"{d.name}: report.json cannot be read ({e}).")
         return {"items": items, "notes": notes}
@@ -2816,15 +2826,16 @@ def report_cmd(run: str, output: str | None) -> None:
     click.echo(f"Report written to {path}")
 ```
 
-In Part 2's `src/colosseum/arena/tournament/run.py`, at the single place that writes `report.json` / `report.txt` (R-P2-2: `TournamentDir.write_report`), add after them:
+In Part 2's `src/colosseum/arena/tournament/run.py`, `TournamentDir.write_reports` (the single place that writes `report.json` / `report.txt`, R-P2-2) already ends with a guarded call of `write_tournament_html(self.path)` (contract amendment A27): remove the `try` / `except ImportError` guard so that it reads
 
 ```python
         from colosseum.arena.report.render import write_tournament_html
 
-        write_tournament_html(self.path)          # report.html: the same page with the tournaments section only
+        written.append(write_tournament_html(self.path))   # report.html: the same page, tournaments section only
+        return written
 ```
 
-and drop any placeholder `report.html` Part 2 wrote. If Part 2's tests assert that `report.html` is absent, update them (one line each; say so in the commit body).
+If Part 2's tests assert that `report.html` is absent, update them (one line each; say so in the commit body).
 
 - [ ] **Step 5: Run the tests**
 
@@ -3555,7 +3566,7 @@ Criterion 3.3 (the ladder: one bot with a share of random moves, so the true ord
 - Create: `docs/benchmarks/sp4-tournament-defaults.json`, `docs/benchmarks/sp4-bt-crossval.json`, `docs/benchmarks/sp4-bt-cost.json`, `docs/benchmarks/sp4-pulse-cadence.json`, `docs/benchmarks/sp4-pipeline-calibration.json`, `docs/benchmarks/sp4-throughput/{main-1,branch-1,main-2,branch-2}.json`; modify `docs/benchmarks.md`
 
 **Interfaces:**
-- Consumes: `colosseum tournament` (T5.4; R-P2-1 report shape, R-P2-3 sizes and flags), `TicTacToeBot` (`examples/tic_tac_toe/bots.py`), `TronGame` (`examples/tron/game.py`), `ScriptedBot`, `pipeline_kit.cli / write_config / pipeline_config / train / evaluate / UNIT_HARVEST / MAIN / RANDOM` (`tests/pipeline_kit.py`), `MatchLog.open_readonly`, `MatchRow.to_dict / to_result` (R-P1-1), `ComparisonTable.add_result`, `match_pairs` (T1.2), `bt.fit / laplace / bootstrap`, `BTOptions`, `BootstrapData.from_table` (R-P1-3), `live.rating_inputs` (R-P1-5), `build_report_data` (T7.1), the `system` counters `pulse_skipped` / `pulse_evaluated` (R-P2-4), `scripts/bench_throughput.py --clock counters --tree` (T8.1).
+- Consumes: `colosseum tournament` (T5.4; R-P2-1 report shape, R-P2-3 sizes and flags), `TicTacToeBot` (`examples/tic_tac_toe/bots.py`), `TronGame` (`examples/tron/game.py`), `ScriptedBot`, `pipeline_kit.cli / write_config / pipeline_config / train / evaluate / UNIT_HARVEST / MAIN / RANDOM` (`tests/pipeline_kit.py`), `MatchLog.open_readonly`, `MatchRow.to_dict / to_result` (R-P1-1), `ComparisonTable.add_result`, `match_pairs` (T1.2), `bt.fit / laplace / bootstrap`, `BTOptions`, `BootstrapData.from_table` (R-P1-3), `live.rating_inputs` (R-P1-5), `build_report_data` (T7.1), the `system` counters `pulse_skipped_snapshots` / `pulse_evaluated_snapshots` (T6.1; R-P2-4, contract amendment A29), `scripts/bench_throughput.py --clock counters --tree` (T8.1).
 - Produces: `examples.tic_tac_toe.ladder.EpsilonTicTacToeBot(epsilon=0.0)`, `examples.tron.bots.FloodFillTronBot(epsilon=0.0)`, `examples.tron.bots.free_area`, `examples.tron.bots.MOVES`; `arena_kit`: `EPSILONS`, `FIELD_EPSILON`, `FIELD`, `candidate_name`, `TRUE_ORDER`, `LadderGame`, `TIC_TAC_TOE`, `TRON`, `LADDER_GAMES`, `ladder_config`, `find_report`, `group_of`, `SelectRun`, `run_select`, `ladder_problems`, `PulseSettings`, `Trend`, `spearman`, `rating_trend`, `PulseRun`, `train_with_pulse`, `select_snapshots`; the four scripts with `decide`, `choose`, `decide_cadence`, `decide_trend`; the rulings.
 
 - [ ] **Step 1: Check that the names are free**
@@ -3565,7 +3576,7 @@ ls examples/tic_tac_toe/ladder.py examples/tron/bots.py tests/arena_kit.py scrip
   scripts/bt_crossval.py scripts/measure_bt_cost.py scripts/measure_pulse_cadence.py 2>/dev/null
 grep -n "DEFAULT_BLOCKS\|DEFAULT_HALVING_BLOCKS\|DEFAULT_CONFIRM_BLOCKS\|--blocks\|--confirm-blocks\|--halving" \
   src/colosseum/arena/tournament/modes.py src/colosseum/cli.py | head
-grep -n "PRIOR_SIGMA\|SMOOTHNESS\|class BootstrapData\|def from_table\|pulse_skipped\|pulse_evaluated" -r src/colosseum | head
+grep -n "PRIOR_SIGMA\|SMOOTHNESS\|class BootstrapData\|def from_table\|pulse_skipped_snapshots\|pulse_evaluated_snapshots" -r src/colosseum | head
 ```
 
 Expected: the first command prints nothing; the greps show the landed names of R-P1-3, R-P1-8, R-P2-3, R-P2-4 (use them if they differ).
@@ -3772,9 +3783,10 @@ Pulse pipeline (criterion 3.4): ``unit_harvest_league`` trained from scratch wit
 rating trend of its snapshots, ``tournament --mode select`` over the run's snapshots with the anchors as
 the field, and ``eval`` of the winner against ``random``.
 
-Report shape (Part 2's ``TournamentReport.to_dict()``, contract notes R-P2-1): ``layouts.<layout>.groups.
-<group>`` with ``candidates`` (rows: ``name``, ``score``, ``score_ci``, ``bt``, ``bt_ci``, ``games``, ...),
-``ranking`` (final order, best first) and ``select`` (``winner``, ``confirmed``, ``indistinguishable``).
+Report shape: ``arena.tournament.modes.report_view`` of the tournament's ``report.json`` (contract amendment
+A26): ``layouts.<layout>.groups.<group>`` with ``candidates`` (rows: ``name``, ``score``, ``score_ci``, ``bt``,
+``bt_ci``, ``games``, ...), ``ranking`` (final order, best first) and ``select`` (``winner``, ``confirmed``,
+``indistinguishable``).
 """
 from __future__ import annotations
 
@@ -3832,9 +3844,11 @@ def ladder_config(game: LadderGame) -> dict:
 
 def find_report(out: Path) -> dict:
     """The tournament's ``report.json`` somewhere under ``out`` (``--output`` dir or ``<run>/tournaments/<name>``)."""
+    from colosseum.arena.tournament.modes import report_view
+
     found = sorted(Path(out).rglob("report.json"))
     assert found, f"no report.json under {out}"
-    return json.loads(found[0].read_text())
+    return report_view(json.loads(found[0].read_text()))
 
 
 def group_of(report: Mapping, layout: str) -> dict:
@@ -3882,7 +3896,7 @@ def run_select(game: LadderGame, workdir: Path, *, seed: int, blocks: int | None
     for name in TRUE_ORDER:
         args += ["-a", name]
     if blocks is not None:
-        args += ["--blocks", blocks]
+        args += ["--halving-blocks", blocks]          # select: the first halving round's blocks per composition
     if confirm_blocks is not None:
         args += ["--confirm-blocks", confirm_blocks]
     start = time.monotonic()
@@ -4010,7 +4024,9 @@ def select_snapshots(run: PulseRun, *, seed: int, name: str = "sel", num_workers
             "--num-workers", num_workers, "--name", name]
     result = kit.cli(args, timeout=timeout)
     assert result.code == 0, f"tournament failed ({result.code}):\n{result.stdout[-2000:]}\n{result.stderr[-3000:]}"
-    return json.loads((run.run.root / "tournaments" / name / "report.json").read_text())
+    from colosseum.arena.tournament.modes import report_view
+
+    return report_view(json.loads((run.run.root / "tournaments" / name / "report.json").read_text()))
 ```
 
 Create `scripts/measure_tournament_defaults.py`:
@@ -4018,7 +4034,7 @@ Create `scripts/measure_tournament_defaults.py`:
 ```python
 """Tournament default sizes on the bot ladders (SP4 criterion 3.3; plan T8.2).
 
-For every grid point (first halving round ``--blocks``, ``--confirm-blocks``) and seed, ``tournament --mode
+For every grid point (first halving round ``--halving-blocks``, ``--confirm-blocks``) and seed, ``tournament --mode
 select`` runs on both ladders (``tests/arena_kit.py``: tic_tac_toe 2p, tron 3p; 2 worker processes). Each run
 is checked by ``arena_kit.ladder_problems``.
 
@@ -4423,7 +4439,8 @@ Create `scripts/measure_pulse_cadence.py`:
 
 Phase 1 (``--every 1 2 5``, seed 0): ``unit_harvest_league`` from scratch with pulse (``tests/arena_kit.py``,
 1 rollout worker + the pulse process), ``evaluation.blocks`` = ``--blocks``. Recorded: snapshots stored,
-snapshots evaluated by pulse (journal), the ``system`` counters ``pulse_skipped`` / ``pulse_evaluated``,
+snapshots evaluated by pulse (journal), the ``system`` counters ``pulse_skipped_snapshots`` /
+``pulse_evaluated_snapshots`` (T6.1),
 training seconds. Rule ``decide_cadence``: the smallest ``every`` with ``pulse_skipped <= 1`` (the final
 snapshot may be cut by the budget) and at least 6 evaluated snapshots.
 
@@ -4496,8 +4513,8 @@ def main() -> int:
             run = kit.train_with_pulse(work, seed=0, settings=kit.PulseSettings(every=every, blocks=args.blocks))
             rows.append({"every": every, "stored": run.stored_versions, "evaluated": len(run.pulse_versions),
                          "pulse_versions": run.pulse_versions,
-                         "pulse_skipped": _system_counter(run, "pulse_skipped"),
-                         "pulse_evaluated": _system_counter(run, "pulse_evaluated"),
+                         "pulse_skipped": _system_counter(run, "pulse_skipped_snapshots"),
+                         "pulse_evaluated": _system_counter(run, "pulse_evaluated_snapshots"),
                          "train_s": round(run.seconds["train"], 1), "spearman": run.trend.spearman,
                          "gain": run.trend.gain})
             print(json.dumps(rows[-1]), flush=True)
@@ -4723,7 +4740,7 @@ Append to `docs/benchmarks.md` (Russian; every `<...>` filled from the JSON file
 
 Боты известной силы: `EpsilonTicTacToeBot` (крестики-нолики, `2p`) и `FloodFillTronBot` (tron, FFA `3p`) с долей случайных ходов ε ∈ {0, 0.25, 0.5, 1}; поле — `random` (`RandomBot`) и `ref` (тот же бот с ε = 0.1). Средний попарный счёт против поля на `MatchRunner` (замер при написании плана): крестики-нолики 0.742 / 0.620 / 0.532 / 0.315, tron 0.872 / 0.552 / 0.435 / 0.326. `scripts/measure_tournament_defaults.py`: `tournament --mode select`, 10 сидов на точку сетки, 2 воркера. Сырые данные: [`benchmarks/sp4-tournament-defaults.json`](benchmarks/sp4-tournament-defaults.json). Дата: <date>.
 
-| `--blocks` (первый раунд) | `--confirm-blocks` | игра | победитель верен | порядок верен | confirmed | BT-соседи | среднее время, с |
+| `--halving-blocks` (первый раунд) | `--confirm-blocks` | игра | победитель верен | порядок верен | confirmed | BT-соседи | среднее время, с |
 |---|---|---|---|---|---|---|---|
 <six rows>
 
@@ -4962,8 +4979,8 @@ def test_journal_and_snapshots_stay_bounded_and_counts_stay_complete(tmp_path):
     from_journal = bt.fit(table, "2p", sources=("train", "pulse"), options=options, fixed_agents=fixed,
                           random_bot=random_bot)
     final_bt = json.loads((run.root / "ratings.json").read_text())["bt"]["2p"]
-    live = {e["entity"]: e["rating"] for group in final_bt.values()
-            for e in (group if isinstance(group, list) else group["entities"])}
+    live = {e["entity"]: e["rating"] for label, group in final_bt.items() if not label.startswith("@")
+            for e in group}                                  # T2.2's bt_section: rows per group, '@' extras
     assert set(live) == set(from_journal.rating)
     worst = max(abs(live[e] - from_journal.rating[e]) for e in live)
     print(f"[disk] {len(live)} entities; max |live - journal| = {worst:.4f} Elo")
@@ -5506,6 +5523,8 @@ Expected: the merge completes without conflicts; the suite and ruff pass on the 
 ---
 
 ## Contract notes
+
+> **Reconciled (pre-flight, 2026-10-16).** These notes are folded into `00-overview.md` «Contract amendments» A1–A33; the pre-flight rulings P1… are in the SDD workspace `constraints.md`. Where a note below differs from an amendment (for example a requirement met under another name), the amendment wins.
 
 Requirements on Parts 1 and 2, details this part pins down, proposed rulings and proposed amendments to the overview contract. The controller folds accepted amendments into `00-overview.md` («Contract amendments») before the pre-flight scan.
 
