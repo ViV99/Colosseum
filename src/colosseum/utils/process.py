@@ -129,8 +129,10 @@ def limit_main_blas_threads() -> bool:
     BLAS libraries read their thread count when they are loaded, i.e. on ``import numpy``: the variables are set,
     numpy is imported, and the environment is restored at once, so spawned children (workers, learners) start with
     the original environment. Returns False (and changes nothing) when numpy is already imported. OpenBLAS (the
-    numpy wheels) and OpenMP read the count at load time; a BLAS that reads it later is not limited."""
+    numpy wheels) and OpenMP read the count at load time; a BLAS that reads it later is not limited. A DEBUG line
+    notes the no-op case."""
     if "numpy" in sys.modules:
+        logger.debug("limit_main_blas_threads: numpy is already imported; its BLAS keeps its thread count")
         return False
     saved = {name: os.environ.get(name) for name in BLAS_THREAD_VARS}
     os.environ.update({name: "1" for name in BLAS_THREAD_VARS})

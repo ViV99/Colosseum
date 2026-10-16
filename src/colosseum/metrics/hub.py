@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import logging
 import numbers
 import time
 from collections.abc import Callable, Collection, Mapping
@@ -15,6 +16,8 @@ from colosseum.league.pfsp import compact_ratings
 from colosseum.metrics.aggregator import EpisodeAggregator, SystemStats
 from colosseum.metrics.console import ConsoleReporter
 from colosseum.metrics.jsonl import MetricsWriter, write_json_atomic
+
+logger = logging.getLogger(__name__)
 
 
 def _is_number(value: Any) -> bool:
@@ -93,8 +96,9 @@ class MetricsHub:
     records, rewrites ``ratings.json`` and prints one console line per agent (ratings aggregated over layouts).
     SP4 (spec block 7.3): the ``ratings`` record is ``{"env_steps", "layouts", "bt"?}`` with each layout's PFSP
     table replaced by its ``pfsp_summary`` and ``bt`` the compact live Bradley-Terry summary (``bt_summary``; absent
-    before the first refit); ``ratings.json`` is ``{"env_steps", "layouts", "bt"}`` with the full PFSP tables and
-    ``bt_section``. The ratings snapshot is built only at a tick (``ratings`` may be a callable).
+    before the first refit, for a snapshot without data and when formatting the snapshot fails); ``ratings.json``
+    is ``{"env_steps", "layouts", "bt"}`` with the full PFSP tables and ``bt_section``. The ratings snapshot is
+    built only at a tick (``ratings`` may be a callable).
     ``initial_env_steps`` / ``initial_train_steps`` are the counters a resumed run continues from (rate baselines,
     see ``SystemStats``). ``agent_ids`` are the trainable agents: one console line each, and the only opponents of
     the console's arena win rate (ruling P11).
@@ -119,6 +123,7 @@ class MetricsHub:
         self._last_train: dict[str, dict[str, float]] = {}
         self._last_logged_step: dict[str, int] = {}
         self._last_returns: dict[str, float] = {}
+        self._bt_failed_versions: set[int] = set()     # live snapshots whose formatting failed (logged once each)
 
     def on_train_metrics(self, metrics: dict) -> None:
         agent_id = str(metrics.get("agent_id", "agent_0"))
@@ -161,13 +166,12 @@ class MetricsHub:
         self._writer.write("system", **system)
         if callable(ratings):
             ratings = ratings()
-        summary = bt_summary(bt, self._agent_ids)
+        summary, section = self._format_bt(bt)
         record = {"env_steps": int(env_steps), "layouts": compact_ratings(ratings)}
-        if bt is not None:
+        if section:
             record["bt"] = summary
         self._writer.write("ratings", **record)
-        write_json_atomic(self._ratings_path, {"env_steps": int(env_steps), "layouts": ratings,
-                                               "bt": bt_section(bt)})
+        write_json_atomic(self._ratings_path, {"env_steps": int(env_steps), "layouts": ratings, "bt": section})
         if self._wandb is not None:
             row = flatten("system", {k: v for k, v in system.items() if k != "env_steps"})
             row.update(flatten("ratings", _ratings_row(ratings)))
@@ -177,6 +181,21 @@ class MetricsHub:
             self._wandb.log_global(row, int(env_steps))
         self._report_console(int(env_steps), system, ratings, summary)
         return True
+
+    def _format_bt(self, bt: RatingsSnapshot | None) -> tuple[dict, dict]:
+        """``(bt_summary, bt_section)`` of a live snapshot; ``({}, {})`` without one, or when formatting it fails
+        (ratings never stop training): one ERROR per failing snapshot, with a traceback the first time; the records
+        are then written without ``bt``."""
+        if bt is None:
+            return {}, {}
+        try:
+            return bt_summary(bt, self._agent_ids), bt_section(bt)
+        except Exception as e:  # noqa: BLE001 - ratings must never stop training
+            if bt.version not in self._bt_failed_versions:
+                logger.error(f"Live ratings: formatting snapshot {bt.version} failed ({type(e).__name__}: {e}); "
+                             f"the ratings records are written without bt", exc_info=not self._bt_failed_versions)
+                self._bt_failed_versions.add(bt.version)
+            return {}, {}
 
     def _report_console(self, env_steps: int, system: dict, ratings: dict, bt: dict) -> None:
         lines = []

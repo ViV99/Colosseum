@@ -43,14 +43,15 @@ from colosseum.arena.bt import (
     score_summary,
     transitivity_test,
 )
-from colosseum.arena.comparisons import ComparisonTable
+from colosseum.arena.comparisons import ComparisonTable, coefficients
 from colosseum.arena.entities import entity_version, lineage
 from colosseum.arena.matchlog import RUN_SOURCES
 
 logger = logging.getLogger(__name__)
 
 LAPLACE_SAMPLES = 1000
-# The final refit at the end of a run runs only when the last refit took at most this long (seconds).
+# The final refit at the end of a run (``LiveRatings.finish``) runs only when the last refit took at most this long
+# (seconds); before any refit finished, only when every layout's fit stays on the dense path (``dense_limit``).
 FINAL_REFIT_MAX_SEC = 2.0
 
 
@@ -185,11 +186,64 @@ class LiveRatings:
                              exc_info=not self._failed)
                 self._failed = True
 
+    @property
+    def alive(self) -> bool:
+        """The refit thread is running (started and not yet ended)."""
+        return self._thread is not None and self._thread.is_alive()
+
     def stop(self, timeout: float) -> None:
         """Stop the thread (a refit in progress finishes first, up to ``timeout`` seconds)."""
         self._stop.set()
         if self._thread is not None:
             self._thread.join(timeout)
+
+    def finish(self, timeout: float) -> RatingsSnapshot | None:
+        """End of a run (the journal writer has flushed): stop the thread, then refit once more on the final data
+        unless that would be slow; returns the newest snapshot (None if there is none). The final refit is skipped,
+        with one INFO line naming the reason and the snapshot kept, when the thread is still refitting after
+        ``timeout`` seconds, when the last refit took longer than ``FINAL_REFIT_MAX_SEC``, or, before any refit
+        finished, when a layout's fit would take the iterative path (more parameters than ``dense_limit``; seconds
+        per refit). A failed final refit is an ERROR; the last snapshot is kept."""
+        self.stop(timeout)
+        reason = None
+        last = self.last_refit_sec
+        if self.alive:
+            reason = f"a refit is still running {timeout:g} s after the stop"
+        elif last is not None and last > FINAL_REFIT_MAX_SEC:
+            reason = f"the last refit took {last:.1f} s (over {FINAL_REFIT_MAX_SEC:g} s)"
+        elif last is None:
+            size = self._largest_fit()
+            if size is not None and size[1] > self._kwargs["options"].dense_limit:
+                reason = (f"no refit finished yet and layout {size[0]!r} has {size[1]} parameters (over "
+                          f"{self._kwargs['options'].dense_limit}: the iterative path)")
+        if reason is None:
+            try:
+                return self.refit_now()
+            except Exception:  # noqa: BLE001 - the final records are still written
+                logger.exception("Live ratings: the final refit failed; ratings.json keeps the last snapshot")
+                return self.latest()
+        kept = self.latest()
+        what = ("has no Bradley-Terry section" if kept is None
+                else f"keeps the snapshot of env step {kept.env_steps} and may miss the games since")
+        logger.info(f"Live ratings: {reason}; no final refit, so ratings.json {what}")
+        return kept
+
+    def _largest_fit(self) -> tuple[str, int] | None:
+        """``(layout, parameters)`` of the layout with the most fit parameters in the table (entities with a
+        non-zero coefficient plus the free side-bias parameters), None without team pairs."""
+        largest = None
+        table = self._table
+        for layout in table.layouts():
+            pairs = table.pairs(layout, RUN_SOURCES)
+            if not pairs:
+                continue
+            entities = set()
+            for a, b, _ in pairs:
+                entities.update(coefficients(a, b))
+            size = len(entities) + max(b.team for _, b, _ in pairs)       # canonical order: a.team < b.team
+            if largest is None or size > largest[1]:
+                largest = (layout, size)
+        return largest
 
 
 # ---------------------------------------------------------------------------

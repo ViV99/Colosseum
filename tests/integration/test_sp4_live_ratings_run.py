@@ -22,3 +22,18 @@ def test_a_run_publishes_live_ratings(tmp_path):
     records = [r for r in run.records("ratings") if "bt" in r]
     assert records and records[-1]["bt"]["main"]["2p"]["latest"]["entity"] == f"main@v{buckets[-1]}"
     assert "| bt " in run.stderr and "Live ratings: Bradley-Terry refit every 1 s" in run.log("main")
+
+
+def test_the_final_refit_covers_every_journaled_match(tmp_path):
+    """Without a periodic refit (a long interval) ratings.json comes from the final refit, which runs after the
+    journal writer flushed: its games are the journal's, match for match."""
+    from colosseum.arena.matchlog import RUN_SOURCES, MatchLogReader
+
+    run = run_train(SP3_TTT_TINY, tmp_path, name="final", tiny=False,
+                    overrides={"ratings.refit_interval_sec": "3600", "training.total_timesteps": "3000"})
+    assert run.returncode == 0, run.stderr[-3000:]
+    rows = run.ratings()["bt"]["2p"]["player"]
+    with MatchLogReader(run.root / "matches.db") as reader:
+        journal = reader.comparison_table(RUN_SOURCES).entity_games("2p", RUN_SOURCES)
+    assert journal and {r["entity"]: r["games"] for r in rows} == journal
+    assert "no final refit" not in run.log("main")

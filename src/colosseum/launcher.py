@@ -868,24 +868,11 @@ class Launcher:
         return None if self._live_ratings is None else self._live_ratings.latest()
 
     def _finish_live_ratings(self):
-        """Stop the refit thread; refit once more on the final data (the journal writer has flushed) unless the
-        last refit was slow (``FINAL_REFIT_MAX_SEC``). Returns the newest snapshot (None without live ratings)."""
+        """Stop the refit thread and refit once more on the final data (the journal writer has flushed), unless
+        that would be slow (``LiveRatings.finish``). Returns the newest snapshot (None without live ratings)."""
         if self._live_ratings is None:
             return None
-        from colosseum.arena.live import FINAL_REFIT_MAX_SEC
-
-        self._live_ratings.stop(SHUTDOWN_GRACE_SEC)
-        last = self._live_ratings.last_refit_sec
-        if last is None or last <= FINAL_REFIT_MAX_SEC:
-            try:
-                return self._live_ratings.refit_now()
-            except Exception:  # noqa: BLE001 - the final records are still written
-                logger.exception("Live ratings: the final refit failed; ratings.json keeps the last snapshot")
-        else:
-            logger.info(f"Live ratings: the last refit took {last:.1f} s (over {FINAL_REFIT_MAX_SEC:g} s); no final "
-                        f"refit, so ratings.json keeps the snapshot of env step "
-                        f"{self._live_ratings.latest().env_steps} and may miss the games since")
-        return self._live_ratings.latest()
+        return self._live_ratings.finish(SHUTDOWN_GRACE_SEC)
 
     def _on_snapshot_evicted(self, agent_id: str, checkpoint_id: str) -> None:
         """Coordinator evict listener (main loop): the journal folds the evicted snapshot's training matches."""
@@ -939,10 +926,13 @@ class Launcher:
         finally:
             try:
                 self._stop_match_log()            # also when the final drains failed
+            except Exception:  # noqa: BLE001 - must not replace the original error
+                logger.exception("Stopping the match log writer failed")
+            try:
                 if self._live_ratings is not None:
                     self._live_ratings.stop(SHUTDOWN_GRACE_SEC)
             except Exception:  # noqa: BLE001 - must not replace the original error
-                logger.exception("Stopping the match log writer or the live ratings failed")
+                logger.exception("Stopping the live ratings failed")
             try:
                 if self._metrics_writer is not None:
                     self._metrics_writer.close()

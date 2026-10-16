@@ -81,6 +81,7 @@ def test_the_thread_publishes_snapshots_and_skips_an_unchanged_table():
         assert live.latest().env_steps == 900 and live.last_refit_sec >= 0.0
     finally:
         live.stop(timeout=5.0)
+    assert not live.alive
 
 
 def test_a_failing_refit_is_logged_once_and_the_thread_goes_on(caplog, monkeypatch):
@@ -102,8 +103,84 @@ def test_a_failing_refit_is_logged_once_and_the_thread_goes_on(caplog, monkeypat
             assert _wait(lambda: live.latest() is not None)
         finally:
             live.stop(timeout=5.0)
+    assert not live.alive
     errors = [r for r in caplog.records if "refit failed" in r.getMessage()]
     assert len(errors) == 3 and errors[0].exc_info and not errors[1].exc_info   # a traceback the first time only
+
+
+def _main_v200_games(snapshot) -> int:
+    return snapshot.fits["2p"].games["main@v200"]
+
+
+def test_finish_refits_on_the_final_data():
+    """Results added after the last periodic refit reach the snapshot that finish() returns (the final refit runs
+    after the journal writer flushed, so ratings.json covers every journaled match)."""
+    table = _league_table()
+    live = LiveRatings(table, interval_sec=3600.0, env_steps_fn=lambda: 7, samples=50)
+    live.start()
+    periodic = live.refit_now()
+    table.add_result(make_match_result([(0, "main", "ckpt_v200"), (1, "random", "fixed")]), [200, None])
+    final = live.finish(timeout=5.0)
+    assert not live.alive
+    assert final.version == periodic.version + 1 and _main_v200_games(final) == _main_v200_games(periodic) + 1
+    assert live.latest() is final
+
+
+def test_finish_skips_the_final_refit_after_a_slow_refit(caplog, monkeypatch):
+    import colosseum.arena.live as live_module
+
+    table = _league_table()
+    live = LiveRatings(table, interval_sec=3600.0, env_steps_fn=lambda: 42, samples=50)
+    live.start()
+    kept = live.refit_now()
+    monkeypatch.setattr(live_module, "FINAL_REFIT_MAX_SEC", -1.0)        # every refit is "slow"
+    table.add_result(make_match_result([(0, "main", "ckpt_v200"), (1, "random", "fixed")]), [200, None])
+    with caplog.at_level(logging.INFO, logger="colosseum.arena.live"):
+        assert live.finish(timeout=5.0) is kept
+    assert not live.alive and _main_v200_games(live.latest()) == _main_v200_games(kept)
+    (line,) = [r.getMessage() for r in caplog.records if "no final refit" in r.getMessage()]
+    assert "the last refit took" in line and "snapshot of env step 42" in line
+
+
+def test_finish_skips_the_final_refit_while_a_refit_is_still_running(caplog, monkeypatch):
+    import threading
+
+    import colosseum.arena.live as live_module
+
+    entered, release = threading.Event(), threading.Event()
+    original = live_module.compute_snapshot
+
+    def slow_snapshot(*args, **kwargs):
+        entered.set()
+        release.wait(10.0)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(live_module, "compute_snapshot", slow_snapshot)
+    live = LiveRatings(_league_table(), interval_sec=0.01, env_steps_fn=lambda: 0, samples=50)
+    live.start()
+    try:
+        assert entered.wait(10.0)
+        with caplog.at_level(logging.INFO, logger="colosseum.arena.live"):
+            assert live.finish(timeout=0.1) is None
+        (line,) = [r.getMessage() for r in caplog.records if "no final refit" in r.getMessage()]
+        assert "still running" in line and "has no Bradley-Terry section" in line
+    finally:
+        release.set()
+        live.stop(timeout=10.0)
+    assert not live.alive
+
+
+def test_finish_before_any_refit_skips_an_iterative_size_table(caplog):
+    from colosseum.arena.bt import BTOptions
+
+    small = LiveRatings(_league_table(), interval_sec=3600.0, env_steps_fn=lambda: 0, samples=50)
+    assert small.finish(timeout=1.0) is not None                       # dense: the one final refit runs
+    large = LiveRatings(_league_table(), interval_sec=3600.0, options=BTOptions(dense_limit=3),
+                        env_steps_fn=lambda: 0, samples=50)
+    with caplog.at_level(logging.INFO, logger="colosseum.arena.live"):
+        assert large.finish(timeout=1.0) is None
+    (line,) = [r.getMessage() for r in caplog.records if "no final refit" in r.getMessage()]
+    assert "no refit finished yet" in line and "layout '2p' has 6 parameters" in line and "iterative" in line
 
 
 def test_anchor_notes_are_logged_once(caplog):
@@ -219,6 +296,27 @@ def test_the_hub_writes_compact_records_bt_in_ratings_json_console_and_wandb(tmp
     assert not any("/pfsp" in key for key in rows[-1])
 
 
+def test_a_failing_bt_format_is_logged_once_and_the_records_are_written_without_bt(tmp_path, caplog, monkeypatch):
+    import colosseum.metrics.hub as hub_module
+
+    def broken(snapshot):
+        raise KeyError("malformed fit")
+
+    monkeypatch.setattr(hub_module, "bt_section", broken)
+    hub = MetricsHub(writer=MetricsWriter(tmp_path / "m.jsonl"), ratings_path=tmp_path / "r.json", agent_ids=["main"],
+                     total_timesteps=10, log_interval=1, console_interval_sec=0.0)
+    snapshot = _snapshot(_league_table())
+    with caplog.at_level(logging.ERROR, logger="colosseum.metrics.hub"):
+        for _ in range(3):
+            hub.maybe_tick(env_steps=1, ratings={}, queue_depths={}, force=True, bt=snapshot)
+        hub.close(env_steps=2, ratings={}, queue_depths={}, bt=snapshot)
+    errors = [r for r in caplog.records if "formatting snapshot" in r.getMessage()]
+    assert len(errors) == 1 and errors[0].exc_info
+    records = [json.loads(line) for line in (tmp_path / "m.jsonl").read_text().splitlines() if '"ratings"' in line]
+    assert len(records) == 4 and not any("bt" in r for r in records)
+    assert json.loads((tmp_path / "r.json").read_text())["bt"] == {}
+
+
 def test_without_a_snapshot_the_record_has_no_bt_and_ratings_json_an_empty_one(tmp_path):
     hub = MetricsHub(writer=MetricsWriter(tmp_path / "m.jsonl"), ratings_path=tmp_path / "r.json", agent_ids=["a"],
                      total_timesteps=10, log_interval=1, console_interval_sec=0.0)
@@ -262,6 +360,23 @@ def test_train_limits_the_main_process_blas_before_numpy(monkeypatch):
 
     result = CliRunner().invoke(main, ["train", "-c", os.devnull])
     assert result.exit_code == 0 and calls == ["blas", "train"]
+
+
+def test_importing_the_cli_loads_neither_numpy_nor_torch():
+    """``limit_main_blas_threads`` is a no-op once numpy is imported: ``colosseum train`` calls it first, so
+    importing the CLI must not import numpy (or torch, which imports numpy)."""
+    probe = "import sys, colosseum.cli; print('numpy' in sys.modules, 'torch' in sys.modules)"
+    out = subprocess.run([sys.executable, "-c", probe], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0, out.stderr
+    assert out.stdout.split() == ["False", "False"]
+
+
+def test_the_blas_limit_is_a_logged_no_op_after_numpy(caplog):
+    from colosseum.utils.process import limit_main_blas_threads
+
+    with caplog.at_level(logging.DEBUG, logger="colosseum.utils.process"):
+        assert limit_main_blas_threads() is False                     # numpy is imported in the test process
+    assert any("already imported" in r.getMessage() for r in caplog.records)
 
 
 _BLAS_PROBE = r"""
