@@ -86,7 +86,8 @@ def test_append_writes_detail_with_rating_versions_and_ignores_duplicates(tmp_pa
     sizes = log.sizes()
     assert sizes.detail_matches == 51 and sizes.detail_bytes == sum(estimated_size(r) for r in results) + \
         estimated_size(synthetic_journal_results(1, first=50)[0])
-    row = log.open_readonly(log.path).matches(limit=1)[0]                         # newest first
+    with log.open_readonly(log.path) as reader:
+        row = reader.matches(limit=1)[0]                                           # newest first
     assert row.uid == "R/train/w0_e2_ep50" and row.worker == 0 and row.env_steps == 500
     main = next(s for s in row.seats if s.agent_id == "main" and s.network_id == "latest")
     assert main.rating_version == (main.version_start // 10) * 10 and main.entity == f"main@v{main.rating_version}"
@@ -131,7 +132,7 @@ def test_compaction_keeps_the_window_and_the_table(tmp_path):
     after = log.comparison_table(("train",)).as_dict()
     assert _close(after, before) and _close(after, _memory_table(log, results).as_dict())
     oldest = _sql(log.path, "SELECT MIN(id) FROM matches")[0][0]
-    assert oldest > stats.folded - 1                                    # the oldest matches were folded
+    assert oldest == stats.folded + 1                                   # ids 1..4000: the oldest were folded
     log.close()
 
 
@@ -214,7 +215,7 @@ def test_import_parent_folds_its_detail_and_copies_counts_tournament_and_pulse(t
     child_run = RunInfo("C", "child", "R", "ttt", "h", 10)
     child = _log(tmp_path, run=child_run, name="child.db")
     stats = child.import_parent(tmp_path / "parent.db")
-    assert stats.copied == 60 and stats.folded > 0 and stats.counts_rows > 0
+    assert stats.copied == 60 and stats.folded > 0 and stats.counts_rows > 0 and not stats.skipped
     sizes = child.sizes()
     assert sizes.detail_matches == 0 and sizes.other_matches == 60      # no training detail copied
     assert _close(child.comparison_table(("train", "pulse")).as_dict(), expected)
@@ -222,6 +223,49 @@ def test_import_parent_folds_its_detail_and_copies_counts_tournament_and_pulse(t
     assert [r.run_id for r in reader.runs()] == ["C", "R"] and reader.runs()[0].parent_run_id == "R"
     assert len(reader.matches(tournament="T1", limit=100)) == 20
     reader.close()
+    child.close()
+
+
+def _parent_journal(tmp_path):
+    parent = _log(tmp_path, name="parent.db")
+    parent.append(synthetic_journal_results(300))
+    parent.compact(window_bytes=parent.sizes().detail_bytes // 2)
+    parent.append(synthetic_journal_results(10, source="pulse", prefix="R/pulse/"))
+    parent.append(synthetic_journal_results(5, source="tournament", prefix="T1/"), tournament="T1")
+    expected = parent.comparison_table(("train", "pulse")).as_dict()
+    parent.close()
+    return tmp_path / "parent.db", expected
+
+
+def test_import_parent_twice_changes_nothing(tmp_path, caplog):
+    path, expected = _parent_journal(tmp_path)
+    child = _log(tmp_path, run=RunInfo("C", "child", "R", "ttt", "h", 10), name="child.db")
+    child.import_parent(path)
+    with caplog.at_level(logging.INFO, logger="colosseum.arena.matchlog"):
+        again = child.import_parent(path)
+    assert again.skipped and (again.counts_rows, again.folded, again.copied) == (0, 0, 0)
+    assert any("already imported" in r.getMessage() for r in caplog.records)
+    assert _close(child.comparison_table(("train", "pulse")).as_dict(), expected)
+    assert child.sizes().other_matches == 15
+    child.close()
+
+
+def test_a_failed_import_leaves_the_journal_unchanged(tmp_path, monkeypatch):
+    path, expected = _parent_journal(tmp_path)
+    child = _log(tmp_path, run=RunInfo("C", "child", "R", "ttt", "h", 10), name="child.db")
+
+    def fail(self, parent, train):
+        raise RuntimeError("disk gone mid-import")
+
+    with monkeypatch.context() as patch:                # after the runs, counts and folds, before the copy
+        patch.setattr(MatchLog, "_copy_detail", fail)
+        with pytest.raises(RuntimeError, match="mid-import"):
+            child.import_parent(path)
+    assert child.comparison_table(("train", "pulse")).layouts() == [] and child.sizes().counts_rows == 0
+    with MatchLogReader(tmp_path / "child.db") as reader:
+        assert [r.run_id for r in reader.runs()] == ["C"]
+    assert not child.import_parent(path).skipped                       # no marker was left: the retry imports
+    assert _close(child.comparison_table(("train", "pulse")).as_dict(), expected)
     child.close()
 
 
@@ -299,6 +343,8 @@ def test_matches_filters(tmp_path):
     assert reader.matches(agent="nobody") == [] and reader.matches(layout="9p") == []
     with pytest.raises(ValueError, match="agent"):
         reader.matches(outcome="win")
+    with pytest.raises(ValueError, match="version filter needs an agent"):
+        reader.matches(version=10)
     reader.close()
     log.close()
 
@@ -393,3 +439,91 @@ def test_an_unreadable_journal_is_not_moved_away(tmp_path):
         path.chmod(0o644)
     with MatchLogReader(path) as reader:
         assert reader.sizes().detail_matches == 3
+
+
+def test_a_failed_append_surfaces_its_error_and_leaves_no_stale_ids(tmp_path):
+    """SQLite rolls a transaction back by itself on SQLITE_FULL: the original error must surface (not a failed
+    ROLLBACK) and the ids of the rolled-back transaction must not survive in the cache."""
+    log = _log(tmp_path)
+    log.append(synthetic_journal_results(5))
+    pages = log._conn.execute("PRAGMA page_count").fetchone()[0]
+    log._conn.execute(f"PRAGMA max_page_count = {pages}")
+    big = [make_match_result([(0, f"q{i}", "fixed"), (1, f"r{i}", "fixed")], uid=f"full/{i}/" + "x" * 300)
+           for i in range(3000)]
+    with pytest.raises(sqlite3.OperationalError, match="full"):
+        log.append(big)
+    log._conn.execute("PRAGMA max_page_count = 1073741823")
+    assert log.append([make_match_result([(0, "a0", "fixed"), (1, "b", "fixed")], uid="L2")]).detailed == 1
+    with MatchLogReader(log.path) as reader:
+        row = reader.matches(limit=1)[0]
+        assert row.uid == "L2" and [(s.agent_id, s.entity) for s in row.seats] == [("a0", "a0"), ("b", "b")]
+        assert reader.sizes().detail_matches == 6
+    log.close()
+
+
+def test_a_read_across_a_compaction_is_retried(tmp_path, monkeypatch):
+    """A compaction that commits between a reader's counts query and its detail queries moves matches out of the
+    detail it is about to read; the reader sees ``compact_generation`` change and reads again."""
+    log = _log(tmp_path)
+    results = synthetic_journal_results(400)
+    log.append(results)
+    full = log.comparison_table(("train",)).as_dict()
+    reader = MatchLogReader(log.path)
+    original = reader._iter_detail
+    calls = []
+
+    def iter_detail(where, args):
+        if not calls:
+            log.compact(window_bytes=log.sizes().detail_bytes // 2)
+        calls.append(1)
+        return original(where, args)
+
+    monkeypatch.setattr(reader, "_iter_detail", iter_detail)
+    assert _close(reader.comparison_table(("train",)).as_dict(), full) and len(calls) == 2
+    calls.clear()
+    counts, details = reader.bootstrap_units("2p", ("train",))
+    assert len(calls) == 2 and sum(stat.n for _, _, stat in counts) + len(details) == len(results)
+    reader.close()
+    log.close()
+
+
+def test_compaction_binds_at_most_999_parameters(tmp_path):
+    log = _log(tmp_path)
+    log.append(synthetic_journal_results(2500))
+    before = log.comparison_table(("train",)).as_dict()
+    log._conn.setlimit(sqlite3.SQLITE_LIMIT_VARIABLE_NUMBER, 999)       # SQLite < 3.32
+    stats = log.compact(window_bytes=0)
+    assert stats.folded == 2500 and stats.batches == 1 and log.sizes().detail_matches == 0
+    assert _close(log.comparison_table(("train",)).as_dict(), before)
+    log.close()
+
+
+def test_paths_with_uri_characters_open_read_only(tmp_path):
+    directory = tmp_path / "odd ?#% dir"
+    log = MatchLog(directory / MATCH_LOG_FILE, RUN, disk_free_fn=lambda _: FREE)
+    log.append(synthetic_journal_results(4))
+    with MatchLogReader(directory / MATCH_LOG_FILE) as reader:
+        assert reader.sizes().detail_matches == 4 and len(reader.matches()) == 4
+    log.close()
+
+
+def test_a_failed_run_registration_closes_the_connection(tmp_path, monkeypatch):
+    import colosseum.arena.matchlog as matchlog
+
+    opened = []
+
+    def connect(path, *, readonly):
+        opened.append(original(path, readonly=readonly))
+        return opened[-1]
+
+    def register(self, run):
+        raise sqlite3.OperationalError("database is locked")
+
+    original = matchlog._connect
+    monkeypatch.setattr(matchlog, "_connect", connect)
+    monkeypatch.setattr(MatchLog, "_register_run", register)
+    with pytest.raises(sqlite3.OperationalError, match="locked"):
+        _log(tmp_path)
+    assert len(opened) == 1
+    with pytest.raises(sqlite3.ProgrammingError):
+        opened[0].execute("SELECT 1")

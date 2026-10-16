@@ -1391,6 +1391,8 @@ class LabelBot(ScriptedBot):
         if self.fail == "raise":
             raise RuntimeError("teacher bot failure")
         return np.int64(self.action)
+
+
 # ---------------------------------------------------------------------------
 # SP4 (T1.2): match records for journal and rating tests
 # ---------------------------------------------------------------------------

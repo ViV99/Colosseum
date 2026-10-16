@@ -23,8 +23,12 @@ usual.
 SQLite rules: WAL; ``auto_vacuum = INCREMENTAL`` (set before the first table); ``synchronous = NORMAL``;
 ``journal_size_limit``; ``busy_timeout``; one connection per thread or process; a writer's transaction is one
 batch, so two writers (training and a tournament) can share the file. ``MatchLogReader`` opens read-only and every
-query is its own transaction. A file that is not an SQLite database is renamed (``matches.db.corrupt-<k>``) and a
-new journal starts (ERROR); a journal of another schema version is a ``MatchLogError``.
+query is its own transaction; a read of several queries that spans a compaction (``meta.compact_generation``
+changed, bumped by every fold transaction) is retried. A file that is not an SQLite database is renamed
+(``matches.db.corrupt-<k>``) and a new journal starts (ERROR); any other error while opening (locked, unreadable)
+propagates and the file stays; a journal of another schema version is a ``MatchLogError``. A failed transaction
+surfaces its own error (SQLite may already have rolled it back) and clears the id cache. ``import_parent`` runs
+in one transaction and skips a parent already imported.
 
 Order is by row id (insertion order), never by the informational ``ts``.
 """
@@ -65,6 +69,10 @@ BUSY_TIMEOUT_MS = 10_000
 JOURNAL_SIZE_LIMIT = 64 * 1024 * 1024
 READ_BATCH = 10_000
 MAX_BATCH = 10_000
+# Bound parameters per statement: SQLite before 3.32 allows at most 999.
+BIND_CHUNK = 500
+# A reader retries a table read this often when a compaction committed in between (``compact_generation``).
+CONSISTENT_READ_ATTEMPTS = 3
 # Estimated bytes of one detailed match: the rows' payload (the uid twice: its UNIQUE index repeats it) times an
 # overhead factor for B-tree pages and the indexes. Calibrated on 1v1, 2v2 and 4-team FFA matches: the estimate
 # is within 7 % of the pages SQLite really uses (T1.2).
@@ -147,6 +155,7 @@ class ImportStats:
     counts_rows: int = 0
     folded: int = 0             # the parent's detailed training matches, folded into counts
     copied: int = 0             # the parent's tournament and pulse matches, copied in detail
+    skipped: bool = False       # the parent was imported before (nothing done)
 
 
 @dataclass(frozen=True)
@@ -237,7 +246,7 @@ def estimated_size(result: MatchResult) -> int:
 
 def _connect(path: Path, *, readonly: bool) -> sqlite3.Connection:
     if readonly:
-        conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True, isolation_level=None,
+        conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro", uri=True, isolation_level=None,
                                timeout=BUSY_TIMEOUT_MS / 1000, check_same_thread=False)
     else:
         conn = sqlite3.connect(str(path), isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000)
@@ -249,6 +258,21 @@ def _is_corrupt(error: sqlite3.DatabaseError) -> bool:
     """A file that is not (or no longer) an SQLite database; other errors (locked, I/O, permissions) are not."""
     text = str(error).lower()
     return "not a database" in text or "malformed" in text
+
+
+def _rollback(conn: sqlite3.Connection) -> None:
+    """Roll back the open transaction, if any: SQLite rolls back by itself on some errors (SQLITE_FULL, IOERR,
+    NOMEM, some BUSY), and an explicit ROLLBACK then fails and would mask the original error."""
+    if conn.in_transaction:
+        try:
+            conn.execute("ROLLBACK")
+        except sqlite3.Error as e:
+            logger.debug(f"Match log: ROLLBACK failed after an error ({e})")
+
+
+def _chunks(ids: Sequence[int], size: int = BIND_CHUNK) -> Iterator[Sequence[int]]:
+    for k in range(0, len(ids), size):
+        yield ids[k:k + size]
 
 
 def _worker_of(match_id: str) -> int | None:
@@ -377,7 +401,26 @@ class _Store:
                 yield match, self._name(layout), self._name(source), keys, ranks.get(match, {}), scores.get(match, {})
             last = hi
 
+    def _generation(self) -> int:
+        return int(self._meta("compact_generation", "0"))
+
+    def _consistent(self, read: Callable[[], object], what: str):
+        """Run ``read`` (several queries, each its own transaction) until no compaction committed during it
+        (``compact_generation`` unchanged), at most ``CONSISTENT_READ_ATTEMPTS`` times; then accept the last read
+        (DEBUG): a compaction moves matches from detail to counts, so a read across one can miss them."""
+        for _ in range(CONSISTENT_READ_ATTEMPTS):
+            before = self._generation()
+            out = read()
+            if self._generation() == before:
+                return out
+        logger.debug(f"Match log: {what} read across a compaction {CONSISTENT_READ_ATTEMPTS} times; accepted the "
+                     f"last read")
+        return out
+
     def _table(self, sources: Collection[str], tournament: str | None) -> ComparisonTable:
+        return self._consistent(lambda: self._read_table(sources, tournament), "comparison table")
+
+    def _read_table(self, sources: Collection[str], tournament: str | None) -> ComparisonTable:
         table = ComparisonTable()
         src_ids = [i for s in sources if (i := self._lookup("source", s)) is not None]
         if tournament is None and src_ids:
@@ -401,6 +444,9 @@ class _Store:
         """The resampling units of ``layout`` outside tournaments (T2.1's ``bt.bootstrap_data``, spec block 2): the
         ``counts`` rows of ``sources`` and, per detailed match of ``sources`` in id order, its block id (None in
         training) and its team-pair contributions ``(a, b, weight, outcome of a)``."""
+        return self._consistent(lambda: self._read_bootstrap(layout, sources), "bootstrap units")
+
+    def _read_bootstrap(self, layout: str, sources: Collection[str]) -> tuple[list, list]:
         lid = self._lookup("layout", layout)
         src_ids = [i for s in sources if (i := self._lookup("source", s)) is not None]
         if lid is None or not src_ids:
@@ -456,7 +502,11 @@ class MatchLog(_Store):
         self._interval = int(run.checkpoint_interval) if run is not None else 1
         self.path.parent.mkdir(parents=True, exist_ok=True)
         super().__init__(self._open())
-        self._run_row = self._register_run(run) if run is not None else None
+        try:
+            self._run_row = self._register_run(run) if run is not None else None
+        except BaseException:
+            self._conn.close()
+            raise
 
     # ---- opening ---------------------------------------------------------------------------------------------
 
@@ -507,13 +557,13 @@ class MatchLog(_Store):
             if row is None:
                 conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)",
                                  [("schema_version", str(SCHEMA_VERSION)), ("detail_train_bytes", "0"),
-                                  ("detail_train_matches", "0")])
+                                  ("detail_train_matches", "0"), ("compact_generation", "0")])
             elif int(row[0]) != SCHEMA_VERSION:
                 raise MatchLogError(f"match log {self.path} has schema version {row[0]}; this Colosseum reads "
                                     f"version {SCHEMA_VERSION} (move the file away to start a new journal)")
             conn.execute("COMMIT")
         except BaseException:
-            conn.execute("ROLLBACK")
+            _rollback(conn)
             raise
 
     def _register_run(self, run: RunInfo) -> int:
@@ -538,9 +588,9 @@ class MatchLog(_Store):
             out = body()
             self._conn.execute("COMMIT")
         except BaseException:
-            self._conn.execute("ROLLBACK")
             self._ids.clear()          # ids inserted by the rolled-back transaction are gone
             self._names.clear()
+            _rollback(self._conn)      # the original error propagates, never a failed ROLLBACK
             raise
         return out
 
@@ -658,21 +708,29 @@ class MatchLog(_Store):
     # ---- compaction --------------------------------------------------------------------------------------------
 
     def _fold_matches(self, ids: Sequence[int]) -> None:
-        """Fold the detailed matches ``ids`` into counts and delete them, in one transaction."""
-        marks = ",".join("?" * len(ids))
-
+        """Fold the detailed matches ``ids`` into counts and delete them, in one transaction (parameters bound in
+        chunks of ``BIND_CHUNK``); bumps ``compact_generation`` so that readers retry a read across it."""
         def body() -> None:
             acc: dict = {}
-            for _, layout, source, keys, ranks, scores in self._iter_detail(f"id IN ({marks})", ids):
-                _fold_into(acc, layout, source, keys, ranks, scores)
+            for chunk in _chunks(ids):
+                marks = ",".join("?" * len(chunk))
+                for _, layout, source, keys, ranks, scores in self._iter_detail(f"id IN ({marks})", chunk):
+                    _fold_into(acc, layout, source, keys, ranks, scores)
             self._write_counts(acc)
             train = self._lookup("source", "train")
-            nbytes, nmatches = self._conn.execute(
-                f"SELECT COALESCE(SUM(size), 0), COUNT(*) FROM matches WHERE id IN ({marks}) AND source = ? "
-                f"AND tournament IS NULL", (*ids, train)).fetchone()
-            for table, column in (("seats", "match"), ("teams", "match"), ("matches", "id")):
-                self._conn.execute(f"DELETE FROM {table} WHERE {column} IN ({marks})", ids)
-            self._bump_detail(-int(nbytes), -int(nmatches))
+            nbytes = nmatches = 0
+            for chunk in _chunks(ids):
+                marks = ",".join("?" * len(chunk))
+                size, count = self._conn.execute(
+                    f"SELECT COALESCE(SUM(size), 0), COUNT(*) FROM matches WHERE id IN ({marks}) AND source = ? "
+                    f"AND tournament IS NULL", (*chunk, train)).fetchone()
+                nbytes, nmatches = nbytes + int(size), nmatches + int(count)
+                for table, column in (("seats", "match"), ("teams", "match"), ("matches", "id")):
+                    self._conn.execute(f"DELETE FROM {table} WHERE {column} IN ({marks})", chunk)
+            self._bump_detail(-nbytes, -nmatches)
+            self._conn.execute(
+                "INSERT INTO meta (key, value) VALUES ('compact_generation', '1') ON CONFLICT (key) DO UPDATE SET "
+                "value = CAST(value AS INTEGER) + 1")
 
         self._transaction(body)
 
@@ -731,49 +789,58 @@ class MatchLog(_Store):
     def import_parent(self, parent_path: str | Path) -> ImportStats:
         """Run-dir resume (spec block 1): copy the parent journal's ``runs`` rows, counts, tournament and pulse
         matches; fold its detailed training matches into this journal's counts (their detail stays in the
-        parent's journal). Batches of ``READ_BATCH`` per transaction. Call it once, on a new journal."""
+        parent's journal). One transaction: a failure leaves this journal unchanged. Idempotent: a parent already
+        imported (marker ``imported:<parent run id>`` in ``meta``) is skipped with an INFO line
+        (``ImportStats.skipped``)."""
         stats = ImportStats()
-        parent = MatchLogReader(parent_path)
-        try:
+        with MatchLogReader(parent_path) as parent:
             runs = parent._conn.execute("SELECT run_id, name, parent_run_id, game, config_hash, checkpoint_interval, "
                                         "created FROM runs ORDER BY id").fetchall()
-            self._transaction(lambda: self._conn.executemany(
-                "INSERT OR IGNORE INTO runs (run_id, name, parent_run_id, game, config_hash, checkpoint_interval, "
-                "created) VALUES (?, ?, ?, ?, ?, ?, ?)", runs))
-            last = 0
-            while True:
-                rows = parent._conn.execute(
-                    "SELECT id, kind, layout, source, key_a, key_b, n, s1, s2 FROM counts WHERE id > ? ORDER BY id "
-                    "LIMIT ?", (last, READ_BATCH)).fetchall()
-                if not rows:
-                    break
-                acc = {(kind, parent._name(layout), parent._name(source), parent._decode_key(key_a),
-                        parent._decode_key(key_b) if key_b else None): (n, s1, s2)
-                       for _, kind, layout, source, key_a, key_b, n, s1, s2 in rows}
-                self._transaction(lambda acc=acc: self._write_counts(acc))
-                stats.counts_rows += len(rows)
-                last = rows[-1][0]
-            train = parent._lookup("source", "train")
-            if train is not None:
-                acc, pending = {}, 0
-                for _, layout, source, keys, ranks, scores in parent._iter_detail(
-                        "source = ? AND tournament IS NULL", (train,)):
-                    _fold_into(acc, layout, source, keys, ranks, scores)
-                    pending += 1
-                    if pending >= READ_BATCH:
-                        self._transaction(lambda acc=acc: self._write_counts(acc))
-                        stats.folded += pending
-                        acc, pending = {}, 0
-                if pending:
-                    self._transaction(lambda acc=acc: self._write_counts(acc))
-                    stats.folded += pending
-            stats.copied = self._copy_detail(parent, train)
-        finally:
-            parent.close()
+            identity = runs[0][0] if runs else f"path:{Path(parent_path).resolve()}"
+            marker = f"imported:{identity}"
+
+            def body() -> bool:
+                if self._conn.execute("SELECT 1 FROM meta WHERE key = ?", (marker,)).fetchone() is not None:
+                    return False
+                self._conn.executemany(
+                    "INSERT OR IGNORE INTO runs (run_id, name, parent_run_id, game, config_hash, checkpoint_interval, "
+                    "created) VALUES (?, ?, ?, ?, ?, ?, ?)", runs)
+                stats.counts_rows = self._copy_counts(parent)
+                train = parent._lookup("source", "train")
+                if train is not None:
+                    acc: dict = {}
+                    for _, layout, source, keys, ranks, scores in parent._iter_detail(
+                            "source = ? AND tournament IS NULL", (train,)):
+                        _fold_into(acc, layout, source, keys, ranks, scores)
+                        stats.folded += 1
+                    self._write_counts(acc)
+                stats.copied = self._copy_detail(parent, train)
+                self._conn.execute("INSERT INTO meta (key, value) VALUES (?, ?)", (marker, str(time.time())))
+                return True
+
+            if not self._transaction(body):
+                logger.info(f"Match log: the journal of run {identity} ({parent_path}) is already imported; skipped")
+                return ImportStats(skipped=True)
         return stats
 
+    def _copy_counts(self, parent: MatchLogReader) -> int:
+        """Add the parent's ``counts`` rows (re-encoded with this journal's ids); returns how many were read."""
+        rows_read = last = 0
+        while True:
+            rows = parent._conn.execute(
+                "SELECT id, kind, layout, source, key_a, key_b, n, s1, s2 FROM counts WHERE id > ? ORDER BY id "
+                "LIMIT ?", (last, READ_BATCH)).fetchall()
+            if not rows:
+                return rows_read
+            self._write_counts({(kind, parent._name(layout), parent._name(source), parent._decode_key(key_a),
+                                 parent._decode_key(key_b) if key_b else None): (n, s1, s2)
+                                for _, kind, layout, source, key_a, key_b, n, s1, s2 in rows})
+            rows_read += len(rows)
+            last = rows[-1][0]
+
     def _copy_detail(self, parent: MatchLogReader, train: int | None) -> int:
-        """Copy the parent's detailed tournament and pulse matches; returns how many were new here."""
+        """Copy the parent's detailed tournament and pulse matches (inside the caller's transaction); returns how
+        many were new here."""
         where = "1" if train is None else "(source != ? OR tournament IS NOT NULL)"
         args: tuple = () if train is None else (train,)
         run_ids = {r[0]: r[1] for r in parent._conn.execute("SELECT id, run_id FROM runs")}
@@ -785,42 +852,35 @@ class MatchLog(_Store):
             if not heads:
                 return copied
             last = heads[-1][0]
-
-            def body(heads=heads) -> int:
-                n = 0
-                for (pid, uid, run, source, layout, kind, length, seed, env_steps, block, tour, worker, ts, replay,
-                     size) in heads:
-                    run_row = None
-                    if run in run_ids:
-                        row = self._conn.execute("SELECT id FROM runs WHERE run_id = ?", (run_ids[run],)).fetchone()
-                        run_row = None if row is None else int(row[0])
-                    tid = None if tour is None else self._id("tournament", parent._name(tour))
-                    cur = self._conn.execute(
-                        f"INSERT OR IGNORE INTO matches ({_MATCH_COLUMNS}) "
-                        f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        (uid, run_row, self._id("source", parent._name(source)),
-                         self._id("layout", parent._name(layout)), kind, length, seed, env_steps, block, tid, worker,
-                         ts, replay, size))
-                    if cur.rowcount == 0:
-                        continue
-                    match = int(cur.lastrowid)
-                    seats = parent._conn.execute(f"SELECT {_SEAT_COLUMNS} FROM seats WHERE match = ?",
-                                                 (pid,)).fetchall()
-                    self._conn.executemany(
-                        f"INSERT INTO seats (match, {_SEAT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                        [(match, seat, team, self._id("role", parent._name(role)),
-                          self._id("agent", parent._name(agent)), self._id("network", parent._name(network)),
-                          self._id("entity", parent._name(entity)), vs, ve, rv, reward, elim,
-                          self._id("category", parent._name(category)))
-                         for seat, team, role, agent, network, entity, vs, ve, rv, reward, elim, category in seats])
-                    self._conn.executemany(
-                        "INSERT INTO teams (match, team, rank, score) VALUES (?, ?, ?, ?)",
-                        [(match, *row) for row in parent._conn.execute(
-                            "SELECT team, rank, score FROM teams WHERE match = ?", (pid,))])
-                    n += 1
-                return n
-
-            copied += self._transaction(body)
+            for (pid, uid, run, source, layout, kind, length, seed, env_steps, block, tour, worker, ts, replay,
+                 size) in heads:
+                run_row = None
+                if run in run_ids:
+                    row = self._conn.execute("SELECT id FROM runs WHERE run_id = ?", (run_ids[run],)).fetchone()
+                    run_row = None if row is None else int(row[0])
+                tid = None if tour is None else self._id("tournament", parent._name(tour))
+                cur = self._conn.execute(
+                    f"INSERT OR IGNORE INTO matches ({_MATCH_COLUMNS}) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (uid, run_row, self._id("source", parent._name(source)),
+                     self._id("layout", parent._name(layout)), kind, length, seed, env_steps, block, tid, worker,
+                     ts, replay, size))
+                if cur.rowcount == 0:
+                    continue
+                match = int(cur.lastrowid)
+                seats = parent._conn.execute(f"SELECT {_SEAT_COLUMNS} FROM seats WHERE match = ?", (pid,)).fetchall()
+                self._conn.executemany(
+                    f"INSERT INTO seats (match, {_SEAT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [(match, seat, team, self._id("role", parent._name(role)),
+                      self._id("agent", parent._name(agent)), self._id("network", parent._name(network)),
+                      self._id("entity", parent._name(entity)), vs, ve, rv, reward, elim,
+                      self._id("category", parent._name(category)))
+                     for seat, team, role, agent, network, entity, vs, ve, rv, reward, elim, category in seats])
+                self._conn.executemany(
+                    "INSERT INTO teams (match, team, rank, score) VALUES (?, ?, ?, ?)",
+                    [(match, *row) for row in parent._conn.execute(
+                        "SELECT team, rank, score FROM teams WHERE match = ?", (pid,)).fetchall()])
+                copied += 1
 
     # ---- reading -----------------------------------------------------------------------------------------------
 
@@ -836,8 +896,8 @@ class MatchLog(_Store):
     def close(self) -> None:
         try:
             self._conn.close()
-        except sqlite3.Error:
-            pass
+        except sqlite3.Error as e:
+            logger.warning(f"Match log {self.path}: closing the connection failed ({e})")
 
 
 class MatchLogReader(_Store):
@@ -908,6 +968,8 @@ class MatchLogReader(_Store):
         best other team; ``env_steps`` is an inclusive range; ``limit=None`` returns every matching row."""
         if outcome is not None and agent is None:
             raise ValueError("an outcome filter needs an agent")
+        if version is not None and agent is None:
+            raise ValueError("a version filter needs an agent")
         clauses: list[str] = []
         args: list = []
         for kind, name in (("layout", layout), ("source", source), ("tournament", tournament)):

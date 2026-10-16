@@ -263,7 +263,9 @@ class ComparisonTable:
         return sorted(merged.items(), key=lambda kv: (kv[0].team, kv[0].members))
 
     def entity_games(self, layout: str, sources: Collection[str]) -> dict[EntityKey, int]:
-        """Matches per entity with a non-zero net coefficient (pairs) or a seat (scores); self-play excluded."""
+        """Comparisons per entity: the team-pair comparisons in which the entity has a non-zero net coefficient
+        (self-play excluded), plus its matches in one-team layouts (scores). In a two-team layout one comparison is
+        one match; in a ``T``-team match an entity takes part in ``T - 1`` comparisons (one per other team)."""
         games: dict[EntityKey, int] = {}
         for a, b, stat in self.pairs(layout, sources):
             for entity in coefficients(a, b):

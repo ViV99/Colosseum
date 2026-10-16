@@ -69,7 +69,7 @@ def test_the_table_stores_pairs_in_canonical_order_and_sums_them():
         table.add("2p", "train", a, a, PairStat(1, 1.0, 1.0))
 
 
-def test_self_play_counts_for_no_entity_and_games_count_matches():
+def test_self_play_counts_for_no_entity_and_games_count_comparisons():
     table = ComparisonTable()
     for ranks in ([1.0, 2.0], [2.0, 1.0]):
         table.add_result(make_match_result([(0, "main", "latest", "player", 3), (1, "main", "latest", "player", 4)],
@@ -78,6 +78,8 @@ def test_self_play_counts_for_no_entity_and_games_count_matches():
     assert table.entity_games("2p", ["train"]) == {"main@v10": 1, "random": 1}
     ((a, b, stat), _) = sorted(table.pairs("2p", ["train"]), key=lambda r: r[2].n, reverse=True)
     assert a.entities() == b.entities() == ["main@v0"] and stat == PairStat(2, 2.0, 1.0)
+    table.add_result(make_match_result([(t, f"p{t}", "fixed") for t in range(3)], layout="3p"), [None] * 3)
+    assert table.entity_games("3p", ["train"]) == {"p0": 2, "p1": 2, "p2": 2}      # T - 1 comparisons per match
 
 
 def test_score_layouts_keep_n_sum_and_sum_of_squares():
