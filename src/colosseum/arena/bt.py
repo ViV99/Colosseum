@@ -43,7 +43,8 @@ whose versions fall into two cells (e.g. two components) is two lineages, each w
 Transitivity (``transitivity_test``). The team pairs with at least ``min_games`` matches are refitted alone by a
 near-maximum-likelihood Bradley-Terry fit (``G2_PRIOR_SIGMA``, no smoothness) and compared with the saturated
 model of the same pairs: ``G2 = 2 (LL_saturated - LL_BT)`` against ``chi^2`` with ``pairs - identified
-parameters`` degrees of freedom (the rank of the tested pairs' design).
+parameters`` degrees of freedom (the rank of the tested pairs' design, exact up to ``EXACT_RANK_LIMIT``
+parameters, a conservative bound above). A refit that does not converge leaves the test untestable (WARNING).
 
 ``PRIOR_SIGMA`` and ``SMOOTHNESS`` are provisional; task T8.2 fixes them by cross-validation (controller rulings).
 """
@@ -52,6 +53,7 @@ from __future__ import annotations
 
 import logging
 import math
+import zlib
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
@@ -72,14 +74,19 @@ DENSE_LIMIT = 2000         # parameters; above it Newton steps use conjugate gra
 MEAN_OF_FIXED = "mean-of-fixed"
 TRANSITIVITY_P = 0.01      # the G2 test flags p < 0.01 (spec block 2)
 G2_PRIOR_SIGMA = 100.0     # logits: the G2 refit is a near-MLE; the tiny prior only keeps separation finite
-# Iterative path (above dense_limit): the fit draws ITERATIVE_SAMPLES perturb-and-solve samples of N(0, H^-1) once
-# (fixed seed: a fit is a deterministic function of its table), takes its Monte Carlo standard errors from them
-# (relative error of an SE about 1 / sqrt(2 * 400) = 3.5 %) and keeps them in BTFit.draws, which laplace() reuses
-# there. 400 instead of the live LAPLACE_SAMPLES = 1000 because each draw costs one conjugate-gradient solve: about
-# 3.5 s at 2500 and 10.5 s at 5000 parameters on a chain-like training graph (T2.1 fix report).
+# Iterative path (above dense_limit): the fit draws ITERATIVE_SAMPLES perturb-and-solve samples of N(0, H^-1) once,
+# takes its Monte Carlo standard errors from them and keeps them in BTFit.draws, which laplace() reuses there. 400
+# instead of the live LAPLACE_SAMPLES = 1000 because each draw costs one conjugate-gradient solve: about 3.5 s at
+# 2500 and 10.5 s at 5000 parameters on a chain-like training graph (T2.1 fix report). Monte Carlo error at 400
+# draws: an SE about 1 / sqrt(2 * 400) = 3.5 % relative; lcb (the 10 % quantile) about 0.085 contrast sd (0.054 at
+# 1000); P(best) / P(top-k) up to about 0.025 absolute (sqrt(0.25 / 400)). The seed is fixed per layout
+# (_ITERATIVE_SEED with a CRC32 of the layout name): a fit is a deterministic function of its table, and the fits of
+# different layouts draw independently (T4.1 averages contrast samples across layouts draw by draw). Hence the error
+# is frozen per fit: it does not average out across refits of the same layout.
 ITERATIVE_SAMPLES = 400
 ITERATIVE_CG_TOL = 1e-5    # relative residual of a draw's solve (relative error ~1e-5, far below the Monte Carlo error)
 _ITERATIVE_SEED = 0
+EXACT_RANK_LIMIT = 500     # G2: exact rank of the tested design up to this many parameters, a conservative bound above
 _SAMPLE_CHUNK = 64         # right-hand sides per block conjugate-gradient solve (memory: nnz x chunk floats)
 
 logger = logging.getLogger(__name__)
@@ -503,8 +510,9 @@ def _hess_diag(d: _Design, w: np.ndarray) -> np.ndarray:
 
 
 def _cg(apply: Callable[[np.ndarray], np.ndarray], b: np.ndarray, diag: np.ndarray, tol: float = 1e-10,
-        max_iter: int = 500) -> np.ndarray:
-    """Preconditioned conjugate gradients for ``apply(x) = b`` (``apply`` symmetric positive definite)."""
+        max_iter: int = 500) -> tuple[np.ndarray, bool]:
+    """Preconditioned conjugate gradients for ``apply(x) = b`` (``apply`` symmetric positive definite); returns
+    ``(x, reached tol)`` (a DEBUG line with the residual when ``max_iter`` ran out)."""
     x = np.zeros_like(b)
     r = b.copy()
     z = r / diag
@@ -522,13 +530,18 @@ def _cg(apply: Callable[[np.ndarray], np.ndarray], b: np.ndarray, diag: np.ndarr
         rz_new = float(r @ z)
         p = z + (rz_new / rz) * p
         rz = rz_new
-    return x
+    residual = float(np.linalg.norm(r)) / bnorm
+    if residual > tol:
+        logger.debug("conjugate gradients stopped at max_iter %d with relative residual %.3g", max_iter, residual)
+        return x, False
+    return x, True
 
 
 def _block_cg(apply: Callable[[np.ndarray], np.ndarray], b: np.ndarray, diag: np.ndarray, tol: float = 1e-8,
-              max_iter: int = 2000) -> np.ndarray:
+              max_iter: int = 2000) -> tuple[np.ndarray, int]:
     """Jacobi-preconditioned conjugate gradients for ``apply(X) = B`` column by column, all columns at once
-    (``B``: ``[n, S]``); a column stops when its residual is below ``tol`` relative to its right-hand side."""
+    (``B``: ``[n, S]``); a column stops when its residual is below ``tol`` relative to its right-hand side.
+    Returns ``(X, columns that did not reach tol)`` (a DEBUG line with the worst residual then)."""
     x = np.zeros_like(b)
     r = b.copy()
     z = r / diag[:, None]
@@ -549,13 +562,19 @@ def _block_cg(apply: Callable[[np.ndarray], np.ndarray], b: np.ndarray, diag: np
         beta = np.where(active, rz_new / np.where(rz > 0, rz, 1.0), 0.0)
         p = z + beta * p
         rz = rz_new
-    return x
+    residual = np.linalg.norm(r, axis=0) / bnorm
+    short = int(np.sum(residual > tol))
+    if short:
+        logger.debug("block conjugate gradients stopped at max_iter %d: %d columns above tol, worst relative "
+                     "residual %.3g", max_iter, short, float(residual.max()))
+    return x, short
 
 
 def _perturb_solve(d: _Design, w: np.ndarray, options: BTOptions, n: int, rng: np.random.Generator) -> np.ndarray:
     """``n`` draws ``[n, params]`` of ``N(0, H^-1)`` without forming ``H^-1`` (module docstring: ``x = H^-1 r``,
     ``r = X^T W^(1/2) z_1 + z_2 / prior_sigma + sqrt(smoothness) D^T z_3``, ``cov(r) = H``)."""
     out = np.empty((n, d.num_params))
+    short = 0
     sqrt_w = np.sqrt(w)[:, None]
     diag = _hess_diag(d, w)
     smooth = math.sqrt(options.smoothness) if len(d.chain_i) and options.smoothness else 0.0
@@ -570,20 +589,30 @@ def _perturb_solve(d: _Design, w: np.ndarray, options: BTOptions, n: int, rng: n
             e = smooth * rng.standard_normal((len(d.chain_i), size))
             np.add.at(rhs, d.chain_i, e)
             np.subtract.at(rhs, d.chain_j, e)
-        out[start:start + size] = _block_cg(hessian.times, rhs, diag, tol=ITERATIVE_CG_TOL).T
+        solved, missed = _block_cg(hessian.times, rhs, diag, tol=ITERATIVE_CG_TOL)
+        out[start:start + size] = solved.T
+        short += missed
+    if short:
+        logger.warning("%d of %d perturb-and-solve draws did not reach the solver tolerance %g", short, n,
+                       ITERATIVE_CG_TOL)
     return out
 
 
 def _newton(d: _Design, sw: np.ndarray, swy: np.ndarray, start: np.ndarray,
-            options: BTOptions) -> tuple[np.ndarray, int, bool]:
+            options: BTOptions) -> tuple[np.ndarray, int, bool, int]:
+    """MAP by Newton's method with backtracking: ``(params, iterations, converged, inexact steps)``, the last the
+    number of Newton steps whose conjugate-gradient solve did not reach its tolerance (iterative path; callers
+    warn once)."""
     params = start.copy()
     value = _log_post(d, params, sw, swy, options)
+    inexact = 0
     for iteration in range(1, options.max_iter + 1):
         grad, w = _gradient(d, params, sw, swy, options)
         if d.prior is not None:
             step = np.linalg.solve(_dense_hessian(d, w), grad)
         else:
-            step = _cg(lambda v, w=w: _hess_times(d, w, v, options), grad, _hess_diag(d, w))
+            step, solved = _cg(lambda v, w=w: _hess_times(d, w, v, options), grad, _hess_diag(d, w))
+            inexact += not solved
         t = 1.0
         while True:                               # backtracking: the log posterior never decreases
             candidate = params + t * step
@@ -591,12 +620,12 @@ def _newton(d: _Design, sw: np.ndarray, swy: np.ndarray, start: np.ndarray,
             if new_value >= value - 1e-12 * max(1.0, abs(value)):
                 break
             if t < 1e-6:                          # no improving step: stop here, converged only if the step is tiny
-                return params, iteration, bool(float(np.max(np.abs(step))) < options.tol)
+                return params, iteration, bool(float(np.max(np.abs(step))) < options.tol), inexact
             t *= 0.5
         params, value = candidate, new_value
         if float(np.max(np.abs(t * step))) < options.tol:
-            return params, iteration, True
-    return params, options.max_iter, False
+            return params, iteration, True, inexact
+    return params, options.max_iter, False, inexact
 
 
 # ---------------------------------------------------------------------------
@@ -707,7 +736,10 @@ def fit(table: ComparisonTable, layout: str, *, sources: Collection[str], option
                 start[i] = warm.params[j]
         if warm.design.num_teams == T:
             start[E:] = warm.params[len(warm.design.entities):]
-    params, iterations, converged = _newton(design, design.sw, design.swy, start, options)
+    params, iterations, converged, inexact = _newton(design, design.sw, design.swy, start, options)
+    if inexact:
+        logger.warning("Bradley-Terry fit of layout %r: %d Newton steps did not reach the conjugate-gradient "
+                       "tolerance", layout, inexact)
     _, w = _gradient(design, params, design.sw, design.swy, options)
     hessian = _dense_hessian(design, w) if design.prior is not None else None
     groups = []
@@ -719,7 +751,7 @@ def fit(table: ComparisonTable, layout: str, *, sources: Collection[str], option
         cov = np.linalg.inv(hessian)
         cov_diag = np.diag(cov)
     else:                     # Monte Carlo: draws of N(0, H^-1), mean zero by construction
-        draws = _perturb_solve(design, w, options, ITERATIVE_SAMPLES, np.random.default_rng(_ITERATIVE_SEED))
+        draws = _perturb_solve(design, w, options, ITERATIVE_SAMPLES, _iterative_rng(layout))
     rating, se = {}, {}
     for group in groups:
         c = _contrast(design, group)
@@ -746,6 +778,11 @@ def fit(table: ComparisonTable, layout: str, *, sources: Collection[str], option
         design=design, options=options, hessian=hessian,
         draws=None if hessian is not None else draws.astype(np.float32),
     )
+
+
+def _iterative_rng(layout: str) -> np.random.Generator:
+    """The fixed per-layout generator of a fit's own draws (``ITERATIVE_SAMPLES`` comment)."""
+    return np.random.default_rng([_ITERATIVE_SEED, zlib.crc32(layout.encode("utf-8"))])
 
 
 def _summaries(fit_: BTFit, samples: np.ndarray, *, top_k: int, quantile: float,
@@ -882,7 +919,7 @@ def bootstrap(fit_: BTFit, data: BootstrapData, *, samples: int, rng: np.random.
                          f"pairs differ, e.g. {a} vs {b}: weights {total_sw[r]:.6g} / outcomes {total_swy[r]:.6g} "
                          f"in the data, {design.sw[r]:.6g} / {design.swy[r]:.6g} in the fit")
     replicates = np.empty((samples, design.num_params))
-    unconverged = 0
+    unconverged = inexact = 0
     for s in range(samples):
         sw, swy = np.zeros(R), np.zeros(R)
         if len(c_rows_a):
@@ -901,11 +938,15 @@ def bootstrap(fit_: BTFit, data: BootstrapData, *, samples: int, rng: np.random.
             weight = unit_weight[b_unit]
             np.add.at(sw, b_row, b_w * weight)
             np.add.at(swy, b_row, b_wy * weight)
-        replicates[s], _, converged = _newton(design, sw, swy, fit_.params, fit_.options)
+        replicates[s], _, converged, steps = _newton(design, sw, swy, fit_.params, fit_.options)
         unconverged += not converged
+        inexact += steps
     if unconverged:
         logger.warning("bootstrap of layout %r: %d of %d replicates did not converge (max_iter %d)", fit_.layout,
                        unconverged, samples, fit_.options.max_iter)
+    if inexact:
+        logger.warning("bootstrap of layout %r: %d Newton steps did not reach the conjugate-gradient tolerance",
+                       fit_.layout, inexact)
     return _summaries(fit_, replicates, top_k=top_k, quantile=quantile, ci_from_samples=True)
 
 
@@ -947,12 +988,14 @@ def chi2_sf(x: float, dof: int) -> float:
 
 
 def _identified_parameters(d: _Design, rows: Sequence[tuple[TeamKey, TeamKey, PairStat]]) -> int:
-    """Rank of the design of ``rows`` (the parameters the data identify): exact via the Gram matrix up to
-    ``dense_limit`` parameters; above it the upper bound ``entities - components + (T - 1)``, which can only make
-    the G2 test more conservative."""
-    if d.prior is not None:
-        gram = _dense_hessian(d, np.ones(len(d.keys))) - d.prior
-        return int(np.linalg.matrix_rank(gram, hermitian=True))
+    """Rank of the design of ``rows`` (the parameters the data identify): exact via the Gram matrix ``X^T X`` up to
+    ``EXACT_RANK_LIMIT`` parameters (an eigendecomposition of at most 500 x 500, milliseconds); above it the upper
+    bound ``entities - components + (T - 1)`` (exact for 1v1 rows whose sides are both played; with teams or an
+    unidentified side it overstates the rank), which can only make the G2 test more conservative."""
+    if d.num_params <= EXACT_RANK_LIMIT:
+        x = np.zeros((len(d.keys), d.num_params))
+        x[d.nz_row, d.nz_col] = d.nz_val
+        return int(np.linalg.matrix_rank(x.T @ x, hermitian=True))
     links = _UnionFind()
     for a, b, _ in rows:
         active = list(coefficients(a, b))
@@ -970,7 +1013,9 @@ def transitivity_test(table: ComparisonTable, fit_: BTFit, *, sources: Collectio
     LL_BT)`` is asymptotically ``chi^2`` with ``pairs - identified parameters`` degrees of freedom (the rank of the
     tested pairs' design: entities minus components plus the identified bias parameters); flagged at p <
     ``TRANSITIVITY_P``. With fractional weights (FFA) and draws the reference distribution is approximate.
-    ``worst_pairs`` are the tested pairs with the largest signed deviance residuals under that refit."""
+    ``worst_pairs`` are the tested pairs with the largest signed deviance residuals under that refit. A refit that
+    does not converge makes the test untestable: ``p_value = None``, not flagged (``g2`` / ``dof`` / ``worst_pairs``
+    as computed), with one WARNING."""
     design = fit_.design
     if design is None:
         return TransitivityResult(0.0, 0, None, False, 0, [])
@@ -986,7 +1031,13 @@ def transitivity_test(table: ComparisonTable, fit_: BTFit, *, sources: Collectio
         start[i] = fit_.params[design.index[entity]]
     if sub.num_teams == design.num_teams:
         start[len(sub.entities):] = fit_.params[len(design.entities):]
-    params, _, _ = _newton(sub, sub.sw, sub.swy, start, options)
+    params, _, converged, inexact = _newton(sub, sub.sw, sub.swy, start, options)
+    if not converged:
+        logger.warning("G2 transitivity test of layout %r: the refit of the tested pairs did not converge within "
+                       "%d iterations; the test is reported as untestable", fit_.layout, options.max_iter)
+    if inexact:
+        logger.warning("G2 transitivity test of layout %r: %d Newton steps did not reach the conjugate-gradient "
+                       "tolerance", fit_.layout, inexact)
     eta = _eta(sub, params)
     g2 = 0.0
     residuals: list[tuple[TeamKey, TeamKey, float, int]] = []
@@ -1002,7 +1053,7 @@ def transitivity_test(table: ComparisonTable, fit_: BTFit, *, sources: Collectio
         g2 += dev
         residuals.append((a, b, math.copysign(math.sqrt(dev), y / n - p), int(stat.n)))
     dof = len(rows) - _identified_parameters(sub, rows)
-    p_value = chi2_sf(g2, dof) if dof > 0 else None
+    p_value = chi2_sf(g2, dof) if dof > 0 and converged else None
     residuals.sort(key=lambda item: -abs(item[2]))
     return TransitivityResult(g2=g2, dof=dof, p_value=p_value,
                               flagged=p_value is not None and p_value < TRANSITIVITY_P, pairs_tested=len(rows),

@@ -258,8 +258,10 @@ def test_an_entity_that_always_loses_or_rarely_plays_gets_a_finite_rating():
 def test_the_transitivity_test_is_quiet_on_transitive_data_with_rare_pairs_and_flags_a_cycle():
     """Transitive: 6 entities with about 100 matches per pair and side, plus 10 entities with a few matches each
     (pairs below min_games are left out); under the null the p-value is approximately uniform (asymptotic chi^2 of
-    the likelihood-ratio statistic), so the assertion p > 1e-3 fails with probability < 1e-3 (seed 0 was
-    checked). A rock-paper-scissors cycle (80 % each way, 300 matches per pair) is flagged."""
+    the likelihood-ratio statistic), so the assertion p > 1e-4 fails with probability 1e-4 at the nominal level;
+    the measured level is about 1.7 times nominal (test below), and even a 5-fold excess in the tail keeps the
+    failure probability at 5e-4 < 1e-3 (seed 0 was checked). A rock-paper-scissors cycle (80 % each way, 300
+    matches per pair) is flagged."""
     rng = np.random.default_rng(0)
     strengths = {f"a{i}": i * 0.3 for i in range(6)}
 
@@ -274,7 +276,7 @@ def test_the_transitivity_test_is_quiet_on_transitive_data_with_rare_pairs_and_f
     table = bt_table(results)
     transitive = transitivity_test(table, fit(table, "2p", sources=TRAIN), sources=TRAIN)
     assert transitive.pairs_tested == 30 and transitive.dof > 0
-    assert transitive.p_value > 1e-3 and transitive.flagged == (transitive.p_value < 0.01)
+    assert transitive.p_value > 1e-4 and transitive.flagged == (transitive.p_value < 0.01)
     cycle = _duels({("A", "B"): (240, 60), ("B", "C"): (240, 60), ("C", "A"): (240, 60)})
     result = transitivity_test(cycle, fit(cycle, "2p", sources=TRAIN), sources=TRAIN)
     assert result.flagged and result.p_value < 1e-10 and len(result.worst_pairs) == 5
@@ -486,9 +488,9 @@ def test_the_transitivity_test_holds_its_level_when_rare_pairs_dominate():
     assert flags <= 5 and np.mean(p_values) > 0.25, (flags, np.mean(p_values))
 
 
-def _chain_table(versions: int = 40) -> ComparisonTable:
+def _chain_table(versions: int = 40, *, seed: int = 0, layout: str = "2p") -> ComparisonTable:
     """Every version plays one of its 3 predecessors (latest against recent snapshots); v0 plays ``random``."""
-    rng = np.random.default_rng(0)
+    rng = np.random.default_rng(seed)
     names = [f"main@v{v}" for v in range(versions)]
     strengths = {name: -2.0 + 0.05 * v for v, name in enumerate(names)} | {"random": -2.0}
 
@@ -498,7 +500,7 @@ def _chain_table(versions: int = 40) -> ComparisonTable:
         teams = [[names[i]], [other]]
         return teams if rng.random() < 0.5 else teams[::-1]
 
-    return bt_table(synthetic_bt_matches(strengths, n_matches=versions * 200, rng=rng, choose=choose))
+    return bt_table(synthetic_bt_matches(strengths, n_matches=versions * 200, rng=rng, choose=choose, layout=layout))
 
 
 def test_the_iterative_path_keeps_the_covariances_of_a_chain_graph():
@@ -618,3 +620,45 @@ def test_a_score_entity_with_one_match_has_no_interval_and_an_infinite_standard_
     assert summary.by_entity["b"] == (1, 2.0, math.inf)
     assert summary.by_entity["a"][2] < math.inf
     assert summary.to_dict()["entities"]["b"]["ci_low"] is None and json.dumps(summary.to_dict())
+
+
+def test_iterative_fits_of_different_layouts_draw_independently():
+    """T4.1 averages contrast samples across layouts draw by draw, so the fits' own draws must be independent
+    between layouts (a per-layout seed) and fixed within one (a deterministic fit). Two independent tables as
+    layouts "a" and "b": for independent draws the sample correlation of 400 pairs has sd 1 / sqrt(400) = 0.05;
+    the bound 0.3 on every one of the 40 versions' |correlation| is 6 sd (two-sided 2e-9 each; shared draws give
+    about 0.99): a correct implementation fails with probability below 1e-7."""
+    options = BTOptions(dense_limit=5)
+    fits = [fit(_chain_table(seed=seed, layout=layout), layout, sources=TRAIN, random_bot="random", options=options)
+            for seed, layout in ((11, "a"), (12, "b"))]
+    again = fit(_chain_table(seed=11, layout="a"), "a", sources=TRAIN, random_bot="random", options=options)
+    assert np.array_equal(again.draws, fits[0].draws)
+    first, second = (laplace(f, samples=400, rng=np.random.default_rng(0)) for f in fits)
+    correlations = [abs(float(np.corrcoef(first.contrast_samples[e], second.contrast_samples[e])[0, 1]))
+                    for e in first.contrast_samples if e != "random"]
+    assert len(correlations) == 40 and max(correlations) < 0.3, max(correlations)
+
+
+def test_solver_shortfalls_are_reported(monkeypatch, caplog):
+    """A G2 refit that does not converge is untestable (p None, not flagged); conjugate-gradient solves that stop
+    at max_iter (Newton steps, perturb-and-solve draws) are counted in one WARNING each."""
+    import functools
+
+    import colosseum.arena.bt as bt
+
+    cycle = _duels({("A", "B"): (240, 60), ("B", "C"): (240, 60), ("C", "A"): (240, 60)})
+    fitted = fit(cycle, "2p", sources=TRAIN)
+    real_newton = bt._newton
+    monkeypatch.setattr(bt, "_newton", lambda *a, **k: (*real_newton(*a, **k)[:2], False, 0))
+    with caplog.at_level(logging.WARNING, logger="colosseum.arena.bt"):
+        result = transitivity_test(cycle, fitted, sources=TRAIN)
+    assert (result.p_value, result.flagged) == (None, False) and result.g2 > 100
+    assert "reported as untestable" in caplog.text
+    monkeypatch.undo()
+    caplog.clear()
+    monkeypatch.setattr(bt, "_cg", functools.partial(bt._cg, max_iter=1))
+    monkeypatch.setattr(bt, "_block_cg", functools.partial(bt._block_cg, max_iter=2))
+    with caplog.at_level(logging.WARNING, logger="colosseum.arena.bt"):
+        fit(_chain_table(10), "2p", sources=TRAIN, random_bot="random", options=BTOptions(dense_limit=5))
+    assert "Newton steps did not reach the conjugate-gradient tolerance" in caplog.text
+    assert f"of {bt.ITERATIVE_SAMPLES} perturb-and-solve draws did not reach" in caplog.text
