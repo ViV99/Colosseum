@@ -32,7 +32,7 @@ def test_self_play_reaches_the_budget_and_checkpoints_carry_roles(tmp_path):
     final = metas(run, "agent_0")[-1]
     assert final["final"] is True and final["roles"] and isinstance(final["role_signature"], str)
     ratings = run.ratings()
-    assert set(ratings) == {"env_steps", "layouts"} and ratings["layouts"]
+    assert set(ratings) == {"env_steps", "layouts", "bt"} and ratings["layouts"]   # SP4: "bt"
     assert all("layouts" in r for r in run.records("ratings"))
     assert sum(r["episodes"] for r in run.records("episodes")) > 0
 

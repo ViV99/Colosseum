@@ -27,11 +27,13 @@ def test_metrics_jsonl_ratings_json_and_console(tmp_path):
     assert systems[-1]["env_steps"] >= BUDGET
     assert any(r["workers_reporting"] >= 1 for r in systems)
     ratings = run.ratings()
-    assert set(ratings) == {"env_steps", "layouts"}
+    assert set(ratings) == {"env_steps", "layouts", "bt"}               # SP4: the live Bradley-Terry section
     assert set(ratings["layouts"]["2p"]) >= {"elo", "win_rates", "games", "wr_vs_past", "past_games"}
     assert "pfsp" in ratings["layouts"]["2p"]
     last_ratings_record = run.records("ratings")[-1]
     assert set(last_ratings_record["layouts"]["2p"]) >= {"elo", "win_rates", "games", "wr_vs_past"}
+    # SP4 (spec block 7.3): the records carry a PFSP summary; the full table stays in ratings.json
+    assert "pfsp" not in last_ratings_record["layouts"]["2p"] and "pfsp_summary" in last_ratings_record["layouts"]["2p"]
     assert "[agent_0] step" in run.stderr  # console progress (main logs INFO to stderr)
 
 

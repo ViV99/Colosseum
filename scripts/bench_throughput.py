@@ -171,6 +171,7 @@ def _make_config(num_workers: int, run_parent: str):
         # SP4 criterion 3.6: the journal is on while throughput is measured.
         match_log={"enabled": True, "detail_window_mb": 512.0, "min_free_disk_mb": 2048.0,
                    "compact_interval_sec": 60.0},
+        ratings={"anchor": None, "refit_interval_sec": 60.0, "bootstrap_samples": 200},
         transport={"mode": "local"},
     )
 

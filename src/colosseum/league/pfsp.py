@@ -33,6 +33,29 @@ def player_name(player: PlayerKey) -> str:
     return f"{player[0]}@{player[1]}"
 
 
+def pfsp_summary(table: Mapping[str, Mapping[str, Mapping[str, float]]]) -> dict[str, dict]:
+    """The compact form of one layout's PFSP table (``snapshot()[layout]``) for the ``ratings`` records of
+    metrics.jsonl (SP4 spec block 7.3): per owner the number of players and their smallest / largest score."""
+    out = {}
+    for owner, players in table.items():
+        scores = [float(cell["score"]) for cell in players.values()]
+        out[owner] = {"players": len(scores), "min_score": min(scores) if scores else None,
+                      "max_score": max(scores) if scores else None}
+    return out
+
+
+def compact_ratings(layouts: Mapping[str, Mapping]) -> dict[str, dict]:
+    """``Coordinator.ratings_snapshot()`` with each layout's ``pfsp`` table replaced by ``pfsp_summary`` (the full
+    table stays in ratings.json)."""
+    out = {}
+    for layout, table in layouts.items():
+        compact = {k: v for k, v in table.items() if k != "pfsp"}
+        if "pfsp" in table:
+            compact["pfsp_summary"] = pfsp_summary(table["pfsp"])
+        out[layout] = compact
+    return out
+
+
 def pfsp_weight(score: float, weighting: str, exponent: float) -> float:
     """Candidate weight of a player against whom the owner's score is ``score`` (module docstring)."""
     x = min(1.0, max(0.0, float(score)))

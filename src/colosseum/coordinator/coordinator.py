@@ -29,7 +29,7 @@ from colosseum.envs.game import GameSpec
 from colosseum.league.base import BaseMatchmaker, MatchmakerContext, build_matchmaker, load_matchmaker_class
 from colosseum.league.lineups import check_lineup
 from colosseum.league.mixture import MixtureMatchmaker, validate_matchmaking
-from colosseum.league.pfsp import PfspStats
+from colosseum.league.pfsp import PfspStats, compact_ratings
 
 logger = logging.getLogger(__name__)
 
@@ -205,13 +205,14 @@ class Coordinator:
     def match_results(self) -> list[MatchResult]:
         return list(self._match_results)
 
-    def ratings_snapshot(self) -> dict:
-        """``RatingBook.snapshot()`` with each layout's PFSP table under ``"pfsp"`` (JSON-serializable)."""
+    def ratings_snapshot(self, *, compact: bool = False) -> dict:
+        """``RatingBook.snapshot()`` with each layout's PFSP table under ``"pfsp"`` (JSON-serializable); with
+        ``compact`` the table is replaced by its ``pfsp_summary`` (the form of the metrics.jsonl records)."""
         snap = self._ratings.snapshot()
         pfsp = self._pfsp.snapshot()
         for layout, table in snap.items():
             table["pfsp"] = pfsp.get(layout, {})
-        return snap
+        return compact_ratings(snap) if compact else snap
 
     def save_checkpoint_payload(self, payload: dict, meta_extra: dict | None = None) -> str:
         """Persist a learner checkpoint payload (see ``learner.make_checkpoint_payload``).

@@ -544,6 +544,34 @@ def _check_warm_start(config: ColosseumConfig, spec: GameSpec, agent_configs: di
         report.lines.append("training.resume_from is set: agents restored from it ignore init")
 
 
+def _check_ratings(config: ColosseumConfig, report: ValidationReport) -> None:
+    """``ratings.anchor`` names an agent of the config (SP4 spec block 2); report the journal and rating
+    settings."""
+    from colosseum.arena.live import random_bot_agent
+
+    anchor = config.ratings.anchor
+    if anchor is not None and anchor not in config.agent_ids():
+        raise ConfigError(f"ratings.anchor {anchor!r} is not an agent of the config (agents: {config.agent_ids()}); "
+                          f"name one of them or remove ratings.anchor")
+    log = config.match_log
+    if not log.enabled:
+        report.lines.append("match log: off (no snapshot ratings)")
+        return
+    report.lines.append(f"match log: on (detail window {log.detail_window_mb:g} MB, min free disk "
+                        f"{log.min_free_disk_mb:g} MB, compaction every {log.compact_interval_sec:g} s)")
+    if anchor is not None:
+        rule = f"anchor {anchor!r}"
+    elif (random_bot := random_bot_agent(config)) is not None:
+        rule = f"anchor {random_bot!r} (the first RandomBot agent)"
+    elif config.fixed_agent_ids():
+        rule = f"anchor: the mean of the fixed agents that played ({', '.join(config.fixed_agent_ids())})"
+    else:
+        rule = "anchor: v0 of the first trainable agent"
+    ratings = config.ratings
+    report.lines.append(f"ratings: Bradley-Terry over train and pulse matches, refit every "
+                        f"{ratings.refit_interval_sec:g} s, {rule}; bootstrap {ratings.bootstrap_samples}")
+
+
 def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] = "train",
                     players: Collection[str] | None = None) -> ValidationReport:
     """Check a whole config before any process starts (spec block 9; SP3 spec block 1).
@@ -599,6 +627,7 @@ def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] 
             report.lines.append(f"matchmaker: {config.matchmaking.matchmaker_class} (custom; the mix below is the "
                                 f"configured matchmaking section, which it may ignore)")
         report.lines.extend(describe_mix(config, spec))
+        _check_ratings(config, report)
     fixed = load_fixed_players(config, spec, selected)   # roles, classes, paths and role signatures of fixed agents
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_roles}
     role_specs = {aid: agent_role_spec(spec, roles) for aid, roles in agent_roles.items()}

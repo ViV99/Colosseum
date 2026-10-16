@@ -16,7 +16,7 @@ SP3: ``agents.<id>.kind`` (trainable / scripted / frozen) and the implicit train
 SP3: ``checkpoint.keep_last`` / ``keep_every`` (``pool_size`` is read as ``keep_last``).
 SP3: ``init`` and ``kickstart`` sections (global + per agent); ``training.kickstart_*`` are translated
 into ``kickstart``.
-SP4: the global ``match_log`` section.
+SP4: the global ``match_log`` and ``ratings`` sections.
 """
 
 from __future__ import annotations
@@ -679,6 +679,20 @@ class MatchLogConfig(StrictModel):
     compact_interval_sec: float = Field(default=60.0, gt=0, description="Seconds between compaction passes.")
 
 
+class RatingsConfig(StrictModel):
+    """Snapshot ratings (SP4 spec block 2): Bradley-Terry over the match log. Global only."""
+
+    anchor: str | None = Field(
+        default=None,
+        description="Agent of the config whose rating is 0 in every role group and component it plays in (a "
+                    "trainable agent: its first version bucket). null: the first RandomBot agent, else the mean of the "
+                    "scripted / frozen agents, else v0 of the first trainable agent.",
+    )
+    refit_interval_sec: float = Field(default=60.0, gt=0, description="Seconds between live refits during training.")
+    bootstrap_samples: int = Field(
+        default=200, ge=20, description="Bootstrap replicates for reports, tournaments and --snapshots top:N.")
+
+
 class RunConfig(StrictModel):
     """Where a training run writes its outputs: ``<dir>/<name>/``."""
 
@@ -909,6 +923,7 @@ class ColosseumConfig(StrictModel):
     kickstart: KickstartConfig = Field(default_factory=KickstartConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
     match_log: MatchLogConfig = Field(default_factory=MatchLogConfig)
+    ratings: RatingsConfig = Field(default_factory=RatingsConfig)
     bc: BCConfig = Field(default_factory=BCConfig)
     transport: TransportConfig = Field(default_factory=TransportConfig)
     run: RunConfig = Field(default_factory=RunConfig)

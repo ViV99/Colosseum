@@ -383,6 +383,8 @@ class Launcher:
         self._comparison_table = None
         self._match_log_stopped = False
         self._results_received = 0
+        # Set by launch() with the journal: the live Bradley-Terry refit thread (T2.2).
+        self._live_ratings = None
 
     @property
     def env_steps_done(self) -> int:
@@ -485,6 +487,7 @@ class Launcher:
             # The journal is opened (and a resumed run's journal imported) before any child starts: a schema or
             # file problem is a ConfigError that leaves no child behind; _finish_metrics stops the writer.
             self._open_match_log(coordinator)
+            self._open_live_ratings()
             started = False
             try:
                 self._start_children(
@@ -671,9 +674,10 @@ class Launcher:
             self._drain_results()
             self._drain_metrics()
             env_steps = int(self._env_step_counter.value)
-            self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot(),
+            # The method itself: the hub builds the ratings snapshot only when a tick is due (spec block 7.3).
+            self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot,
                                  queue_depths=queue_depths(self._trajectory_queues),
-                                 match_log=self._match_log_stats())
+                                 match_log=self._match_log_stats(), bt=self._live_snapshot())
             if self._supervisor.received_signal is not None:
                 return self._signal_exit_code()
             if self._stop_event.is_set():
@@ -842,6 +846,47 @@ class Launcher:
         logger.info(f"Match log: {path} (detail window {mlc.detail_window_mb:g} MB, min free disk "
                     f"{mlc.min_free_disk_mb:g} MB, compaction every {mlc.compact_interval_sec:g} s)")
 
+    def _open_live_ratings(self) -> None:
+        """The live Bradley-Terry refit thread over the writer's in-memory table (spec block 2); none without the
+        journal. ``top_k`` is 0 until snapshot retention by rating exists (T4.1)."""
+        if self._comparison_table is None:
+            return
+        from colosseum.arena.live import LiveRatings, rating_inputs
+
+        cfg = self._config
+        options, fixed_agents, random_bot = rating_inputs(cfg)
+        self._live_ratings = LiveRatings(
+            self._comparison_table, interval_sec=cfg.ratings.refit_interval_sec,
+            options=options, fixed_agents=fixed_agents,
+            random_bot=random_bot, agent_order=cfg.agent_ids(), top_k=0, quantile=0.1,
+            env_steps_fn=lambda: int(self._env_step_counter.value), seed=cfg.training.seed or 0)
+        self._live_ratings.start()
+        logger.info(f"Live ratings: Bradley-Terry refit every {cfg.ratings.refit_interval_sec:g} s")
+
+    def _live_snapshot(self):
+        """The newest live ratings snapshot (None without live ratings or before the first refit)."""
+        return None if self._live_ratings is None else self._live_ratings.latest()
+
+    def _finish_live_ratings(self):
+        """Stop the refit thread; refit once more on the final data (the journal writer has flushed) unless the
+        last refit was slow (``FINAL_REFIT_MAX_SEC``). Returns the newest snapshot (None without live ratings)."""
+        if self._live_ratings is None:
+            return None
+        from colosseum.arena.live import FINAL_REFIT_MAX_SEC
+
+        self._live_ratings.stop(SHUTDOWN_GRACE_SEC)
+        last = self._live_ratings.last_refit_sec
+        if last is None or last <= FINAL_REFIT_MAX_SEC:
+            try:
+                return self._live_ratings.refit_now()
+            except Exception:  # noqa: BLE001 - the final records are still written
+                logger.exception("Live ratings: the final refit failed; ratings.json keeps the last snapshot")
+        else:
+            logger.info(f"Live ratings: the last refit took {last:.1f} s (over {FINAL_REFIT_MAX_SEC:g} s); no final "
+                        f"refit, so ratings.json keeps the snapshot of env step "
+                        f"{self._live_ratings.latest().env_steps} and may miss the games since")
+        return self._live_ratings.latest()
+
     def _on_snapshot_evicted(self, agent_id: str, checkpoint_id: str) -> None:
         """Coordinator evict listener (main loop): the journal folds the evicted snapshot's training matches."""
         from colosseum.arena.entities import entity_key, snapshot_version
@@ -886,15 +931,18 @@ class Launcher:
                 self._drain_results()
                 self._drain_metrics()
                 self._stop_match_log()
+                final_bt = self._finish_live_ratings()
                 self._hub.close(env_steps=int(self._env_step_counter.value),
-                                ratings=self._coordinator.ratings_snapshot(),
+                                ratings=self._coordinator.ratings_snapshot,
                                 queue_depths=queue_depths(self._trajectory_queues),
-                                match_log=self._match_log_stats())
+                                match_log=self._match_log_stats(), bt=final_bt)
         finally:
             try:
                 self._stop_match_log()            # also when the final drains failed
+                if self._live_ratings is not None:
+                    self._live_ratings.stop(SHUTDOWN_GRACE_SEC)
             except Exception:  # noqa: BLE001 - must not replace the original error
-                logger.exception("Stopping the match log writer failed")
+                logger.exception("Stopping the match log writer or the live ratings failed")
             try:
                 if self._metrics_writer is not None:
                     self._metrics_writer.close()

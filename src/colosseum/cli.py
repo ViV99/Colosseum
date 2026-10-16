@@ -125,6 +125,9 @@ def train(config: str, overrides: tuple[str, ...]) -> None:
 
     Exit code: 0 budget reached, 1 config error or a child process died, 130 SIGINT, 143 SIGTERM.
     """
+    from colosseum.utils.process import limit_main_blas_threads
+
+    limit_main_blas_threads()   # first: numpy is imported below; this process's BLAS gets one thread (SP4)
     with _config_errors():
         from colosseum.launcher import run_training  # imports torch: about a second
 
