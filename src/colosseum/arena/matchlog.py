@@ -71,8 +71,10 @@ READ_BATCH = 10_000
 MAX_BATCH = 10_000
 # Bound parameters per statement: SQLite before 3.32 allows at most 999.
 BIND_CHUNK = 500
-# A reader retries a table read this often when a compaction committed in between (``compact_generation``).
-CONSISTENT_READ_ATTEMPTS = 3
+# A reader retries a table read this often when a compaction committed in between (``compact_generation``),
+# sleeping ``CONSISTENT_READ_BACKOFF_SEC * attempt`` before each retry so that a running compaction can finish.
+CONSISTENT_READ_ATTEMPTS = 5
+CONSISTENT_READ_BACKOFF_SEC = 0.05
 # Estimated bytes of one detailed match: the rows' payload (the uid twice: its UNIQUE index repeats it) times an
 # overhead factor for B-tree pages and the indexes. Calibrated on 1v1, 2v2 and 4-team FFA matches: the estimate
 # is within 7 % of the pages SQLite really uses (T1.2).
@@ -406,15 +408,21 @@ class _Store:
 
     def _consistent(self, read: Callable[[], object], what: str):
         """Run ``read`` (several queries, each its own transaction) until no compaction committed during it
-        (``compact_generation`` unchanged), at most ``CONSISTENT_READ_ATTEMPTS`` times; then accept the last read
-        (DEBUG): a compaction moves matches from detail to counts, so a read across one can miss them."""
-        for _ in range(CONSISTENT_READ_ATTEMPTS):
+        (``compact_generation`` unchanged): a compaction moves matches from detail to counts, so a read across one
+        can miss them. At most ``CONSISTENT_READ_ATTEMPTS`` attempts with a growing back-off; then the last read
+        is returned with a WARNING (it may undercount)."""
+        overlapped = 0
+        for attempt in range(CONSISTENT_READ_ATTEMPTS):
+            if attempt:
+                time.sleep(CONSISTENT_READ_BACKOFF_SEC * attempt)
             before = self._generation()
             out = read()
-            if self._generation() == before:
+            after = self._generation()
+            if after == before:
                 return out
-        logger.debug(f"Match log: {what} read across a compaction {CONSISTENT_READ_ATTEMPTS} times; accepted the "
-                     f"last read")
+            overlapped += after - before
+        logger.warning(f"Match log: the {what} read overlapped {overlapped} compaction batches in "
+                       f"{CONSISTENT_READ_ATTEMPTS} attempts; the result may undercount until the next read")
         return out
 
     def _table(self, sources: Collection[str], tournament: str | None) -> ComparisonTable:
@@ -789,7 +797,9 @@ class MatchLog(_Store):
     def import_parent(self, parent_path: str | Path) -> ImportStats:
         """Run-dir resume (spec block 1): copy the parent journal's ``runs`` rows, counts, tournament and pulse
         matches; fold its detailed training matches into this journal's counts (their detail stays in the
-        parent's journal). One transaction: a failure leaves this journal unchanged. Idempotent: a parent already
+        parent's journal). One transaction: a failure leaves this journal unchanged. The transaction holds the
+        journal's write lock for the whole import, so it must run at start-up, before any other writer opens the
+        journal. Idempotent: a parent already
         imported (marker ``imported:<parent run id>`` in ``meta``) is skipped with an INFO line
         (``ImportStats.skipped``)."""
         stats = ImportStats()

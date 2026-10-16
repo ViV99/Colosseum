@@ -453,10 +453,11 @@ def test_a_failed_append_surfaces_its_error_and_leaves_no_stale_ids(tmp_path):
     with pytest.raises(sqlite3.OperationalError, match="full"):
         log.append(big)
     log._conn.execute("PRAGMA max_page_count = 1073741823")
-    assert log.append([make_match_result([(0, "a0", "fixed"), (1, "b", "fixed")], uid="L2")]).detailed == 1
+    # "q0" was cached during the failed batch: a stale cached id would mislabel (or lose) this seat
+    assert log.append([make_match_result([(0, "a0", "fixed"), (1, "q0", "fixed")], uid="L2")]).detailed == 1
     with MatchLogReader(log.path) as reader:
         row = reader.matches(limit=1)[0]
-        assert row.uid == "L2" and [(s.agent_id, s.entity) for s in row.seats] == [("a0", "a0"), ("b", "b")]
+        assert row.uid == "L2" and [(s.agent_id, s.entity) for s in row.seats] == [("a0", "a0"), ("q0", "q0")]
         assert reader.sizes().detail_matches == 6
     log.close()
 
@@ -483,6 +484,36 @@ def test_a_read_across_a_compaction_is_retried(tmp_path, monkeypatch):
     calls.clear()
     counts, details = reader.bootstrap_units("2p", ("train",))
     assert len(calls) == 2 and sum(stat.n for _, _, stat in counts) + len(details) == len(results)
+    reader.close()
+    log.close()
+
+
+def test_a_read_that_overlaps_every_attempt_warns_and_returns(tmp_path, monkeypatch, caplog):
+    """The bounded retry's fallback: a compaction batch commits during every attempt, so the reader gives up after
+    ``CONSISTENT_READ_ATTEMPTS`` reads and returns the last one with a WARNING."""
+    import colosseum.arena.matchlog as matchlog
+
+    log = _log(tmp_path)
+    log.append(synthetic_journal_results(60))
+    reader = MatchLogReader(log.path)
+    original = reader._iter_detail
+    calls, sleeps = [], []
+
+    def iter_detail(where, args):
+        calls.append(1)
+        log.compact(window_bytes=log.sizes().detail_bytes - 1, max_batch=1)      # one batch per attempt
+        return original(where, args)
+
+    monkeypatch.setattr(reader, "_iter_detail", iter_detail)
+    monkeypatch.setattr(matchlog.time, "sleep", sleeps.append)
+    with caplog.at_level(logging.WARNING, logger="colosseum.arena.matchlog"):
+        table = reader.comparison_table(("train",))
+    attempts = matchlog.CONSISTENT_READ_ATTEMPTS
+    assert len(calls) == attempts and table.layouts() == ["2p"]
+    assert sleeps == [matchlog.CONSISTENT_READ_BACKOFF_SEC * k for k in range(1, attempts)]
+    (warning,) = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert f"overlapped {attempts} compaction batches" in warning.getMessage()
+    assert "may undercount" in warning.getMessage()
     reader.close()
     log.close()
 
