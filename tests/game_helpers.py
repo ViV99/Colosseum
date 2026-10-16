@@ -1391,3 +1391,57 @@ class LabelBot(ScriptedBot):
         if self.fail == "raise":
             raise RuntimeError("teacher bot failure")
         return np.int64(self.action)
+# ---------------------------------------------------------------------------
+# SP4 (T1.2): match records for journal and rating tests
+# ---------------------------------------------------------------------------
+
+
+def make_match_result(seats: Sequence[tuple], ranks: Sequence[float] | None = None, *, layout: str = "2p",
+                      uid: str = "u0", source: str = "train", scores: Sequence[float] | None = None,
+                      match_id: str | None = None, env_steps: int | None = None, seed: int | None = None,
+                      block: str | None = None, length: int = 5, outcome_kind: str | None = None):
+    """A ``MatchResult`` from compact seat tuples ``(team, agent_id, network_id[, role[, version_start[,
+    version_end]]])`` in seat order. ``ranks`` / ``scores``: one per team (default: team 0 best, then 1, ...; scores
+    0); the outcome kind follows the number of teams unless given."""
+    from colosseum.core.types import MatchResult, SeatResult, TeamResult
+
+    seat_results = []
+    for i, spec in enumerate(seats):
+        team, agent, network, *rest = spec
+        role = rest[0] if len(rest) > 0 else "player"
+        start = rest[1] if len(rest) > 1 else None
+        end = rest[2] if len(rest) > 2 else start
+        seat_results.append(SeatResult(seat=i, role=role, team=int(team), agent_id=agent, network_id=network,
+                                       reward=0.0, version_start=start, version_end=end))
+    num_teams = 1 + max(s.team for s in seat_results)
+    ranks = list(ranks) if ranks is not None else [float(t + 1) for t in range(num_teams)]
+    scores = list(scores) if scores is not None else [0.0] * num_teams
+    kind = outcome_kind or ("score" if num_teams == 1 else "wdl" if num_teams == 2 else "rank")
+    return MatchResult(match_id=match_id or uid, layout=layout, outcome_kind=kind, seats=seat_results,
+                       teams=[TeamResult(t, float(ranks[t]), float(scores[t])) for t in range(num_teams)],
+                       episode_length=length, uid=uid, source=source, seed=seed, env_steps=env_steps, block=block)
+
+
+def synthetic_journal_results(n: int, *, seed: int = 0, prefix: str = "R/train/", source: str = "train",
+                              layout: str = "2p", interval: int = 10, first: int = 0) -> list:
+    """``n`` tic-tac-toe-like 1v1 results for journal tests: agent ``main``'s latest weights (``version_start`` in
+    ``[0, 3 * interval)``, i.e. buckets v0 / v10 / v20 at the default interval) against ``main@ckpt_v10``,
+    ``main@ckpt_v20``, the fixed agents ``random`` / ``greedy`` or latest itself, on random sides, with draws.
+    uids ``<prefix>w0_e<k % 4>_ep<k>`` for ``k = first .. first + n - 1``; ``env_steps = 10 * k``."""
+    rng = np.random.default_rng(seed)
+    opponents = [("main", "ckpt_v10"), ("main", "ckpt_v20"), ("random", "fixed"), ("greedy", "fixed"),
+                 ("main", "latest")]
+    out = []
+    for k in range(first, first + n):
+        version = int(rng.integers(0, 3 * interval))
+        agent, network = opponents[int(rng.integers(len(opponents)))]
+        own = (0, "main", "latest", "player", version, version + int(rng.integers(0, 2)))
+        other = (1, agent, network, "player", version if network == "latest" else None,
+                 version if network == "latest" else None)
+        seats = [own, other] if rng.random() < 0.5 else [(0, *other[1:]), (1, *own[1:])]
+        u = rng.random()
+        ranks = [1.0, 1.0] if u < 0.1 else ([1.0, 2.0] if u < 0.55 else [2.0, 1.0])
+        out.append(make_match_result(seats, ranks, layout=layout, uid=f"{prefix}w0_e{k % 4}_ep{k}",
+                                     match_id=f"w0_e{k % 4}_ep{k}", source=source, env_steps=10 * k,
+                                     seed=int(rng.integers(2**31)), length=int(rng.integers(5, 10))))
+    return out
