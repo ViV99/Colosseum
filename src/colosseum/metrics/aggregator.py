@@ -200,13 +200,20 @@ class EpisodeAggregator:
         return out
 
 
+# Worker stats that are cumulative per worker: the run-level value is the sum over every worker ever seen of the
+# largest value it reported, so it never decreases (SP4 spec block 7.2).
+CUMULATIVE_WORKER_KEYS = ("dropped_results",)
+
+
 class SystemStats:
     """Throughput and queue health between two snapshots (SP1 behavior, unchanged).
 
     Rate baselines start at ``initial_env_steps`` and ``initial_train_steps[agent]`` (0 for
     agents not listed): the counters a resumed run continues from, so the first snapshot
     of a resumed run measures only progress made since the start, not the resumed totals.
-    Per-worker stats older than ``worker_timeout_sec`` (a dead or stuck worker) are forgotten.
+    Per-worker stats older than ``worker_timeout_sec`` (a dead or stuck worker) are forgotten, except the
+    ``CUMULATIVE_WORKER_KEYS`` counters, which are kept for the whole run. ``dropped_match_results`` = the workers'
+    dropped results + the journal writer's (``match_log["dropped"]``).
     """
 
     def __init__(self, clock: Callable[[], float] = time.monotonic, *, initial_env_steps: int = 0,
@@ -219,14 +226,25 @@ class SystemStats:
         self._train_steps: dict[str, int] = dict(self._last_train_steps)
         self._worker_timeout = float(worker_timeout_sec)
         self._workers: dict[int, tuple[float, dict]] = {}
+        self._cumulative: dict[str, dict[int, int]] = {key: {} for key in CUMULATIVE_WORKER_KEYS}
 
     def on_train_step(self, agent_id: str, train_step: int) -> None:
         self._train_steps[agent_id] = max(int(train_step), self._train_steps.get(agent_id, 0))
 
     def on_worker_stats(self, stats: dict) -> None:
-        self._workers[int(stats["worker_id"])] = (self._clock(), dict(stats))
+        worker = int(stats["worker_id"])
+        self._workers[worker] = (self._clock(), dict(stats))
+        for key, per_worker in self._cumulative.items():
+            if key in stats:
+                per_worker[worker] = max(per_worker.get(worker, 0), int(stats[key]))
 
-    def snapshot(self, env_steps: int, queue_depths: dict[str, int]) -> dict[str, Any]:
+    def cumulative(self, key: str) -> int:
+        """A ``CUMULATIVE_WORKER_KEYS`` counter for the whole run."""
+        return int(sum(self._cumulative[key].values()))
+
+    def snapshot(self, env_steps: int, queue_depths: dict[str, int], *,
+                 match_log: dict[str, Any] | None = None) -> dict[str, Any]:
+        """``match_log``: the journal writer's ``WriterStats.as_dict()`` (None: no journal)."""
         now = self._clock()
         dt = now - self._last_t
         self._workers = {w: v for w, v in self._workers.items() if now - v[0] <= self._worker_timeout}
@@ -244,6 +262,8 @@ class SystemStats:
             "parked_buffers": int(sum(int(w.get("parked_buffers", 0)) for _, w in self._workers.values())),
             "dropped_reward_episodes": int(sum(int(w.get("dropped_reward_episodes", 0))
                                                for _, w in self._workers.values())),
+            "dropped_match_results": self.cumulative("dropped_results") + int((match_log or {}).get("dropped", 0)),
+            "match_log": None if match_log is None else dict(match_log),
             "workers_reporting": len(self._workers),
         }
         self._last_t = now

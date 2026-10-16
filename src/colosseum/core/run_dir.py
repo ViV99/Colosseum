@@ -6,6 +6,7 @@
       logs/<process>.log       main, learner-<agent>, worker-<i>, worker-<i>-env<k>
       metrics.jsonl            one JSON record per line (T6.3)
       ratings.json             latest ratings snapshot (T6.3)
+      matches.db               the match log (SP4: colosseum.arena.matchlog)
       checkpoints/<agent>/ckpt_v<N>/{model.pt, trainer_state.pt, meta.json}
 """
 
@@ -84,6 +85,13 @@ class RunDir:
     @property
     def run_info_path(self) -> Path:
         return self.root / RUN_INFO_FILE
+
+    @property
+    def matches_path(self) -> Path:
+        # A local import: colosseum.arena.matchlog pulls in colosseum.core.types.
+        from colosseum.arena.matchlog import MATCH_LOG_FILE
+
+        return self.root / MATCH_LOG_FILE
 
     @property
     def run_id(self) -> str | None:

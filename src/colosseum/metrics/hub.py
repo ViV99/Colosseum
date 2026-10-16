@@ -131,12 +131,17 @@ class MetricsHub:
     def on_worker_stats(self, stats: dict) -> None:
         self._system.on_worker_stats(stats)
 
+    def system_cumulative(self, key: str) -> int:
+        """A run-level worker counter (``SystemStats.cumulative``)."""
+        return self._system.cumulative(key)
+
     def on_match_result(self, result) -> None:
         self._episodes.add(result)
 
     def maybe_tick(self, *, env_steps: int, ratings: dict, queue_depths: dict[str, int],
-                   force: bool = False) -> bool:
-        """``ratings`` is ``RatingBook.snapshot()``: ``{layout: {elo, win_rates, ...}}``."""
+                   force: bool = False, match_log: dict | None = None) -> bool:
+        """``ratings`` is ``RatingBook.snapshot()``: ``{layout: {elo, win_rates, ...}}``; ``match_log`` the journal
+        writer's ``WriterStats.as_dict()`` (None: no journal), written into the ``system`` record."""
         now = self._clock()
         if not force and now - self._last_tick < self._interval:
             return False
@@ -145,7 +150,7 @@ class MetricsHub:
         for agent_id, ep in episodes.items():
             self._writer.write("episodes", agent=agent_id, env_steps=int(env_steps), **ep)
             self._last_returns[agent_id] = ep["return_mean"]
-        system = self._system.snapshot(env_steps, queue_depths)
+        system = self._system.snapshot(env_steps, queue_depths, match_log=match_log)
         self._writer.write("system", **system)
         self._writer.write("ratings", env_steps=int(env_steps), layouts=ratings)
         write_json_atomic(self._ratings_path, {"env_steps": int(env_steps), "layouts": ratings})
@@ -175,9 +180,11 @@ class MetricsHub:
             ))
         self._console.emit(lines)
 
-    def close(self, *, env_steps: int, ratings: dict, queue_depths: dict[str, int]) -> None:
+    def close(self, *, env_steps: int, ratings: dict, queue_depths: dict[str, int],
+              match_log: dict | None = None) -> None:
         """Final records and ratings.json, then close the file (also if writing them fails)."""
         try:
-            self.maybe_tick(env_steps=env_steps, ratings=ratings, queue_depths=queue_depths, force=True)
+            self.maybe_tick(env_steps=env_steps, ratings=ratings, queue_depths=queue_depths, force=True,
+                            match_log=match_log)
         finally:
             self._writer.close()

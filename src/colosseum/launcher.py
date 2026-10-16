@@ -377,6 +377,12 @@ class Launcher:
         self._metrics_queue: mp.Queue | None = None
         # Set by launch(): this run's id (run.json; match uids and the journal's runs table).
         self._run_id: str | None = None
+        # Set by launch() when match_log.enabled: the journal writer thread and the in-memory comparison table it
+        # feeds (the live ratings' input, T2.2); results received from the workers so far.
+        self._match_log_writer = None
+        self._comparison_table = None
+        self._match_log_stopped = False
+        self._results_received = 0
 
     @property
     def env_steps_done(self) -> int:
@@ -476,6 +482,9 @@ class Launcher:
             # The metrics hub (and its file) exists before any child starts: an open failure here
             # cannot orphan children. _finish_metrics closes whatever was opened.
             self._open_metrics(resume_states)
+            # The journal is opened (and a resumed run's journal imported) before any child starts: a schema or
+            # file problem is a ConfigError that leaves no child behind; _finish_metrics stops the writer.
+            self._open_match_log(coordinator)
             started = False
             try:
                 self._start_children(
@@ -663,7 +672,8 @@ class Launcher:
             self._drain_metrics()
             env_steps = int(self._env_step_counter.value)
             self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot(),
-                                 queue_depths=queue_depths(self._trajectory_queues))
+                                 queue_depths=queue_depths(self._trajectory_queues),
+                                 match_log=self._match_log_stats())
             if self._supervisor.received_signal is not None:
                 return self._signal_exit_code()
             if self._stop_event.is_set():
@@ -735,9 +745,9 @@ class Launcher:
         return reader.drain()
 
     def _drain_results(self) -> None:
-        """Feed queued match results to the coordinator (ratings, PFSP) and the hub; a result without
-        ``env_steps`` is stamped with the global env-step counter at its arrival (spec block 1; a pulse result
-        arrives with its snapshot's, T6.1)."""
+        """Feed queued match results to the coordinator (ratings, PFSP), the hub and the journal writer (never
+        blocking: a full writer queue drops and counts); a result without ``env_steps`` is stamped with the
+        global env-step counter at its arrival (spec block 1; a pulse result arrives with its snapshot's, T6.1)."""
         if self._results_queue is None:
             return
         workers = lambda: [n for n in self._supervisor.names if n.startswith("worker-")]  # noqa: E731
@@ -750,6 +760,111 @@ class Launcher:
                 result.env_steps = env_steps
             self._coordinator.report_match_result(result)
             self._hub.on_match_result(result)
+        self._results_received += len(results)
+        if self._match_log_writer is not None:
+            self._match_log_writer.submit(results)
+
+    def _open_match_log(self, coordinator: Coordinator) -> None:
+        """The match log (spec block 1). The journal is opened here first, so a schema or file problem is a
+        ConfigError before any child starts (a file that is not an SQLite database is moved aside by
+        ``MatchLog``); a run-dir resume imports the resumed run's journal (an SP3 run dir has none: INFO, the
+        journal starts empty); the in-memory comparison table of the live ratings is read from it once; then the
+        writer thread starts with its own connection (opened in the thread). Evicted snapshots reach the writer
+        through the coordinator's evict listener."""
+        import sqlite3
+        from functools import partial
+        from pathlib import Path
+
+        from colosseum.arena.matchlog import (
+            MATCH_LOG_FILE,
+            RUN_SOURCES,
+            MatchLog,
+            MatchLogError,
+            MatchLogWriter,
+            RunInfo,
+        )
+        from colosseum.coordinator.checkpoint_manager import RESUME_RUN_DIR, classify_resume_source
+        from colosseum.core.config import config_hash
+        from colosseum.core.errors import ConfigError
+        from colosseum.core.run_dir import read_run_id
+
+        cfg = self._config
+        if not cfg.match_log.enabled:
+            logger.info("Match log: off (match_log.enabled is false)")
+            return
+        resume_from = cfg.training.resume_from
+        parent = (Path(resume_from) if resume_from and classify_resume_source(resume_from) == RESUME_RUN_DIR
+                  else None)
+        run = RunInfo(run_id=self._run_id, name=self._run_dir.run_name or self._run_dir.root.name,
+                      parent_run_id=read_run_id(parent) if parent is not None else None, game=cfg.env.env_class,
+                      config_hash=config_hash(cfg), checkpoint_interval=cfg.checkpoint.interval)
+        path = self._run_dir.matches_path
+        factory = partial(MatchLog, path, run, min_free_disk_mb=cfg.match_log.min_free_disk_mb)
+        hint = "move it away or set match_log.enabled: false"
+        try:
+            log = factory()
+        except MatchLogError as e:
+            raise ConfigError(f"Match log: {e}; {hint}") from e
+        except (sqlite3.Error, OSError) as e:
+            raise ConfigError(f"Match log {path} cannot be opened ({type(e).__name__}: {e}; locked by another "
+                              f"process or unreadable); {hint}") from e
+        try:
+            if parent is not None:
+                parent_log = parent / MATCH_LOG_FILE
+                if not parent_log.exists():
+                    logger.info(f"Match log: the resumed run dir {parent} has no {MATCH_LOG_FILE} (an SP3 run "
+                                f"dir); the journal starts empty")
+                else:
+                    try:
+                        stats = log.import_parent(parent_log)
+                    except (MatchLogError, sqlite3.Error, OSError) as e:
+                        raise ConfigError(f"Match log: importing the resumed run's journal {parent_log} failed "
+                                          f"({type(e).__name__}: {e}); this run's journal is unchanged; move "
+                                          f"{parent_log} away to resume without it, or set match_log.enabled: "
+                                          f"false") from e
+                    if not stats.skipped:
+                        logger.info(f"Match log: imported {parent_log}: {stats.counts_rows} counts rows, "
+                                    f"{stats.folded} detailed training matches folded into counts, "
+                                    f"{stats.copied} tournament / pulse matches copied")
+            try:
+                table = log.comparison_table(RUN_SOURCES)
+            except (MatchLogError, sqlite3.Error) as e:
+                raise ConfigError(f"Match log {path} cannot be read ({type(e).__name__}: {e}); {hint}") from e
+        finally:
+            log.close()
+        self._comparison_table = table
+        mlc = cfg.match_log
+        self._match_log_writer = MatchLogWriter(
+            factory, compact_interval_sec=mlc.compact_interval_sec,
+            window_bytes=int(mlc.detail_window_mb * 1024 * 1024), table=table)
+        self._match_log_writer.start()
+        coordinator.add_evict_listener(self._on_snapshot_evicted)
+        logger.info(f"Match log: {path} (detail window {mlc.detail_window_mb:g} MB, min free disk "
+                    f"{mlc.min_free_disk_mb:g} MB, compaction every {mlc.compact_interval_sec:g} s)")
+
+    def _on_snapshot_evicted(self, agent_id: str, checkpoint_id: str) -> None:
+        """Coordinator evict listener (main loop): the journal folds the evicted snapshot's training matches."""
+        from colosseum.arena.entities import entity_key, snapshot_version
+
+        version = snapshot_version(checkpoint_id)
+        if self._match_log_writer is not None and version is not None:
+            self._match_log_writer.note_evicted([entity_key(agent_id, version)])
+
+    def _match_log_stats(self) -> dict | None:
+        """The journal writer's stats for the ``system`` record (None without a journal)."""
+        return None if self._match_log_writer is None else self._match_log_writer.stats.as_dict()
+
+    def _stop_match_log(self) -> None:
+        """Flush and stop the journal writer (within SHUTDOWN_GRACE_SEC, after the children are gone and the final
+        drains are done); log the run's result accounting. Runs once."""
+        if self._match_log_writer is None or self._match_log_stopped:
+            return
+        self._match_log_stopped = True
+        stats = self._match_log_writer.stop(SHUTDOWN_GRACE_SEC)
+        worker_drops = self._hub.system_cumulative("dropped_results") if self._hub is not None else 0
+        logger.info(f"Match results: {self._results_received} received, {stats.written} journaled, "
+                    f"{stats.duplicates} duplicates, {stats.dropped} dropped by the journal writer, {worker_drops} "
+                    f"dropped by workers")
 
     def _drain_metrics(self) -> None:
         """Learner train metrics and worker stats share the metrics queue."""
@@ -762,17 +877,24 @@ class Launcher:
                 self._hub.on_train_metrics(item)
 
     def _finish_metrics(self) -> None:
-        """Record what arrived during shutdown (final train metrics, last results), write the
-        final records and ratings.json; the metrics file is closed and the WandB run finished
-        even if any of that fails (or if the hub was never built)."""
+        """Record what arrived during shutdown (final train metrics, last results), flush and stop
+        the journal writer, write the final records and ratings.json; the writer is stopped, the
+        metrics file closed and the WandB run finished even if any of that fails (or if the hub
+        was never built)."""
         try:
             if self._hub is not None:
                 self._drain_results()
                 self._drain_metrics()
+                self._stop_match_log()
                 self._hub.close(env_steps=int(self._env_step_counter.value),
                                 ratings=self._coordinator.ratings_snapshot(),
-                                queue_depths=queue_depths(self._trajectory_queues))
+                                queue_depths=queue_depths(self._trajectory_queues),
+                                match_log=self._match_log_stats())
         finally:
+            try:
+                self._stop_match_log()            # also when the final drains failed
+            except Exception:  # noqa: BLE001 - must not replace the original error
+                logger.exception("Stopping the match log writer failed")
             try:
                 if self._metrics_writer is not None:
                     self._metrics_writer.close()
