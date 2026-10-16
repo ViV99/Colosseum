@@ -394,6 +394,40 @@ def bc(
     click.echo(f"Weights saved to {output}")
 
 
+@main.command("pin")
+@click.argument("run_dir", type=click.Path(exists=True, file_okay=False))
+@click.argument("snapshot", required=False)
+@click.option("--remove", is_flag=True, default=False, help="Unpin instead of pin")
+@click.option("--list", "list_", is_flag=True, default=False, help="List every agent's stored snapshots")
+def pin_cmd(run_dir: str, snapshot: str | None, remove: bool, list_: bool) -> None:
+    """Pin a stored snapshot (AGENT@vN) of a run dir so retention never evicts it, unpin it (--remove) or list
+    the snapshots (--list). Safe while the run trains: its next retention pass sees the pin.
+
+    Exit code: 0 done, 1 config error (not a run dir, unknown agent or snapshot), 2 bad arguments.
+    """
+    from colosseum.coordinator.checkpoint_manager import list_snapshots, parse_snapshot_ref, pin_snapshot
+    from colosseum.core.errors import ConfigError
+
+    if list_ == (snapshot is not None):
+        raise click.UsageError("give either a snapshot (AGENT@vN) or --list")
+    if list_ and remove:
+        raise click.UsageError("--remove needs a snapshot, not --list")
+    if snapshot is not None:
+        try:
+            agent_id, version = parse_snapshot_ref(snapshot)
+        except ConfigError as e:  # a malformed reference is a usage error
+            raise click.BadParameter(str(e), param_hint="'SNAPSHOT'") from e
+    with _config_errors():
+        if list_:
+            for agent_id, infos in list_snapshots(run_dir).items():
+                names = [f"{c.checkpoint_id} (pinned)" if c.meta.get("pinned") is True else c.checkpoint_id
+                         for c in infos]
+                click.echo(f"{agent_id}: {', '.join(names)}")
+            return
+        path = pin_snapshot(run_dir, agent_id, version, pinned=not remove)
+    click.echo(f"{'Unpinned' if remove else 'Pinned'} {agent_id}@v{version} ({path})")
+
+
 @main.command("run-learner")
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
 @click.option("--agent", "-a", default="agent_0", help="Trainable agent id this learner owns")

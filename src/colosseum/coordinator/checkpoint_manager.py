@@ -220,6 +220,55 @@ def set_pinned(ckpt_dir: str | Path, pinned: bool) -> dict:
     return meta
 
 
+SNAPSHOT_REF_RE = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_-]*)@v(\d+)")
+
+
+def parse_snapshot_ref(text: str) -> tuple[str, int]:
+    """``"main@v1200"`` -> ``("main", 1200)``: a snapshot reference of the CLI (spec §8: ``agent@v<N>`` in the CLI
+    only; configs name agents). ConfigError for anything else."""
+    match = SNAPSHOT_REF_RE.fullmatch(text)
+    if match is None:
+        raise ConfigError(f"{text!r} is not a snapshot reference; write agent@v<version>, e.g. main@v1200")
+    return match.group(1), int(match.group(2))
+
+
+def _run_checkpoints(run_dir: str | Path) -> Path:
+    root = Path(run_dir)
+    ckpts = root / "checkpoints"
+    if not ckpts.is_dir():
+        raise ConfigError(f"{root} is not a run dir (no checkpoints/ inside); pass runs/<name>")
+    return ckpts
+
+
+def list_snapshots(run_dir: str | Path) -> dict[str, list[CheckpointInfo]]:
+    """Stored snapshots of every agent of a run dir, agents in name order, snapshots by version. Read-only: no
+    ``CheckpointManager`` scan (it would clean the tmp dirs of a live writer); malformed snapshots are skipped
+    with a warning (``read_snapshots``); agents without valid snapshots are left out."""
+    ckpts = _run_checkpoints(run_dir)
+    out: dict[str, list[CheckpointInfo]] = {}
+    for agent_dir in sorted(p for p in ckpts.iterdir() if p.is_dir() and not p.name.startswith(".")):
+        infos = read_snapshots(agent_dir)
+        if infos:
+            out[agent_dir.name] = infos
+    return out
+
+
+def pin_snapshot(run_dir: str | Path, agent_id: str, version: int, *, pinned: bool = True) -> Path:
+    """Pin (unpin) snapshot ``ckpt_v<version>`` of ``agent_id`` in ``run_dir`` by ``set_pinned``; idempotent and
+    safe while the run trains (its retention re-reads pins before every decision). Returns the snapshot dir.
+    ConfigError (not a run dir, an unknown agent or snapshot) naming the stored agents or snapshots."""
+    snapshots = list_snapshots(run_dir)
+    if agent_id not in snapshots:
+        raise ConfigError(f"{run_dir}: no snapshots of agent {agent_id!r}; agents with snapshots: {sorted(snapshots)}")
+    by_id = {c.checkpoint_id: c for c in snapshots[agent_id]}
+    checkpoint_id = f"ckpt_v{int(version)}"
+    if checkpoint_id not in by_id:
+        raise ConfigError(f"{run_dir}: agent {agent_id!r} has no stored snapshot {checkpoint_id} (newest stored: "
+                          f"{list(by_id)[-10:]}); see colosseum pin {run_dir} --list")
+    set_pinned(by_id[checkpoint_id].path, pinned)
+    return by_id[checkpoint_id].path
+
+
 class CheckpointManager:
     """Saves snapshots atomically and applies the retention rules per agent (module docstring)."""
 
