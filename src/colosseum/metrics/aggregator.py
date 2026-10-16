@@ -202,7 +202,7 @@ class EpisodeAggregator:
 
 # Worker stats that are cumulative per worker: the run-level value is the sum over every worker ever seen of the
 # largest value it reported, so it never decreases (SP4 spec block 7.2).
-CUMULATIVE_WORKER_KEYS = ("dropped_results",)
+CUMULATIVE_WORKER_KEYS = ("dropped_results", "dropped_reward_episodes")
 
 
 class SystemStats:
@@ -260,8 +260,7 @@ class SystemStats:
             },
             "queue_depths": dict(queue_depths),
             "parked_buffers": int(sum(int(w.get("parked_buffers", 0)) for _, w in self._workers.values())),
-            "dropped_reward_episodes": int(sum(int(w.get("dropped_reward_episodes", 0))
-                                               for _, w in self._workers.values())),
+            "dropped_reward_episodes": self.cumulative("dropped_reward_episodes"),
             "dropped_match_results": self.cumulative("dropped_results") + int((match_log or {}).get("dropped", 0)),
             "match_log": None if match_log is None else dict(match_log),
             "workers_reporting": len(self._workers),

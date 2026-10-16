@@ -30,7 +30,7 @@ UNITS = RoleSpec(OBS, Units(6, gymnasium.spaces.Discrete(3)))
 UNITS_ONE = RoleSpec(OBS, Units(1, gymnasium.spaces.Discrete(3)))
 
 DIAGNOSTICS = {
-    "approx_kl", "clip_fraction", "clip_fraction_joint", "rho_mean", "rho_clip_frac", "c_clip_frac",
+    "approx_kl", "clip_fraction", "clip_fraction_joint", "rho_mean", "rho_trunc_mass", "c_trunc_mass",
     "log_rho_abs_mean", "log_rho_abs_p95", "log_rho_joint_abs_mean", "log_rho_joint_abs_p95", "ess",
     "deciders_valid_mean", "deciders_valid_max", "boot_frac", "pad_frac", "explained_variance",
 }
@@ -106,7 +106,8 @@ def test_zero_lag_diagnostics_are_exact(role, core):
     """Fresh chunks of the same weights: rho = 1 everywhere, nothing is clipped, ESS = 1.
 
     The bars are above 1 (as in SP1's zero-lag metric test): worker and learner log-probs agree
-    only up to float rounding (~1e-7), and a rho of 1 + 1e-7 is clipped by a bar of exactly 1.
+    only up to float rounding (~1e-7), and a rho of 1 + 1e-7 is clipped by a bar of exactly 1 (the truncated
+    mass at bars of 1 is tested in test_sp4_metric_changes.py).
     """
     torch.manual_seed(0)
     model = make_test_model(role, core=core)
@@ -116,7 +117,7 @@ def test_zero_lag_diagnostics_are_exact(role, core):
         losses = {k: float(v) for k, v in algo.compute_loss(chunks).items()}
     assert losses["ess"] == pytest.approx(1.0, abs=1e-6)
     assert losses["clip_fraction"] == losses["clip_fraction_joint"] == 0.0
-    assert losses["rho_clip_frac"] == losses["c_clip_frac"] == 0.0
+    assert losses["rho_trunc_mass"] == losses["c_trunc_mass"] == 0.0
     assert losses["rho_mean"] == pytest.approx(1.0, abs=1e-5)
     assert losses["log_rho_joint_abs_p95"] == pytest.approx(0.0, abs=1e-5)
     assert losses["log_rho_abs_p95"] == pytest.approx(0.0, abs=1e-5)
@@ -143,7 +144,7 @@ def test_log_rho_quantiles_and_ess_are_taken_over_act_slots():
     assert losses["log_rho_abs_p95"] == pytest.approx(float(torch.quantile(per_decider.abs(), 0.95)), abs=1e-5)
     assert losses["ess"] == pytest.approx(float(rho.sum() ** 2 / (rho.numel() * (rho ** 2).sum())), rel=1e-4)
     assert 0.0 < losses["ess"] < 1.0
-    assert losses["rho_clip_frac"] == pytest.approx(float((rho > 1.0).float().mean()))
+    assert losses["rho_trunc_mass"] == pytest.approx(float((rho - 1.0).clamp(min=0).sum() / rho.sum()), rel=1e-4)
 
 
 @pytest.mark.parametrize("role", [DISCRETE, UNITS_ONE], ids=["discrete", "units1"])

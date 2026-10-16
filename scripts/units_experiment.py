@@ -9,7 +9,8 @@ Afterwards the newest checkpoint of every run plays greedily (in-process ``play_
   score share own / (own + opponent), which does not saturate when every mode beats random.
 Diagnostics are the means over the last quarter of the run's ``train`` records in
 ``metrics.jsonl``: ``clip_fraction`` (per decider), ``clip_fraction_joint``, ``ess``,
-``log_rho_abs_p95``, ``log_rho_joint_abs_mean``, ``c_clip_frac``, ``deciders_valid_mean``.
+``log_rho_abs_p95``, ``log_rho_joint_abs_mean``, ``c_trunc_mass``, ``deciders_valid_mean`` (``c_clip_frac`` before
+SP4: the tables of ``docs/benchmarks.md`` recorded then keep that column).
 
 The script prints a Markdown table and the ``unit_trace`` recommendation of the decision rule
 (T8.4): keep ``geo_mean`` unless another trace, with ``ratio_mode=per_unit``, has a K=128 score
@@ -61,7 +62,7 @@ SP3_CELLS = (("per_unit", "auto"), ("joint", "auto"), ("per_unit", "none"))
 SE_FACTOR = 2.0          # SP3 rule: the K=128 gain must exceed 2 standard errors of the difference
 K8_TOLERANCE = 0.03      # SP3 rule: at K=8 the alternative may be at most this much worse
 DIAG_KEYS = ("clip_fraction", "clip_fraction_joint", "ess", "log_rho_abs_p95", "log_rho_joint_abs_mean",
-             "c_clip_frac", "deciders_valid_mean")
+             "c_trunc_mass", "deciders_valid_mean")
 DEFAULT_TRACE = "geo_mean"   # the rule's baseline (the spec's pre-experiment default); the current default is joint
 MARGIN = 0.05
 
