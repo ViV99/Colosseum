@@ -41,7 +41,7 @@ def _journal_matches(path) -> int:
 def test_every_match_is_journaled_once_or_counted(tmp_path):
     run = run_train(TTT_CONFIG, tmp_path, name="journal",
                     overrides={"training.total_timesteps": str(BUDGET), "match_log.compact_interval_sec": "1",
-                               "match_log.detail_window_mb": "0.05"})
+                               "match_log.detail_window_mb": "0.05", "checkpoint.keep_last": "1"})
     assert run.returncode == 0, run.stderr[-3000:]
     worker, accounting = _worker_stats(run), _accounting(run)
     assert worker["episodes"] > 100
@@ -55,6 +55,9 @@ def test_every_match_is_journaled_once_or_counted(tmp_path):
     # a 50 KB window: compaction folded matches into counts (the final record also counts the matches written after
     # the last pass; the disk bound itself is criterion 3.5, a slow test of part 3)
     assert system["match_log"]["folded"] > 0 and system["match_log"]["counts_rows"] > 0
+    # keep_last 1: snapshots are evicted about one checkpoint interval after their save, while their bucket's matches
+    # are the newest in the journal; the evict listener (Launcher._on_snapshot_evicted) makes the next pass fold them
+    assert system["match_log"]["evicted_folded"] > 0
 
 
 def test_journaled_seats_carry_versions_and_uids_the_run_id(tmp_path):

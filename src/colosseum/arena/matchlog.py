@@ -1071,32 +1071,34 @@ WRITE_BATCH = 2_000
 UNTOUCHED_WARNING_FLOOR = 64 * 1024 * 1024
 # ``stop(timeout)`` ends the flush this long before ``timeout``, so that closing the journal fits in it too.
 _STOP_MARGIN_SEC = 0.5
+# The ``LogSizes`` fields of ``WriterStats.as_dict()`` (null until the first sizes are read).
+_SIZE_KEYS = ("file_bytes", "wal_bytes", "detail_bytes", "detail_matches", "other_matches", "counts_rows",
+              "free_disk_bytes")
 
 
 @dataclass(frozen=True)
 class WriterStats:
-    """What the writer did so far (an immutable snapshot; the main loop reads it for the ``system`` record)."""
+    """What the writer did so far (an immutable snapshot; the main loop reads it for the ``system`` record).
+    Every submitted result ends up in exactly one of ``written``, ``duplicates``, ``dropped`` and ``pending``."""
 
     written: int = 0            # journaled results (detailed or counted)
-    dropped: int = 0            # lost: writer queue full, write errors, left in the queue at stop, journal unusable
+    dropped: int = 0            # lost: writer queue full, write errors, not written at stop, journal unusable
     duplicates: int = 0         # uids already in the journal
-    write_errors: int = 0       # failed appends and compaction passes
+    write_errors: int = 0       # failed appends, compaction passes and table feeds; a failed open or a dead thread
     compactions: int = 0
     folded: int = 0             # training matches folded into counts by compaction
+    evicted_folded: int = 0     # of which because they had an evicted snapshot's entity
     degraded: bool = False      # the disk guard is on (counts only)
     sizes: LogSizes | None = None   # after the last compaction pass (or the start / the stop)
-    pending: int = 0            # results waiting in the queue
+    pending: int = 0            # results waiting in the queue or being written
 
     def as_dict(self) -> dict:
-        """JSON-ready form for the ``system`` record (``match_log``)."""
+        """JSON-ready form for the ``system`` record (``match_log``); the ``LogSizes`` keys are null until the
+        sizes were read, so the record keeps one shape."""
         out = {"written": self.written, "dropped": self.dropped, "duplicates": self.duplicates,
                "write_errors": self.write_errors, "compactions": self.compactions, "folded": self.folded,
-               "degraded": self.degraded, "pending": self.pending}
-        if self.sizes is not None:
-            out.update({"file_bytes": self.sizes.file_bytes, "wal_bytes": self.sizes.wal_bytes,
-                        "detail_bytes": self.sizes.detail_bytes, "detail_matches": self.sizes.detail_matches,
-                        "other_matches": self.sizes.other_matches, "counts_rows": self.sizes.counts_rows,
-                        "free_disk_bytes": self.sizes.free_disk_bytes})
+               "evicted_folded": self.evicted_folded, "degraded": self.degraded, "pending": self.pending}
+        out.update({key: None if self.sizes is None else getattr(self.sizes, key) for key in _SIZE_KEYS})
         return out
 
 
@@ -1105,9 +1107,14 @@ class MatchLogWriter:
     the thread: a ``MatchLog`` connection belongs to the thread that opened it); ``table`` (optional) gets every
     journaled result; ``clock`` measures the compaction cadence and the stop deadline (monotonic).
 
-    Thread rules: the thread touches nothing of the caller but its queue, its stats (under its lock), the evicted
-    entities (under its lock) and ``table`` (internally locked). ``submit``, ``note_evicted`` and ``stop`` are
-    called from one thread (the main loop)."""
+    Thread rules: the thread touches nothing of the caller but its queue, its stats, its in-flight count and the
+    evicted entities (all under its lock) and ``table`` (internally locked). ``submit``, ``note_evicted`` and
+    ``stop`` are called from one thread (the main loop).
+
+    Accounting: a batch the thread took from the queue is "in flight" (``pending``) until its append returns.
+    When ``stop`` gives up waiting for the thread, the in-flight and queued results are counted as dropped and the
+    writer is abandoned: whatever the thread does afterwards no longer changes the stats. When the journal cannot
+    be opened or the thread dies, the writer is dead: queued and later results are counted as dropped."""
 
     def __init__(self, log_factory: Callable[[], MatchLog], *, queue_size: int = WRITER_QUEUE_SIZE,
                  compact_interval_sec: float, window_bytes: int, table: ComparisonTable | None = None,
@@ -1121,6 +1128,9 @@ class MatchLogWriter:
         self._clock = clock
         self._lock = threading.Lock()
         self._stats = WriterStats()
+        self._in_flight = 0
+        self._abandoned = False      # stop() gave up waiting: the thread's late updates are ignored
+        self._dead = False           # the thread cannot write (the journal is unusable or the thread died)
         self._evicted: set[EntityKey] = set()
         self._stop = threading.Event()
         self._deadline = math.inf
@@ -1130,40 +1140,59 @@ class MatchLogWriter:
     @property
     def stats(self) -> WriterStats:
         with self._lock:
-            return replace(self._stats, pending=self._queue.qsize())
+            return self._snapshot_locked()
 
-    def _bump(self, **delta: int) -> None:
-        with self._lock:
-            self._stats = replace(self._stats, **{k: getattr(self._stats, k) + v for k, v in delta.items()})
+    def _snapshot_locked(self) -> WriterStats:
+        return replace(self._stats, pending=self._queue.qsize() + self._in_flight)
 
-    def _set(self, **values) -> None:
+    def _bump_locked(self, **delta: int) -> None:
+        self._stats = replace(self._stats, **{k: getattr(self._stats, k) + v for k, v in delta.items()})
+
+    def _drain_locked(self) -> int:
+        """Remove everything queued; returns how many results that was."""
+        n = 0
+        while True:
+            try:
+                self._queue.get_nowait()
+            except queue.Empty:
+                return n
+            n += 1
+
+    def _thread_update(self, *, values: Mapping | None = None, **delta: int) -> bool:
+        """A stats update by the thread; ignored (False) once the writer is abandoned."""
         with self._lock:
-            self._stats = replace(self._stats, **values)
+            if self._abandoned:
+                return False
+            self._bump_locked(**delta)
+            if values:
+                self._stats = replace(self._stats, **values)
+            return True
 
     def start(self) -> None:
         self._thread = threading.Thread(target=self._run, name="match-log-writer", daemon=True)
         self._thread.start()
 
     def submit(self, results: Sequence[MatchResult]) -> int:
-        """Queue ``results`` without blocking; returns how many were dropped (queue full, or the writer is
-        stopped; counted, the first time a WARNING)."""
-        if self._stop.is_set():
-            dropped = len(results)
-        else:
-            dropped = 0
-            for result in results:
-                try:
-                    self._queue.put_nowait(result)
-                except queue.Full:
-                    dropped += 1
-        if dropped:
-            self._bump(dropped=dropped)
-            if not self._warned_drop:
-                self._warned_drop = True
-                reason = ("is stopped" if self._stop.is_set()
-                          else f"queue is full ({self._queue.maxsize} results)")
-                logger.warning(f"Match log writer {reason}; dropped {dropped} match results (counted in "
-                               f"dropped_match_results; further drops are only counted)")
+        """Queue ``results`` without blocking; returns how many were dropped (queue full, the writer stopped or
+        dead; counted, the first time a WARNING)."""
+        with self._lock:
+            if self._stop.is_set() or self._dead:
+                reason = "is stopped" if self._stop.is_set() else "is not running (the journal is unusable)"
+                dropped = len(results)
+            else:
+                reason = f"queue is full ({self._queue.maxsize} results)"
+                dropped = 0
+                for result in results:
+                    try:
+                        self._queue.put_nowait(result)
+                    except queue.Full:
+                        dropped += 1
+            if dropped:
+                self._bump_locked(dropped=dropped)
+        if dropped and not self._warned_drop:
+            self._warned_drop = True
+            logger.warning(f"Match log writer {reason}; dropped {dropped} match results (counted in "
+                           f"dropped_match_results; further drops are only counted)")
         return dropped
 
     def note_evicted(self, entities: Collection[EntityKey]) -> None:
@@ -1173,40 +1202,53 @@ class MatchLogWriter:
 
     def stop(self, timeout: float) -> WriterStats:
         """Stop compacting, write what is queued, close the journal; within ``timeout`` seconds. What could not be
-        written in time is counted as dropped (one WARNING). Idempotent; harmless without ``start``."""
+        written in time (queued, or in flight when the thread does not stop in time) is counted as dropped (one
+        WARNING); the returned stats are final. Idempotent; harmless without ``start``."""
         timeout = max(0.0, float(timeout))
         self._deadline = self._clock() + max(0.0, timeout - _STOP_MARGIN_SEC)
         self._stop.set()
+        alive = False
         if self._thread is not None:
             self._thread.join(timeout)
-            if self._thread.is_alive():
-                logger.warning(f"Match log writer did not stop within {timeout:.1f} s; the journal stays open "
-                               f"until the process exits")
-        left = 0
-        while True:
-            try:
-                self._queue.get_nowait()
-                left += 1
-            except queue.Empty:
-                break
+            alive = self._thread.is_alive()
+        with self._lock:
+            in_flight = 0
+            if alive:
+                self._abandoned = True
+                in_flight, self._in_flight = self._in_flight, 0
+            left = self._drain_locked()
+            if in_flight + left:
+                self._bump_locked(dropped=in_flight + left)
+            final = self._snapshot_locked()
+        if alive:
+            logger.warning(f"Match log writer did not stop within {timeout:.1f} s; the {in_flight} results it was "
+                           f"writing are counted as dropped (the journal stays open until the process exits)")
         if left:
-            self._bump(dropped=left)
             logger.warning(f"Match log writer stopped with {left} results not written (counted in "
                            f"dropped_match_results)")
-        return self.stats
+        return final
 
     # ---- the thread --------------------------------------------------------------------------------------------
 
     def _take(self, timeout: float) -> list[MatchResult]:
-        try:
-            batch = [self._queue.get(timeout=timeout) if timeout > 0 else self._queue.get_nowait()]
-        except queue.Empty:
-            return []
-        while len(batch) < WRITE_BATCH:
+        """Up to ``WRITE_BATCH`` queued results, now in flight; waits up to ``timeout`` for the first."""
+        batch: list[MatchResult] = []
+        if timeout > 0:
             try:
-                batch.append(self._queue.get_nowait())
+                batch.append(self._queue.get(timeout=timeout))
             except queue.Empty:
-                break
+                return []
+        with self._lock:
+            if self._abandoned:
+                if batch:
+                    self._bump_locked(dropped=len(batch))
+                return []
+            while len(batch) < WRITE_BATCH:
+                try:
+                    batch.append(self._queue.get_nowait())
+                except queue.Empty:
+                    break
+            self._in_flight = len(batch)
         return batch
 
     def _error(self, what: str, error: Exception) -> None:
@@ -1219,11 +1261,19 @@ class MatchLogWriter:
         try:
             stats = log.append(batch)
         except Exception as e:  # noqa: BLE001 - a journal problem must never stop training
-            self._bump(dropped=len(batch), write_errors=1)
+            with self._lock:
+                if self._abandoned:
+                    return
+                self._in_flight = 0
+                self._bump_locked(dropped=len(batch), write_errors=1)
             self._error(f"writing {len(batch)} results failed; they are counted in dropped_match_results", e)
             return
-        self._bump(written=stats.detailed + stats.counted, duplicates=stats.duplicates)
-        self._set(degraded=stats.degraded)
+        with self._lock:
+            if self._abandoned:                     # counted as dropped by stop()
+                return
+            self._in_flight = 0
+            self._bump_locked(written=stats.detailed + stats.counted, duplicates=stats.duplicates)
+            self._stats = replace(self._stats, degraded=stats.degraded)
         if self._table is None:
             return
         try:
@@ -1231,8 +1281,8 @@ class MatchLogWriter:
                 if accepted:
                     self._table.add_result(result, log.rating_versions(result))
         except Exception as e:  # noqa: BLE001 - journaled already; only the live ratings miss them
-            self._bump(write_errors=1)
-            self._error(f"adding {len(batch)} journaled results to the live comparison table failed", e)
+            if self._thread_update(write_errors=1):
+                self._error(f"adding {len(batch)} journaled results to the live comparison table failed", e)
 
     def _compact(self, log: MatchLog) -> None:
         with self._lock:
@@ -1241,10 +1291,10 @@ class MatchLogWriter:
             result = log.compact(window_bytes=self._window, evicted=evicted, should_stop=self._stop.is_set)
             sizes = log.sizes()
         except Exception as e:  # noqa: BLE001 - a journal problem must never stop training
-            self._bump(write_errors=1)
             with self._lock:
                 self._evicted |= evicted
-            self._error("compaction failed", e)
+            if self._thread_update(write_errors=1):
+                self._error("compaction failed", e)
             return
         if result.interrupted:
             with self._lock:
@@ -1255,14 +1305,44 @@ class MatchLogWriter:
             logger.warning(f"Match log: the parts compaction does not touch (counts, tournament and pulse matches) "
                            f"take {untouched / 2**20:.0f} MB, more than the detail window; the journal grows past "
                            f"match_log.detail_window_mb")
-        self._bump(compactions=1, folded=result.folded)
-        self._set(sizes=sizes)
+        self._thread_update(compactions=1, folded=result.folded, evicted_folded=result.evicted_folded,
+                            values={"sizes": sizes})
 
     def _refresh_sizes(self, log: MatchLog) -> None:
         try:
-            self._set(sizes=log.sizes())
+            sizes = log.sizes()
         except Exception as e:  # noqa: BLE001 - only the reported sizes are stale
             self._error("reading the journal sizes failed", e)
+            return
+        self._thread_update(values={"sizes": sizes})
+
+    def _die(self) -> None:
+        """The thread cannot write any more: the in-flight and queued results are dropped, and so are later ones
+        (``submit``)."""
+        with self._lock:
+            self._dead = True
+            if self._abandoned:
+                return
+            lost = self._in_flight + self._drain_locked()
+            self._in_flight = 0
+            self._bump_locked(dropped=lost, write_errors=1)
+
+    def _loop(self, log: MatchLog) -> None:
+        self._refresh_sizes(log)
+        last_compact = self._clock()
+        while not self._stop.is_set():
+            batch = self._take(0.2)
+            if batch:
+                self._write(log, batch)
+            if not self._stop.is_set() and self._clock() - last_compact >= self._interval:
+                self._compact(log)
+                last_compact = self._clock()
+        while self._clock() < self._deadline:          # stop(): flush the queue, no more compaction
+            batch = self._take(0.0)
+            if not batch:
+                break
+            self._write(log, batch)
+        self._refresh_sizes(log)
 
     def _run(self) -> None:
         try:
@@ -1270,26 +1350,13 @@ class MatchLogWriter:
         except Exception as e:  # noqa: BLE001 - reported; results are only counted from now on
             logger.error(f"Match log: opening the journal failed ({type(e).__name__}: {e}); match results are "
                          f"counted as dropped, training goes on", exc_info=True)
-            while not self._stop.is_set():
-                batch = self._take(0.2)
-                if batch:
-                    self._bump(dropped=len(batch), write_errors=1)
+            self._die()
             return
         try:
-            self._refresh_sizes(log)
-            last_compact = self._clock()
-            while not self._stop.is_set():
-                batch = self._take(0.2)
-                if batch:
-                    self._write(log, batch)
-                if not self._stop.is_set() and self._clock() - last_compact >= self._interval:
-                    self._compact(log)
-                    last_compact = self._clock()
-            while self._clock() < self._deadline:          # stop(): flush the queue, no more compaction
-                batch = self._take(0.0)
-                if not batch:
-                    break
-                self._write(log, batch)
-            self._refresh_sizes(log)
+            self._loop(log)
+        except Exception as e:  # noqa: BLE001 - reported; results are only counted from now on
+            logger.error(f"Match log: the match-log writer thread died ({type(e).__name__}: {e}); match results "
+                         f"are counted as dropped from now on, training goes on", exc_info=True)
+            self._die()
         finally:
             log.close()

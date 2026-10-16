@@ -22,6 +22,7 @@ from colosseum.arena.matchlog import (
     MatchLog,
     MatchLogWriter,
     RunInfo,
+    WriterStats,
 )
 from colosseum.metrics.aggregator import SystemStats
 from game_helpers import make_coordinator, make_test_config, synthetic_journal_results
@@ -128,7 +129,7 @@ def test_a_write_error_is_logged_and_counted_and_the_writer_goes_on(caplog):
         stats = writer.stop(timeout=5.0)
     assert (stats.written, stats.dropped, stats.write_errors) == (5, 7, 1)
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1 and errors[0].exc_info is not None and "training goes on" in errors[0].getMessage()
+    assert len(errors) == 1 and isinstance(errors[0].exc_info, tuple) and "training goes on" in errors[0].getMessage()
 
 
 def test_compaction_runs_on_its_cadence_with_the_evicted_entities():
@@ -169,9 +170,53 @@ def test_a_journal_that_cannot_be_opened_never_stops_training(caplog):
         writer.start()
         writer.submit(synthetic_journal_results(4))
         assert _wait(lambda: writer.stats.dropped == 4)
+        assert writer.submit(synthetic_journal_results(3, first=4)) == 3      # a dead writer drops at once
         stats = writer.stop(timeout=5.0)
-    assert stats.written == 0 and stats.dropped == 4
+    assert stats.written == 0 and stats.dropped == 7 and stats.write_errors == 1    # the failed open, once
     assert any("opening the journal failed" in r.getMessage() for r in caplog.records)
+
+
+def test_a_batch_still_in_flight_at_the_stop_deadline_is_counted_as_dropped(caplog):
+    log = FakeLog(delay=2.0)
+    writer = MatchLogWriter(lambda: log, compact_interval_sec=3600.0, window_bytes=1)
+    results = synthetic_journal_results(3 * WRITE_BATCH)
+    writer.submit(results)
+    writer.start()
+    assert _wait(lambda: writer.stats.pending == len(results) and writer._queue.qsize() == 2 * WRITE_BATCH)
+    with caplog.at_level(logging.WARNING, logger="colosseum.arena.matchlog"):
+        stats = writer.stop(timeout=1.0)
+    assert (stats.written, stats.dropped, stats.pending) == (0, len(results), 0)
+    assert any("did not stop within" in r.getMessage() for r in caplog.records)
+    assert _wait(lambda: not writer._thread.is_alive())                  # the late append finished
+    assert len(log.appended) == WRITE_BATCH and writer.stats == stats       # ... and changed nothing
+
+
+def test_a_writer_thread_that_dies_counts_everything_as_dropped(caplog):
+    log = FakeLog()
+
+    def clock() -> float:
+        if threading.current_thread().name == "match-log-writer":
+            raise RuntimeError("clock broke")
+        return 0.0
+
+    writer = MatchLogWriter(lambda: log, compact_interval_sec=3600.0, window_bytes=1, clock=clock)
+    writer.submit(synthetic_journal_results(5))
+    with caplog.at_level(logging.WARNING, logger="colosseum.arena.matchlog"):
+        writer.start()
+        assert _wait(lambda: writer.stats.dropped == 5)
+        assert writer.submit(synthetic_journal_results(3, first=5)) == 3
+        stats = writer.stop(timeout=5.0)
+    assert (stats.written, stats.dropped, stats.write_errors, stats.pending) == (0, 8, 1, 0) and log.closed
+    died = [r for r in caplog.records if "writer thread died" in r.getMessage()]
+    assert len(died) == 1 and died[0].levelno == logging.ERROR and isinstance(died[0].exc_info, tuple)
+    assert any("is not running" in r.getMessage() for r in caplog.records)
+    assert not any("queue is full" in r.getMessage() for r in caplog.records)
+
+
+def test_writer_stats_keep_one_shape():
+    empty = WriterStats().as_dict()
+    sized = WriterStats(sizes=FakeLog().sizes()).as_dict()
+    assert set(empty) == set(sized) and empty["file_bytes"] is None and empty["evicted_folded"] == 0
 
 
 def test_run_level_counters_never_decrease_and_include_the_writer():
@@ -197,6 +242,26 @@ def test_the_coordinator_tells_evict_listeners(tmp_path):
     for version in (10, 20, 30):
         coordinator.save_checkpoint_payload({"agent_id": "agent_0", "policy_version": version, "model_state": state})
     assert heard == [("agent_0", "ckpt_v10"), ("agent_0", "ckpt_v20")]
+
+
+def test_a_failing_evict_listener_never_stops_the_run(tmp_path, caplog):
+    config = make_test_config("solo", checkpoint={"interval": 10, "keep_last": 1, "keep_every": 0})
+    coordinator = make_coordinator(config, tmp_path / "ckpt")
+    heard: list[str] = []
+
+    def broken(agent: str, ckpt: str) -> None:
+        raise RuntimeError("listener broke")
+
+    coordinator.add_evict_listener(broken)
+    coordinator.add_evict_listener(lambda agent, ckpt: heard.append(ckpt))
+    state = {"w": np.zeros(2, np.float32)}
+    with caplog.at_level(logging.ERROR, logger="colosseum.coordinator.coordinator"):
+        for version in (10, 20, 30):
+            payload = {"agent_id": "agent_0", "policy_version": version, "model_state": state}
+            coordinator.save_checkpoint_payload(payload)
+    assert heard == ["ckpt_v10", "ckpt_v20"]                         # the other listener still hears every eviction
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 2 and isinstance(errors[0].exc_info, tuple) and not errors[1].exc_info
 
 
 def test_stop_without_start_and_twice_is_harmless():

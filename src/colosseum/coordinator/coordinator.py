@@ -57,6 +57,7 @@ class Coordinator:
         ckpt = config.checkpoint
         self._evicted: dict[str, list[str]] = {}   # evicted since the last take_evictions(), per agent
         self._evict_listeners: list[Callable[[str, str], None]] = []   # e.g. the journal writer (SP4)
+        self._evict_listener_failed = False   # the first failing listener call is logged with its traceback
         # Only the launcher's match refresh drains evictions (take_evictions); without it nothing is buffered.
         self._buffer_evictions = config.rollout.match_refresh_interval_sec > 0
         self._pfsp = PfspStats({aid: config.get_agent_config(aid).matchmaking.pfsp.halflife_games
@@ -128,7 +129,8 @@ class Coordinator:
 
     def add_evict_listener(self, listener: Callable[[str, str], None]) -> None:
         """Also call ``listener(agent_id, checkpoint_id)`` for every evicted snapshot (main loop; SP4: the journal
-        writer folds the snapshot's matches)."""
+        writer folds the snapshot's matches). A raising listener is logged (ERROR) and never stops the eviction or
+        the run."""
         self._evict_listeners.append(listener)
 
     def _on_evict(self, agent_id: str, checkpoint_id: str) -> None:
@@ -140,7 +142,12 @@ class Coordinator:
         logger.debug(f"Snapshot {checkpoint_id} of {agent_id} evicted")
         self._pfsp.forget((agent_id, checkpoint_id))
         for listener in self._evict_listeners:
-            listener(agent_id, checkpoint_id)
+            try:
+                listener(agent_id, checkpoint_id)
+            except Exception:  # noqa: BLE001 - a listener (the journal) must never stop training
+                logger.error(f"Evict listener {listener!r} failed for snapshot {checkpoint_id} of {agent_id}; "
+                             f"training goes on", exc_info=not self._evict_listener_failed)
+                self._evict_listener_failed = True
         if not self._buffer_evictions:
             return
         bucket = self._evicted.setdefault(agent_id, [])
