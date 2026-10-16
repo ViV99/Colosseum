@@ -1447,3 +1447,75 @@ def synthetic_journal_results(n: int, *, seed: int = 0, prefix: str = "R/train/"
                                      match_id=f"w0_e{k % 4}_ep{k}", source=source, env_steps=10 * k,
                                      seed=int(rng.integers(2**31)), length=int(rng.integers(5, 10))))
     return out
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T2.1): synthetic matches of known strengths for the Bradley-Terry tests
+# ---------------------------------------------------------------------------
+
+
+def _entity_seat(entity: str) -> tuple[str, str]:
+    """``"main@v40"`` -> ``("main", "ckpt_v40")`` (a snapshot seat); any other name -> a fixed seat."""
+    if "@v" in entity:
+        agent, version = entity.rsplit("@v", 1)
+        return agent, f"ckpt_v{version}"
+    return entity, "fixed"
+
+
+def synthetic_bt_matches(strengths: Mapping[str, float], *, n_matches: int, rng: np.random.Generator,
+                         team_size: int = 1, num_teams: int = 2, bias: Sequence[float] | None = None,
+                         draw: float = 0.0, roles: Sequence[str] | None = None, layout: str = "2p",
+                         choose: Callable[[np.random.Generator], list[list[str]]] | None = None,
+                         source: str = "train", uid_prefix: str = "u") -> list:
+    """Match results drawn from a known Bradley-Terry model (logits). Entities ``agent@v<N>`` sit on snapshot seats
+    (rating version N), other names on fixed seats. Teams: ``choose(rng)`` or ``num_teams * team_size`` distinct
+    entities drawn uniformly. Team strength = mean member strength + ``bias[team index]``. Two teams: team 0 wins with
+    ``sigmoid(S_0 - S_1)``, with draws of probability ``draw * 2 * min(p, 1 - p)`` arranged so the expected outcome
+    stays ``p``; more teams: ranks from ``S + Gumbel noise`` (every pairwise probability is the logistic one).
+    ``roles[t]`` is the role of team t's seats (default ``"player"``)."""
+    from colosseum.core.types import MatchResult, SeatResult, TeamResult
+
+    names = sorted(strengths)
+    bias = list(bias) if bias is not None else [0.0] * num_teams
+    roles = list(roles) if roles is not None else ["player"] * num_teams
+    out = []
+    for m in range(n_matches):
+        if choose is not None:
+            teams = choose(rng)
+        else:
+            picked = rng.choice(len(names), size=team_size * num_teams, replace=False)
+            teams = [[names[i] for i in picked[t * team_size:(t + 1) * team_size]] for t in range(num_teams)]
+        strength = [float(np.mean([strengths[e] for e in team])) + bias[t] for t, team in enumerate(teams)]
+        if len(teams) == 2:
+            p = 1.0 / (1.0 + math.exp(-(strength[0] - strength[1])))
+            d = draw * 2.0 * min(p, 1.0 - p)
+            if rng.random() < d:
+                ranks = [1.0, 1.0]
+            else:
+                ranks = [1.0, 2.0] if rng.random() < (p - d / 2.0) / (1.0 - d) else [2.0, 1.0]
+        else:
+            order = np.argsort(-(np.asarray(strength) + rng.gumbel(size=len(teams))))
+            ranks = [0.0] * len(teams)
+            for place, team in enumerate(order):
+                ranks[int(team)] = float(place + 1)
+        seats = []
+        for t, team in enumerate(teams):
+            for entity in team:
+                agent, network = _entity_seat(entity)
+                seats.append(SeatResult(seat=len(seats), role=roles[t], team=t, agent_id=agent, network_id=network,
+                                        reward=0.0))
+        out.append(MatchResult(match_id=f"m{m}", layout=layout, outcome_kind="wdl" if len(teams) == 2 else "rank",
+                               seats=seats, teams=[TeamResult(t, ranks[t], 0.0) for t in range(len(teams))],
+                               episode_length=1, uid=f"{uid_prefix}{m}", source=source))
+    return out
+
+
+def bt_table(results: Sequence, interval: int = 1):
+    """A ``ComparisonTable`` of ``results`` (rating versions with checkpoint interval ``interval``)."""
+    from colosseum.arena.comparisons import ComparisonTable
+    from colosseum.arena.entities import rating_version
+
+    table = ComparisonTable()
+    for result in results:
+        table.add_result(result, [rating_version(s.network_id, s.version_start, interval) for s in result.seats])
+    return table
