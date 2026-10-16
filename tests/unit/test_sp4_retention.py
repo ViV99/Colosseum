@@ -190,7 +190,8 @@ def test_no_ratings_yet_is_not_rated_with_zero_games():
     assert kept(rated_none) == [50]
     waiting = retain(entries, None, pol)                    # no ratings yet: every unrated one is new, cap 2 x 2
     assert kept(waiting) == [20, 30, 40, 50] and waiting.reasons["ckpt_v20"] == "kept: new (no ratings yet)"
-    assert waiting.reasons["ckpt_v10"] == "evicted: over max_snapshots=4 (new)"
+    assert waiting.reasons["ckpt_v10"] == ("evicted: over max_snapshots=2 (raised to 4 until the first rating "
+                                           "refit) (new)")
     assert kept(retain(entries, None, policy(keep_last=1, keep_top_k=0))) == [50]   # no top-k: scores never matter
 
 
@@ -202,3 +203,25 @@ def test_combine_scores_refuses_a_lower_bound_without_draws_in_a_counted_layout(
     # a zero-weight layout is not counted, so its missing draws do not matter
     out = combine_scores("main", fits=fits, uncertainty=unc, scores={}, layout_weights={"2p": 1.0}, quantile=0.1)
     assert out["ckpt_v10"].lcb == 1.0
+
+
+def test_the_raised_pre_refit_cap_names_the_configured_value_and_says_when_it_matters():
+    pol = policy(keep_last=1, keep_top_k=1, top_k_min_games=0, max_snapshots=2)
+    small = retain(snaps(10, 20), None, pol)
+    assert small.waiting and small.notes == [] and small.warnings == []
+    held = retain(snaps(10, 20, 30), None, pol)
+    assert held.notes == ["3 snapshots are kept, more than checkpoint.max_snapshots=2: no ratings yet; the cap "
+                          "applies after the first refit (until then at most 4)"]
+    pinned = retain(snaps(10, 20, 30, 40, 50, pinned=(10, 20, 30, 40, 50)), None, pol)
+    assert pinned.warnings == ["5 protected snapshots (keep_last, final of this run, pinned, just saved) exceed "
+                               "checkpoint.max_snapshots=2 (raised to 4 until the first rating refit); they are "
+                               "all kept"]
+    rated = retain(snaps(10, 20, 30), {}, pol)
+    assert not rated.waiting and rated.notes == []
+
+
+def test_describe_retention_names_the_raised_pre_refit_cap():
+    top = describe_retention(CheckpointConfig(keep_top_k=5, keep_last=20, max_snapshots=100))
+    assert "until the first rating refit nothing unrated is evicted and the cap is 200" in top
+    assert "first rating refit" not in describe_retention(CheckpointConfig(keep_top_k=5, max_snapshots=None))
+    assert "first rating refit" not in describe_retention(CheckpointConfig(max_snapshots=100))

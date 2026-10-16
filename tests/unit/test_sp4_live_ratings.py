@@ -424,3 +424,21 @@ def test_the_blas_limit_applies_to_this_process_only(tmp_path):
     assert int(main_threads) == 1
     if (os.cpu_count() or 1) > 1:
         assert int(child_threads) > 1                     # spawned children keep the default
+
+
+def test_a_table_with_matches_at_the_start_is_fitted_at_once_an_empty_one_waits():
+    """T4.1: a resumed run's table (the parent's journal) gets its first refit without waiting an interval."""
+    loaded = LiveRatings(_league_table(n=200), interval_sec=3600.0, fixed_agents=("random", "greedy"),
+                         random_bot="random", env_steps_fn=lambda: 0, samples=100)
+    empty = LiveRatings(ComparisonTable(), interval_sec=3600.0, env_steps_fn=lambda: 0, samples=100)
+    loaded.start()
+    empty.start()
+    try:
+        assert _wait(lambda: loaded.latest() is not None)
+        assert loaded.latest().version == 1 and set(loaded.latest().fits) == {"2p"}
+        time.sleep(0.2)
+        assert empty.latest() is None                                    # waits for its first interval
+    finally:
+        loaded.stop(5.0)
+        empty.stop(5.0)
+    assert not loaded.alive and not empty.alive

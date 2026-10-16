@@ -28,8 +28,9 @@ If rule 1 alone exceeds the cap, every other snapshot is evicted, rule 1 stays a
 run, or a resume whose imported snapshots the parent rated). "Not rated yet" is not "rated with 0 games":
 every snapshot outside the ``keep_last`` window counts as new whatever ``top_k_min_games`` is (so nothing is
 evicted by rules 2-4), and the cap is ``NO_RATINGS_CAP_FACTOR * max_snapshots`` instead of ``max_snapshots``
-(the real cap waits for ratings; the raised one still bounds the disk if refits never come). The caller reruns
-retention after the first refit. ``scores={}`` means "rated, none of these snapshots has a score".
+(the real cap waits for ratings; the raised one still bounds the disk if refits never come; ``reasons`` and
+``warnings`` name both values, ``notes`` says when the raised cap holds more than ``max_snapshots``). The caller
+reruns retention after the first refit. ``scores={}`` means "rated, none of these snapshots has a score".
 
 ``reasons`` names, per checkpoint id, why it was kept or evicted.
 The function never touches the file system; ``CheckpointManager`` applies the decision (index first, then
@@ -89,6 +90,8 @@ class RetentionDecision:
     evict: list[str]
     reasons: dict[str, str]   # checkpoint_id -> why kept / evicted (validate, logs)
     warnings: list[str] = field(default_factory=list)
+    waiting: bool = False     # decided without ratings (scores=None, keep_top_k > 0): the raised cap applied
+    notes: list[str] = field(default_factory=list)   # informational (the raised cap holds more than max_snapshots)
 
 
 def _lcb(scores: Mapping[str, SnapshotScore], checkpoint_id: str) -> float | None:
@@ -155,13 +158,19 @@ def retain(entries: Sequence[SnapshotInfo], scores: Mapping[str, SnapshotScore] 
             reasons[cid] = "evicted: no retention rule"
 
     warnings: list[str] = []
+    notes: list[str] = []
     cap = policy.max_snapshots
+    cap_text = f"max_snapshots={cap}"
     if waiting and cap is not None:
-        cap *= NO_RATINGS_CAP_FACTOR                        # the real cap waits for the first refit
+        configured, cap = cap, cap * NO_RATINGS_CAP_FACTOR  # the real cap waits for the first refit
+        cap_text = f"max_snapshots={configured} (raised to {cap} until the first rating refit)"
+        if len(keep) > configured:
+            notes.append(f"{min(len(keep), cap)} snapshots are kept, more than checkpoint.max_snapshots={configured}: "
+                         f"no ratings yet; the cap applies after the first refit (until then at most {cap})")
     if cap is not None and len(keep) > cap:
         if len(always) > cap:
             warnings.append(f"{len(always)} protected snapshots (keep_last, final of this run, pinned, just saved) "
-                            f"exceed checkpoint.max_snapshots={cap}; they are all kept")
+                            f"exceed checkpoint.{cap_text}; they are all kept")
         unprotected = [cid for cid in ids if cid in keep and cid not in always]
         every_only = [cid for cid in unprotected if cid not in top and cid not in new]
         new_only = [cid for cid in unprotected if cid in new and cid not in top]
@@ -180,9 +189,9 @@ def retain(entries: Sequence[SnapshotInfo], scores: Mapping[str, SnapshotScore] 
                 if len(keep) <= cap:
                     break
                 keep.discard(cid)
-                reasons[cid] = f"evicted: over max_snapshots={cap} ({label})"
+                reasons[cid] = f"evicted: over {cap_text} ({label})"
     return RetentionDecision(keep=[c for c in ids if c in keep], evict=[c for c in ids if c not in keep],
-                             reasons=reasons, warnings=warnings)
+                             reasons=reasons, warnings=warnings, waiting=waiting, notes=notes)
 
 
 def _version_of(entity: str, agent_id: str) -> int | None:
@@ -290,4 +299,7 @@ def describe_retention(checkpoint: Any) -> str:
         order = "keep_every snapshots oldest first"
     cap = checkpoint.max_snapshots
     parts.append("no cap" if cap is None else f"at most {cap} per agent (over the cap: {order})")
+    if cap is not None and checkpoint.keep_top_k > 0:
+        parts.append(f"until the first rating refit nothing unrated is evicted and the cap is "
+                     f"{cap * NO_RATINGS_CAP_FACTOR}")
     return "snapshots: " + "; ".join(parts)

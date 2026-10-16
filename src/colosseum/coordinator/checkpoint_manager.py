@@ -247,7 +247,10 @@ class CheckpointManager:
         self._top_k_min_games = int(top_k_min_games)
         self._max_snapshots = max_snapshots
         self._scores_fn = scores_fn
-        self._warned: set[str] = set()       # agents whose cap overflow was logged (once per agent)
+        # (agent, decided without ratings) whose cap overflow was logged: once per agent and kind, so a WARNING
+        # against the raised pre-refit cap never hides a later one against max_snapshots itself
+        self._warned: set[tuple[str, bool]] = set()
+        self._noted: set[str] = set()        # agents whose raised pre-refit cap was announced (INFO once)
         self._scores_failed = False          # the first failing scores_fn call is logged with its traceback
         self._reasons: dict[str, dict[str, str]] = {}   # per agent: the last decision's reasons (retain)
         self._base_dir.mkdir(parents=True, exist_ok=True)
@@ -385,10 +388,14 @@ class CheckpointManager:
                               c.meta.get("pinned") is True) for c in entries]
         decision = retain(infos, scores, self._policy(), protect=protect)
         self._reasons[agent_id] = dict(decision.reasons)
-        if decision.warnings and agent_id not in self._warned:      # once per agent (ruling D4)
-            self._warned.add(agent_id)
+        if decision.warnings and (agent_id, decision.waiting) not in self._warned:   # once (ruling D4)
+            self._warned.add((agent_id, decision.waiting))
             for warning in decision.warnings:
                 logger.warning(f"Snapshots of {agent_id}: {warning}")
+        if decision.notes and agent_id not in self._noted:
+            self._noted.add(agent_id)
+            for note in decision.notes:
+                logger.info(f"Snapshots of {agent_id}: {note}")
         keep = set(decision.keep)
         newest = {c.checkpoint_id for c in entries[-self._keep_last:]}
         kept: list[CheckpointInfo] = []

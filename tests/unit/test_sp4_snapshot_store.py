@@ -370,3 +370,22 @@ def test_imported_rated_snapshots_survive_until_the_first_refit_of_a_resumed_run
     launcher._reapply_retention()
     assert ids(child.checkpoint_manager, "agent_0") == ["ckpt_v20", "ckpt_v60"]
     assert child.checkpoint_manager.retention_reasons("agent_0")["ckpt_v20"] == "kept: top_k"
+
+
+def test_a_warning_against_the_raised_cap_does_not_hide_a_real_overflow_and_the_raised_cap_is_announced_once(
+        tmp_path, caplog):
+    ratings = [None]
+    mgr = CheckpointManager(tmp_path, keep_last=1, keep_top_k=1, top_k_min_games=0, max_snapshots=2, run_id="r",
+                            scores_fn=lambda agent: ratings[0])
+    with caplog.at_level(logging.INFO, logger="colosseum.coordinator.checkpoint_manager"):
+        for version in (10, 20, 30, 40, 50):
+            mgr.save("a", version, sd(version))
+            mgr.pin("a", f"ckpt_v{version}")
+        ratings[0] = {}                                                  # the first refit
+        mgr.save("a", 60, sd(60))
+    messages = [r.getMessage() for r in caplog.records]
+    infos = [m for m in messages if "the cap applies after the first refit" in m]
+    assert len(infos) == 1 and "3 snapshots are kept, more than checkpoint.max_snapshots=2" in infos[0]
+    warnings = [m for m in messages if "exceed checkpoint.max_snapshots" in m]
+    assert len(warnings) == 2
+    assert "raised to 4 until the first rating refit" in warnings[0] and "raised" not in warnings[1]

@@ -1,6 +1,7 @@
 """Live snapshot ratings of a training run (SP4 spec block 2, "Живой рейтинг").
 
-``LiveRatings`` is a thread of the training main process. Every ``interval_sec`` (monotonic) it takes a copy of the
+``LiveRatings`` is a thread of the training main process. Every ``interval_sec`` (monotonic; at once at the start
+when the table already holds matches, as on a resume with the parent's journal) it takes a copy of the
 in-memory ``ComparisonTable`` that the journal writer feeds (``table.copy()``; nothing else is shared), fits every
 layout of the run's sources (``RUN_SOURCES``: train and pulse; ``colosseum.arena.bt.fit`` warm-started from the
 previous fit), computes Laplace uncertainty (``LAPLACE_SAMPLES`` draws) and the G2 test, summarizes one-team
@@ -178,13 +179,21 @@ class LiveRatings:
         self._thread.start()
 
     def _run(self) -> None:
+        # A table that already holds matches when the thread starts (a resume: the parent's journal) is fitted at
+        # once, so snapshot retention gets ratings without waiting a whole interval (T4.1); an empty one (a fresh
+        # run) waits for the first interval as before.
+        if self._table.layouts() and not self._stop.is_set():
+            self._refit_logged()
         while not self._stop.wait(self._interval):
-            try:
-                self.refit_now()
-            except Exception as e:  # noqa: BLE001 - ratings must never stop training
-                logger.error(f"Live ratings: a refit failed ({type(e).__name__}: {e}); training goes on",
-                             exc_info=not self._failed)
-                self._failed = True
+            self._refit_logged()
+
+    def _refit_logged(self) -> None:
+        try:
+            self.refit_now()
+        except Exception as e:  # noqa: BLE001 - ratings must never stop training
+            logger.error(f"Live ratings: a refit failed ({type(e).__name__}: {e}); training goes on",
+                         exc_info=not self._failed)
+            self._failed = True
 
     @property
     def alive(self) -> bool:
