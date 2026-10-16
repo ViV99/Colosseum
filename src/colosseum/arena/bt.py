@@ -16,23 +16,41 @@ comparable only within a cell = (role group, component); every cell has its own 
 ``_anchor``: ``options.anchor`` (an agent of the config: its entity, or for a trainable agent its lowest version)
 if it played in the cell; else the config's first ``RandomBot`` agent; else the mean of the scripted / frozen agents
 that played in the cell; else the lowest version (``v0``) of the first trainable agent (config order) of the cell;
-else the first entity by name. A configured or default anchor that did not play in a cell is noted in
-``BTGroup.note`` (callers log each note once).
+else the first entity by name. A configured or default anchor that did not play in a cell (also a missing ``v0``
+of the first trainable agent, replaced by its lowest version there) is noted in ``BTGroup.note`` (callers log
+each note once, at INFO).
 
 Scale: Elo units, ``ELO_PER_LOGIT = 400 / ln 10`` per logit.
 
 Uncertainty. ``laplace``: normal intervals from the inverse Hessian at the MAP; ``P(best)``, ``P(top-k)`` and the
-lower bound from samples of ``N(theta_hat, H^-1)`` (a diagonal approximation on the iterative path).
-``bootstrap``: refits on resampled data (``BootstrapData``), warm-started at the fit, percentile intervals. Both
-report ``P(best)`` within the entity's lineage and within its cell, ``P(top-k)`` likewise, and ``lcb``, the
+lower bound from samples of ``N(theta_hat, H^-1)``. On the dense path the standard errors are exact
+(``H^-1``) and the samples come from a Cholesky factor of ``H``. On the iterative path (above
+``BTOptions.dense_limit``) no inverse is formed: samples are drawn by perturb-and-solve, ``x = H^-1 r`` with
+``r = X^T W^(1/2) z_1 + P^(1/2) z_2`` (``X`` the design, ``W`` the curvature weights, ``P`` the prior precision,
+realized as ``z_2 / prior_sigma + sqrt(smoothness) D^T z_3`` with ``D`` the lineage difference operator), so
+``cov(x) = H^-1`` exactly, every covariance (the smoothness chain included) kept; the right-hand sides are solved
+together by block conjugate gradients. There the fit draws ``ITERATIVE_SAMPLES`` such samples once, its
+standard errors are Monte Carlo estimates from them (``BTFit.approximate``), and ``laplace`` reuses them
+(``BTFit.draws``: at most ``ITERATIVE_SAMPLES`` samples, its ``rng`` unused).
+
+``bootstrap``: refits on resampled data (``BootstrapData``), warm-started at the fit, percentile intervals;
+replicates whose Newton iteration did not converge are counted and logged (WARNING).
+Both report ``P(best)`` within the entity's lineage and within its cell, ``P(top-k)`` likewise, and ``lcb``, the
 ``quantile`` of the entity's lineage contrast ``theta_e - mean(theta of its lineage in the cell)`` (spec block 4:
-the anchor's uncertainty does not reorder the snapshots of one agent).
+the anchor's uncertainty does not reorder the snapshots of one agent). Lineage quantities are per cell: a lineage
+whose versions fall into two cells (e.g. two components) is two lineages, each with ``P(best)`` summing to 1.
+
+Transitivity (``transitivity_test``). The team pairs with at least ``min_games`` matches are refitted alone by a
+near-maximum-likelihood Bradley-Terry fit (``G2_PRIOR_SIGMA``, no smoothness) and compared with the saturated
+model of the same pairs: ``G2 = 2 (LL_saturated - LL_BT)`` against ``chi^2`` with ``pairs - identified
+parameters`` degrees of freedom (the rank of the tested pairs' design).
 
 ``PRIOR_SIGMA`` and ``SMOOTHNESS`` are provisional; task T8.2 fixes them by cross-validation (controller rulings).
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
@@ -53,6 +71,18 @@ SMOOTHNESS = 0.5           # precision of one version step (sd ~1.41 logits); pr
 DENSE_LIMIT = 2000         # parameters; above it Newton steps use conjugate gradients
 MEAN_OF_FIXED = "mean-of-fixed"
 TRANSITIVITY_P = 0.01      # the G2 test flags p < 0.01 (spec block 2)
+G2_PRIOR_SIGMA = 100.0     # logits: the G2 refit is a near-MLE; the tiny prior only keeps separation finite
+# Iterative path (above dense_limit): the fit draws ITERATIVE_SAMPLES perturb-and-solve samples of N(0, H^-1) once
+# (fixed seed: a fit is a deterministic function of its table), takes its Monte Carlo standard errors from them
+# (relative error of an SE about 1 / sqrt(2 * 400) = 3.5 %) and keeps them in BTFit.draws, which laplace() reuses
+# there. 400 instead of the live LAPLACE_SAMPLES = 1000 because each draw costs one conjugate-gradient solve: about
+# 3.5 s at 2500 and 10.5 s at 5000 parameters on a chain-like training graph (T2.1 fix report).
+ITERATIVE_SAMPLES = 400
+ITERATIVE_CG_TOL = 1e-5    # relative residual of a draw's solve (relative error ~1e-5, far below the Monte Carlo error)
+_ITERATIVE_SEED = 0
+_SAMPLE_CHUNK = 64         # right-hand sides per block conjugate-gradient solve (memory: nnz x chunk floats)
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -105,10 +135,34 @@ class _Design:
     prior: np.ndarray | None         # dense prior precision (None above the dense limit)
     prior_diag: np.ndarray
     chains: list[tuple[int, int]]    # smoothness edges (column pairs)
+    chain_i: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))   # chains as index arrays
+    chain_j: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    col_perm: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))  # non-zeros sorted by column
+    col_ids: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))   # columns with a non-zero
+    col_starts: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+    row_perm: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))  # non-zeros sorted by row
+    row_starts: np.ndarray = field(default_factory=lambda: np.zeros(0, np.int64))
+
+    def __post_init__(self) -> None:
+        if self.chains:
+            self.chain_i = np.asarray([i for i, _ in self.chains], np.int64)
+            self.chain_j = np.asarray([j for _, j in self.chains], np.int64)
+        self.col_perm, self.col_ids, self.col_starts = _segments(self.nz_col)
+        self.row_perm, _, self.row_starts = _segments(self.nz_row)
 
     @property
     def num_params(self) -> int:
         return len(self.entities) + max(self.num_teams - 1, 0)
+
+
+def _segments(index: np.ndarray) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """``(permutation sorting index, distinct values, segment starts)`` for ``np.add.reduceat`` by ``index``."""
+    perm = np.argsort(index, kind="stable")
+    ordered = index[perm]
+    if len(ordered) == 0:
+        return perm, ordered, ordered
+    starts = np.flatnonzero(np.r_[True, ordered[1:] != ordered[:-1]])
+    return perm, ordered[starts], starts
 
 
 @dataclass
@@ -122,11 +176,12 @@ class BTFit:
     games: dict[EntityKey, int]         # matches with a non-zero coefficient (self-play excluded)
     iterations: int
     converged: bool
-    approximate: bool = False           # iterative path: standard errors from the Hessian's diagonal
+    approximate: bool = False           # iterative path: Monte Carlo standard errors (perturb-and-solve draws)
     params: np.ndarray = field(default_factory=lambda: np.zeros(0), repr=False)   # MAP, logits
     design: _Design | None = field(default=None, repr=False)
     options: BTOptions = field(default=DEFAULT_OPTIONS, repr=False)
     hessian: np.ndarray | None = field(default=None, repr=False)   # dense negative Hessian at the MAP
+    draws: np.ndarray | None = field(default=None, repr=False)     # iterative path: [ITERATIVE_SAMPLES, params]
 
     def group_of(self, entity: EntityKey) -> BTGroup:
         for group in self.groups:
@@ -225,10 +280,13 @@ class TransitivityResult:
 
 @dataclass
 class ScoreCell:
+    """Mean team score with a 95 % normal interval; ``ci_low = ci_high = None`` below two matches (no variance
+    estimate: a one-game entity is never treated as certain)."""
+
     n: int
     mean: float
-    ci_low: float
-    ci_high: float
+    ci_low: float | None
+    ci_high: float | None
 
 
 @dataclass
@@ -241,11 +299,12 @@ class ScoreSummary:
     @property
     def by_entity(self) -> dict[EntityKey, tuple[int, float, float]]:
         """``(n, mean, standard error)`` of every entity (every match it sat in; T4.1's top-k in games with
-        score layouts only)."""
-        return {e: (c.n, c.mean, (c.ci_high - c.ci_low) / (2.0 * Z_95)) for e, c in self.entities.items()}
+        score layouts only); the standard error is ``math.inf`` below two matches."""
+        return {e: (c.n, c.mean, math.inf if c.ci_low is None or c.ci_high is None
+                    else (c.ci_high - c.ci_low) / (2.0 * Z_95)) for e, c in self.entities.items()}
 
     def to_dict(self) -> dict:
-        """JSON-ready form (reports)."""
+        """JSON-ready form (reports); ``ci_low`` / ``ci_high`` are null below two matches."""
         return {"layout": self.layout,
                 "entities": {e: {"n": c.n, "mean": c.mean, "ci_low": c.ci_low, "ci_high": c.ci_high}
                              for e, c in self.entities.items()},
@@ -348,11 +407,59 @@ def _prior_times(d: _Design, v: np.ndarray, options: BTOptions) -> np.ndarray:
     if d.prior is not None:
         return d.prior @ v
     out = v / options.prior_sigma ** 2
-    for i, j in d.chains:
-        diff = options.smoothness * (v[i] - v[j])
-        out[i] += diff
-        out[j] -= diff
+    if len(d.chain_i) and options.smoothness:
+        diff = options.smoothness * (v[d.chain_i] - v[d.chain_j])
+        np.add.at(out, d.chain_i, diff)
+        np.subtract.at(out, d.chain_j, diff)
     return out
+
+
+def _xt_times(d: _Design, u: np.ndarray) -> np.ndarray:
+    """``X^T u`` for a block ``u`` of shape ``[rows, S]``."""
+    out = np.zeros((d.num_params, u.shape[1]))
+    if len(d.col_perm):
+        contrib = (d.nz_val[:, None] * u[d.nz_row])[d.col_perm]
+        out[d.col_ids] = np.add.reduceat(contrib, d.col_starts, axis=0)
+    return out
+
+
+@dataclass
+class _SparseH:
+    """The negative Hessian ``X^T W X + P`` as row-sorted coordinates (iterative path: block products)."""
+
+    row_ids: np.ndarray
+    starts: np.ndarray
+    cols: np.ndarray
+    vals: np.ndarray
+    size: int
+
+    def times(self, v: np.ndarray) -> np.ndarray:
+        out = np.zeros((self.size, v.shape[1]))
+        out[self.row_ids] = np.add.reduceat(self.vals[:, None] * v[self.cols], self.starts, axis=0)
+        return out
+
+
+def _sparse_hessian(d: _Design, w: np.ndarray, options: BTOptions) -> _SparseH:
+    P = d.num_params
+    keys, vals = [np.arange(P, dtype=np.int64) * (P + 1)], [np.full(P, 1.0 / options.prior_sigma ** 2)]
+    if len(d.chain_i) and options.smoothness:
+        ci, cj, sm = d.chain_i, d.chain_j, options.smoothness
+        keys += [ci * (P + 1), cj * (P + 1), ci * P + cj, cj * P + ci]
+        vals += [np.full(len(ci), sm), np.full(len(ci), sm), np.full(len(ci), -sm), np.full(len(ci), -sm)]
+    rows, cols, nz = d.nz_row[d.row_perm], d.nz_col[d.row_perm], d.nz_val[d.row_perm]
+    ends = np.r_[d.row_starts[1:], len(rows)]
+    sizes = ends - d.row_starts
+    for k in np.unique(sizes):                    # rows grouped by their number of non-zeros
+        sel = d.row_starts[sizes == k]
+        idx = sel[:, None] + np.arange(k)[None, :]
+        c, v = cols[idx], nz[idx]
+        keys.append((c[:, :, None] * P + c[:, None, :]).ravel())
+        vals.append((w[rows[sel]][:, None, None] * v[:, :, None] * v[:, None, :]).ravel())
+    unique, inverse = np.unique(np.concatenate(keys), return_inverse=True)
+    summed = np.bincount(inverse, weights=np.concatenate(vals), minlength=len(unique))
+    row = unique // P
+    starts = np.flatnonzero(np.r_[True, row[1:] != row[:-1]])
+    return _SparseH(row_ids=row[starts], starts=starts, cols=unique % P, vals=summed, size=P)
 
 
 def _log_post(d: _Design, params: np.ndarray, sw: np.ndarray, swy: np.ndarray, options: BTOptions) -> float:
@@ -418,6 +525,55 @@ def _cg(apply: Callable[[np.ndarray], np.ndarray], b: np.ndarray, diag: np.ndarr
     return x
 
 
+def _block_cg(apply: Callable[[np.ndarray], np.ndarray], b: np.ndarray, diag: np.ndarray, tol: float = 1e-8,
+              max_iter: int = 2000) -> np.ndarray:
+    """Jacobi-preconditioned conjugate gradients for ``apply(X) = B`` column by column, all columns at once
+    (``B``: ``[n, S]``); a column stops when its residual is below ``tol`` relative to its right-hand side."""
+    x = np.zeros_like(b)
+    r = b.copy()
+    z = r / diag[:, None]
+    p = z.copy()
+    rz = np.sum(r * z, axis=0)
+    bnorm = np.maximum(np.linalg.norm(b, axis=0), 1e-300)
+    for _ in range(max_iter):
+        active = np.linalg.norm(r, axis=0) > tol * bnorm
+        if not active.any():
+            break
+        ap = apply(p)
+        pap = np.sum(p * ap, axis=0)
+        alpha = np.where(active, rz / np.where(pap > 0, pap, 1.0), 0.0)
+        x += alpha * p
+        r -= alpha * ap
+        z = r / diag[:, None]
+        rz_new = np.sum(r * z, axis=0)
+        beta = np.where(active, rz_new / np.where(rz > 0, rz, 1.0), 0.0)
+        p = z + beta * p
+        rz = rz_new
+    return x
+
+
+def _perturb_solve(d: _Design, w: np.ndarray, options: BTOptions, n: int, rng: np.random.Generator) -> np.ndarray:
+    """``n`` draws ``[n, params]`` of ``N(0, H^-1)`` without forming ``H^-1`` (module docstring: ``x = H^-1 r``,
+    ``r = X^T W^(1/2) z_1 + z_2 / prior_sigma + sqrt(smoothness) D^T z_3``, ``cov(r) = H``)."""
+    out = np.empty((n, d.num_params))
+    sqrt_w = np.sqrt(w)[:, None]
+    diag = _hess_diag(d, w)
+    smooth = math.sqrt(options.smoothness) if len(d.chain_i) and options.smoothness else 0.0
+
+    hessian = _sparse_hessian(d, w, options)
+
+    for start in range(0, n, _SAMPLE_CHUNK):
+        size = min(_SAMPLE_CHUNK, n - start)
+        rhs = _xt_times(d, sqrt_w * rng.standard_normal((len(d.keys), size)))
+        rhs += rng.standard_normal((d.num_params, size)) / options.prior_sigma
+        if smooth:
+            e = smooth * rng.standard_normal((len(d.chain_i), size))
+            np.add.at(rhs, d.chain_i, e)
+            np.subtract.at(rhs, d.chain_j, e)
+        out[start:start + size] = _block_cg(hessian.times, rhs, diag, tol=ITERATIVE_CG_TOL).T
+    return out
+
+
 def _newton(d: _Design, sw: np.ndarray, swy: np.ndarray, start: np.ndarray,
             options: BTOptions) -> tuple[np.ndarray, int, bool]:
     params = start.copy()
@@ -432,8 +588,10 @@ def _newton(d: _Design, sw: np.ndarray, swy: np.ndarray, start: np.ndarray,
         while True:                               # backtracking: the log posterior never decreases
             candidate = params + t * step
             new_value = _log_post(d, candidate, sw, swy, options)
-            if new_value >= value - 1e-12 * max(1.0, abs(value)) or t < 1e-6:
+            if new_value >= value - 1e-12 * max(1.0, abs(value)):
                 break
+            if t < 1e-6:                          # no improving step: stop here, converged only if the step is tiny
+                return params, iteration, bool(float(np.max(np.abs(step))) < options.tol)
             t *= 0.5
         params, value = candidate, new_value
         if float(np.max(np.abs(t * step))) < options.tol:
@@ -509,6 +667,8 @@ def _anchor(cell: Sequence[EntityKey], options: BTOptions, fixed_agents: Collect
             continue
         lowest = _lowest_version(agent, cell)
         if lowest is not None:
+            if entity_version(lowest) != 0:
+                note = "; ".join([*notes, f"v0 of {agent!r} did not play here: anchor {lowest}"])
             return lowest, [lowest], "first_trainable", note
     first = sorted(cell)[0]
     return first, [first], "first", note
@@ -558,8 +718,8 @@ def fit(table: ComparisonTable, layout: str, *, sources: Collection[str], option
     if hessian is not None:
         cov = np.linalg.inv(hessian)
         cov_diag = np.diag(cov)
-    else:
-        diag_inv = 1.0 / _hess_diag(design, w)
+    else:                     # Monte Carlo: draws of N(0, H^-1), mean zero by construction
+        draws = _perturb_solve(design, w, options, ITERATIVE_SAMPLES, np.random.default_rng(_ITERATIVE_SEED))
     rating, se = {}, {}
     for group in groups:
         c = _contrast(design, group)
@@ -569,13 +729,13 @@ def fit(table: ComparisonTable, layout: str, *, sources: Collection[str], option
             cov_c = cov @ c
             var = cov_diag[cols] - 2.0 * cov_c[cols] + float(c @ cov_c)
         else:
-            var = diag_inv[cols] - 2.0 * c[cols] * diag_inv[cols] + float(np.sum(c * c * diag_inv))
+            var = np.mean((draws[:, cols] - (draws @ c)[:, None]) ** 2, axis=0)
         for k, entity in enumerate(group.entities):
             rating[entity] = (float(params[cols[k]]) - base) * ELO_PER_LOGIT
             se[entity] = math.sqrt(max(float(var[k]), 0.0)) * ELO_PER_LOGIT
     C = np.vstack([np.eye(T - 1), -np.ones((1, T - 1))])         # T >= 2: every row pairs two teams
     bias_var = (np.einsum("ti,ij,tj->t", C, cov[E:, E:], C) if hessian is not None
-                else (C * C) @ diag_inv[E:])
+                else np.mean((draws[:, E:] @ C.T) ** 2, axis=0))
     bias_logits = C @ params[E:]
     games = {e: g for e, g in table.entity_games(layout, sources).items() if e in design.index}
     return BTFit(
@@ -584,6 +744,7 @@ def fit(table: ComparisonTable, layout: str, *, sources: Collection[str], option
         bias_se={t: math.sqrt(max(float(bias_var[t]), 0.0)) * ELO_PER_LOGIT for t in range(T)},
         games=games, iterations=iterations, converged=converged, approximate=hessian is None, params=params,
         design=design, options=options, hessian=hessian,
+        draws=None if hessian is not None else draws.astype(np.float32),
     )
 
 
@@ -639,16 +800,16 @@ def _empty_uncertainty() -> Uncertainty:
 def laplace(fit_: BTFit, *, samples: int = 1000, rng: np.random.Generator, top_k: int = 0,
             quantile: float = 0.1) -> Uncertainty:
     """Fast uncertainty (module docstring): normal intervals from the fit's standard errors; probabilities and
-    ``lcb`` from ``samples`` draws of ``N(theta_hat, H^-1)``."""
+    ``lcb`` from ``samples`` draws of ``N(theta_hat, H^-1)``. On the iterative path the fit's own draws
+    (``BTFit.draws``, the first ``min(samples, ITERATIVE_SAMPLES)``; ``rng`` unused)."""
     if fit_.design is None:
         return _empty_uncertainty()
-    z = rng.standard_normal((samples, fit_.design.num_params))
     if fit_.hessian is not None:
+        z = rng.standard_normal((samples, fit_.design.num_params))
         L = np.linalg.cholesky(fit_.hessian)
         delta = np.linalg.solve(L.T, z.T).T              # cov(delta) = (L L^T)^-1 = H^-1
     else:
-        _, w = _gradient(fit_.design, fit_.params, fit_.design.sw, fit_.design.swy, fit_.options)
-        delta = z / np.sqrt(_hess_diag(fit_.design, w))
+        delta = fit_.draws[:samples].astype(np.float64)
     return _summaries(fit_, fit_.params[None, :] + delta, top_k=top_k, quantile=quantile, ci_from_samples=False)
 
 
@@ -672,7 +833,9 @@ def bootstrap(fit_: BTFit, data: BootstrapData, *, samples: int, rng: np.random.
               quantile: float = 0.1) -> Uncertainty:
     """Uncertainty from ``samples`` refits on resampled ``data`` (``BootstrapData``), each warm-started at the fit;
     percentile intervals. The cells and anchors are those of ``fit_``; ``data`` must decompose the table it was fit
-    on (a team pair the fit does not know is a ValueError)."""
+    on: a team pair the fit does not know, or per-row sums of weights / weighted outcomes that differ from the
+    fit's (data covering only part of the table), is a ValueError. Replicates whose Newton iteration did not
+    converge are kept and counted in one WARNING."""
     design = fit_.design
     if design is None:
         return _empty_uncertainty()
@@ -705,7 +868,21 @@ def bootstrap(fit_: BTFit, data: BootstrapData, *, samples: int, rng: np.random.
     b_unit, b_row, b_w, b_wy = _contribution_arrays(
         design, ((u, a, b, w, y) for u, contribs in enumerate(units) for a, b, w, y in contribs))
     R = len(design.keys)
+    total_sw, total_swy = np.zeros(R), np.zeros(R)
+    for rows_, w_, wy_ in ((c_rows_a, c_w_a * (c_wins_a + c_losses_a), c_w_a * c_wins_a), (m_row, m_w, m_wy),
+                           (b_row, b_w, b_wy)):
+        np.add.at(total_sw, rows_, w_)
+        np.add.at(total_swy, rows_, wy_)
+    mismatch = ~(np.isclose(total_sw, design.sw, rtol=1e-6, atol=1e-9)
+                 & np.isclose(total_swy, design.swy, rtol=1e-6, atol=1e-9))
+    if mismatch.any():
+        r = int(np.flatnonzero(mismatch)[0])
+        a, b = design.keys[r]
+        raise ValueError(f"bootstrap data does not decompose the fitted table: {int(mismatch.sum())} of {R} team "
+                         f"pairs differ, e.g. {a} vs {b}: weights {total_sw[r]:.6g} / outcomes {total_swy[r]:.6g} "
+                         f"in the data, {design.sw[r]:.6g} / {design.swy[r]:.6g} in the fit")
     replicates = np.empty((samples, design.num_params))
+    unconverged = 0
     for s in range(samples):
         sw, swy = np.zeros(R), np.zeros(R)
         if len(c_rows_a):
@@ -724,7 +901,11 @@ def bootstrap(fit_: BTFit, data: BootstrapData, *, samples: int, rng: np.random.
             weight = unit_weight[b_unit]
             np.add.at(sw, b_row, b_w * weight)
             np.add.at(swy, b_row, b_wy * weight)
-        replicates[s], _, _ = _newton(design, sw, swy, fit_.params, fit_.options)
+        replicates[s], _, converged = _newton(design, sw, swy, fit_.params, fit_.options)
+        unconverged += not converged
+    if unconverged:
+        logger.warning("bootstrap of layout %r: %d of %d replicates did not converge (max_iter %d)", fit_.layout,
+                       unconverged, samples, fit_.options.max_iter)
     return _summaries(fit_, replicates, top_k=top_k, quantile=quantile, ci_from_samples=True)
 
 
@@ -765,25 +946,51 @@ def chi2_sf(x: float, dof: int) -> float:
     return min(1.0, math.exp(log_front) * h)
 
 
+def _identified_parameters(d: _Design, rows: Sequence[tuple[TeamKey, TeamKey, PairStat]]) -> int:
+    """Rank of the design of ``rows`` (the parameters the data identify): exact via the Gram matrix up to
+    ``dense_limit`` parameters; above it the upper bound ``entities - components + (T - 1)``, which can only make
+    the G2 test more conservative."""
+    if d.prior is not None:
+        gram = _dense_hessian(d, np.ones(len(d.keys))) - d.prior
+        return int(np.linalg.matrix_rank(gram, hermitian=True))
+    links = _UnionFind()
+    for a, b, _ in rows:
+        active = list(coefficients(a, b))
+        for entity in active:
+            links.union(active[0], entity)
+    components = len({links.find(e) for e in d.entities})
+    return len(d.entities) - components + d.num_teams - 1
+
+
 def transitivity_test(table: ComparisonTable, fit_: BTFit, *, sources: Collection[str],
                       min_games: int = 20) -> TransitivityResult:
-    """Deviance ``G2 = 2 (LL_pairs - LL_BT)`` over the team pairs with at least ``min_games`` matches, against
-    ``chi^2`` with ``pairs - (entities - cells) - (T - 1)`` degrees of freedom; flagged at p < 0.01 (spec block 2).
-    With fractional weights (FFA) and draws the reference distribution is approximate."""
+    """Likelihood-ratio test of the Bradley-Terry model against the saturated model on the team pairs with at
+    least ``min_games`` matches (spec block 2). Those pairs are refitted alone, as a near-maximum-likelihood fit
+    (prior ``G2_PRIOR_SIGMA`` logits, no smoothness, warm-started at ``fit_``), so that ``G2 = 2 (LL_saturated -
+    LL_BT)`` is asymptotically ``chi^2`` with ``pairs - identified parameters`` degrees of freedom (the rank of the
+    tested pairs' design: entities minus components plus the identified bias parameters); flagged at p <
+    ``TRANSITIVITY_P``. With fractional weights (FFA) and draws the reference distribution is approximate.
+    ``worst_pairs`` are the tested pairs with the largest signed deviance residuals under that refit."""
     design = fit_.design
     if design is None:
         return TransitivityResult(0.0, 0, None, False, 0, [])
-    eta = _eta(design, fit_.params)
+    rows = [(a, b, stat) for a, b, stat in table.pairs(fit_.layout, sources)
+            if stat.n >= min_games and stat.sw > 0 and (a, b) in design.row_of]
+    options = BTOptions(prior_sigma=G2_PRIOR_SIGMA, smoothness=0.0, max_iter=200, tol=1e-8,
+                        dense_limit=fit_.options.dense_limit)
+    sub = _build_design(rows, options) if rows else None
+    if sub is None:                  # no tested pair, or only pairs without a non-zero entity coefficient
+        return TransitivityResult(0.0, 0, None, False, len(rows), [])
+    start = np.zeros(sub.num_params)
+    for entity, i in sub.index.items():
+        start[i] = fit_.params[design.index[entity]]
+    if sub.num_teams == design.num_teams:
+        start[len(sub.entities):] = fit_.params[len(design.entities):]
+    params, _, _ = _newton(sub, sub.sw, sub.swy, start, options)
+    eta = _eta(sub, params)
     g2 = 0.0
     residuals: list[tuple[TeamKey, TeamKey, float, int]] = []
-    involved: set[EntityKey] = set()
-    tested = 0
-    for a, b, stat in table.pairs(fit_.layout, sources):
-        r = design.row_of.get((a, b))
-        if stat.n < min_games or stat.sw <= 0 or r is None:
-            continue
-        tested += 1
-        involved.update(coefficients(a, b))
+    for r, (a, b, stat) in enumerate(rows):
         p = min(max(float(_sigmoid(eta[r])), 1e-12), 1.0 - 1e-12)
         y, n = stat.swy, stat.sw
         dev = 0.0
@@ -794,19 +1001,20 @@ def transitivity_test(table: ComparisonTable, fit_: BTFit, *, sources: Collectio
         dev = max(2.0 * dev, 0.0)
         g2 += dev
         residuals.append((a, b, math.copysign(math.sqrt(dev), y / n - p), int(stat.n)))
-    cells = {(g.group, g.component) for g in fit_.groups if set(g.entities) & involved}
-    dof = tested - (len(involved) - len(cells)) - (design.num_teams - 1)
-    p_value = chi2_sf(g2, dof) if tested and dof > 0 else None
+    dof = len(rows) - _identified_parameters(sub, rows)
+    p_value = chi2_sf(g2, dof) if dof > 0 else None
     residuals.sort(key=lambda item: -abs(item[2]))
     return TransitivityResult(g2=g2, dof=dof, p_value=p_value,
-                              flagged=p_value is not None and p_value < TRANSITIVITY_P, pairs_tested=tested,
+                              flagged=p_value is not None and p_value < TRANSITIVITY_P, pairs_tested=len(rows),
                               worst_pairs=residuals[:5])
 
 
 def _score_cell(n: int, total: float, total_sq: float) -> ScoreCell:
     mean = total / n
-    var = (total_sq - n * mean * mean) / (n - 1) if n >= 2 else 0.0
-    half = Z_95 * math.sqrt(max(var, 0.0) / n) if n >= 2 else 0.0
+    if n < 2:
+        return ScoreCell(n=n, mean=mean, ci_low=None, ci_high=None)
+    var = (total_sq - n * mean * mean) / (n - 1)
+    half = Z_95 * math.sqrt(max(var, 0.0) / n)
     return ScoreCell(n=n, mean=mean, ci_low=mean - half, ci_high=mean + half)
 
 
