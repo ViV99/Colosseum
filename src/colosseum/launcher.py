@@ -386,6 +386,8 @@ class Launcher:
         # Set by launch() with the journal: the live Bradley-Terry refit thread (T2.2).
         self._live_ratings = None
         self._league_state_error_logged = False   # the first failing league_state.json write logs its traceback
+        # The live ratings version the last retention pass used (T4.1: retention reruns after every refit).
+        self._retention_version: int | None = None
 
     @property
     def env_steps_done(self) -> int:
@@ -395,7 +397,7 @@ class Launcher:
     def _build_coordinator(self, setup: RunSetup) -> Coordinator:
         """The run's coordinator; its matchmaker reads the global env-step counter (share schedules)."""
         return Coordinator(self._config, setup.spec, setup.player_roles, checkpoint_dir=self._run_dir.checkpoints,
-                           env_steps=lambda: int(self._env_step_counter.value))
+                           env_steps=lambda: int(self._env_step_counter.value), run_id=self._run_id)
 
     def launch(self) -> int:
         """Run the full training pipeline; returns the process exit code.
@@ -490,6 +492,7 @@ class Launcher:
             # file problem is a ConfigError that leaves no child behind; _finish_metrics stops the writer.
             self._open_match_log(coordinator)
             self._open_live_ratings()
+            self._wire_retention()
             started = False
             try:
                 self._start_children(
@@ -673,6 +676,7 @@ class Launcher:
         last_refresh = time.monotonic()
         while True:
             self._drain_all_checkpoints()
+            self._reapply_retention()   # after a new live refit (T4.1); the refit thread never touches storage
             self._drain_results()
             self._drain_metrics()
             env_steps = int(self._env_step_counter.value)
@@ -851,7 +855,7 @@ class Launcher:
 
     def _open_live_ratings(self) -> None:
         """The live Bradley-Terry refit thread over the writer's in-memory table (spec block 2); none without the
-        journal. ``top_k`` is 0 until snapshot retention by rating exists (T4.1)."""
+        journal. Lower bounds at ``checkpoint.top_k_quantile``, ``P(top-k)`` with ``checkpoint.keep_top_k``."""
         if self._comparison_table is None:
             return
         from colosseum.arena.live import LiveRatings, rating_inputs
@@ -861,10 +865,30 @@ class Launcher:
         self._live_ratings = LiveRatings(
             self._comparison_table, interval_sec=cfg.ratings.refit_interval_sec,
             options=options, fixed_agents=fixed_agents,
-            random_bot=random_bot, agent_order=cfg.agent_ids(), top_k=0, quantile=0.1,
+            random_bot=random_bot, agent_order=cfg.agent_ids(), top_k=cfg.checkpoint.keep_top_k,
+            quantile=cfg.checkpoint.top_k_quantile,
             env_steps_fn=lambda: int(self._env_step_counter.value), seed=cfg.training.seed or 0)
         self._live_ratings.start()
         logger.info(f"Live ratings: Bradley-Terry refit every {cfg.ratings.refit_interval_sec:g} s")
+
+    def _wire_retention(self) -> None:
+        """T4.1: top-k retention reads the live ratings (spec block 4). Evictions already reach the journal through
+        T1.3's evict listener (``_on_snapshot_evicted``), whose next compaction pass folds the evicted entity's
+        detailed matches into counts."""
+        if self._live_ratings is not None:
+            self._coordinator.set_ratings_source(self._live_ratings.latest)
+
+    def _reapply_retention(self) -> None:
+        """After every live refit (a new ``RatingsSnapshot.version``), rerun retention for every trainable agent;
+        only with ``keep_top_k > 0``, where scores decide (spec block 4). Main loop only."""
+        if self._live_ratings is None or self._config.checkpoint.keep_top_k == 0 or self._coordinator is None:
+            return
+        snapshot = self._live_ratings.latest()
+        if snapshot is None or snapshot.version == self._retention_version:
+            return
+        self._retention_version = snapshot.version
+        for aid in self._agent_ids:
+            self._coordinator.checkpoint_manager.reapply_retention(aid)
 
     def _live_snapshot(self):
         """The newest live ratings snapshot (None without live ratings or before the first refit)."""

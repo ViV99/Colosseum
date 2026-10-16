@@ -19,6 +19,7 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
+from colosseum.arena.retention import SnapshotScore, snapshot_scores
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.coordinator.ratings import RatingBook
 from colosseum.core.config import ColosseumConfig
@@ -27,7 +28,7 @@ from colosseum.core.roles import agent_role_spec, role_signature
 from colosseum.core.types import Lineup, MatchResult
 from colosseum.envs.game import GameSpec
 from colosseum.league.base import BaseMatchmaker, MatchmakerContext, build_matchmaker, load_matchmaker_class
-from colosseum.league.lineups import check_lineup
+from colosseum.league.lineups import check_lineup, enabled_layouts
 from colosseum.league.mixture import MixtureMatchmaker, validate_matchmaking
 from colosseum.league.pfsp import PfspStats, compact_ratings
 
@@ -42,9 +43,11 @@ class Coordinator:
     """Central coordinator of a single-machine training run."""
 
     def __init__(self, config: ColosseumConfig, spec: GameSpec, player_roles: Mapping[str, Sequence[str]],
-                 checkpoint_dir: str | Path, env_steps: Callable[[], int] = lambda: 0) -> None:
+                 checkpoint_dir: str | Path, env_steps: Callable[[], int] = lambda: 0,
+                 run_id: str | None = None) -> None:
         """``player_roles``: roles of EVERY agent (``players.registry.resolve_player_roles``); ``env_steps``:
-        the run's global env-step counter (share schedules, SP3 block 5)."""
+        the run's global env-step counter (share schedules, SP3 block 5); ``run_id``: the current run (SP4: only
+        its final snapshot is protected; None keeps the SP3 rule)."""
         self._config = config
         self._spec = spec
         trainable = config.get_trainable_agent_ids()
@@ -66,9 +69,11 @@ class Coordinator:
         self._buffer_evictions = config.rollout.match_refresh_interval_sec > 0
         self._pfsp = PfspStats({aid: config.get_agent_config(aid).matchmaking.pfsp.halflife_games
                                 for aid in trainable})
+        self._ratings_source: Callable[[], object | None] | None = None   # top-k retention (SP4 T4.1)
         self._checkpoint_manager = CheckpointManager(
             base_dir=checkpoint_dir, keep_last=ckpt.keep_last, keep_every=ckpt.keep_every, interval=ckpt.interval,
-            on_evict=self._on_evict,
+            on_evict=self._on_evict, run_id=run_id, keep_top_k=ckpt.keep_top_k,
+            top_k_min_games=ckpt.top_k_min_games, max_snapshots=ckpt.max_snapshots, scores_fn=self.snapshot_scores,
         )
         self._ratings = RatingBook(spec, players)   # every player is a rating entity
         self._role_signatures = {a: role_signature(agent_role_spec(spec, roles))
@@ -136,6 +141,21 @@ class Coordinator:
         writer folds the snapshot's matches). A raising listener is logged (ERROR) and never stops the eviction or
         the run."""
         self._evict_listeners.append(listener)
+
+    def set_ratings_source(self, fn: Callable[[], object | None]) -> None:
+        """Where top-k retention reads ratings from: a callable returning the latest immutable
+        ``RatingsSnapshot`` (``LiveRatings.latest``) or None. Main loop only."""
+        self._ratings_source = fn
+
+    def snapshot_scores(self, agent_id: str) -> dict[str, SnapshotScore]:
+        """Live-rating scores of ``agent_id``'s snapshots (``arena.retention.snapshot_scores``): layout weights from
+        the agent's ``matchmaking.layouts``, quantile ``checkpoint.top_k_quantile``; ``{}`` before the first refit."""
+        snapshot = self._ratings_source() if self._ratings_source is not None else None
+        if snapshot is None:
+            return {}
+        weights = enabled_layouts(self._spec, self._config.get_agent_config(agent_id).matchmaking)
+        return snapshot_scores(snapshot, agent_id, layout_weights=weights,
+                               quantile=self._config.checkpoint.top_k_quantile)
 
     def _on_evict(self, agent_id: str, checkpoint_id: str) -> None:
         """Storage evicted a snapshot (spec block 4): new lineups no longer draw it (the matchmaker's

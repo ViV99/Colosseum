@@ -147,7 +147,12 @@ def test_resume_continues_versions_env_steps_and_lr(tmp_path):
     assert [v for v in versions if v > first_final], (first_final, versions)
     # SP3 T2.1: a run-dir resume carries the first run's stored snapshots (model.pt + meta.json) into the pool
     carried = [v for v in versions if v <= first_final]
-    assert first_final in carried and set(carried) <= set(checkpoint_versions(first, "agent_0")), (carried, versions)
+    assert set(carried) <= set(checkpoint_versions(first, "agent_0")), (carried, versions)
+    # SP4 T4.1: the first run's final is an ordinary snapshot here; only this run's final is protected
+    second_final = json.loads((second.root / "checkpoints" / "agent_0" / f"ckpt_v{versions[-1]}" / "meta.json")
+                              .read_text())
+    assert second_final["final"] is True and second_final["run_id"] != json.loads(
+        (first.root / "checkpoints" / "agent_0" / f"ckpt_v{first_final}" / "meta.json").read_text())["run_id"]
     assert not any((second.root / "checkpoints" / "agent_0" / f"ckpt_v{v}" / "trainer_state.pt").is_file()
                    for v in carried)
     assert versions[-1] == max(r["train_step"] for r in second_train), (versions, second_train[-1])

@@ -561,6 +561,10 @@ class CheckpointConfig(StrictModel):
     Kept: the newest ``keep_last`` (with ``trainer_state.pt``), every snapshot whose version is a multiple of
     ``interval * keep_every`` (``model.pt`` + ``meta.json``), and every final snapshot. ``pool_size`` (SP2) is
     read as ``keep_last`` with a warning.
+
+    SP4: only the final snapshot of the current run is protected (``meta.json`` ``run_id``), pinned snapshots
+    (``colosseum pin``) are; ``keep_top_k`` keeps the top-k by the live rating's lower bound with protection of new
+    snapshots; ``max_snapshots`` caps the pool (spec block 4; the rule: ``arena.retention``).
     """
 
     interval: int = Field(
@@ -576,6 +580,26 @@ class CheckpointConfig(StrictModel):
         default=10, ge=0,
         description="Also keep every snapshot whose version is a multiple of interval * keep_every (model.pt and "
                     "meta.json only); 0 = off.",
+    )
+    keep_top_k: int = Field(
+        default=0, ge=0,
+        description="Also keep the k snapshots with the highest lower bound of their live BT rating (needs "
+                    "match_log.enabled); 0 = off.",
+    )
+    top_k_quantile: float = Field(
+        default=0.1, gt=0.0, lt=0.5,
+        description="Quantile of the rating distribution used as the lower bound for keep_top_k.",
+    )
+    top_k_min_games: int = Field(
+        default=200, ge=0,
+        description="With keep_top_k > 0, a snapshot outside keep_last with fewer rated games is never evicted "
+                    "(rated comparisons, self-play excluded: one per match in a two-team layout, T - 1 per match "
+                    "in a T-team free-for-all).",
+    )
+    max_snapshots: int | None = Field(
+        default=100, ge=1,
+        description="At most this many snapshots per agent (keep_last, this run's final and pinned ones are never "
+                    "evicted); null = no cap.",
     )
     save_optimizer: bool = Field(
         default=True,
@@ -598,6 +622,14 @@ class CheckpointConfig(StrictModel):
         logger.warning(f"checkpoint.pool_size is the SP2 name of checkpoint.keep_last; read as keep_last: "
                        f"{data['keep_last']} (rename it in the config)")
         return data
+
+    @model_validator(mode="after")
+    def _check_cap(self) -> CheckpointConfig:
+        if self.max_snapshots is not None and self.max_snapshots < self.keep_last:
+            raise ValueError(f"checkpoint.max_snapshots ({self.max_snapshots}) is smaller than checkpoint.keep_last "
+                             f"({self.keep_last}): the newest keep_last snapshots are never evicted; raise "
+                             f"max_snapshots or lower keep_last")
+        return self
 
 
 class InitConfig(StrictModel):
@@ -1006,6 +1038,14 @@ class ColosseumConfig(StrictModel):
                 self.get_agent_config(agent_id)
             except ValidationError as e:
                 raise ValueError(f"agents.{agent_id}: invalid override:\n{e}") from None
+        return self
+
+    @model_validator(mode="after")
+    def _check_sp4_dependencies(self) -> ColosseumConfig:
+        """SP4 features that read the match log (spec blocks 1, 4, 6)."""
+        if self.checkpoint.keep_top_k > 0 and not self.match_log.enabled:
+            raise ValueError(f"checkpoint.keep_top_k={self.checkpoint.keep_top_k} keeps snapshots by their rating, "
+                             f"which comes from the match log; set match_log.enabled: true or keep_top_k: 0")
         return self
 
     def _has_implicit_agent(self) -> bool:

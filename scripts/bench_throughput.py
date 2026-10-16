@@ -162,6 +162,10 @@ def _make_config(num_workers: int, run_parent: str):
             "interval": 10**9,  # no checkpoints: every seat collects
             "keep_last": 10,
             "keep_every": 0,
+            "keep_top_k": 0,
+            "top_k_quantile": 0.1,
+            "top_k_min_games": 200,
+            "max_snapshots": 100,
             "save_optimizer": True,
         },
         init={"from": None, "strict": True, "critic_warmup_steps": 0},

@@ -210,6 +210,9 @@ def check_distributed_scope(config: ColosseumConfig) -> None:
         problem = _teacher_problem(config, teacher)
         if problem is not None:
             problems.append(problem)
+    if config.checkpoint.keep_top_k > 0:
+        problems.append(f"checkpoint.keep_top_k={config.checkpoint.keep_top_k} (snapshot ratings need the match "
+                        f"log, which the distributed roles do not write)")
     if problems:
         raise ConfigError(f"{_SP5}: " + "; ".join(problems))
     reduced = {aid: acfg.matchmaking.opponents.model_dump(mode="json")
@@ -223,15 +226,18 @@ def check_distributed_scope(config: ColosseumConfig) -> None:
                        f"across machines come with SP5): {'; '.join(ignored)}")
 
 
-def distributed_checkpoint_manager(config: ColosseumConfig, base_dir: str | Path) -> CheckpointManager:
+def distributed_checkpoint_manager(config: ColosseumConfig, base_dir: str | Path,
+                                   run_id: str | None = None) -> CheckpointManager:
     """The distributed learner's snapshot storage: the local retention (``keep_last``, every
-    ``keep_every``-th, the final snapshot; ``trainer_state.pt`` only in the ``keep_last`` window).
-    Nothing listens for evictions: distributed workers play latest weights only."""
+    ``keep_every``-th, the final snapshot of this learner's run (``run_id``), pinned ones;
+    ``trainer_state.pt`` only in the ``keep_last`` window); ``max_snapshots`` with FIFO order (no ratings:
+    ``keep_top_k > 0`` is refused by ``check_distributed_scope``). Nothing listens for evictions: distributed
+    workers play latest weights only."""
     from colosseum.coordinator.checkpoint_manager import CheckpointManager
 
     ckpt = config.checkpoint
     return CheckpointManager(base_dir=base_dir, keep_last=ckpt.keep_last, keep_every=ckpt.keep_every,
-                             interval=ckpt.interval)
+                             interval=ckpt.interval, run_id=run_id, max_snapshots=ckpt.max_snapshots)
 
 
 def distributed_setup(config: ColosseumConfig, agent_ids: list[str]) -> DistributedSetup:
@@ -338,7 +344,8 @@ def run_distributed_learner(
     # Checkpoint persistence (drained off-thread so training never blocks). Always on:
     # the learner's final snapshot is saved even without periodic checkpoints.
     checkpoint_queue: queue.Queue = queue.Queue(maxsize=16)
-    coordinator_ckpt = distributed_checkpoint_manager(config, run_dir.checkpoints)
+    # The distributed learner never runs Launcher.launch: it creates its run's run.json itself (A2).
+    coordinator_ckpt = distributed_checkpoint_manager(config, run_dir.checkpoints, run_id=run_dir.ensure_run_id())
 
     # The kickstart teacher (if any) is read here, before training starts, into a numpy spec.
     teacher = resolve_teacher(config, agent_id, setup.spec)

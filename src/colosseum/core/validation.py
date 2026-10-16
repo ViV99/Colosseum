@@ -7,6 +7,7 @@ can monkeypatch it there).
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -30,6 +31,8 @@ from colosseum.core.tree import (
 from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
 from colosseum.envs.game import GameSpec, RoleSpec, StepResult
 from colosseum.networks.dist import Distribution
+
+logger = logging.getLogger(__name__)
 
 VALIDATE_STEPS = 8  # random legal steps per enabled layout
 VALIDATE_LINEUPS = 16  # lineups drawn per trainable agent from a custom matchmaker
@@ -544,6 +547,34 @@ def _check_warm_start(config: ColosseumConfig, spec: GameSpec, agent_configs: di
         report.lines.append("training.resume_from is set: agents restored from it ignore init")
 
 
+def _describe_retention(config: ColosseumConfig, report: ValidationReport) -> None:
+    """The effective retention rule per trainable agent (spec block 4), and a WARNING when the pinned snapshots a
+    run-dir resume carries over plus ``keep_last`` exceed ``max_snapshots``."""
+    from pathlib import Path
+
+    from colosseum.arena.retention import describe_retention
+    from colosseum.coordinator.checkpoint_manager import RESUME_RUN_DIR, classify_resume_source, read_snapshots
+
+    rule = describe_retention(config.checkpoint)
+    source = config.training.resume_from
+    try:
+        run_dir = Path(source) if source and classify_resume_source(source) == RESUME_RUN_DIR else None
+    except ConfigError:
+        run_dir = None          # a bad resume source is reported by the launcher, as before (SP3)
+    cap = config.checkpoint.max_snapshots
+    for aid in config.get_trainable_agent_ids():
+        report.lines.append(f"agent '{aid}': {rule}")
+        if run_dir is None or cap is None:
+            continue
+        pinned = sum(1 for c in read_snapshots(run_dir / "checkpoints" / aid) if c.meta.get("pinned") is True)
+        if config.checkpoint.keep_last + pinned > cap:
+            message = (f"agent '{aid}': keep_last {config.checkpoint.keep_last} + {pinned} pinned snapshots carried "
+                       f"over from {run_dir} exceed checkpoint.max_snapshots {cap}: the protected snapshots are all "
+                       f"kept and nothing else fits; unpin some (colosseum pin --remove) or raise max_snapshots")
+            logger.warning(message)
+            report.lines.append(f"WARNING: {message}")
+
+
 def _check_ratings(config: ColosseumConfig, report: ValidationReport) -> None:
     """``ratings.anchor`` names an agent of the config (SP4 spec block 2); report the journal and rating
     settings."""
@@ -628,6 +659,7 @@ def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] 
                                 f"configured matchmaking section, which it may ignore)")
         report.lines.extend(describe_mix(config, spec))
         _check_ratings(config, report)
+        _describe_retention(config, report)
     fixed = load_fixed_players(config, spec, selected)   # roles, classes, paths and role signatures of fixed agents
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_roles}
     role_specs = {aid: agent_role_spec(spec, roles) for aid, roles in agent_roles.items()}
