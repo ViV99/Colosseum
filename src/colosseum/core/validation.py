@@ -52,6 +52,7 @@ class ValidationReport:
     visible in the config (fixed players; later the opponent mix and init reports)."""
 
     lines: list[str] = field(default_factory=list)
+    fixed: Any = None  # the FixedPlayers validate loaded (reused by eval / record / tournament)
 
 
 def _seeded(space: Any, rng: np.random.Generator) -> Any:
@@ -665,6 +666,7 @@ def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] 
         _check_ratings(config, report)
         _describe_retention(config, report)
     fixed = load_fixed_players(config, spec, selected)   # roles, classes, paths and role signatures of fixed agents
+    report.fixed = fixed
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_roles}
     role_specs = {aid: agent_role_spec(spec, roles) for aid, roles in agent_roles.items()}
     for aid, acfg in agent_configs.items():

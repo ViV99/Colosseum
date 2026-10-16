@@ -39,7 +39,8 @@ A lineup naming a snapshot the pool cannot provide is seated as the agent's late
 ``collect=True`` (SP1 rule; one warning per (agent, network)), unless the pool serves that agent's
 ``"latest"`` as a ``ScriptedPlayer`` (a ``ValueError``: a bot never collects); latest and fixed seats must
 be in the pool. Only ``latest`` seats of neural players may collect: any other seat with ``collect=True`` (also a
-``ScriptedPlayer`` a pool serves under ``"latest"``) is a ``ValueError``.
+``ScriptedPlayer`` a pool serves under ``"latest"``) is a ``ValueError``. With ``snapshot_fallback=False``
+(``play_lineups``) a snapshot seat must be in the pool itself (ValueError otherwise) and is never replaced.
 
 ``context`` is a prefix ending with ``", "`` (e.g. ``"worker 3, "``); env contract errors
 read ``"worker 3, env 1, seat 2, episode step 7, layout 4p: ..."``.
@@ -185,6 +186,7 @@ class MatchRunner:
         version_fn: Callable[[str], int | None] | None = None,
         source: str = "train",
         uid_prefix: str = "",
+        snapshot_fallback: bool = True,
     ) -> None:
         if source not in MATCH_SOURCES:
             raise ValueError(f"MatchRunner: source must be one of {MATCH_SOURCES}, got {source!r}")
@@ -203,6 +205,7 @@ class MatchRunner:
         self._version_fn = version_fn
         self._source = source
         self._uid_prefix = uid_prefix
+        self._snapshot_fallback = bool(snapshot_fallback)
         self._episodes_finished = 0
         self._warned_missing: set[tuple[str, str]] = set()
         self._bots: dict[tuple[str, int, int], ScriptedBot] = {}
@@ -278,7 +281,8 @@ class MatchRunner:
             )
         for seat, assignment in enumerate(lineup.seats):
             net = assignment.network_id
-            needed = net if net in (LATEST_NETWORK_ID, FIXED_NETWORK_ID) else LATEST_NETWORK_ID
+            needed = net if net in (LATEST_NETWORK_ID, FIXED_NETWORK_ID) or not self._snapshot_fallback \
+                else LATEST_NETWORK_ID
             player = self._players.get(assignment.agent_id, needed)
             if player is None:
                 raise ValueError(
@@ -298,8 +302,10 @@ class MatchRunner:
 
     def _resolve(self, lineup: Lineup, env: int) -> Lineup:
         """Validate ``lineup`` and replace snapshots the pool cannot provide by latest + collect (never for a
-        scripted player: ValueError)."""
+        scripted player: ValueError); without the fallback every seat is checked as it is and kept."""
         self._check_lineup(lineup, env)
+        if not self._snapshot_fallback:   # the pool serves every seat itself (eval, tournament, pulse)
+            return replace(lineup, seats=[replace(seat) for seat in lineup.seats])
         seats = []
         for seat, assignment in enumerate(lineup.seats):
             aid, net = assignment.agent_id, assignment.network_id

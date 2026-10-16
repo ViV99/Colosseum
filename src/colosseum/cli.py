@@ -108,14 +108,6 @@ def _parse_overrides(overrides: tuple[str, ...]) -> dict:
     return result
 
 
-def _parse_agent_spec(spec: str) -> tuple[str, str | None]:
-    """``name=path`` -> (name, path); ``name`` -> (name, None): a scripted or frozen agent of the config."""
-    name, sep, path = spec.partition("=")
-    if not name or (sep and not path):
-        raise click.BadParameter(f"expected name or name=path, got {spec!r}", param_hint="'--agent'")
-    return name, (path if sep else None)
-
-
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
 @click.option("--set", "overrides", multiple=True,
@@ -203,12 +195,16 @@ def eval_cmd(
         raise click.BadParameter(f"directory {str(Path(output).parent)!r} does not exist", param_hint="'--output'")
     with _config_errors():
         from colosseum.core.config import load_config
+        from colosseum.core.errors import ConfigError
         from colosseum.core.registry import env_spec, validate_config
-        from colosseum.eval import evaluate
+        from colosseum.eval import balanced_match_count, evaluate, parse_agent_spec
 
         cfg = load_config(config, _parse_overrides(overrides) or None)
-        specs = [_parse_agent_spec(spec) for spec in agents]
-        validate_config(cfg, scope="play", players=[name for name, path in specs if path is None])
+        try:
+            specs = [parse_agent_spec(spec) for spec in agents]
+        except ConfigError as e:
+            raise click.BadParameter(str(e), param_hint="'--agent'") from e
+        report_v = validate_config(cfg, scope="play", players=[name for name, path in specs if path is None])
         names = [name for name, _ in specs]
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
@@ -224,14 +220,14 @@ def eval_cmd(
                 raise click.BadParameter(f"{p}: expected a checkpoint directory or a .pt file",
                                          param_hint="'--agent'")
         spec = env_spec(cfg)
-        chosen = list(layouts) or list(spec.layouts)
-        competitive = any(spec.num_teams(name) >= 2 for name in chosen if name in spec.layouts)
-        if len(specs) > 1 and competitive and num_matches % 2:
-            click.echo(f"Note: --num-matches {num_matches} is odd; using {num_matches + 1} per pair so every "
-                       f"agent plays every side equally often.", err=True)
-            num_matches += 1
+        if len(specs) > 1:
+            rounded = balanced_match_count(spec, list(layouts) or None, num_matches)
+            if rounded != num_matches:
+                click.echo(f"Note: --num-matches {num_matches} is odd; using {rounded} per pair so every "
+                           f"agent plays every side equally often.", err=True)
+                num_matches = rounded
         report = evaluate(cfg, dict(specs), layouts=list(layouts) or None, num_matches=num_matches, seed=seed,
-                          deterministic=deterministic, num_envs=num_envs)
+                          deterministic=deterministic, num_envs=num_envs, fixed=report_v.fixed)
     click.echo("\n" + report.text())
     if output:
         report.write_json(output)
@@ -278,14 +274,16 @@ def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tupl
     with _config_errors():  # also a scripted player's error (PlayerError)
         from colosseum.core.config import load_config
         from colosseum.core.registry import validate_config
-        from colosseum.eval import EvalReport
-        from colosseum.record import RECORD_FILE, parse_player, record
+        from colosseum.eval import EvalReport, parse_agent_spec
+        from colosseum.record import RECORD_FILE, record
 
         cfg = load_config(config, _parse_overrides(overrides) or None)
-        named = [parse_player(text) for text in (player, *against)]
-        validate_config(cfg, scope="play", players=[name for name, path in named if path is None])
+        named = [parse_agent_spec(text, option=opt) for opt, text in (("--player", player),
+                                                                       *(("--against", a) for a in against))]
+        report_v = validate_config(cfg, scope="play", players=[name for name, path in named if path is None])
         content = record(cfg, player, list(against), layouts=list(layouts) or None, num_matches=num_matches,
-                         output=output, num_envs=num_envs, seed=seed, deterministic=deterministic)
+                         output=output, num_envs=num_envs, seed=seed, deterministic=deterministic,
+                         fixed=report_v.fixed)
     summary = content["summary"]
     report = EvalReport(agents=summary["agents"], num_matches=summary["num_matches"],
                         deterministic=summary["deterministic"], layouts=summary["layouts"])

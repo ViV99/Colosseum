@@ -32,8 +32,8 @@ from colosseum.envs.game import GameSpec
 from colosseum.networks.model import PolicyModel
 from colosseum.players.scripted import ScriptedBot
 
-__all__ = ["BotSpec", "FixedPlayers", "FrozenSpec", "build_frozen_model", "load_fixed_players", "load_frozen",
-           "make_bot", "resolve_player_roles"]
+__all__ = ["BotSpec", "FixedPlayers", "FrozenSpec", "build_frozen_model", "checkpoint_roles", "load_fixed_players",
+           "load_frozen", "make_bot", "resolve_player_roles"]
 
 
 @dataclass(frozen=True)
@@ -127,7 +127,8 @@ def _pt_roles(config: ColosseumConfig, spec: GameSpec, name: str, path: Path, ex
     return roles
 
 
-def _checkpoint_roles(spec: GameSpec, path: Path, meta: dict) -> list[str]:
+def checkpoint_roles(spec: GameSpec, path: Path, meta: dict) -> list[str]:
+    """The roles of a checkpoint dir's ``meta.json``, checked against the game (names and role signature)."""
     roles, signature = meta.get("roles"), meta.get("role_signature")
     if roles is None or signature is None:
         raise ConfigError(f"Checkpoint {path}: meta.json has no roles/role_signature (not an SP2 checkpoint)")
@@ -180,7 +181,7 @@ def resolve_player_roles(config: ColosseumConfig, spec: GameSpec,
             path = Path(entry.path)
             if path.is_dir():
                 _check_dir_entry(agent_id, entry, path)
-                out[agent_id] = _checkpoint_roles(spec, path, read_checkpoint_meta(path))
+                out[agent_id] = checkpoint_roles(spec, path, read_checkpoint_meta(path))
             elif path.is_file() and path.suffix == ".pt":
                 out[agent_id] = _pt_roles(config, spec, agent_id, path, entry.roles)
             else:
@@ -188,7 +189,8 @@ def resolve_player_roles(config: ColosseumConfig, spec: GameSpec,
     return out
 
 
-def load_frozen(config: ColosseumConfig, agent_id: str, path: str | Path, spec: GameSpec) -> FrozenSpec:
+def load_frozen(config: ColosseumConfig, agent_id: str, path: str | Path, spec: GameSpec, *,
+                use_entry: bool = True) -> FrozenSpec:
     """Read fixed weights for the player ``agent_id`` from a checkpoint dir or a ``.pt`` (read-only).
 
     - Checkpoint dir (``load_checkpoint_dir``): roles and role signature from ``meta.json`` (required; checked
@@ -197,10 +199,16 @@ def load_frozen(config: ColosseumConfig, agent_id: str, path: str | Path, spec: 
     - ``.pt``: roles by ``_pt_roles``; networks: a trainable agent's effective networks, a frozen agent's
       ``networks`` override deep-merged onto the global networks, else the global networks.
 
+    ``use_entry=False`` (a path given on the command line): a frozen entry of the same name is ignored (SP4 §8); a
+    trainable entry's architecture still applies to a ``.pt``.
+
     ConfigError naming the path; a path that is neither raises FileNotFoundError (callers check first).
     """
     p = Path(path)
     entry = config.agent_entry(agent_id) if agent_id in config.agent_ids() else None
+    if not use_entry and isinstance(entry, FrozenAgent):
+        entry = None    # a user path (-a name=path in eval / record / tournament): the frozen entry's .pt settings
+                        # do not apply
     if entry is not None and entry.kind == "scripted":
         raise ConfigError(f"agent {agent_id!r} is a scripted agent: it has no weights to load from {p}")
     frozen_entry = entry if isinstance(entry, FrozenAgent) else None
@@ -209,7 +217,7 @@ def load_frozen(config: ColosseumConfig, agent_id: str, path: str | Path, spec: 
     if p.is_dir():
         _check_dir_entry(agent_id, frozen_entry, p)
         loaded = load_checkpoint_dir(p)
-        roles = _checkpoint_roles(spec, p, loaded["meta"])
+        roles = checkpoint_roles(spec, p, loaded["meta"])
         raw = loaded["meta"].get("networks")
         if raw is not None:
             try:
