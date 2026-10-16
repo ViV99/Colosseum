@@ -8,6 +8,7 @@ top-level classes, so ``functools.partial(Game, ...)`` or the class itself is a 
 from __future__ import annotations
 
 import functools
+import json
 import math
 import queue
 import shutil
@@ -1176,6 +1177,33 @@ def copy_sp2_run(tmp_path) -> Path:
     """A writable copy of the SP2 fixture run dir under ``tmp_path`` (tests never write into tests/fixtures)."""
     dst = Path(tmp_path) / "sp2_run"
     shutil.copytree(SP2_RUN, dst)
+    return dst
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T0.1): SP3 compatibility fixtures (read-only inputs; copy before writing)
+# ---------------------------------------------------------------------------
+
+
+SP3_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "sp3"
+SP3_CONFIGS = SP3_FIXTURES / "configs"
+SP3_CONFIG_NAMES = ("chase", "coin_grid", "coop_buttons", "predator_prey", "space_miners", "team_tag",
+                    "tic_tac_toe", "tic_tac_toe_attention", "tic_tac_toe_multi", "tron", "unit_harvest",
+                    "unit_harvest_league")
+SP3_TTT_TINY = SP3_FIXTURES / "sp3_ttt_tiny.yaml"
+SP3_RUN = SP3_FIXTURES / "run"
+
+
+def sp3_manifest() -> dict:
+    """What the SP3 run fixture holds (``tests/fixtures/sp3/manifest.json``, written by its generator):
+    ``agent``, ``anchor``, ``layout``, ``versions``, ``final_version``, ``with_trainer_state``, ``env_steps``."""
+    return json.loads((SP3_FIXTURES / "manifest.json").read_text())
+
+
+def copy_sp3_run(tmp_path) -> Path:
+    """A writable copy of the SP3 run fixture under ``tmp_path`` (tests never write into tests/fixtures)."""
+    dst = Path(tmp_path) / "sp3_run"
+    shutil.copytree(SP3_RUN, dst)
     return dst
 
 
