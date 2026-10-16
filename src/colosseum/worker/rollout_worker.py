@@ -23,6 +23,7 @@ from colosseum.envs.game import MultiAgentEnv
 from colosseum.metrics.aggregator import WORKER_STATS_INTERVAL_SEC
 from colosseum.networks.model import PolicyModel
 from colosseum.players.registry import BotSpec, FixedPlayers
+from colosseum.utils.process import SHUTDOWN_GRACE_SEC, flush_queue
 from colosseum.worker.rollout_loop import LATEST_NETWORK_ID, LoopIO, RolloutLoop
 
 __all__ = ["LATEST_NETWORK_ID", "report_worker_stats", "rollout_worker_process"]
@@ -63,11 +64,15 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
     return WorkerCommand(lineups=lineups, new_checkpoints=merged, evict=evict)
 
 
-def report_worker_stats(q, worker_id: int, stats: dict) -> None:
-    """Best-effort worker stats for the main process (system metrics). Never blocks."""
+def report_worker_stats(q, worker_id: int, stats: dict, timeout: float | None = None) -> None:
+    """Best-effort worker stats for the main process (system metrics). Never blocks, unless ``timeout`` (seconds)
+    is given: the final report on exit waits that long for room in the queue."""
+    item = {"kind": "worker_stats", "worker_id": int(worker_id), **{k: int(v) for k, v in stats.items()}}
     try:
-        q.put_nowait({"kind": "worker_stats", "worker_id": int(worker_id),
-                      **{k: int(v) for k, v in stats.items()}})
+        if timeout is None:
+            q.put_nowait(item)
+        else:
+            q.put(item, timeout=timeout)
     except queue.Full:
         pass
 
@@ -100,17 +105,22 @@ def rollout_worker_process(
     max_idle_steps: int = 1000,
     fixed_players: FixedPlayers | None = None,
     teachers: Mapping[str, BotSpec] | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Worker process entry point (see module docstring).
 
     Chunk payloads (``TrajectoryChunk.to_payload()``) go to ``trajectory_queues[agent_id]``
     (blocking put that gives up when ``stop_event`` is set); weights are drained newest-wins
-    from ``weight_queues[agent_id]``; results are put non-blocking on ``results_queue``;
+    from ``weight_queues[agent_id]``; results are put non-blocking on ``results_queue`` (a full queue drops
+    the result: counted in the stats as ``dropped_results``, the first drop is a WARNING);
     commands are drained (merged) from ``command_queue``. ``max_env_steps`` limits this
     worker's env steps (0 = until stopped). Env steps are added to ``env_step_counter``
     about every 0.5 s and once more on exit. ``fixed_players``: scripted and frozen agents, built
     inside this process (served under ``FIXED_NETWORK_ID``; they never collect). ``teachers``: scripted
     kickstart teachers by student agent (``BotSpec``, never instances; DAgger labels in the chunks).
+    ``run_id`` prefixes the match uids (``<run_id>/train/...``). On exit a final stats report is sent, and the
+    results and stats queues are flushed (``flush_queue``) so that neither the last results nor the final
+    counters are lost.
     """
     configure_torch_threads(torch_threads)
 
@@ -127,11 +137,19 @@ def rollout_worker_process(
     def poll_weights(agent_id: str) -> WeightPayload | None:
         return drain_latest(weight_queues[agent_id])
 
-    def report_result(result: MatchResult) -> None:
+    drop_warned = [False]
+
+    def report_result(result: MatchResult) -> bool:
         try:
             results_queue.put_nowait(result)
+            return True
         except queue.Full:
-            logger.debug(f"Worker {worker_id}: results queue full, dropping {result.match_id}")
+            if not drop_warned[0]:
+                drop_warned[0] = True
+                logger.warning(f"Worker {worker_id}: the results queue is full; dropped match result "
+                               f"{result.uid or result.match_id} (counted in dropped_match_results of the system "
+                               f"metrics; further drops are only counted)")
+            return False
 
     def poll_command() -> WorkerCommand | None:
         return _drain_commands(command_queue)
@@ -155,7 +173,7 @@ def rollout_worker_process(
         lineups=lineups, weight_sync_interval=weight_sync_interval,
         checkpoint_state_dicts_by_agent=checkpoint_state_dicts_by_agent, seed=seed,
         vec_env_kind=vec_env_kind, subproc_workers=subproc_workers, max_idle_steps=max_idle_steps,
-        fixed_players=fixed_players, teachers=teachers,
+        fixed_players=fixed_players, teachers=teachers, run_id=run_id,
     )
     last_stats = [time.monotonic()]
 
@@ -172,10 +190,16 @@ def rollout_worker_process(
         if counter is not None:
             counter.flush()
         try:
+            if stats_queue is not None:   # the final counters (dropped results, dropped reward episodes)
+                report_worker_stats(stats_queue, worker_id, loop.stats, timeout=1.0)
             loop.close()
         finally:
-            # Detach feeder threads of queues this worker produced to, so undrained
-            # items (e.g. chunks a stopped learner never consumed) cannot block exit.
+            # The results and the final stats must reach the main process (it drains them until this process
+            # exits); then detach every feeder thread, so undrained items (e.g. chunks a stopped learner never
+            # consumed) cannot block exit.
+            for q in (results_queue, stats_queue):
+                if q is not None:
+                    flush_queue(q, warn_after=SHUTDOWN_GRACE_SEC)
             for q in [*trajectory_queues.values(), results_queue, stats_queue]:
                 if q is not None and hasattr(q, "cancel_join_thread"):
                     q.cancel_join_thread()

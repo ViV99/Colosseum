@@ -258,7 +258,7 @@ def play_lineups(
     need no eval mode; a ``ScriptedBot`` instance is never played itself (deep copies are).
     ``observer`` (optional) sees every decision and episode of the scheduled lineups; see ``_Collector``.
     """
-    lineups = [Lineup(lineup.layout, [dataclasses.replace(seat, collect=False) for seat in lineup.seats])
+    lineups = [dataclasses.replace(lineup, seats=[dataclasses.replace(seat, collect=False) for seat in lineup.seats])
                for lineup in lineups]
     if not lineups:
         return []

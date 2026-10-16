@@ -168,6 +168,9 @@ def _make_config(num_workers: int, run_parent: str):
         kickstart={"teacher": None, "lambda": 1.0, "decay_steps": 50_000, "kl": "forward"},
         run={"dir": run_parent, "name": f"bench-w{num_workers}"},
         metrics={"use_wandb": False, "log_interval": 1, "console_interval_sec": SYSTEM_RECORD_INTERVAL_S},
+        # SP4 criterion 3.6: the journal is on while throughput is measured.
+        match_log={"enabled": True, "detail_window_mb": 512.0, "min_free_disk_mb": 2048.0,
+                   "compact_interval_sec": 60.0},
         transport={"mode": "local"},
     )
 

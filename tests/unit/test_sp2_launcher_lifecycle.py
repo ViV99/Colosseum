@@ -19,6 +19,7 @@ from fake_wandb import FakeWandb
 import colosseum.launcher as launcher_module
 from colosseum.cli import main
 from colosseum.core.config import ColosseumConfig
+from colosseum.core.types import MatchResult
 from colosseum.launcher import Launcher
 from game_helpers import make_coordinator, make_test_config, make_test_run_dir
 
@@ -562,7 +563,7 @@ def test_launcher_closes_metrics_file_when_final_drain_fails(tmp_path):
             return {}
 
     results = queue.Queue()
-    results.put("a result")
+    results.put(MatchResult("w0_e0_ep0", "2p", "wdl", [], [], 1))   # SP4: results are stamped with env_steps
     launcher._coordinator = FailingCoordinator()
     launcher._results_queue, launcher._metrics_queue = results, queue.Queue()
     with pytest.raises(RuntimeError, match="boom"):

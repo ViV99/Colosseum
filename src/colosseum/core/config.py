@@ -16,6 +16,7 @@ SP3: ``agents.<id>.kind`` (trainable / scripted / frozen) and the implicit train
 SP3: ``checkpoint.keep_last`` / ``keep_every`` (``pool_size`` is read as ``keep_last``).
 SP3: ``init`` and ``kickstart`` sections (global + per agent); ``training.kickstart_*`` are translated
 into ``kickstart``.
+SP4: the global ``match_log`` section.
 """
 
 from __future__ import annotations
@@ -657,6 +658,27 @@ class MetricsConfig(StrictModel):
     )
 
 
+class MatchLogConfig(StrictModel):
+    """The match log ``runs/<name>/matches.db`` (SP4 spec block 1). Global only (no per-agent override)."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Journal every training match (false: only the online ELO of SP2; snapshot ratings, top-k "
+                    "snapshots and evaluation need the journal).",
+    )
+    detail_window_mb: float = Field(
+        default=512.0, gt=0,
+        description="Detailed training matches are kept within this size (an estimate, about 1M matches at "
+                    "512); older ones are compacted into counts, which keep the ratings exact.",
+    )
+    min_free_disk_mb: float = Field(
+        default=2048.0, ge=0,
+        description="When the journal's disk has less free space, new training matches go to the counts only "
+                    "(the detail resumes when space is back).",
+    )
+    compact_interval_sec: float = Field(default=60.0, gt=0, description="Seconds between compaction passes.")
+
+
 class RunConfig(StrictModel):
     """Where a training run writes its outputs: ``<dir>/<name>/``."""
 
@@ -886,6 +908,7 @@ class ColosseumConfig(StrictModel):
     init: InitConfig = Field(default_factory=InitConfig)
     kickstart: KickstartConfig = Field(default_factory=KickstartConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    match_log: MatchLogConfig = Field(default_factory=MatchLogConfig)
     bc: BCConfig = Field(default_factory=BCConfig)
     transport: TransportConfig = Field(default_factory=TransportConfig)
     run: RunConfig = Field(default_factory=RunConfig)

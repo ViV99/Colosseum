@@ -25,6 +25,10 @@ slots of every collecting seat (slot rules of spec block 4):
   seat from collecting for its agent; a seat that starts collecting takes a parked buffer
   of that agent first (``BufferPool``).
 - A chunk's ``policy_version`` is the agent's version at its first slot.
+- **Match results** (SP4 spec block 1) carry each latest seat's policy version at the episode's start and end
+  (``MatchRunner(version_fn=...)`` reads ``policy_versions``, which change when weights are synced, also
+  mid-episode) and the uid ``<run_id>/train/w<W>_e<E>_ep<K>`` (``match_id`` without a run id). A result
+  ``LoopIO.report_result`` could not deliver (it returns False) is counted in ``stats["dropped_results"]``.
 - Snapshot eviction (spec block 3): ids in ``WorkerCommand.evict`` are unloaded as soon as no env's
   current or staged lineup uses them; a later lineup naming one gets the agent's latest weights
   (``MatchRunner``'s SP1 fallback).
@@ -85,7 +89,8 @@ class LoopIO:
 
     send_chunk: Callable[[TrajectoryChunk], None]
     poll_weights: Callable[[str], WeightPayload | None]
-    report_result: Callable[[MatchResult], None] | None = None
+    # Returns False when the result was dropped (counted in stats["dropped_results"]); None or True: delivered.
+    report_result: Callable[[MatchResult], bool | None] | None = None
     poll_command: Callable[[], WorkerCommand | None] | None = None
     add_env_steps: Callable[[int], None] | None = None  # global env-step budget counter
 
@@ -134,6 +139,7 @@ class RolloutLoop:
         max_idle_steps: int = 1000,
         fixed_players: FixedPlayers | None = None,
         teachers: Mapping[str, BotSpec] | None = None,
+        run_id: str | None = None,
     ) -> None:
         if len(lineups) != num_envs:
             raise ValueError(f"worker {worker_id}: need one lineup per env: {len(lineups)} lineups for {num_envs} envs")
@@ -210,10 +216,13 @@ class RolloutLoop:
             self._chunks_sent = 0
             self._dropped_reward_episodes = 0
             self._dropped_reward_warned = False
+            self._dropped_results = 0
             self._recorded: dict[str, int] = defaultdict(int)
             self._runner = MatchRunner(
                 vec_env=vec_env, lineups=lineups, models=self, observer=self, seed=seed,
                 max_idle_steps=max_idle_steps, context=f"worker {worker_id}, ", match_id_prefix=f"w{worker_id}_e",
+                version_fn=self._policy_versions.get, source="train",
+                uid_prefix=f"{run_id}/train/" if run_id else "",
             )
             for e in range(num_envs):
                 for seat, assignment in enumerate(self._runner.lineup(e).seats):
@@ -272,6 +281,7 @@ class RolloutLoop:
             "episodes": self._episodes,
             "parked_buffers": self._pool.parked_count(),
             "dropped_reward_episodes": self._dropped_reward_episodes,
+            "dropped_results": self._dropped_results,
             "recorded_transitions": sum(self._recorded.values()),
         }
         for aid in self._agent_ids:
@@ -395,8 +405,8 @@ class RolloutLoop:
                                    f"rewards of waiting seats")
             track.pending_reward = 0.0
         self._episodes += 1
-        if self._io.report_result is not None:
-            self._io.report_result(end.result)
+        if self._io.report_result is not None and self._io.report_result(end.result) is False:
+            self._dropped_results += 1
 
     def on_episode_start(self, env: int, layout: str, episode_seed: int | None) -> None:
         """MatchRunner hook after every env reset: the episode's layout and seed (teacher resets)."""

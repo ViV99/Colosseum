@@ -43,6 +43,13 @@ be in the pool. Only ``latest`` seats of neural players may collect: any other s
 
 ``context`` is a prefix ending with ``", "`` (e.g. ``"worker 3, "``); env contract errors
 read ``"worker 3, env 1, seat 2, episode step 7, layout 4p: ..."``.
+
+Match records (SP4 spec block 1). Every ``SeatResult`` carries the seat's weights version at the episode's start
+(read right after the env reset) and at its end (read when the result is made): ``ckpt_v<N>`` -> N, ``fixed`` ->
+None, ``latest`` -> ``version_fn(agent_id)`` (the worker's current version; None without ``version_fn``). A lineup's
+explicit ``seed`` replaces the derived episode seed (``SeedSequence([seed, env, episode])``); the episode seed (when
+there is one) goes into ``MatchResult.seed``, the lineup's ``block`` into ``MatchResult.block``, and the uid is the
+lineup's ``uid`` or ``uid_prefix + match_id``. ``source`` (one of ``MATCH_SOURCES``) is copied into every result.
 """
 
 from __future__ import annotations
@@ -50,17 +57,19 @@ from __future__ import annotations
 import logging
 from collections import defaultdict
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, Protocol
 
 import numpy as np
 
+from colosseum.arena.entities import snapshot_version
 from colosseum.core.errors import PlayerError
 from colosseum.core.specs import ActionSpec, ObsSpec
 from colosseum.core.tree import Tree, tree_map, tree_to_numpy, tree_to_torch
 from colosseum.core.types import (
     FIXED_NETWORK_ID,
     LATEST_NETWORK_ID,
+    MATCH_SOURCES,
     Lineup,
     MatchResult,
     SeatAssignment,
@@ -154,6 +163,8 @@ class _EnvState:
         self.states: dict[int, State] = {}
         self.scripted: dict[int, ScriptedPlayer] = {}   # seats of the current lineup played by bots
         self.episode_index = 0
+        self.seed: int | None = None                 # the current episode's seed
+        self.version_start: dict[int, int | None] = {}   # weights version per seat at the episode start
 
 
 class MatchRunner:
@@ -171,7 +182,12 @@ class MatchRunner:
         deterministic: bool = False,
         context: str = "",
         match_id_prefix: str = "m",
+        version_fn: Callable[[str], int | None] | None = None,
+        source: str = "train",
+        uid_prefix: str = "",
     ) -> None:
+        if source not in MATCH_SOURCES:
+            raise ValueError(f"MatchRunner: source must be one of {MATCH_SOURCES}, got {source!r}")
         self._vec_env = vec_env
         self.num_envs = vec_env.num_envs
         self.spec: GameSpec = vec_env.spec
@@ -184,6 +200,9 @@ class MatchRunner:
         self._deterministic = deterministic
         self._context = context
         self._prefix = match_id_prefix
+        self._version_fn = version_fn
+        self._source = source
+        self._uid_prefix = uid_prefix
         self._episodes_finished = 0
         self._warned_missing: set[tuple[str, str]] = set()
         self._bots: dict[tuple[str, int, int], ScriptedBot] = {}
@@ -300,7 +319,19 @@ class MatchRunner:
                     f"seating {LATEST_NETWORK_ID!r} (collecting) instead"
                 )
             seats.append(SeatAssignment(aid, LATEST_NETWORK_ID, True, assignment.source))
-        return Lineup(layout=lineup.layout, seats=seats)
+        return replace(lineup, seats=seats)   # seed, block and uid stay
+
+    def _seat_version(self, assignment: SeatAssignment) -> int | None:
+        """The seat's weights version now: ``ckpt_v<N>`` -> N, ``fixed`` -> None, ``latest`` -> ``version_fn``."""
+        net = assignment.network_id
+        if net == FIXED_NETWORK_ID:
+            return None
+        if net == LATEST_NETWORK_ID:
+            if self._version_fn is None:
+                return None
+            version = self._version_fn(assignment.agent_id)
+            return None if version is None else int(version)
+        return snapshot_version(net)
 
     def _player(self, agent_id: str, network_id: str) -> PolicyModel | ScriptedPlayer:
         player = self._players.get(agent_id, network_id)
@@ -464,16 +495,24 @@ class MatchRunner:
                 reward=float(returns[s]),
                 eliminated_step=tracker.eliminated_step(s),
                 source=a.source,
+                version_start=env_state.version_start.get(s),
+                version_end=self._seat_version(a),
             )
             for s, a in enumerate(env_state.lineup.seats)
         ]
+        lineup = env_state.lineup
+        match_id = f"{self._prefix}{e}_ep{env_state.episode_index}"
         return MatchResult(
-            match_id=f"{self._prefix}{e}_ep{env_state.episode_index}",
+            match_id=match_id,
             layout=layout,
             outcome_kind=self.spec.outcome_kind(layout),
             seats=seats,
             teams=[TeamResult(team=t, rank=float(ranks[t]), score=float(scores[t])) for t in sorted(ranks)],
             episode_length=tracker.episode_step,
+            uid=lineup.uid if lineup.uid is not None else f"{self._uid_prefix}{match_id}",
+            source=self._source,
+            seed=env_state.seed,
+            block=lineup.block,
         )
 
     def _init_model_states(self, env_state: _EnvState) -> None:
@@ -517,14 +556,19 @@ class MatchRunner:
                 raise PlayerError(f"{self._where(e, seat, aid)}: reset raised {type(exc).__name__}: {exc}") from exc
 
     def _reset_envs(self, envs: list[int]) -> None:
-        requests = {
-            e: (self._episode_seed(e, self._envs[e].episode_index), self._envs[e].lineup.layout) for e in envs
-        }
+        requests = {}
+        for e in envs:
+            lineup = self._envs[e].lineup
+            seed = (int(lineup.seed) if lineup.seed is not None
+                    else self._episode_seed(e, self._envs[e].episode_index))
+            requests[e] = (seed, lineup.layout)
         results = self._vec_env.reset(requests)
         for e in envs:
             env_state = self._envs[e]
             env_state.masks = env_state.tracker.on_reset(env_state.lineup.layout, results[e])
             env_state.result = results[e]
+            env_state.seed = requests[e][0]
+            env_state.version_start = {s: self._seat_version(a) for s, a in enumerate(env_state.lineup.seats)}
             if env_state.scripted:
                 self._reset_bots(e, requests[e][0])
             if self._on_episode_start is not None:

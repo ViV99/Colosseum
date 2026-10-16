@@ -49,7 +49,8 @@ logger = logging.getLogger(__name__)
 _WEIGHT_QUEUE_SIZE = 1  # newest-wins mailbox per (agent, worker); see core.ipc.put_latest
 _CHECKPOINT_QUEUE_SIZE = 16
 _METRICS_QUEUE_SIZE = 100
-_RESULTS_QUEUE_SIZE = 1000
+# Match results from all workers (SP4 spec block 1): a full queue drops results, and workers count the drops.
+_RESULTS_QUEUE_SIZE = 10_000
 # One slot: a command that was put has been taken by the worker before the next one
 # can be put, so no command (and none of its new_checkpoints) is replaced unseen (D9).
 _COMMAND_QUEUE_SIZE = 1
@@ -161,6 +162,7 @@ def _worker_main(
     metrics_queue: mp.Queue | None = None,
     fixed_players: FixedPlayers | None = None,
     teachers: Mapping[str, BotSpec] | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Worker process body (see ``_worker_target``).
 
@@ -168,7 +170,7 @@ def _worker_main(
     functions is picklable under spawn, which the subprocess vector env needs to ship ``env_fn``
     to its children). Models are built for each agent's role spec. ``fixed_players`` (numpy and
     ``BotSpec`` data from the main process) become this worker's bots and frozen models; ``teachers``
-    (``BotSpec`` by student agent) its scripted kickstart teachers (DAgger).
+    (``BotSpec`` by student agent) its scripted kickstart teachers (DAgger); ``run_id`` prefixes the match uids.
     """
     from functools import partial
 
@@ -204,6 +206,7 @@ def _worker_main(
         max_idle_steps=config.env.max_idle_steps,
         fixed_players=fixed_players,
         teachers=teachers,
+        run_id=run_id,
     )
 
 
@@ -321,7 +324,7 @@ def _resolve_lineups(
                 seats.append(replace(seat))
             else:
                 seats.append(replace(seat, network_id=LATEST_NETWORK_ID, collect=True))
-        resolved.append(Lineup(layout=lineup.layout, seats=seats))
+        resolved.append(replace(lineup, seats=seats))   # seed, block and uid stay
     return new_ckpts, resolved
 
 
@@ -372,6 +375,8 @@ class Launcher:
         self._command_queues: list[mp.Queue] = []
         self._results_queue: mp.Queue | None = None
         self._metrics_queue: mp.Queue | None = None
+        # Set by launch(): this run's id (run.json; match uids and the journal's runs table).
+        self._run_id: str | None = None
 
     @property
     def env_steps_done(self) -> int:
@@ -392,7 +397,8 @@ class Launcher:
         cfg = self._config
         trainable_agents = cfg.get_trainable_agent_ids()
 
-        logger.info("Colosseum: Starting training pipeline")
+        self._run_id = self._run_dir.ensure_run_id()
+        logger.info(f"Colosseum: Starting training pipeline (run id {self._run_id})")
         logger.info(f"  Agents: {trainable_agents}")
         logger.info(f"  Algorithm: {cfg.algorithm.name}")
         logger.info(f"  Workers: {cfg.rollout.num_workers}")
@@ -621,6 +627,7 @@ class Launcher:
                     fixed_players=setup.fixed,
                     teachers=scripted_teachers,
                     metrics_queue=metrics_queue,
+                    run_id=self._run_id,
                 ),
                 daemon=worker_daemon,
             )
@@ -728,11 +735,19 @@ class Launcher:
         return reader.drain()
 
     def _drain_results(self) -> None:
-        """Feed queued match results to the coordinator (ratings, PFSP) and the hub."""
+        """Feed queued match results to the coordinator (ratings, PFSP) and the hub; a result without
+        ``env_steps`` is stamped with the global env-step counter at its arrival (spec block 1; a pulse result
+        arrives with its snapshot's, T6.1)."""
         if self._results_queue is None:
             return
         workers = lambda: [n for n in self._supervisor.names if n.startswith("worker-")]  # noqa: E731
-        for result in self._drain(self._results_queue, "results", workers):
+        results = self._drain(self._results_queue, "results", workers)
+        if not results:
+            return
+        env_steps = int(self._env_step_counter.value)
+        for result in results:
+            if result.env_steps is None:
+                result.env_steps = env_steps
             self._coordinator.report_match_result(result)
             self._hub.on_match_result(result)
 
