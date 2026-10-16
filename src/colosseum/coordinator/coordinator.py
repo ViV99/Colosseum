@@ -33,6 +33,10 @@ from colosseum.league.pfsp import PfspStats, compact_ratings
 
 logger = logging.getLogger(__name__)
 
+# The league state of a run (SP4 spec block 7.4): ratings and PFSP statistics, restored by a run-dir resume.
+LEAGUE_STATE_FILE = "league_state.json"
+LEAGUE_STATE_VERSION = 1
+
 
 class Coordinator:
     """Central coordinator of a single-machine training run."""
@@ -213,6 +217,34 @@ class Coordinator:
         for layout, table in snap.items():
             table["pfsp"] = pfsp.get(layout, {})
         return compact_ratings(snap) if compact else snap
+
+    def save_league_state(self, path: str | Path, *, env_steps: int) -> None:
+        """Write the ratings (``RatingBook``) and the PFSP statistics (with the forgotten snapshots) atomically to
+        ``path`` (spec block 7.4). A custom matchmaker's own state (``on_result``) is not saved."""
+        from colosseum.metrics.jsonl import write_json_atomic
+
+        write_json_atomic(path, {"version": LEAGUE_STATE_VERSION, "env_steps": int(env_steps),
+                                 "ratings": self._ratings.state_dict(), "pfsp": self._pfsp.state_dict()})
+
+    def load_league_state(self, path: str | Path) -> bool:
+        """Restore a saved league state; False when ``path`` does not exist (an SP3 run dir). Entries of agents
+        that are not in this config are dropped (INFO). An unreadable file is a ConfigError."""
+        import json
+
+        path = Path(path)
+        if not path.is_file():
+            return False
+        try:
+            state = json.loads(path.read_text())
+            if state.get("version") != LEAGUE_STATE_VERSION:
+                raise ValueError(f"version {state.get('version')!r}, expected {LEAGUE_STATE_VERSION}")
+            players = list(self._player_roles)
+            self._ratings.load_state_dict(state["ratings"], agents=players)
+            self._pfsp.load_state_dict(state["pfsp"], agents=players)
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as e:
+            raise ConfigError(f"Cannot read the league state {path} ({type(e).__name__}: {e}); move it away to "
+                              f"resume with empty ratings and PFSP statistics") from e
+        return True
 
     def save_checkpoint_payload(self, payload: dict, meta_extra: dict | None = None) -> str:
         """Persist a learner checkpoint payload (see ``learner.make_checkpoint_payload``).

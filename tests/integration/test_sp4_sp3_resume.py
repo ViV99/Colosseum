@@ -33,3 +33,5 @@ def test_training_resumes_from_the_sp3_run_dir(tmp_path):
     assert only.parent_run_id is None                                     # an SP3 run dir has no run id
     assert reader.matches(limit=1) and all(r.run_id == only.run_id for r in reader.matches(limit=1000))
     reader.close()
+    assert "has no league_state.json (an SP3 run dir); ratings and PFSP statistics start empty" in log   # T3.2
+    assert (run.root / "league_state.json").is_file()

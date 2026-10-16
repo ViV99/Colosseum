@@ -28,7 +28,7 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from colosseum.coordinator.coordinator import Coordinator
+from colosseum.coordinator.coordinator import LEAGUE_STATE_FILE, Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.ipc import QueueReader, SharedCounter, queue_depths, release_command_queues
 from colosseum.core.run_dir import RunDir
@@ -385,6 +385,7 @@ class Launcher:
         self._results_received = 0
         # Set by launch() with the journal: the live Bradley-Terry refit thread (T2.2).
         self._live_ratings = None
+        self._league_state_error_logged = False   # the first failing league_state.json write logs its traceback
 
     @property
     def env_steps_done(self) -> int:
@@ -425,6 +426,7 @@ class Launcher:
 
         # Resume (before any process starts: a bad resume source fails fast).
         resume_states = self._resolve_resume(setup.agent_configs, setup.role_specs)
+        self._load_league_state(coordinator)          # before the import: evictions there forget PFSP entries
         self._import_snapshot_pool(coordinator)
         from colosseum.learner.factory import resolve_teacher
         # Kickstart teachers are resolved here (ConfigError before any process starts) into numpy specs.
@@ -675,9 +677,10 @@ class Launcher:
             self._drain_metrics()
             env_steps = int(self._env_step_counter.value)
             # The method itself: the hub builds the ratings snapshot only when a tick is due (spec block 7.3).
-            self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot,
-                                 queue_depths=queue_depths(self._trajectory_queues),
-                                 match_log=self._match_log_stats(), bt=self._live_snapshot())
+            if self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot,
+                                    queue_depths=queue_depths(self._trajectory_queues),
+                                    match_log=self._match_log_stats(), bt=self._live_snapshot()):
+                self._save_league_state()
             if self._supervisor.received_signal is not None:
                 return self._signal_exit_code()
             if self._stop_event.is_set():
@@ -923,6 +926,7 @@ class Launcher:
                                 ratings=self._coordinator.ratings_snapshot,
                                 queue_depths=queue_depths(self._trajectory_queues),
                                 match_log=self._match_log_stats(), bt=final_bt)
+                self._save_league_state()
         finally:
             try:
                 self._stop_match_log()            # also when the final drains failed
@@ -1001,6 +1005,36 @@ class Launcher:
                     logger.info(line)
             states[aid] = state
         return states
+
+    def _load_league_state(self, coordinator: Coordinator) -> None:
+        """A run-dir resume restores the resumed run's ratings and PFSP statistics (spec block 7.4); an SP3 run dir
+        has no league_state.json (INFO: they start empty). A resume from a checkpoint dir or a .pt starts empty, as
+        in SP3."""
+        from pathlib import Path
+
+        from colosseum.coordinator.checkpoint_manager import RESUME_RUN_DIR, classify_resume_source
+
+        resume_from = self._config.training.resume_from
+        if not resume_from or classify_resume_source(resume_from) != RESUME_RUN_DIR:
+            return
+        path = Path(resume_from) / LEAGUE_STATE_FILE
+        if coordinator.load_league_state(path):
+            logger.info(f"Resume: league state (ratings, PFSP statistics) restored from {path}")
+        else:
+            logger.info(f"Resume: {resume_from} has no {LEAGUE_STATE_FILE} (an SP3 run dir); ratings and PFSP "
+                        f"statistics start empty")
+
+    def _save_league_state(self) -> None:
+        """Write league_state.json (each metrics tick and at the end); a failure is an ERROR, never a crash."""
+        if self._coordinator is None:
+            return
+        try:
+            self._coordinator.save_league_state(self._run_dir.league_state_path,
+                                                env_steps=int(self._env_step_counter.value))
+        except Exception as e:  # noqa: BLE001 - the league state must never stop training
+            logger.error(f"Writing {self._run_dir.league_state_path} failed ({type(e).__name__}: {e})",
+                         exc_info=not self._league_state_error_logged)
+            self._league_state_error_logged = True
 
     def _import_snapshot_pool(self, coordinator: Coordinator) -> None:
         """A resume from a run dir carries its snapshot pool into this run (spec block 4), before the first

@@ -8,7 +8,8 @@ draw = 0.5). Only pairs with O@latest on one side and anything but O@latest on t
 of a pair of weight ``w`` is ``1 - 2 ** (-w / halflife_games)``; before the first game the score is the prior
 (0.5). Statistics of an evicted snapshot are dropped (``forget``) and stay dropped: results that still
 contain it (episodes that were running at the eviction) are ignored for it, since snapshot ids are never
-reused within a run. A resumed run starts empty (as SP2 ratings).
+reused within a run. A run-dir resume restores the statistics from ``league_state.json`` (SP4,
+``state_dict`` / ``load_state_dict``); any other resume starts empty.
 
 ``pfsp_weight`` turns a score into a candidate weight for the matchmaker: ``hard`` ``(1 - x) ** p`` (focus on
 the players O loses to), ``balanced`` ``x * (1 - x)`` (focus on even players), ``uniform`` 1; floor 1e-6.
@@ -16,10 +17,14 @@ the players O loses to), ``balanced`` ``x * (1 - x)`` (focus on even players), `
 
 from __future__ import annotations
 
-from collections.abc import Mapping
+import logging
+from collections.abc import Collection, Mapping
+from typing import Any
 
 from colosseum.coordinator.ratings import member_pairs
 from colosseum.core.types import LATEST_NETWORK_ID, MatchResult
+
+logger = logging.getLogger(__name__)
 
 PlayerKey = tuple[str, str]  # (agent_id, network_id)
 
@@ -122,6 +127,40 @@ class PfspStats:
         for owners in self._table.values():
             for players in owners.values():
                 players.pop(key, None)
+
+    def state_dict(self) -> dict[str, Any]:
+        """The statistics and the forgotten snapshots, JSON-ready (``league_state.json``)."""
+        return {
+            "prior": self._prior,
+            "table": {layout: {owner: [[p[0], p[1], cell[0], cell[1]] for p, cell in sorted(players.items())]
+                               for owner, players in owners.items()}
+                      for layout, owners in self._table.items()},
+            "forgotten": sorted([list(p) for p in self._forgotten]),
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any], *, agents: Collection[str]) -> list[str]:
+        """Restore ``state_dict`` output: owners that are not tracked here and players of agents not in ``agents``
+        are dropped (one INFO line); forgotten snapshots stay forgotten (also those forgotten here before the
+        load). Returns the dropped agents."""
+        known = set(agents)
+        dropped: set[str] = set()
+        self._forgotten |= {(str(p[0]), str(p[1])) for p in state.get("forgotten", ()) if p[0] in known}
+        table: dict[str, dict[str, dict[PlayerKey, list[float]]]] = {}
+        for layout, owners in state.get("table", {}).items():
+            for owner, rows in owners.items():
+                if owner not in self._halflife:
+                    dropped.add(owner)
+                    continue
+                for agent, network, score, games in rows:
+                    player = (str(agent), str(network))
+                    if agent not in known:
+                        dropped.add(agent)
+                    elif player not in self._forgotten:
+                        table.setdefault(layout, {}).setdefault(owner, {})[player] = [float(score), float(games)]
+        self._table = table
+        if dropped:
+            logger.info(f"League state: PFSP statistics of agents not in this config are dropped: {sorted(dropped)}")
+        return sorted(dropped)
 
     def snapshot(self) -> dict[str, dict[str, dict[str, dict[str, float]]]]:
         """``{layout: {owner: {"agent@net": {"score", "games"}}}}`` (JSON-ready; players sorted)."""
