@@ -8,6 +8,7 @@ top-level classes, so ``functools.partial(Game, ...)`` or the class itself is a 
 from __future__ import annotations
 
 import functools
+import hashlib
 import json
 import math
 import queue
@@ -1205,6 +1206,16 @@ def copy_sp3_run(tmp_path) -> Path:
     dst = Path(tmp_path) / "sp3_run"
     shutil.copytree(SP3_RUN, dst)
     return dst
+
+
+def tree_digest(root) -> dict[str, str]:
+    """``{relative path: sha256 hex}`` of every file under ``root`` (directories map to ``"<dir>"``).
+
+    Compares contents, not only names: a file rewritten in place (e.g. through a hard link of a run-dir
+    resume's snapshot import) changes its digest."""
+    root = Path(root)
+    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "<dir>"
+            for p in sorted(root.rglob("*"))}
 
 
 # ---------------------------------------------------------------------------

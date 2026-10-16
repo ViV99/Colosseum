@@ -56,15 +56,34 @@ def test_every_finished_episode_is_reported_once_with_a_unique_match_id():
 
 
 def test_lineup_changes_keep_one_result_per_episode_with_the_lineup_that_played_it():
+    """A command's lineup is staged and applied at the env's next episode end (``MatchRunner.set_next_lineup``).
+    The expected lineup of each episode is derived from the test's own timeline (the step each command was
+    polled at, the step each episode ended at), not from the runner's state."""
     model = make_test_model(ROLE2)
     loop, col = make_loop(GameFactory((_episode(2), 2)), {"a": lambda: model, "b": lambda: model},
                           [lineup("2p", "a", "a")])
+    commands: list[tuple[int, tuple[str, str]]] = []           # (step the command was polled at, agents)
+    ended: list[int] = []                                      # the step each reported episode ended at
     for i in range(40):
         if i % 5 == 0:
-            col.commands.append(WorkerCommand(lineups=[lineup("2p", *("ab" if i % 10 == 0 else "ba"))]))
-        loop.step()
-    assert len(col.results) == loop.stats["episodes"]
-    assert {tuple(s.agent_id for s in r.seats) for r in col.results} <= {("a", "a"), ("a", "b"), ("b", "a")}
+            agents = ("a", "b") if i % 10 == 0 else ("b", "a")
+            col.commands.append(WorkerCommand(lineups=[lineup("2p", *agents)]))
+            commands.append((i, agents))
+        before = len(col.results)
+        loop.step()                                            # polls the command first, then steps the env
+        ended += [i] * (len(col.results) - before)
+    assert len(col.results) == loop.stats["episodes"] == len(ended) > 4
+    for k, result in enumerate(col.results):
+        # Episode k started after episode k-1 ended; the last command polled at or before that end step is its
+        # lineup (an earlier one staged in the same episode is overwritten), else the initial lineup.
+        start_after = ended[k - 1] if k > 0 else -1
+        expected = ("a", "a")
+        for polled, agents in commands:
+            if polled <= start_after:
+                expected = agents
+        assert tuple(s.agent_id for s in result.seats) == expected, (k, ended, commands)
+    played = {tuple(s.agent_id for s in r.seats) for r in col.results}
+    assert {("a", "b"), ("b", "a")} <= played
 
 
 def _result(i: int) -> MatchResult:
@@ -74,12 +93,21 @@ def _result(i: int) -> MatchResult:
                        [TeamResult(0, 1.0, 1.0), TeamResult(1, 2.0, -1.0)], 4)
 
 
-class _Recorder:
+class _CoordinatorRecorder:
+    """Only the coordinator's method: a call meant for the hub fails with AttributeError."""
+
     def __init__(self) -> None:
         self.results: list[MatchResult] = []
 
     def report_match_result(self, result: MatchResult) -> None:
         self.results.append(result)
+
+
+class _HubRecorder:
+    """Only the hub's method: a call meant for the coordinator fails with AttributeError."""
+
+    def __init__(self) -> None:
+        self.results: list[MatchResult] = []
 
     def on_match_result(self, result: MatchResult) -> None:
         self.results.append(result)
@@ -92,7 +120,7 @@ def test_the_launcher_feeds_each_drained_result_to_the_coordinator_and_the_hub_o
     sent = [_result(i) for i in range(5)]
     for item in sent:
         results_queue.put(item)
-    coordinator, hub = _Recorder(), _Recorder()
+    coordinator, hub = _CoordinatorRecorder(), _HubRecorder()
     launcher._results_queue, launcher._coordinator, launcher._hub = results_queue, coordinator, hub
     launcher._drain_results()
     launcher._drain_results()                                   # nothing new: nothing fed twice

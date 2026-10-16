@@ -21,14 +21,10 @@ from colosseum.coordinator.checkpoint_manager import check_model_state, load_che
 from colosseum.core.config import NetworkConfig, load_config
 from colosseum.core.registry import build_network, env_spec
 from colosseum.core.types import Lineup, MatchResult, SeatAssignment, SeatResult, TeamResult
-from game_helpers import SP3_CONFIG_NAMES, SP3_CONFIGS, SP3_RUN, SP3_TTT_TINY, sp3_manifest
+from game_helpers import SP3_CONFIG_NAMES, SP3_CONFIGS, SP3_RUN, SP3_TTT_TINY, sp3_manifest, tree_digest
 
 SP3_META_KEYS = {"agent_id", "checkpoint_id", "config_hash", "env_steps", "final", "networks",
                  "policy_version", "role_signature", "roles", "timestamp"}
-
-
-def _listing(root):
-    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
 
 
 def test_the_fixture_has_a_copy_of_every_sp3_example_config():
@@ -79,19 +75,19 @@ def test_the_run_fixture_is_an_sp3_run_dir():
 
 def test_every_sp3_snapshot_loads_read_only_with_its_architecture():
     manifest = sp3_manifest()
-    before = _listing(SP3_RUN)
+    before = tree_digest(SP3_RUN)
     spec = env_spec(load_config(SP3_TTT_TINY))
     for version in manifest["versions"]:
         ckpt = load_checkpoint_dir(SP3_RUN / "checkpoints" / manifest["agent"] / f"ckpt_v{version}")
         assert ckpt["meta"]["policy_version"] == version and ckpt["roles"] == ["player"]
         model = build_network(NetworkConfig.model_validate(ckpt["meta"]["networks"]), spec.roles["player"])
         check_model_state(model, ckpt["model_state"], f"ckpt_v{version}")
-    assert _listing(SP3_RUN) == before
+    assert tree_digest(SP3_RUN) == before
 
 
 def test_eval_plays_sp3_snapshots_by_path_and_as_a_frozen_agent(tmp_path):
     manifest = sp3_manifest()
-    before = _listing(SP3_RUN)
+    before = tree_digest(SP3_RUN)
     agent_dir = SP3_RUN / "checkpoints" / manifest["agent"]
     first, last = agent_dir / f"ckpt_v{manifest['versions'][0]}", agent_dir / f"ckpt_v{manifest['final_version']}"
     out = tmp_path / "paths.json"
@@ -108,7 +104,7 @@ def test_eval_plays_sp3_snapshots_by_path_and_as_a_frozen_agent(tmp_path):
                                        "--num-envs", "2", "--seed", "0", "-o", str(out)])
     assert result.exit_code == 0, result.output
     assert json.loads(out.read_text())["layouts"]["2p"]["n"] == 2
-    assert _listing(SP3_RUN) == before
+    assert tree_digest(SP3_RUN) == before
 
 
 def test_match_records_are_constructible_without_the_sp4_fields():

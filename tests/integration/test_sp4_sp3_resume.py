@@ -3,21 +3,17 @@ its snapshot pool over; the source is only read. T1.3 adds the empty journal, T3
 from __future__ import annotations
 
 from cli_runner import run_train
-from game_helpers import SP3_TTT_TINY, copy_sp3_run, sp3_manifest
+from game_helpers import SP3_TTT_TINY, copy_sp3_run, sp3_manifest, tree_digest
 
 
 def _versions(agent_dir) -> list[int]:
     return sorted(int(p.name.removeprefix("ckpt_v")) for p in agent_dir.glob("ckpt_v*"))
 
 
-def _listing(root):
-    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
-
-
 def test_training_resumes_from_the_sp3_run_dir(tmp_path):
     manifest = sp3_manifest()
     source = copy_sp3_run(tmp_path)
-    before = _listing(source)
+    before = tree_digest(source)
     budget = manifest["env_steps"] + 2000          # a resume needs a budget above the checkpoint's env_steps
     run = run_train(SP3_TTT_TINY, tmp_path, name="resumed",
                     overrides={"training.resume_from": str(source), "training.total_timesteps": str(budget)})
@@ -28,4 +24,4 @@ def test_training_resumes_from_the_sp3_run_dir(tmp_path):
     assert "snapshot pool carried over" in log
     versions = _versions(run.root / "checkpoints" / manifest["agent"])
     assert min(versions) <= manifest["final_version"] < max(versions)   # imported snapshots + new ones
-    assert _listing(source) == before                                     # the source is untouched
+    assert tree_digest(source) == before        # the source is untouched: names and contents (hard links)
