@@ -200,7 +200,7 @@ def test_the_coordinator_feeds_top_k_from_the_live_ratings_and_tells_listeners(t
     assert ids(coord.checkpoint_manager, "agent_0") == ["ckpt_v10", "ckpt_v30"]
     assert seen == [("agent_0", "ckpt_v20")]
     coord.set_ratings_source(lambda: None)
-    assert coord.snapshot_scores("agent_0") == {}
+    assert coord.snapshot_scores("agent_0") is None                          # no refit yet: not "rated, empty"
 
 
 def test_the_distributed_learner_caps_its_pool_fifo_and_refuses_top_k(tmp_path):
@@ -273,3 +273,100 @@ def test_the_launcher_reapplies_retention_once_per_new_live_refit(tmp_path):
     launcher._live_ratings.snapshot = _Snapshot(3, {}, {})
     launcher._reapply_retention()
     assert calls == []
+
+
+def test_no_ratings_yet_keeps_unrated_snapshots_and_a_raising_provider_never_loses_a_save(tmp_path, caplog):
+    waiting = CheckpointManager(tmp_path / "w", keep_last=1, keep_top_k=1, top_k_min_games=0, max_snapshots=2,
+                                run_id="r", scores_fn=lambda agent: None)
+    for version in (10, 20, 30, 40):
+        waiting.save("a", version, sd(version))
+    assert ids(waiting) == ["ckpt_v10", "ckpt_v20", "ckpt_v30", "ckpt_v40"]     # the cap is 2 x 2 until ratings
+    assert waiting.retention_reasons("a")["ckpt_v10"] == "kept: new (no ratings yet)"
+    waiting.save("a", 50, sd(50))
+    assert ids(waiting) == ["ckpt_v20", "ckpt_v30", "ckpt_v40", "ckpt_v50"]     # the raised cap still bounds it
+
+    def broken(agent):
+        raise RuntimeError("ratings exploded")
+
+    mgr = CheckpointManager(tmp_path / "b", keep_last=1, keep_top_k=1, top_k_min_games=0, run_id="r",
+                            scores_fn=broken)
+    with caplog.at_level(logging.ERROR, logger="colosseum.coordinator.checkpoint_manager"):
+        mgr.save("a", 10, sd(10))
+        mgr.save("a", 20, sd(20))
+    assert ids(mgr) == ["ckpt_v10", "ckpt_v20"]                              # read as "no ratings yet"
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 2 and errors[0].exc_info and not errors[1].exc_info   # the traceback once
+
+
+_STRENGTHS = {"agent_0@v10": -1.0, "agent_0@v20": 1.5, "agent_0@v30": 0.0, "agent_0@v40": -0.5,
+              "agent_0@v50": 0.2}
+
+
+def _real_snapshot():
+    """A real ``RatingsSnapshot`` (``live.compute_snapshot`` over a ``ComparisonTable`` of synthetic matches):
+    v20 is by far the strongest. 3000 matches over 5 snapshots: v20's lower bound is far above every other one
+    (deterministic: fixed seeds)."""
+    from colosseum.arena.live import compute_snapshot
+    from game_helpers import bt_table, synthetic_bt_matches
+
+    table = bt_table(synthetic_bt_matches(_STRENGTHS, n_matches=3000, rng=np.random.default_rng(0)), interval=10)
+    return compute_snapshot(table, version=1, env_steps=0, agent_order=("agent_0",), top_k=1, quantile=0.1,
+                            rng=np.random.default_rng(1), samples=400)
+
+
+def _payload(version):
+    return {"agent_id": "agent_0", "policy_version": version, "model_state": sd(version),
+            "trainer_state_bytes": b"opt"}
+
+
+def test_top_k_with_real_live_ratings_keeps_the_best_snapshot_for_the_top_k_reason(tmp_path):
+    snap = _real_snapshot()
+    cfg = make_test_config("turns", checkpoint={"interval": 10, "keep_last": 1, "keep_top_k": 1,
+                                                "top_k_min_games": 0, "keep_every": 0})
+    coord = make_coordinator(cfg, tmp_path / "ckpt")
+    coord.set_ratings_source(lambda: snap)
+    scores = coord.snapshot_scores("agent_0")
+    assert set(scores) == {f"ckpt_v{v}" for v in (10, 20, 30, 40, 50)}
+    assert max(scores, key=lambda c: scores[c].lcb) == "ckpt_v20" and all(s.games > 500 for s in scores.values())
+    for version in (10, 20, 30, 40, 50):
+        coord.save_checkpoint_payload(_payload(version))
+    assert ids(coord.checkpoint_manager, "agent_0") == ["ckpt_v20", "ckpt_v50"]
+    reasons = coord.checkpoint_manager.retention_reasons("agent_0")
+    assert reasons["ckpt_v20"] == "kept: top_k" and reasons["ckpt_v40"] == "evicted: no retention rule"
+
+
+def test_imported_rated_snapshots_survive_until_the_first_refit_of_a_resumed_run(tmp_path):
+    from colosseum.coordinator.coordinator import Coordinator
+    from colosseum.core.registry import env_spec
+    from colosseum.launcher import Launcher
+    from colosseum.players.registry import resolve_player_roles
+
+    parent_cfg = make_test_config("turns", checkpoint={"interval": 10, "keep_last": 5, "keep_every": 0})
+    parent = make_coordinator(parent_cfg, tmp_path / "parent" / "checkpoints")
+    for version in (10, 20, 30, 40, 50):
+        parent.save_checkpoint_payload(_payload(version))
+    cfg = make_test_config("turns", checkpoint={"interval": 10, "keep_last": 1, "keep_top_k": 1,
+                                                "top_k_min_games": 0, "keep_every": 0, "max_snapshots": 3})
+    spec = env_spec(cfg)
+    child = Coordinator(cfg, spec, resolve_player_roles(cfg, spec), tmp_path / "child", run_id="child")
+    child.import_snapshots(tmp_path / "parent")              # as Launcher.launch: before the live ratings exist
+    # (before the fix, "no ratings" read as "rated with 0 games" and the import evicted v10-v40 at once)
+    child.save_checkpoint_payload(_payload(60))
+    assert ids(child.checkpoint_manager, "agent_0") == [f"ckpt_v{v}" for v in (10, 20, 30, 40, 50, 60)]
+
+    class _Live:
+        snapshot = None
+
+        def latest(self):
+            return self.snapshot
+
+    launcher = object.__new__(Launcher)
+    launcher._config, launcher._coordinator, launcher._live_ratings = cfg, child, _Live()
+    launcher._agent_ids, launcher._retention_version = ["agent_0"], None
+    launcher._wire_retention()
+    launcher._reapply_retention()                            # no refit yet: nothing changes
+    assert len(ids(child.checkpoint_manager, "agent_0")) == 6
+    launcher._live_ratings.snapshot = _real_snapshot()       # the first refit (it includes the parent's journal)
+    launcher._reapply_retention()
+    assert ids(child.checkpoint_manager, "agent_0") == ["ckpt_v20", "ckpt_v60"]
+    assert child.checkpoint_manager.retention_reasons("agent_0")["ckpt_v20"] == "kept: top_k"

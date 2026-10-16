@@ -566,11 +566,15 @@ def _describe_retention(config: ColosseumConfig, report: ValidationReport) -> No
         report.lines.append(f"agent '{aid}': {rule}")
         if run_dir is None or cap is None:
             continue
+        # Not len(newest keep_last | pinned) of the parent: once this run has saved keep_last snapshots of its own
+        # (new snapshots are not pinned), every carried pin lies outside the window, so keep_last + pinned is the
+        # number of protected snapshots for the rest of the run.
         pinned = sum(1 for c in read_snapshots(run_dir / "checkpoints" / aid) if c.meta.get("pinned") is True)
         if config.checkpoint.keep_last + pinned > cap:
-            message = (f"agent '{aid}': keep_last {config.checkpoint.keep_last} + {pinned} pinned snapshots carried "
-                       f"over from {run_dir} exceed checkpoint.max_snapshots {cap}: the protected snapshots are all "
-                       f"kept and nothing else fits; unpin some (colosseum pin --remove) or raise max_snapshots")
+            message = (f"agent '{aid}': {pinned} pinned snapshots carried over from {run_dir} plus the newest "
+                       f"keep_last {config.checkpoint.keep_last} of this run exceed checkpoint.max_snapshots {cap}: "
+                       f"the protected snapshots are all kept and nothing else fits; unpin some (colosseum pin "
+                       f"--remove) or raise max_snapshots")
             logger.warning(message)
             report.lines.append(f"WARNING: {message}")
 

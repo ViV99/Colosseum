@@ -226,9 +226,10 @@ class CheckpointManager:
     def __init__(self, base_dir: str | Path, keep_last: int = 20, keep_every: int = 0, interval: int = 1,
                  on_evict: Callable[[str, str], None] | None = None, *, run_id: str | None = None,
                  keep_top_k: int = 0, top_k_min_games: int = 200, max_snapshots: int | None = None,
-                 scores_fn: Callable[[str], Mapping[str, SnapshotScore]] | None = None) -> None:
+                 scores_fn: Callable[[str], Mapping[str, SnapshotScore] | None] | None = None) -> None:
         """``run_id``: the current run (only its final snapshot is protected; None keeps the SP3 rule: every
-        final); ``scores_fn(agent_id)``: ``{checkpoint_id: SnapshotScore}`` of the agent's rated snapshots, read
+        final); ``scores_fn(agent_id)``: ``{checkpoint_id: SnapshotScore}`` of the agent's rated snapshots, or
+        None while there are no ratings yet (``arena.retention``: unrated snapshots are new, the cap waits), read
         only with ``keep_top_k > 0``."""
         if keep_last < 1 or keep_every < 0 or interval < 1 or keep_top_k < 0 or top_k_min_games < 0 \
                 or (max_snapshots is not None and max_snapshots < keep_last):
@@ -247,6 +248,8 @@ class CheckpointManager:
         self._max_snapshots = max_snapshots
         self._scores_fn = scores_fn
         self._warned: set[str] = set()       # agents whose cap overflow was logged (once per agent)
+        self._scores_failed = False          # the first failing scores_fn call is logged with its traceback
+        self._reasons: dict[str, dict[str, str]] = {}   # per agent: the last decision's reasons (retain)
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._index: dict[str, list[CheckpointInfo]] = {}
         self._scan()
@@ -333,6 +336,7 @@ class CheckpointManager:
         entries = [c for c in self._index.get(agent_id, []) if c.checkpoint_id != checkpoint_id]
         entries.append(CheckpointInfo(checkpoint_id, agent_id, int(policy_version), final_dir, timestamp, meta))
         entries.sort(key=lambda c: c.policy_version)
+        self._index[agent_id] = entries          # indexed before retention: the dir is in place whatever happens
         self._index[agent_id], evicted = self._retain(agent_id, entries, protect=checkpoint_id)
         logger.info(f"Saved checkpoint {checkpoint_id} of {agent_id} (pool {len(self._index[agent_id])})")
         self._notify_evicted(agent_id, evicted)
@@ -355,6 +359,20 @@ class CheckpointManager:
             if isinstance(disk, dict):
                 c.meta["pinned"] = disk.get("pinned") is True
 
+    def _scores(self, agent_id: str) -> Mapping[str, SnapshotScore] | None:
+        """The provider's scores (only with ``keep_top_k > 0``; ``{}`` without a provider); None = no ratings yet
+        (``arena.retention``). A raising provider is logged (ERROR, once per manager) and read as "no ratings yet":
+        retention never fails a save over the ratings."""
+        if self._scores_fn is None or self._keep_top_k == 0:
+            return {}
+        try:
+            return self._scores_fn(agent_id)
+        except Exception:  # noqa: BLE001 - the snapshot is already stored; keep it and wait for good ratings
+            logger.error(f"Snapshot scores of {agent_id} failed; retention treats them as not rated yet",
+                         exc_info=not self._scores_failed)
+            self._scores_failed = True
+            return None
+
     def _retain(self, agent_id: str, entries: list[CheckpointInfo],
                 protect: str | None = None) -> tuple[list[CheckpointInfo], list[str]]:
         """Apply ``arena.retention.retain`` to ``entries`` (sorted by version); returns the kept ones and the ids
@@ -362,10 +380,11 @@ class CheckpointManager:
         if not entries:
             return [], []
         self._refresh_pins(entries)
-        scores = self._scores_fn(agent_id) if self._scores_fn is not None and self._keep_top_k > 0 else {}
+        scores = self._scores(agent_id)
         infos = [SnapshotInfo(c.checkpoint_id, c.policy_version, c.meta.get("final") is True, c.meta.get("run_id"),
                               c.meta.get("pinned") is True) for c in entries]
         decision = retain(infos, scores, self._policy(), protect=protect)
+        self._reasons[agent_id] = dict(decision.reasons)
         if decision.warnings and agent_id not in self._warned:      # once per agent (ruling D4)
             self._warned.add(agent_id)
             for warning in decision.warnings:
@@ -406,6 +425,11 @@ class CheckpointManager:
             stored = [c.checkpoint_id for c in self._index.get(agent_id, [])]
             raise ConfigError(f"agent {agent_id!r} has no stored snapshot {checkpoint_id!r} (stored: {stored[-10:]})")
         entry.meta.update(set_pinned(entry.path, pinned))
+
+    def retention_reasons(self, agent_id: str) -> dict[str, str]:
+        """``{checkpoint_id: "kept: ..." | "evicted: ..."}`` of the agent's last retention decision (``{}`` before
+        one); diagnostics and tests."""
+        return dict(self._reasons.get(agent_id, {}))
 
     def pinned(self, agent_id: str) -> list[str]:
         """Ids of the pinned snapshots of ``agent_id`` (as on disk now), by version."""
@@ -473,6 +497,7 @@ class CheckpointManager:
                                           agent_dir / info.checkpoint_id, info.timestamp, dict(info.meta)))
             imported += 1
         entries.sort(key=lambda c: c.policy_version)
+        self._index[agent_id] = entries          # indexed before retention: the dirs are in place
         self._index[agent_id], evicted = self._retain(agent_id, entries)
         kept = [c.checkpoint_id for c in self._index[agent_id]]
         if infos:

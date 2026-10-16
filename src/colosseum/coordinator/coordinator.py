@@ -147,12 +147,14 @@ class Coordinator:
         ``RatingsSnapshot`` (``LiveRatings.latest``) or None. Main loop only."""
         self._ratings_source = fn
 
-    def snapshot_scores(self, agent_id: str) -> dict[str, SnapshotScore]:
+    def snapshot_scores(self, agent_id: str) -> dict[str, SnapshotScore] | None:
         """Live-rating scores of ``agent_id``'s snapshots (``arena.retention.snapshot_scores``): layout weights from
-        the agent's ``matchmaking.layouts``, quantile ``checkpoint.top_k_quantile``; ``{}`` before the first refit."""
+        the agent's ``matchmaking.layouts``, quantile ``checkpoint.top_k_quantile``. None while there are no
+        ratings yet (no source, as during the run-dir import, or no refit yet): retention then keeps every unrated
+        snapshot as new and reruns after the first refit (``Launcher._reapply_retention``)."""
         snapshot = self._ratings_source() if self._ratings_source is not None else None
         if snapshot is None:
-            return {}
+            return None
         weights = enabled_layouts(self._spec, self._config.get_agent_config(agent_id).matchmaking)
         return snapshot_scores(snapshot, agent_id, layout_weights=weights,
                                quantile=self._config.checkpoint.top_k_quantile)

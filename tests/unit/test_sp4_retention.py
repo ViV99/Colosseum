@@ -181,3 +181,24 @@ def test_combine_scores_truncates_draws_of_different_lengths_and_handles_infinit
     assert out["ckpt_v20"].games == 13          # games count every layout, the lower bound only the weighted ones
     d = retain(snaps(10, 20, 30), out, policy(keep_last=1, keep_top_k=1, top_k_min_games=0))
     assert kept(d) == [20, 30]                  # -inf is rated, and the lowest
+
+
+def test_no_ratings_yet_is_not_rated_with_zero_games():
+    entries = snaps(10, 20, 30, 40, 50)
+    pol = policy(keep_last=1, keep_top_k=1, top_k_min_games=0, max_snapshots=2)
+    rated_none = retain(entries, {}, pol)                   # rated, none of them has a score: rule-based eviction
+    assert kept(rated_none) == [50]
+    waiting = retain(entries, None, pol)                    # no ratings yet: every unrated one is new, cap 2 x 2
+    assert kept(waiting) == [20, 30, 40, 50] and waiting.reasons["ckpt_v20"] == "kept: new (no ratings yet)"
+    assert waiting.reasons["ckpt_v10"] == "evicted: over max_snapshots=4 (new)"
+    assert kept(retain(entries, None, policy(keep_last=1, keep_top_k=0))) == [50]   # no top-k: scores never matter
+
+
+def test_combine_scores_refuses_a_lower_bound_without_draws_in_a_counted_layout():
+    fits = {"2p": _Fit({"main@v10": 0.0}, {"main@v10": 3}), "4p": _Fit({"main@v10": 0.0}, {"main@v10": 3})}
+    unc = {"2p": _Unc({"main@v10": 1.0}, {"main@v10": np.zeros(10)}), "4p": _Unc({"main@v10": 2.0})}
+    with pytest.raises(ValueError, match="no contrast_samples in layouts \\['4p'\\]"):
+        combine_scores("main", fits=fits, uncertainty=unc, scores={}, layout_weights={}, quantile=0.1)
+    # a zero-weight layout is not counted, so its missing draws do not matter
+    out = combine_scores("main", fits=fits, uncertainty=unc, scores={}, layout_weights={"2p": 1.0}, quantile=0.1)
+    assert out["ckpt_v10"].lcb == 1.0

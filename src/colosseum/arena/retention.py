@@ -22,7 +22,16 @@ b. new-only snapshots (rule 4, not 3): oldest first;
 c. top-k snapshots: ascending ``lcb`` (ties: the older first).
 
 If rule 1 alone exceeds the cap, every other snapshot is evicted, rule 1 stays and ``warnings`` says so
-(the caller logs it once per agent). ``reasons`` names, per checkpoint id, why it was kept or evicted.
+(the caller logs it once per agent).
+
+**No ratings yet** (``scores=None``, with ``keep_top_k > 0``): the first live refit has not happened (a fresh
+run, or a resume whose imported snapshots the parent rated). "Not rated yet" is not "rated with 0 games":
+every snapshot outside the ``keep_last`` window counts as new whatever ``top_k_min_games`` is (so nothing is
+evicted by rules 2-4), and the cap is ``NO_RATINGS_CAP_FACTOR * max_snapshots`` instead of ``max_snapshots``
+(the real cap waits for ratings; the raised one still bounds the disk if refits never come). The caller reruns
+retention after the first refit. ``scores={}`` means "rated, none of these snapshots has a score".
+
+``reasons`` names, per checkpoint id, why it was kept or evicted.
 The function never touches the file system; ``CheckpointManager`` applies the decision (index first, then
 ``on_evict``), and SP5's storage can call it the same way.
 
@@ -44,6 +53,9 @@ import numpy as np
 
 KEEP_LAST, FINAL, PINNED, SAVED = "keep_last", "final", "pinned", "just saved"
 KEEP_EVERY, TOP_K, NEW = "keep_every", "top_k", "new"
+NO_RATINGS = "new (no ratings yet)"
+# Before the first live refit the cap waits for ratings, up to this multiple of max_snapshots (module docstring).
+NO_RATINGS_CAP_FACTOR = 2
 
 
 @dataclass(frozen=True)
@@ -84,9 +96,10 @@ def _lcb(scores: Mapping[str, SnapshotScore], checkpoint_id: str) -> float | Non
     return None if score is None else score.lcb
 
 
-def retain(entries: Sequence[SnapshotInfo], scores: Mapping[str, SnapshotScore], policy: RetentionPolicy,
+def retain(entries: Sequence[SnapshotInfo], scores: Mapping[str, SnapshotScore] | None, policy: RetentionPolicy,
            *, protect: str | None = None) -> RetentionDecision:
-    """Apply the rules of the module docstring to ``entries`` (any order; ids unique)."""
+    """Apply the rules of the module docstring to ``entries`` (any order; ids unique); ``scores=None``: no
+    ratings yet (module docstring)."""
     if policy.keep_last < 1 or policy.keep_every_period < 0 or policy.keep_top_k < 0 \
             or policy.top_k_min_games < 0 or (policy.max_snapshots is not None and policy.max_snapshots < 1):
         raise ValueError(f"retain: invalid policy {policy}")
@@ -111,11 +124,15 @@ def retain(entries: Sequence[SnapshotInfo], scores: Mapping[str, SnapshotScore],
         if why:
             always[e.checkpoint_id] = why
 
+    waiting = scores is None and policy.keep_top_k > 0      # no ratings yet
+    scores = {} if scores is None else scores
     period = policy.keep_every_period
     every = {e.checkpoint_id for e in ordered if period > 0 and e.version % period == 0}
     top: set[str] = set()
     new: set[str] = set()
-    if policy.keep_top_k > 0:
+    if waiting:
+        new = {e.checkpoint_id for e in ordered if e.checkpoint_id not in newest}
+    elif policy.keep_top_k > 0:
         rated = [e for e in ordered if _lcb(scores, e.checkpoint_id) is not None]
         rated.sort(key=lambda e: (-_lcb(scores, e.checkpoint_id), -e.version))
         top = {e.checkpoint_id for e in rated[:policy.keep_top_k]}
@@ -129,7 +146,8 @@ def retain(entries: Sequence[SnapshotInfo], scores: Mapping[str, SnapshotScore],
     keep: set[str] = set()
     for cid in ids:
         rules = list(always.get(cid, []))
-        rules += [name for name, members in ((KEEP_EVERY, every), (TOP_K, top), (NEW, new)) if cid in members]
+        rules += [name for name, members in ((KEEP_EVERY, every), (TOP_K, top),
+                                             (NO_RATINGS if waiting else NEW, new)) if cid in members]
         if rules:
             keep.add(cid)
             reasons[cid] = "kept: " + ", ".join(rules)
@@ -138,6 +156,8 @@ def retain(entries: Sequence[SnapshotInfo], scores: Mapping[str, SnapshotScore],
 
     warnings: list[str] = []
     cap = policy.max_snapshots
+    if waiting and cap is not None:
+        cap *= NO_RATINGS_CAP_FACTOR                        # the real cap waits for the first refit
     if cap is not None and len(keep) > cap:
         if len(always) > cap:
             warnings.append(f"{len(always)} protected snapshots (keep_last, final of this run, pinned, just saved) "
@@ -189,7 +209,8 @@ def combine_scores(agent_id: str, *, fits: Mapping[str, Any], uncertainty: Mappi
       rated in one (counted) layout gets that layout's ``Uncertainty.lcb``; rated in several, the ``quantile`` of
       the layout-weighted mean of its ``Uncertainty.contrast_samples`` per draw index (layouts are independent
       fits with their own seeds; the draws are truncated to the shortest layout's count, e.g. 400 iterative
-      draws next to the Laplace ones; without draws in some layout, the weighted mean of the layouts' ``lcb``).
+      draws next to the Laplace ones; missing draws in a counted layout are a ValueError: ``bt`` always publishes
+      them next to ``lcb``).
       ``games``: ``BTFit.games`` summed over the layouts, i.e. rated COMPARISONS, self-play excluded: one per
       match in a two-team layout, ``T - 1`` per match in a ``T``-team FFA (``top_k_min_games`` counts these).
     - Only when no fit names the agent's snapshots: ``score`` layouts (``scores``: layout -> ``ScoreSummary``
@@ -218,13 +239,14 @@ def combine_scores(agent_id: str, *, fits: Mapping[str, Any], uncertainty: Mappi
             else:
                 total = sum(w for _i, w in counted)
                 draws = [unc[i].contrast_samples.get(entity) for i, _w in counted]
-                if any(d is None or len(d) == 0 for d in draws):
-                    lcb = float(sum(w * unc[i].lcb[entity] for i, w in counted) / total)
-                else:
-                    arrays = [np.asarray(d, dtype=np.float64) for d in draws]
-                    n = min(len(d) for d in arrays)
-                    mixed = sum(w * d[:n] for (_i, w), d in zip(counted, arrays, strict=True)) / total
-                    lcb = float(np.quantile(mixed, quantile))
+                missing = [layouts[i] for (i, _w), d in zip(counted, draws, strict=True) if d is None or len(d) == 0]
+                if missing:     # bt always publishes draws next to lcb: a producer bug, not a case to average over
+                    raise ValueError(f"combine_scores: {entity} has a lower bound but no contrast_samples in layouts "
+                                     f"{missing}; the layout-weighted lower bound needs the draws of every layout")
+                arrays = [np.asarray(d, dtype=np.float64) for d in draws]
+                n = min(len(d) for d in arrays)
+                mixed = sum(w * d[:n] for (_i, w), d in zip(counted, arrays, strict=True)) / total
+                lcb = float(np.quantile(mixed, quantile))
             out[f"ckpt_v{_version_of(entity, agent_id)}"] = SnapshotScore(lcb, games)
         return out
     z = NormalDist().inv_cdf(quantile)
