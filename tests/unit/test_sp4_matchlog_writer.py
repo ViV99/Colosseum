@@ -186,9 +186,41 @@ def test_a_batch_still_in_flight_at_the_stop_deadline_is_counted_as_dropped(capl
     with caplog.at_level(logging.WARNING, logger="colosseum.arena.matchlog"):
         stats = writer.stop(timeout=1.0)
     assert (stats.written, stats.dropped, stats.pending) == (0, len(results), 0)
-    assert any("did not stop within" in r.getMessage() for r in caplog.records)
+    (line,) = [r.getMessage() for r in caplog.records if "did not stop within" in r.getMessage()]
+    assert f"writing a batch of {WRITE_BATCH} results" in line and "may still commit them" in line
+    assert f"at most {WRITE_BATCH}" in line                               # the over-count is said and bounded
     assert _wait(lambda: not writer._thread.is_alive())                  # the late append finished
-    assert len(log.appended) == WRITE_BATCH and writer.stats == stats       # ... and changed nothing
+    assert len(log.appended) == WRITE_BATCH and writer.stats == stats       # ... and changed nothing (journaled
+    #                                                                        and counted as dropped: the over-count)
+
+
+class _StuckCompaction(FakeLog):
+    """A compaction pass that blocks (e.g. on the write lock of a tournament process) until released."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.entered, self.release = threading.Event(), threading.Event()
+
+    def compact(self, **kwargs):
+        self.entered.set()
+        self.release.wait(10.0)
+        return super().compact(**kwargs)
+
+
+def test_a_writer_stuck_in_compaction_at_the_stop_deadline_says_so(caplog):
+    log = _StuckCompaction()
+    writer = MatchLogWriter(lambda: log, compact_interval_sec=0.0, window_bytes=1)
+    writer.start()
+    try:
+        assert log.entered.wait(10.0)
+        with caplog.at_level(logging.WARNING, logger="colosseum.arena.matchlog"):
+            stats = writer.stop(timeout=0.6)
+    finally:
+        log.release.set()
+    assert (stats.dropped, stats.pending) == (0, 0)
+    (line,) = [r.getMessage() for r in caplog.records if "did not stop within" in r.getMessage()]
+    assert "compacting the journal" in line and "no results in flight" in line
+    assert "0 results" not in line and "counted as dropped" not in line
 
 
 def test_a_writer_thread_that_dies_counts_everything_as_dropped(caplog):
