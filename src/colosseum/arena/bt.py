@@ -46,7 +46,9 @@ model of the same pairs: ``G2 = 2 (LL_saturated - LL_BT)`` against ``chi^2`` wit
 parameters`` degrees of freedom (the rank of the tested pairs' design, exact up to ``EXACT_RANK_LIMIT``
 parameters, a conservative bound above). A refit that does not converge leaves the test untestable (WARNING).
 
-``PRIOR_SIGMA`` and ``SMOOTHNESS`` are provisional; task T8.2 fixes them by cross-validation (controller rulings).
+``PRIOR_SIGMA`` and ``SMOOTHNESS``: T8.2 ruling (cross-validation, ``scripts/bt_crossval.py``; docs/benchmarks.md
+«Приор и гладкость Bradley–Terry»): journals of four demo games, 5 folds, a 5 x 5 grid; the smallest mean held-out
+log-loss was at prior 8 / smoothness 1 (0.23344), and the 1-SE window paired by fold held no other point.
 """
 
 from __future__ import annotations
@@ -68,8 +70,8 @@ if TYPE_CHECKING:
 
 ELO_PER_LOGIT = 400.0 / math.log(10.0)
 Z_95 = 1.959963984540054
-PRIOR_SIGMA = 4.0          # logits (~695 Elo); provisional (T8.2)
-SMOOTHNESS = 0.5           # precision of one version step (sd ~1.41 logits); provisional (T8.2)
+PRIOR_SIGMA = 8.0          # logits (~1390 Elo); T8.2 ruling (cross-validation)
+SMOOTHNESS = 1.0           # precision of one version step (sd 1 logit); T8.2 ruling (cross-validation)
 DENSE_LIMIT = 2000         # parameters; above it Newton steps use conjugate gradients
 MEAN_OF_FIXED = "mean-of-fixed"
 TRANSITIVITY_P = 0.01      # the G2 test flags p < 0.01 (spec block 2)
@@ -108,7 +110,7 @@ DEFAULT_OPTIONS = BTOptions()
 
 
 def default_options(anchor: str | None = None) -> BTOptions:
-    """The module's prior and smoothness (``PRIOR_SIGMA``, ``SMOOTHNESS``; T8.2 fixes them) with ``anchor``."""
+    """The module's prior and smoothness (``PRIOR_SIGMA``, ``SMOOTHNESS``; T8.2 rulings) with ``anchor``."""
     return BTOptions(anchor=anchor)
 
 

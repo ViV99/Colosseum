@@ -368,11 +368,11 @@ def _run_selection(item: dict):
               type=click.Choice(["gauntlet", "round-robin", "halving", "select"]))
 @click.option("--layout", "layouts", multiple=True, help="Layout (repeatable); default: the enabled layouts")
 @click.option("--blocks", default=None, type=click.IntRange(min=1),
-              help="gauntlet / round-robin: blocks per composition (default 50, provisional)")
+              help="gauntlet / round-robin: blocks per composition (default 50; T8.2 ruling)")
 @click.option("--halving-blocks", default=None, type=click.IntRange(min=1),
-              help="halving / select: blocks per composition of round 0 (default 8, provisional)")
+              help="halving / select: blocks per composition of round 0 (default 8; T8.2 ruling)")
 @click.option("--confirm-blocks", default=None, type=click.IntRange(min=1),
-              help="select: blocks per composition of the confirmation stage (default 100, provisional)")
+              help="select: blocks per composition of the confirmation stage (default 100; T8.2 ruling)")
 @click.option("--finalists", default=None, type=click.IntRange(min=1), help="halving / select (default 3)")
 @click.option("--num-workers", default=1, type=click.IntRange(min=1), show_default=True, help="Worker processes")
 @click.option("--num-envs", default=8, type=click.IntRange(min=1), show_default=True, help="Envs per worker")

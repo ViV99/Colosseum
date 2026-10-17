@@ -1,0 +1,50 @@
+{
+  "machine": {
+    "platform": "Linux-6.18.54.1-microsoft-standard-WSL2-x86_64-with-glibc2.35",
+    "cpu_count": 20,
+    "python": "3.12.15",
+    "torch": "2.14.1+cu130",
+    "torch_threads_default": 10
+  },
+  "workload": {
+    "env": "tic_tac_toe",
+    "layout": "2p",
+    "envs_per_worker": 8,
+    "chunk_length": 32,
+    "batch_chunks": 8,
+    "queue_size": 32,
+    "warmup_s": 15.0,
+    "duration_s": 60.0
+  },
+  "clock": "counters",
+  "tree": "/home/viv/dev/repos/Colosseum-wt-main",
+  "results": [
+    {
+      "updates_per_s": 19.17162143508016,
+      "env_steps_per_s": 4737.981254118188,
+      "chunks_per_update": 8.0,
+      "queue_depth_mean": 27.85774058577406,
+      "bound": "learner",
+      "train_steps": 1147,
+      "workers": 1
+    },
+    {
+      "updates_per_s": 26.291408155961026,
+      "env_steps_per_s": 6527.360543962131,
+      "chunks_per_update": 8.0,
+      "queue_depth_mean": 30.217573221757323,
+      "bound": "learner",
+      "train_steps": 1572,
+      "workers": 2
+    },
+    {
+      "updates_per_s": 52.717929177024246,
+      "env_steps_per_s": 13118.841632539434,
+      "chunks_per_update": 8.0,
+      "queue_depth_mean": 31.230125523012553,
+      "bound": "learner",
+      "train_steps": 3154,
+      "workers": 4
+    }
+  ]
+}

@@ -1,0 +1,63 @@
+{
+  "blocks": 25,
+  "rows": [
+    {
+      "seed": 0,
+      "every": 1,
+      "spearman": 0.9878787878787878,
+      "gain": 1730.7338466697518,
+      "evaluated": 9,
+      "winner": "main@v969",
+      "confirmed": false,
+      "vs_random_win": 1.0,
+      "train_s": 77.5
+    },
+    {
+      "seed": 1,
+      "every": 1,
+      "spearman": 0.9818181818181818,
+      "gain": 1374.5324837994433,
+      "evaluated": 9,
+      "winner": "main@v1019",
+      "confirmed": true,
+      "vs_random_win": 1.0,
+      "train_s": 75.5
+    },
+    {
+      "seed": 2,
+      "every": 1,
+      "spearman": 1.0,
+      "gain": 1378.6451482491213,
+      "evaluated": 10,
+      "winner": "main@v1035",
+      "confirmed": false,
+      "vs_random_win": 1.0,
+      "train_s": 72.0
+    }
+  ],
+  "decision": {
+    "rho_min": 0.8500000000000001,
+    "gain_min": 0.0,
+    "rhos": [
+      0.9878787878787878,
+      0.9818181818181818,
+      1.0
+    ],
+    "gains": [
+      1730.7338466697518,
+      1374.5324837994433,
+      1378.6451482491213
+    ],
+    "vs_random": [
+      1.0,
+      1.0,
+      1.0
+    ],
+    "confirmed": [
+      false,
+      true,
+      false
+    ],
+    "reasons": []
+  }
+}

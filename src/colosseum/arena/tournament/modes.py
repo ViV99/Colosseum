@@ -73,7 +73,11 @@ logger = logging.getLogger(__name__)
 
 MODES = ("gauntlet", "round-robin", "halving", "select")
 REPORT_FORMAT = 1
-# Provisional defaults; T8.2 measures them on the bot ladder and the controller fixes them as rulings.
+# T8.2 ruling (ladder measurement, docs/benchmarks.md «Лесенка ботов и размеры турнира»): on both bot ladders
+# (tic_tac_toe 2p, tron 3p; 10 seeds per grid point) the smallest grid point, 8 halving blocks / 32 confirm
+# blocks, passed (winner right 10/10, order 9/10, confirmed 10/10, BT neighbours 10/10 on each game), so the
+# pre-fixed rule kept the floors: max(8, 8), max(100, 32), max(50, 2 * 8). The floors keep real selections
+# (differences far smaller than the ladder's) from defaulting to tiny tournaments.
 DEFAULT_BLOCKS = 50            # gauntlet / round-robin: blocks per composition (pair)
 DEFAULT_HALVING_BLOCKS = 8     # halving round 0: blocks per composition
 DEFAULT_CONFIRM_BLOCKS = 100   # select stage B: blocks per composition

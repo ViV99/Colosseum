@@ -1,0 +1,124 @@
+{
+  "blocks": 25,
+  "rows": [
+    {
+      "every": 1,
+      "stored": [
+        100,
+        200,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900,
+        969
+      ],
+      "evaluated": 9,
+      "pulse_versions": [
+        100,
+        200,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900
+      ],
+      "pulse_skipped": 0,
+      "pulse_evaluated": 9,
+      "train_s": 77.1,
+      "spearman": 0.9878787878787878,
+      "gain": 1599.2003791379118
+    },
+    {
+      "every": 2,
+      "stored": [
+        100,
+        200,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900,
+        971
+      ],
+      "evaluated": 4,
+      "pulse_versions": [
+        200,
+        400,
+        600,
+        800
+      ],
+      "pulse_skipped": 0,
+      "pulse_evaluated": 4,
+      "train_s": 77.6,
+      "spearman": 0.9999999999999999,
+      "gain": 1638.1430430621017
+    },
+    {
+      "every": 5,
+      "stored": [
+        100,
+        200,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900,
+        969
+      ],
+      "evaluated": 1,
+      "pulse_versions": [
+        500
+      ],
+      "pulse_skipped": 0,
+      "pulse_evaluated": 1,
+      "train_s": 77.1,
+      "spearman": 0.9999999999999999,
+      "gain": 1763.4215954733017
+    }
+  ],
+  "decision": {
+    "every": 1,
+    "row": {
+      "every": 1,
+      "stored": [
+        100,
+        200,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900,
+        969
+      ],
+      "evaluated": 9,
+      "pulse_versions": [
+        100,
+        200,
+        300,
+        400,
+        500,
+        600,
+        700,
+        800,
+        900
+      ],
+      "pulse_skipped": 0,
+      "pulse_evaluated": 9,
+      "train_s": 77.1,
+      "spearman": 0.9878787878787878,
+      "gain": 1599.2003791379118
+    },
+    "reasons": {}
+  }
+}
