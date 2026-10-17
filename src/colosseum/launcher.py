@@ -1205,8 +1205,10 @@ class Launcher:
         if self._pulse_feeder is None:
             return
         for agent_id, checkpoint_id in self._pulse_feeder.unevaluated_final():
-            logger.info(f"pulse: the final snapshot {checkpoint_id} of {agent_id} was not evaluated (the run "
-                        f"stopped first); evaluate it with colosseum tournament")
+            why = ("the backlog skipped it" if self._pulse_feeder.skipped_by_backlog(agent_id, checkpoint_id)
+                   else "the run stopped first")
+            logger.info(f"pulse: the final snapshot {checkpoint_id} of {agent_id} was not evaluated ({why}); "
+                        f"evaluate it with colosseum tournament")
         self._write_pulse_state()
 
     def _drain_all_checkpoints(self) -> None:

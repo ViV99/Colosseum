@@ -707,7 +707,8 @@ class EvaluationConfig(StrictModel):
         default=None, description="Scripted / frozen agents of the config to play against; null = all of them.")
     layouts: list[str] | None = Field(
         default=None, description="Layouts; null = every enabled layout with a seat of the agent's roles.")
-    every: int = Field(default=1, ge=1, description="Evaluate every k-th saved snapshot (the final one always).")
+    every: int = Field(default=1, ge=1, description="Evaluate every k-th saved snapshot (the final one is offered "
+                       "too, but a local run stops before it is played: evaluate it with colosseum tournament).")
     blocks: int = Field(default=25, ge=1, description="Blocks per field member (or composition); 1v1: 2 matches each.")
     num_envs: int = Field(default=8, ge=1, description="Envs of the pulse process.")
     deterministic: bool = Field(default=False, description="Greedy snapshot policies.")

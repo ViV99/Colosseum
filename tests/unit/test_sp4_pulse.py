@@ -380,3 +380,30 @@ def test_one_team_games_need_no_pulse_field_and_two_team_games_still_do(monkeypa
     two = make_test_config("turns", agents={"main": {}}, evaluation={"enabled": True})
     with pytest.raises(ConfigError, match="evaluation.field is empty: the config has no scripted / frozen agents"):
         pulse_plan(two, env_spec(two), resolve_player_roles(two, env_spec(two)))
+
+
+def test_the_texts_about_the_final_snapshot_say_a_local_run_never_evaluates_it(tmp_path, caplog):
+    """B-M4 (T6.1 ruling): the final snapshot is offered, but a local run stops before it is played; the validate
+    line and the schema say so, and the end-of-run INFO gives the real reason (the stop, or the backlog: T6.1
+    deferred)."""
+    from colosseum.core.config import EvaluationConfig
+    from colosseum.launcher import Launcher
+    from game_helpers import make_test_run_dir
+
+    (line,) = [x for x in validate_config(_cfg()).lines if x.startswith("pulse:")]
+    assert "the final one always" not in line and "evaluate it with colosseum tournament" in line
+    every = EvaluationConfig.model_fields["every"].description
+    assert "always" not in every and "colosseum tournament" in every
+    cfg = _cfg()
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
+    launcher._pulse_feeder = feeder = PulseFeeder(["main", "b"], every=1, max_backlog=1)
+    feeder.offer("main", "ckpt_v5", 5, 50, {}, final=True)
+    feeder.offer("b", "ckpt_v7", 7, 70, {}, final=True)                     # pushes main's final out
+    with caplog.at_level(logging.INFO, logger="colosseum.launcher"):
+        launcher._finish_pulse()
+    messages = sorted(r.getMessage() for r in caplog.records if "final snapshot" in r.getMessage())
+    assert messages == [
+        "pulse: the final snapshot ckpt_v5 of main was not evaluated (the backlog skipped it); evaluate it with "
+        "colosseum tournament",
+        "pulse: the final snapshot ckpt_v7 of b was not evaluated (the run stopped first); evaluate it with "
+        "colosseum tournament"]

@@ -393,13 +393,13 @@ evaluation:
 - в записи `system`: `pulse_evaluated_snapshots`, `pulse_skipped_snapshots`, `pulse_pending_snapshots`;
 - `pulse_state.json` — по агенту версии предложенные, оценённые, пропущенные и неоценённые.
 
-`colosseum validate` проверяет поле (агенты есть, их роли покрывают раскладки) и печатает итог, например `pulse: agents ['main'], every 1 saved snapshot(s) (the final one always); field ['greedy', 'random']; layouts {'main': ['2p']}; 25 blocks per composition: 100 matches per snapshot of 'main'; 8 envs, stochastic; backlog 4`.
+`colosseum validate` проверяет поле (агенты есть, их роли покрывают раскладки) и печатает итог, например `pulse: agents ['main'], every 1 saved snapshot(s) (the final one is offered too, but a local run stops before it is played: evaluate it with colosseum tournament); field ['greedy', 'random']; layouts {'main': ['2p']}; 25 blocks per composition: 100 matches per snapshot of 'main'; 8 envs, stochastic; backlog 4`.
 
 **Цена.** Один процесс и `num_envs` сред: CPU, которого не получат воркеры. Бенчмарк скорости (`scripts/bench_throughput.py`) идёт без pulse.
 
 **Очередь.** Если оценка не успевает, ждут не больше `max_backlog` снимков; при переполнении самый старый ждущий пропускается (INFO в `logs/main.log`, счётчик `pulse_skipped_snapshots`): новейшие важнее. Пропуски на перегруженной машине — повод поднять `every` или уменьшить `blocks`.
 
-**Финальный снимок.** Финальный снимок предлагается pulse всегда, но сохраняется в момент остановки, а после остановки задания pulse больше не выдаются. Поэтому в локальном запуске pulse его не оценивает: он остаётся в очереди (`pulse_pending_snapshots`), а не в пропущенных, и в `logs/main.log` пишется INFO вида `pulse: the final snapshot ckpt_v1019 of main was not evaluated (the run stopped first); evaluate it with colosseum tournament`. Так было во всех замерах SP4. Снимки без игр pulse отчёт помечает как неоценённые (`unevaluated`); финальный снимок оцените турниром.
+**Финальный снимок.** Финальный снимок предлагается pulse всегда, но сохраняется в момент остановки, а после остановки задания pulse больше не выдаются. Поэтому в локальном запуске pulse его не оценивает: он остаётся в очереди (`pulse_pending_snapshots`), а не в пропущенных, и в `logs/main.log` пишется INFO вида `pulse: the final snapshot ckpt_v1019 of main was not evaluated (the run stopped first); evaluate it with colosseum tournament` (`the backlog skipped it`, если его вытеснила очередь, например финальный снимок другого агента). Так было во всех замерах SP4. Снимки без игр pulse отчёт помечает как неоценённые (`unevaluated`); финальный снимок оцените турниром.
 
 **Выбор `every` и `blocks`.** Замер SP4 на `unit_harvest_league` (1 воркер + pulse, поле `greedy` и `random`, `blocks: 25` = 100 матчей на снимок, 10 снимков за ≈ 77 с обучения): `every: 1` — оценено 9 снимков, пропущено 0; `every: 2` — 4; `every: 5` — 1 (`benchmarks.md`, «Оценка во время обучения и пороги конвейера»). Начинайте с `every: 1` и увеличивайте `every`, если растёт `pulse_skipped_snapshots`; `blocks` меньше 25 делает кривую шумнее.
 

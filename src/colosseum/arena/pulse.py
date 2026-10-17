@@ -2,8 +2,10 @@
 
 Main process (``PulseFeeder``): after every snapshot save the launcher offers the snapshot (numpy state dict, as
 for workers). Agents of ``evaluation.agents`` (null: every trainable agent); every ``evaluation.every``-th saved
-snapshot of each, and the final one always. Requests wait in a backlog of ``max_backlog``; when it is full the
-oldest waiting request is dropped (INFO, ``skipped``: newer snapshots matter more). ``pump`` hands the oldest
+snapshot of each. The final one is offered too, but it is saved at the stop, after which the pulse takes no new
+request, so a local run never evaluates it (T6.1 ruling; ``colosseum tournament`` does). Requests wait in a
+backlog of ``max_backlog``; when it is full the oldest waiting request is dropped (INFO, ``skipped``: newer
+snapshots matter more). ``pump`` hands the oldest
 waiting request to the one-slot request queue whenever the pulse process has taken the previous one (the feeder
 then keeps only its ids, not its weights); ``done`` records an evaluated snapshot. ``state()``
 (``runs/<name>/pulse_state.json``) lists per agent the versions offered, evaluated, skipped and unevaluated
@@ -185,7 +187,8 @@ def describe_pulse(plan: PulsePlan, config: ColosseumConfig, spec: GameSpec, pla
                               prefix="pulse")
         matches[name] = sum(len(b.lineups) for b in blocks)
     per = ", ".join(f"{matches[n]} matches per snapshot of '{n}'" for n in plan.agents)
-    return (f"pulse: agents {list(plan.agents)}, every {ev.every} saved snapshot(s) (the final one always); field "
+    return (f"pulse: agents {list(plan.agents)}, every {ev.every} saved snapshot(s) (the final one is offered too, "
+            f"but a local run stops before it is played: evaluate it with colosseum tournament); field "
             f"{plan.field}; layouts { {n: list(a.layouts) for n, a in plan.agents.items()} }; {ev.blocks} blocks per "
             f"composition: {per}; {ev.num_envs} envs, {'greedy' if ev.deterministic else 'stochastic'}; backlog "
             f"{ev.max_backlog}")
@@ -264,6 +267,10 @@ class PulseFeeder:
         for request in [*self._in_flight.values(), *self._waiting]:
             out[request.agent_id].append(request.version)
         return {a: sorted(v) for a, v in out.items()}
+
+    def skipped_by_backlog(self, agent_id: str, checkpoint_id: str) -> bool:
+        """Whether that final snapshot left the backlog unevaluated (a newer request pushed it out)."""
+        return (agent_id, checkpoint_id) in self._skipped_final
 
     def unevaluated_final(self) -> list[tuple[str, str]]:
         """``(agent, checkpoint id)`` of final snapshots never evaluated: still waiting, in flight, or skipped."""
