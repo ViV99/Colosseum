@@ -33,7 +33,8 @@ slots of every collecting seat (slot rules of spec block 4):
   true (the factory weights then stay, and ``run`` with the same, sticky stop returns before its first step). Without
   it (None, the default: in-process loops and tests that never push weights) the initial sync is one non-blocking
   poll.
-- **Match results** (SP4 spec block 1) carry each latest seat's policy version at the episode's start and end
+- **Match results** (SP4 spec block 1) carry each latest seat's policy version at the episode's start (at the env's
+  reset, which ``step`` does before its weight sync, so the first decision may use one sync newer weights) and end
   (``MatchRunner(version_fn=...)`` reads ``policy_versions``, which change when weights are synced, also
   mid-episode) and the uid ``<run_id>/train/w<W>_e<E>_ep<K>`` (``match_id`` without a run id). A result
   ``LoopIO.report_result`` could not deliver (it returns False) is counted in ``stats["dropped_results"]``.

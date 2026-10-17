@@ -46,8 +46,10 @@ be in the pool. Only ``latest`` seats of neural players may collect: any other s
 read ``"worker 3, env 1, seat 2, episode step 7, layout 4p: ..."``.
 
 Match records (SP4 spec block 1). Every ``SeatResult`` carries the seat's weights version at the episode's start
-(read right after the env reset) and at its end (read when the result is made): ``ckpt_v<N>`` -> N, ``fixed`` ->
-None, ``latest`` -> ``version_fn(agent_id)`` (the worker's current version; None without ``version_fn``). A lineup's
+(the version at reset: read right after the env reset, so a weight sync between the reset and the first decision,
+as ``RolloutLoop`` does after each step, makes that decision use weights one sync newer) and at its end (read when
+the result is made): ``ckpt_v<N>`` -> N, ``fixed`` -> None, ``latest`` -> ``version_fn(agent_id)`` (the worker's
+current version; None without ``version_fn``). A lineup's
 explicit ``seed`` replaces the derived episode seed (``SeedSequence([seed, env, episode])``); the episode seed (when
 there is one) goes into ``MatchResult.seed``, the lineup's ``block`` into ``MatchResult.block``, and the uid is the
 lineup's ``uid`` or ``uid_prefix + match_id``. ``source`` (one of ``MATCH_SOURCES``) is copied into every result.
@@ -165,7 +167,7 @@ class _EnvState:
         self.scripted: dict[int, ScriptedPlayer] = {}   # seats of the current lineup played by bots
         self.episode_index = 0
         self.seed: int | None = None                 # the current episode's seed
-        self.version_start: dict[int, int | None] = {}   # weights version per seat at the episode start
+        self.version_start: dict[int, int | None] = {}   # weights version per seat at the episode's reset
 
 
 class MatchRunner:

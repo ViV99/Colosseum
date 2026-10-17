@@ -293,7 +293,10 @@ class SeatResult:
     """One seat of a finished match. ``reward`` is the undiscounted episode return; ``source`` is the
     seat's ``SeatAssignment.source``. ``version_start`` / ``version_end`` (SP4): the seat's weights version at the
     episode's start and end (``latest``: the worker's version of the agent, which can change mid-episode;
-    ``ckpt_v<N>``: N; ``fixed``: None; None also when the runner has no version source)."""
+    ``ckpt_v<N>``: N; ``fixed``: None; None also when the runner has no version source). ``version_start`` is the
+    version at the env's reset (read right after it); the worker may sync weights between the reset and the
+    episode's first decision, so that decision can already use weights one sync newer. ``version_end`` is read when
+    the result is made."""
 
     seat: int
     role: str
