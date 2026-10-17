@@ -559,8 +559,9 @@ def report_cmd(run: str, output: str | None) -> None:
     """Build a self-contained HTML report of a run directory (or of a tournament directory): ratings, results
     matrix, anchors, opponents, training, system, matches and tournaments. The page needs no network.
 
-    Exit code: 0 done, 1 not a run or tournament directory (or an unreadable run), 2 bad command-line
-    arguments, 130 SIGINT.
+    Exit code: 0 done, 1 not a run or tournament directory (or an unreadable run), or a section failed (the
+    page is still written, with a note in place of each failed section), 2 bad command-line arguments,
+    130 SIGINT.
     """
     import logging
     from pathlib import Path
@@ -570,9 +571,15 @@ def report_cmd(run: str, output: str | None) -> None:
         raise click.BadParameter(f"directory {str(Path(output).absolute().parent)!r} does not exist",
                                  param_hint="'--output'")
     with _config_errors():
-        from colosseum.arena.report.render import write_report
+        from colosseum.arena.report.render import ReportSectionsFailed, write_report
 
-        path = write_report(run, output)
+        try:
+            path = write_report(run, output)
+        except ReportSectionsFailed as e:
+            failed = "; ".join(f"{name} ({error})" for name, error in e.failed.items())
+            click.echo(f"Report written to {e.path}, but {len(e.failed)} section(s) failed and show a note "
+                       f"instead: {failed} (tracebacks in the log above)", err=True)
+            sys.exit(1)
     click.echo(f"Report written to {path}")
 
 

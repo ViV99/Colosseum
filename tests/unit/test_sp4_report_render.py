@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import copy
 import json
+import logging
 import re
 import shutil
 import subprocess
@@ -209,6 +210,27 @@ def test_write_report_default_path_and_output(tmp_path):
     with pytest.raises(ConfigError, match=r"neither a run directory \(metrics.jsonl, config.resolved.yaml, "
                                           r"matches.db or tournaments/\)"):
         write_report(tmp_path / "empty")
+
+
+def test_a_failing_section_is_a_note_and_the_page_is_still_written(tmp_path, monkeypatch, caplog):
+    """Sections are isolated as in the dashboard (ruling C-M4): a failing section becomes a "This section failed"
+    note, the other sections and the page are written, the traceback is logged, and ``write_report`` raises
+    ``ReportSectionsFailed`` naming the section after writing (the CLI exits 1)."""
+    from colosseum.arena.report.data import ReportBuilder
+    from colosseum.arena.report.render import ReportSectionsFailed
+
+    run = write_run_dir(tmp_path, "wdl")
+    monkeypatch.setattr(ReportBuilder, "_matrix", lambda self, **kw: 1 / 0)
+    with caplog.at_level(logging.ERROR, logger="colosseum.arena.report.data"):
+        with pytest.raises(ReportSectionsFailed, match="matrix") as info:
+            write_report(run.root)
+    assert info.value.path == run.root / REPORT_FILE
+    assert info.value.failed == {"matrix": "ZeroDivisionError: division by zero"}
+    data = _data_of(info.value.path.read_text())
+    assert set(data["sections"]) == set(SECTIONS)
+    assert data["sections"]["matrix"] == {"notes": ["This section failed: ZeroDivisionError: division by zero"]}
+    assert data["sections"]["ratings"]["layouts"] and data["sections"]["summary"]["status"] == "finished"
+    assert "section matrix failed" in caplog.text and "ZeroDivisionError" in caplog.text
 
 
 def test_an_unfinished_tournament_dir_is_refused_with_its_own_message(tmp_path):

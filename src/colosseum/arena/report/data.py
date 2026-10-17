@@ -266,6 +266,11 @@ class MetricsTail:
         return [r for (k, _), series in self._series.items() if k == kind for r in series.records()]
 
 
+def failed_section(error: str) -> dict:
+    """The section drawn in place of one whose build failed (the static report and the dashboard's page)."""
+    return {"notes": [f"This section failed: {error}"]}
+
+
 def _sorted_by(records: list[dict], key: str) -> list[dict]:
     """Stable sort by a counter (records without it keep file order at the end)."""
     return sorted(records, key=lambda r: (r.get(key) is None, r.get(key) or 0))
@@ -302,6 +307,7 @@ class ReportBuilder:
         self._reader = None
         self._reader_failed: str | None = None
         self._cache: dict[tuple, Any] = {}
+        self.failed_sections: dict[str, str] = {}      # of the last build(): section -> error
 
     # ----- sources -----
     @property
@@ -431,8 +437,19 @@ class ReportBuilder:
 
     # ----- public -----
     def build(self) -> dict:
-        sections = {name: self.section(name) for name in SECTIONS
-                    if name != "tournaments" or self.include_tournaments}
+        """Every section. Sections are isolated as in the dashboard: a section whose build raises is logged with
+        its traceback and drawn as a note (``failed_section``); its name and error are in ``failed_sections``."""
+        self.failed_sections = {}
+        sections = {}
+        for name in SECTIONS:
+            if name == "tournaments" and not self.include_tournaments:
+                continue
+            try:
+                sections[name] = self.section(name)
+            except Exception as e:  # noqa: BLE001 - one failing section never costs the whole report
+                logger.exception(f"report: building section {name} failed")
+                self.failed_sections[name] = f"{type(e).__name__}: {e}"
+                sections[name] = failed_section(self.failed_sections[name])
         return {"format": REPORT_FORMAT, "title": self.title(), "sections": sections}
 
     def title(self) -> str:
@@ -1052,7 +1069,7 @@ def _cells(axis: Sequence[str], acc: Mapping[tuple[str, str], Sequence[float]]) 
 
 def build_report_data(run_dir: str | Path, *, include_tournaments: bool = True,
                       limits: ReportLimits | None = None) -> dict:
-    """Every section of the run's report (``ReportBuilder.build``)."""
+    """Every section of the run's report (``ReportBuilder.build``: a failing section is a note in its place)."""
     builder = ReportBuilder(run_dir, limits=limits, include_tournaments=include_tournaments)
     try:
         return builder.build()

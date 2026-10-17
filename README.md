@@ -468,7 +468,9 @@ colosseum dashboard RUN [--host 127.0.0.1] [--port 8765] [--refresh 10]
   fixed field on fixed seeds, for an unbiased "score against the field by version" curve.
 - **`colosseum report`** writes one self-contained HTML file (default `RUN/report.html`; no network, no CDN): summary,
   ratings by version with intervals, results matrix, score against the anchors, opponent mix, training and system
-  series, recent matches, tournaments. `colosseum report runs/x/tournaments/<name>` renders one tournament.
+  series, recent matches, tournaments. `colosseum report runs/x/tournaments/<name>` renders one tournament. A section
+  that fails to build shows a note in its place: the page is still written, and the command names the failed
+  sections and exits 1.
 - **`colosseum dashboard`** serves the same page live (per-section JSON at `/api/<section>`). It has no authentication
   and binds `127.0.0.1`: reach it from another machine or a phone through an SSH tunnel
   (`ssh -N -L 8765:127.0.0.1:8765 user@train-box`, then `http://127.0.0.1:8765/`), never by listening on `0.0.0.0`.

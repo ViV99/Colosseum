@@ -10,6 +10,7 @@ import html
 import json
 import math
 import re
+from collections.abc import Mapping
 from importlib import resources
 from pathlib import Path
 from typing import Any
@@ -19,6 +20,16 @@ from colosseum.utils.fs import write_text_atomic
 
 REPORT_FILE = "report.html"
 _PLACEHOLDER = re.compile(r"\{\{([A-Z]+)\}\}")
+
+
+class ReportSectionsFailed(Exception):
+    """``write_report`` wrote the page, but some sections failed: each is drawn as a note in its place and its
+    traceback is logged. ``path``: the page; ``failed``: section -> error."""
+
+    def __init__(self, path: Path, failed: Mapping[str, str]) -> None:
+        self.path, self.failed = Path(path), dict(failed)
+        listed = "; ".join(f"{name} ({error})" for name, error in self.failed.items())
+        super().__init__(f"{self.path} was written, but these sections failed: {listed}")
 
 
 def asset(name: str) -> str:
@@ -99,10 +110,13 @@ def write_tournament_html(tournament_dir: str | Path) -> Path:
 
 
 def write_report(run_dir: str | Path, out: str | Path | None = None) -> Path:
-    """``colosseum report``: the HTML of a run dir (default ``<run>/report.html``) or of a tournament dir."""
-    from colosseum.arena.report.data import build_report_data
+    """``colosseum report``: the HTML of a run dir (default ``<run>/report.html``) or of a tournament dir. Sections
+    are isolated: when some fail, the page is written with a note in their place and ``ReportSectionsFailed``
+    is raised afterwards (the CLI exits 1)."""
+    from colosseum.arena.report.data import ReportBuilder
 
     root = Path(run_dir)
+    failed: dict[str, str] = {}
     if is_tournament_dir(root):
         if out is None:                        # one writer of a tournament dir's report.html
             return write_tournament_html(root)
@@ -111,10 +125,18 @@ def write_report(run_dir: str | Path, out: str | Path | None = None) -> Path:
         raise ConfigError(f"{root} is a tournament directory, but the tournament has no report.json yet (it is "
                           f"running or was interrupted: rerun it with the same --name to finish it)")
     elif is_run_dir(root):
-        data = build_report_data(root)
+        builder = ReportBuilder(root)
+        try:
+            data = builder.build()
+        finally:
+            builder.close()
+        failed = builder.failed_sections
         data["generated"] = "colosseum report"
     else:
         raise ConfigError(f"{root} is neither a run directory (metrics.jsonl, config.resolved.yaml, matches.db or "
                           f"tournaments/) nor a tournament directory (tournament.yaml and report.json)")
     target = Path(out) if out is not None else root / REPORT_FILE
-    return write_text_atomic(target, render_html(data))
+    path = write_text_atomic(target, render_html(data))
+    if failed:
+        raise ReportSectionsFailed(path, failed)
+    return path

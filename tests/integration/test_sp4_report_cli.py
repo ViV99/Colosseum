@@ -11,6 +11,7 @@ import pytest
 
 from cli_runner import REPO_ROOT, run_in_session, run_train
 from colosseum.arena.report.data import SECTIONS
+from report_kit import write_run_dir
 
 EXAMPLES = REPO_ROOT / "configs" / "examples"
 URL = re.compile(r"(?:https?:)?//[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -46,3 +47,19 @@ def test_report_exit_codes(tmp_path):
     proc = run_in_session([sys.executable, "-m", "colosseum", "report", str(tmp_path), "-o",
                            str(tmp_path / "no" / "such" / "dir.html")], timeout=60)
     assert proc.returncode == 2 and "does not exist" in proc.stderr
+
+
+def test_report_exits_1_naming_the_failed_sections_after_writing_the_page(tmp_path, monkeypatch):
+    """A failing section (ruling C-M4): the page is written with a note in its place, and the command says which
+    sections failed and exits 1, so a partial report never looks like a success."""
+    from click.testing import CliRunner
+
+    from colosseum.arena.report.data import ReportBuilder
+    from colosseum.cli import main
+
+    run = write_run_dir(tmp_path, "wdl")
+    monkeypatch.setattr(ReportBuilder, "_anchors", lambda self: 1 / 0)
+    result = CliRunner().invoke(main, ["report", str(run.root)])
+    assert result.exit_code == 1, result.output
+    assert "anchors" in result.stderr and "ZeroDivisionError" in result.stderr
+    assert str(run.root / "report.html") in result.stderr and (run.root / "report.html").exists()

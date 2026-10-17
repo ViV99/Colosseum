@@ -41,7 +41,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
 
-from colosseum.arena.report.data import FILTERS, REPORT_FORMAT, SECTIONS, ReportBuilder
+from colosseum.arena.report.data import FILTERS, REPORT_FORMAT, SECTIONS, ReportBuilder, failed_section
 from colosseum.arena.report.render import embed_json, is_run_dir, render_html
 from colosseum.core.errors import ConfigError
 
@@ -290,7 +290,7 @@ class _Handler(BaseHTTPRequestHandler):
             if state in ("fresh", "stale"):
                 sections[name] = json.loads(payload)
             elif state in ("error", "failed"):
-                sections[name] = {"notes": [f"This section failed: {payload}"]}
+                sections[name] = failed_section(str(payload))
             else:
                 sections[name] = placeholder(name)
         data = {"format": REPORT_FORMAT, "title": self.server.title, "sections": sections}
