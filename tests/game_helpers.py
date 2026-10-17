@@ -1556,3 +1556,38 @@ def write_fake_run(root, game: str = "turns", *, agent: str = "main", versions=(
     for i, version in enumerate(versions):
         write_ckpt_dir(root / "checkpoints" / agent, config, agent, policy_version=version, seed=i)
     return root, config
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T5.2): tournament stand-ins
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SyntheticSource:
+    origin: str = "synthetic"
+
+
+@dataclass(frozen=True)
+class SyntheticPlayer:
+    """A tournament player stand-in with the fields ``schedule``, ``stats`` and ``modes`` read."""
+
+    agent_id: str
+    network_id: str = "fixed"
+    roles: tuple[str, ...] = ("player",)
+    display: str = ""
+    kind: str = "scripted"
+    lineage: str = ""
+    source: SyntheticSource = field(default_factory=SyntheticSource)
+
+
+def synthetic_players(names, roles=None) -> dict:
+    """``"main@v3"`` -> a snapshot of ``main`` (``ckpt_v3``, lineage ``main``); any other name -> a scripted player
+    (lineage = name). ``roles``: name -> roles (default ``("player",)``)."""
+    out = {}
+    for name in names:
+        agent, _, version = name.partition("@v")
+        out[name] = SyntheticPlayer(agent, f"ckpt_v{version}" if version else "fixed",
+                                    tuple((roles or {}).get(name, ("player",))), display=name,
+                                    kind="snapshot" if version else "scripted", lineage=agent)
+    return out
