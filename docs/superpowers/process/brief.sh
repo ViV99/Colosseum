@@ -9,7 +9,7 @@ cd "$(git rev-parse --show-toplevel)"
 WS=${WS:?set WS to the workspace, e.g. .superpowers/sdd/<plan-name>}
 P=${PLAN:?set PLAN to the plan dir, e.g. docs/superpowers/plans/<plan-name>}
 id=$1
-part=$(grep -l -E "^### Task ${id//./\\.}:" $P/0[1-4]-*.md | head -1)
+part=$(grep -l -E "^### Task ${id//./\\.}:" $P/0[1-9]-*.md | head -1)
 [ -n "$part" ] || { echo "task $id not found" >&2; exit 3; }
 out=$WS/task-$id-brief.md
 {
