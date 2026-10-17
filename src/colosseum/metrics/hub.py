@@ -124,6 +124,7 @@ class MetricsHub:
         self._last_logged_step: dict[str, int] = {}
         self._last_returns: dict[str, float] = {}
         self._bt_failed_versions: set[int] = set()     # live snapshots whose formatting failed (logged once each)
+        self._system_values: dict[str, Any] = {}       # merged into every system record (SP4 T6.1)
 
     def on_train_metrics(self, metrics: dict) -> None:
         agent_id = str(metrics.get("agent_id", "agent_0"))
@@ -140,6 +141,10 @@ class MetricsHub:
 
     def on_worker_stats(self, stats: dict) -> None:
         self._system.on_worker_stats(stats)
+
+    def set_system_value(self, key: str, value: Any) -> None:
+        """A value merged at the top level of every later ``system`` record (SP4 T6.1: the pulse counters)."""
+        self._system_values[key] = value
 
     def system_cumulative(self, key: str) -> int:
         """A run-level worker counter (``SystemStats.cumulative``)."""
@@ -163,6 +168,7 @@ class MetricsHub:
             self._writer.write("episodes", agent=agent_id, env_steps=int(env_steps), **ep)
             self._last_returns[agent_id] = ep["return_mean"]
         system = self._system.snapshot(env_steps, queue_depths, match_log=match_log)
+        system.update(self._system_values)
         self._writer.write("system", **system)
         if callable(ratings):
             ratings = ratings()

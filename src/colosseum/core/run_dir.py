@@ -8,6 +8,7 @@
       ratings.json             latest ratings snapshot (T6.3)
       matches.db               the match log (SP4: colosseum.arena.matchlog)
       league_state.json        ratings and PFSP statistics, for a run-dir resume (SP4)
+      pulse_state.json         pulse bookkeeping (SP4 T6.1)
       checkpoints/<agent>/ckpt_v<N>/{model.pt, trainer_state.pt, meta.json}
 """
 
@@ -92,6 +93,12 @@ class RunDir:
         from colosseum.coordinator.coordinator import LEAGUE_STATE_FILE
 
         return self.root / LEAGUE_STATE_FILE
+
+    @property
+    def pulse_state_path(self) -> Path:
+        from colosseum.arena.pulse import PULSE_STATE_FILE
+
+        return self.root / PULSE_STATE_FILE
 
     @property
     def matches_path(self) -> Path:

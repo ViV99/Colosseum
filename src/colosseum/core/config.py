@@ -690,6 +690,22 @@ class MetricsConfig(StrictModel):
     )
 
 
+
+class EvaluationConfig(StrictModel):
+    """Pulse: every new snapshot against a fixed field during training (SP4 spec block 6). Global only."""
+
+    enabled: bool = Field(default=False, description="Start the pulse process (needs match_log.enabled).")
+    agents: list[str] | None = Field(default=None, description="Trainable agents to evaluate; null = all.")
+    field: list[str] | None = Field(
+        default=None, description="Scripted / frozen agents of the config to play against; null = all of them.")
+    layouts: list[str] | None = Field(
+        default=None, description="Layouts; null = every enabled layout with a seat of the agent's roles.")
+    every: int = Field(default=1, ge=1, description="Evaluate every k-th saved snapshot (the final one always).")
+    blocks: int = Field(default=25, ge=1, description="Blocks per field member (or composition); 1v1: 2 matches each.")
+    num_envs: int = Field(default=8, ge=1, description="Envs of the pulse process.")
+    deterministic: bool = Field(default=False, description="Greedy snapshot policies.")
+    max_backlog: int = Field(default=4, ge=1, description="Snapshots waiting for evaluation; the oldest are skipped.")
+
 class MatchLogConfig(StrictModel):
     """The match log ``runs/<name>/matches.db`` (SP4 spec block 1). Global only (no per-agent override)."""
 
@@ -951,6 +967,7 @@ class ColosseumConfig(StrictModel):
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     matchmaking: MatchmakingConfig = Field(default_factory=MatchmakingConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     init: InitConfig = Field(default_factory=InitConfig)
     kickstart: KickstartConfig = Field(default_factory=KickstartConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
@@ -1046,6 +1063,12 @@ class ColosseumConfig(StrictModel):
         if self.checkpoint.keep_top_k > 0 and not self.match_log.enabled:
             raise ValueError(f"checkpoint.keep_top_k={self.checkpoint.keep_top_k} keeps snapshots by their rating, "
                              f"which comes from the match log; set match_log.enabled: true or keep_top_k: 0")
+        ev = self.evaluation
+        if ev.enabled and not self.match_log.enabled:
+            raise ValueError("evaluation.enabled: pulse matches go to the match log; set match_log.enabled: true or "
+                             "evaluation.enabled: false")
+        if ev.enabled and ev.field is not None and not ev.field:
+            raise ValueError("evaluation.field is empty: name scripted / frozen agents of the config, or null for all")
         return self
 
     def _has_implicit_agent(self) -> bool:

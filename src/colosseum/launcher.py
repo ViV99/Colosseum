@@ -57,6 +57,8 @@ _COMMAND_QUEUE_SIZE = 1
 # Bound on each step of releasing the queues after the teardown (reading back unread
 # commands, joining feeder threads, ending abandoned reads); see Launcher._release_queues.
 _QUEUE_RELEASE_SEC = 1.0
+# Pulse results (SP4 T6.1): one message per evaluated snapshot; the pulse process puts with a blocking put.
+_PULSE_RESULTS_QUEUE_SIZE = 64
 
 
 # =====================================================================
@@ -388,6 +390,13 @@ class Launcher:
         self._league_state_error_logged = False   # the first failing league_state.json write logs its traceback
         # The live ratings version the last retention pass used (T4.1: retention reruns after every refit).
         self._retention_version: int | None = None
+        # Set by launch() with evaluation.enabled (SP4 T6.1): the pulse plan, the feeder of snapshot requests, the
+        # one-slot request queue (this process produces it) and the pulse results queue (journal only, A20).
+        self._pulse_plan = None
+        self._pulse_feeder = None
+        self._pulse_requests: mp.Queue | None = None
+        self._pulse_results: mp.Queue | None = None
+        self._pulse_state_error_logged = False    # the first failing pulse_state.json write logs its traceback
 
     @property
     def env_steps_done(self) -> int:
@@ -442,6 +451,14 @@ class Launcher:
                   "config_hash": cfg_hash}
             for aid in trainable_agents
         }
+        if cfg.evaluation.enabled:
+            from colosseum.arena.pulse import PulseFeeder, pulse_plan
+
+            self._pulse_plan = pulse_plan(cfg, setup.spec, setup.player_roles)
+            self._pulse_feeder = PulseFeeder(self._pulse_plan.agents, cfg.evaluation.every,
+                                             cfg.evaluation.max_backlog)
+            self._pulse_requests = mp.Queue(maxsize=1)
+            self._pulse_results = mp.Queue(maxsize=_PULSE_RESULTS_QUEUE_SIZE)
 
         trajectory_queues: dict[str, mp.Queue] = {}
         checkpoint_queues: dict[str, mp.Queue] = {}
@@ -471,6 +488,7 @@ class Launcher:
             self._all_queues.append(trajectory_queues[aid])
             self._all_queues.append(checkpoint_queues[aid])
             self._all_queues.extend(weight_queues_per_agent[aid])
+        self._all_queues += [q for q in (self._pulse_requests, self._pulse_results) if q is not None]
 
         self._coordinator = coordinator
         self._agent_ids = list(trainable_agents)
@@ -651,6 +669,21 @@ class Launcher:
             start_process(worker_proc)
             self._supervisor.add(f"worker-{worker_id}", worker_proc)
 
+        if self._pulse_feeder is not None:
+            from colosseum.arena.pulse import pulse_target
+
+            fixed, names = setup.fixed, self._pulse_plan.field
+            field_specs = FixedPlayers(bots={n: fixed.bots[n] for n in names if n in fixed.bots},
+                                       frozen={n: fixed.frozen[n] for n in names if n in fixed.frozen},
+                                       roles={n: fixed.roles[n] for n in names})
+            pulse_proc = mp.Process(target=pulse_target, name="pulse", daemon=True, kwargs=dict(
+                log_dir=str(self._run_dir.logs), config=cfg, requests=self._pulse_requests,
+                results=self._pulse_results, stop_event=self._stop_event, field_specs=field_specs, field=list(names),
+                agents=self._pulse_plan.agents, run_id=self._run_id))
+            start_process(pulse_proc)
+            self._supervisor.add("pulse", pulse_proc)
+            logger.info(f"Pulse started for {list(self._pulse_plan.agents)} against {names}")
+
     def _monitor_loop(
         self,
         coordinator: Coordinator,
@@ -678,6 +711,7 @@ class Launcher:
             self._drain_all_checkpoints()
             self._reapply_retention()   # after a new live refit (T4.1); the refit thread never touches storage
             self._drain_results()
+            self._pump_pulse()
             self._drain_metrics()
             env_steps = int(self._env_step_counter.value)
             # The method itself: the hub builds the ratings snapshot only when a tick is due (spec block 7.3).
@@ -943,9 +977,11 @@ class Launcher:
         try:
             if self._hub is not None:
                 self._drain_results()
+                self._pump_pulse()                # before the writer stops: the last pulse results (A17, A20)
                 self._drain_metrics()
                 self._stop_match_log()
                 final_bt = self._finish_live_ratings()
+                self._finish_pulse()
                 self._hub.close(env_steps=int(self._env_step_counter.value),
                                 ratings=self._coordinator.ratings_snapshot,
                                 queue_depths=queue_depths(self._trajectory_queues),
@@ -1071,8 +1107,61 @@ class Launcher:
 
     def _save_checkpoint(self, payload: dict) -> None:
         aid = payload["agent_id"]
-        meta = {**self._checkpoint_meta.get(aid, {}), "env_steps": int(self._env_step_counter.value)}
-        self._coordinator.save_checkpoint_payload(payload, meta_extra=meta)
+        env_steps = int(self._env_step_counter.value)
+        meta = {**self._checkpoint_meta.get(aid, {}), "env_steps": env_steps}
+        checkpoint_id = self._coordinator.save_checkpoint_payload(payload, meta_extra=meta)
+        if self._pulse_feeder is not None:          # the pulse evaluates it even if retention evicts it (spec block 6)
+            self._pulse_feeder.offer(aid, checkpoint_id, int(payload["policy_version"]), env_steps,
+                                     payload["model_state"], final=bool(payload.get("final", False)))
+
+    def _main_produced_queues(self) -> list:
+        """Queues this process writes to and must release itself (``release_command_queues``)."""
+        return [*self._command_queues, *([self._pulse_requests] if self._pulse_requests is not None else [])]
+
+    def _pump_pulse(self) -> None:
+        """Hand waiting snapshots to the pulse process; give its results to the journal writer only (contract
+        amendment A20: not to the coordinator, the online ELO, PFSP or the episodes aggregator); keep the
+        ``system`` counters and ``pulse_state.json`` current. Main loop only."""
+        feeder = self._pulse_feeder
+        if feeder is None or self._pulse_requests is None:
+            return
+        handing_out = not self._stop_event.is_set()     # after the stop the pulse takes no new request
+        if handing_out:
+            feeder.pump(self._pulse_requests)
+        if self._pulse_results is not None:
+            for message in self._drain(self._pulse_results, "pulse-results", lambda: ["pulse"]):
+                if self._match_log_writer is not None:
+                    self._match_log_writer.submit(message.results)   # a drop is counted by the writer (T1.3)
+                feeder.done(message)
+            if handing_out:
+                feeder.pump(self._pulse_requests)   # the next one, if the pulse took the previous request
+        if self._hub is not None:
+            self._hub.set_system_value("pulse_skipped_snapshots", feeder.skipped)
+            self._hub.set_system_value("pulse_evaluated_snapshots", feeder.evaluated)
+            self._hub.set_system_value("pulse_pending_snapshots", feeder.pending)
+        if feeder.changed:
+            self._write_pulse_state()
+
+    def _write_pulse_state(self) -> None:
+        """``pulse_state.json`` (bookkeeping; a failing write is logged and retried at the next change, never fatal)."""
+        from colosseum.metrics.jsonl import write_json_atomic
+
+        self._pulse_feeder.changed = False
+        try:
+            write_json_atomic(self._run_dir.pulse_state_path, self._pulse_feeder.state())
+        except Exception as e:  # noqa: BLE001 - the pulse bookkeeping must never stop training
+            logger.error(f"Writing {self._run_dir.pulse_state_path} failed ({type(e).__name__}: {e})",
+                         exc_info=not self._pulse_state_error_logged)
+            self._pulse_state_error_logged = True
+
+    def _finish_pulse(self) -> None:
+        """At the end: the final pulse state, and an INFO per final snapshot the run gave no time to evaluate."""
+        if self._pulse_feeder is None:
+            return
+        for agent_id, checkpoint_id in self._pulse_feeder.unevaluated_final():
+            logger.info(f"pulse: the final snapshot {checkpoint_id} of {agent_id} was not evaluated (the run "
+                        f"stopped first); evaluate it with colosseum tournament")
+        self._write_pulse_state()
 
     def _drain_all_checkpoints(self) -> None:
         """Save every queued checkpoint payload.
@@ -1154,7 +1243,7 @@ class Launcher:
 
         def poll() -> None:
             nonlocal first_error
-            for drain in (self._drain_all_checkpoints, self._drain_results, self._drain_metrics):
+            for drain in (self._drain_all_checkpoints, self._drain_results, self._pump_pulse, self._drain_metrics):
                 try:
                     drain()
                 except Exception as e:  # noqa: BLE001 - re-raised after the teardown
@@ -1176,9 +1265,9 @@ class Launcher:
             self._finish_reads(max(deadline, time.monotonic() + 1.0), poll)
             # Detach queue feeder threads so a queue still holding undrained data (e.g.
             # trajectory chunks a now-dead learner never consumed) cannot block this process
-            # from exiting. The command queues (fed by this process) are drained, closed and
-            # joined with a bound by _release_queues instead.
-            produced_here = {id(q) for q in self._command_queues}
+            # from exiting. The command queues and the pulse request queue (fed by this process)
+            # are drained, closed and joined with a bound by _release_queues instead.
+            produced_here = {id(q) for q in self._main_produced_queues()}
             for q in self._all_queues:
                 if id(q) in produced_here:
                     continue
@@ -1198,7 +1287,7 @@ class Launcher:
         GC frees them, e.g. along with a traceback; a GC that runs inside the
         multiprocessing resource tracker then warns that they "might leak" (gh-109629).
         Every step is bounded by ``_QUEUE_RELEASE_SEC``, so a release never blocks the exit.
-        - Command queues (this process is their producer): unread commands are read back,
+        - Command queues and the pulse request queue (this process is their producer): unread items are read back,
           then the queue is closed and its feeder thread joined, so no feeder outlives
           ``launch`` to unlink the semaphores during interpreter shutdown
           (``release_command_queues``).
@@ -1209,8 +1298,8 @@ class Launcher:
         for reader in self._readers.values():
             reader.release(_QUEUE_RELEASE_SEC)
         busy = {key: reader for key, reader in self._readers.items() if reader.busy}
-        produced_here = {id(q) for q in self._command_queues}
-        release_command_queues(self._command_queues, _QUEUE_RELEASE_SEC)
+        produced_here = {id(q) for q in self._main_produced_queues()}
+        release_command_queues(self._main_produced_queues(), _QUEUE_RELEASE_SEC)
         for q in self._all_queues:
             if id(q) in produced_here:
                 continue
@@ -1226,6 +1315,7 @@ class Launcher:
         self._trajectory_queues = {}
         self._checkpoint_queues = {}
         self._results_queue = self._metrics_queue = None
+        self._pulse_requests = self._pulse_results = None
 
     def _finish_reads(self, deadline: float, poll: Callable[[], None]) -> None:
         """All children are gone: let in-progress reads complete until ``deadline``, then

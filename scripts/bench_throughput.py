@@ -176,6 +176,8 @@ def _make_config(num_workers: int, run_parent: str):
         match_log={"enabled": True, "detail_window_mb": 512.0, "min_free_disk_mb": 2048.0,
                    "compact_interval_sec": 60.0},
         ratings={"anchor": None, "refit_interval_sec": 60.0, "bootstrap_samples": 200},
+        evaluation={"enabled": False, "agents": None, "field": None, "layouts": None, "every": 1, "blocks": 25,
+                    "num_envs": 8, "deterministic": False, "max_backlog": 4},   # criterion 3.6: pulse off
         transport={"mode": "local"},
     )
 

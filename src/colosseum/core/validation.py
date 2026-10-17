@@ -551,6 +551,18 @@ def _check_warm_start(config: ColosseumConfig, spec: GameSpec, agent_configs: di
         report.lines.append("training.resume_from is set: agents restored from it ignore init")
 
 
+def _check_evaluation(config: ColosseumConfig, spec: GameSpec, player_roles: dict[str, list[str]],
+                      report: ValidationReport) -> None:
+    """Pulse (spec block 6): the field, the agents and the role coverage (``arena.pulse.pulse_plan``), and the
+    effective settings in one line."""
+    if not config.evaluation.enabled:
+        return
+    from colosseum.arena.pulse import describe_pulse, pulse_plan
+
+    plan = pulse_plan(config, spec, player_roles)
+    report.lines.append(describe_pulse(plan, config, spec, player_roles))
+
+
 def _describe_retention(config: ColosseumConfig, report: ValidationReport) -> None:
     """The effective retention rule per trainable agent (spec block 4), and a WARNING when the pinned snapshots a
     run-dir resume carries over plus ``keep_last`` exceed ``max_snapshots``."""
@@ -626,6 +638,8 @@ def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] 
       agents' roles (``resolve_agent_roles``), the matchmaking checks per agent
       (``colosseum.league.mixture.validate_matchmaking``), a custom matchmaker's lineups, and the
       effective opponent mix of every agent (``ValidationReport.lines``);
+    - with ``evaluation.enabled``, the pulse (SP4 spec block 6): its field, agents, layouts and role coverage,
+      and one ``pulse:`` line with the effective settings;
     - ``networks.critic_encoder_class`` only for agents whose roles declare a ``global_state_space``;
     - ``reset`` of every enabled layout and up to ``VALIDATE_STEPS`` random legal steps under the
       contract checks, with full ``space.contains`` checks of observations, global states and
@@ -668,6 +682,7 @@ def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] 
         report.lines.extend(describe_mix(config, spec))
         _check_ratings(config, report)
         _describe_retention(config, report)
+        _check_evaluation(config, spec, player_roles, report)
     fixed = load_fixed_players(config, spec, selected)   # roles, classes, paths and role signatures of fixed agents
     report.fixed = fixed
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_roles}

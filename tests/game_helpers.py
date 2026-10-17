@@ -42,6 +42,7 @@ from colosseum.networks.dist import Distribution, make_distribution
 from colosseum.networks.heads import UnitsHead
 from colosseum.networks.model import PolicyModel, PolicyStep, UnrollOutput
 from colosseum.players import ScriptedBot
+from colosseum.utils.logging import ENV_PROCESS_NAME
 from colosseum.worker.buffers import BufferSpec, RolloutBuffer
 from colosseum.worker.match_runner import ScriptedPlayer
 
@@ -1556,6 +1557,24 @@ def write_fake_run(root, game: str = "turns", *, agent: str = "main", versions=(
     for i, version in enumerate(versions):
         write_ckpt_dir(root / "checkpoints" / agent, config, agent, policy_version=version, seed=i)
     return root, config
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T6.1): pulse
+# ---------------------------------------------------------------------------
+
+
+class PulseFailBot(ScriptedBot):
+    """Random legal play, except in the process named ``pulse`` (``COLOSSEUM_PROCESS_NAME``), where ``act`` raises:
+    ``validate`` and the rollout workers play it normally, the pulse process crashes on it."""
+
+    def reset(self, *, role, seat, layout, rng) -> None:
+        self._role, self._rng = self.game_spec.roles[role], rng
+
+    def act(self, obs, mask, info):
+        if os.environ.get(ENV_PROCESS_NAME) == "pulse":
+            raise RuntimeError("pulse failure on purpose")
+        return random_legal_action(self._role, mask, self._rng)
 
 
 # ---------------------------------------------------------------------------
