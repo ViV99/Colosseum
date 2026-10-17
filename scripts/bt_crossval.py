@@ -1,10 +1,14 @@
 """Bradley-Terry prior and smoothness by cross-validation (SP4 spec block 2; plan T8.2).
 
 Journals: short training runs of four demo games (``--make-journals``: tic_tac_toe, tron, unit_harvest_league,
-predator_prey; the journal is on by default). Every match of a journal goes to fold ``sha1(uid) % FOLDS``;
-for each fold and grid point the fit on the other folds predicts the held-out team pairs
-(``match_pairs``: weight ``1/(T-1)``, outcome 1 / 0.5 / 0) and scores them by the weighted log-loss.
-Pairs with an entity the training folds never saw are skipped (counted). Score layouts have no pairs.
+predator_prey; the journal is on by default). Every match of a journal goes to fold ``sha1(key) % FOLDS``, the
+key being the match's block id when it has one (the seat rotations of one pulse block stay in one fold), else
+its uid; for each fold and grid point the fit on the other folds predicts the held-out team pairs
+(``match_pairs``: weight ``1/(T-1)``, outcome 1 / 0.5 / 0) and scores them by the weighted log-loss. The
+prediction is the model's own linear predictor in logits (raw parameters, not the per-cell anchored ratings,
+so pairs across rating cells - e.g. predator_prey's hunter vs prey - are predicted as the fit models them).
+Pairs with an entity the training folds never saw are skipped (counted); self-play pairs (every entity
+cancels, only the seat bias is left) are left out of the score (counted). Score layouts have no pairs.
 
 Decision rule (fixed before the measurement, ``choose``): the grid point with the smallest mean held-out
 log-loss (games weighted equally); among the points within one standard error (over folds) of it, the one
@@ -47,8 +51,13 @@ ELO = 400.0 / math.log(10.0)                      # Elo units per logit (BTFit r
 SOURCES = ("train", "pulse")
 
 
-def fold_of(uid: str) -> int:
-    return int(hashlib.sha1(uid.encode("utf-8")).hexdigest(), 16) % FOLDS
+def fold_of(key: str) -> int:
+    return int(hashlib.sha1(key.encode("utf-8")).hexdigest(), 16) % FOLDS
+
+
+def fold_key(result) -> str:
+    """The match's block id when it has one (a pulse block's rotations share a fold), else its uid."""
+    return result.block if result.block else result.uid
 
 
 def make_journals(work_dir: Path, seed: int) -> None:
@@ -81,48 +90,76 @@ def load(journal: Path):
         for row in rows:
             result, versions = row.to_result()
             if result.source in SOURCES:
-                items.append((fold_of(result.uid), result, versions))
+                items.append((fold_of(fold_key(result)), result, versions))
     finally:
         reader.close()
     return rating_inputs(config), items
 
 
 def predict(fit_, a, b) -> float | None:
-    """P(team a beats team b) under the fit; None if a member was not rated."""
-    def strength(team) -> float | None:
-        ratings = [fit_.rating.get(e) for e, _ in team.members]
-        if any(r is None for r in ratings):
-            return None
-        return (sum(ratings) / len(ratings) + fit_.bias.get(team.team, 0.0)) / ELO
+    """P(team a beats team b) under the fit: the model's linear predictor in logits (``comparisons.coefficients``
+    over the raw parameters ``fit_.params`` plus the seat-bias difference), so pairs across rating cells keep the
+    cells' offsets; None if a member or a team is not in the fit's design."""
+    from colosseum.arena.comparisons import coefficients
 
-    sa, sb = strength(a), strength(b)
-    if sa is None or sb is None:
+    design = fit_.design
+    if design is None:
         return None
-    return 1.0 / (1.0 + math.exp(-(sa - sb)))
+    if any(e not in design.index for team in (a, b) for e, _ in team.members):
+        return None
+    if a.team not in fit_.bias or b.team not in fit_.bias:
+        return None
+    z = sum(c * float(fit_.params[design.index[e]]) for e, c in coefficients(a, b).items())
+    z += (fit_.bias[a.team] - fit_.bias[b.team]) / ELO
+    return 1.0 / (1.0 + math.exp(-z))
 
 
-def evaluate(inputs, items, prior: float, smooth: float) -> dict:
-    """Held-out log-loss per fold: ``{"loss": [...], "weight": [...], "skipped": n}``."""
-    from colosseum.arena import bt
-    from colosseum.arena.comparisons import ComparisonTable, match_pairs
+def is_self_play(a, b) -> bool:
+    """Every entity cancels in ``S_a - S_b`` (the same entities on both sides): the pair tests only the bias."""
+    from colosseum.arena.comparisons import coefficients
 
-    options, fixed, random_bot = inputs
-    options = dataclasses.replace(options, prior_sigma=prior, smoothness=smooth)
-    losses, weights, skipped = [], [], 0
+    return not coefficients(a, b)
+
+
+def fold_tables(items) -> list:
+    """The training table of every fold (all matches of the other folds); built once, reused for every grid point."""
+    from colosseum.arena.comparisons import ComparisonTable
+
+    tables = []
     for k in range(FOLDS):
         table = ComparisonTable()
         for fold, result, versions in items:
             if fold != k:
                 table.add_result(result, versions)
+        tables.append(table)
+    return tables
+
+
+def evaluate(inputs, items, prior: float, smooth: float, tables: list | None = None) -> dict:
+    """Held-out log-loss per fold: ``{"loss": [...], "weight": [...], "skipped": n, "self_play": n}``
+    (``tables``: ``fold_tables(items)``, built here when not given)."""
+    from colosseum.arena import bt
+    from colosseum.arena.comparisons import match_pairs
+
+    options, fixed, random_bot = inputs
+    options = dataclasses.replace(options, prior_sigma=prior, smoothness=smooth)
+    tables = fold_tables(items) if tables is None else tables
+    losses, weights, skipped, self_play = [], [], 0, 0
+    for k in range(FOLDS):
+        table = tables[k]
+        layouts = set(table.layouts())
         loss = weight = 0.0
         fits = {}
         for fold, result, versions in items:
-            if fold != k or result.outcome_kind == "score" or result.layout not in table.layouts():
+            if fold != k or result.outcome_kind == "score" or result.layout not in layouts:
                 continue
             if result.layout not in fits:
                 fits[result.layout] = bt.fit(table, result.layout, sources=SOURCES, options=options,
                                              fixed_agents=fixed, random_bot=random_bot)
             for a, b, w, y in match_pairs(result, versions):
+                if is_self_play(a, b):
+                    self_play += 1
+                    continue
                 p = predict(fits[result.layout], a, b)
                 if p is None:
                     skipped += 1
@@ -132,12 +169,13 @@ def evaluate(inputs, items, prior: float, smooth: float) -> dict:
                 weight += w
         losses.append(loss)
         weights.append(weight)
-    return {"loss": losses, "weight": weights, "skipped": skipped}
+    return {"loss": losses, "weight": weights, "skipped": skipped, "self_play": self_play}
 
 
 def choose(rows: list[dict]) -> dict:
     """The decision rule (module docstring). ``rows``: ``{"game", "prior", "smooth", "loss": [per fold],
-    "weight": [per fold]}``; returns ``{"prior", "smooth", "mean", "se", "best": (prior, smooth)}``."""
+    "weight": [per fold]}``; returns ``{"prior", "smooth", "mean", "se", "best": [prior, smooth], "best_mean",
+    "best_se", "eligible": [{prior, smooth, mean, se}]}`` (``eligible``: the points inside the 1-SE window)."""
     games = sorted({r["game"] for r in rows})
     by_point: dict[tuple[float, float], list[float]] = defaultdict(lambda: [0.0] * FOLDS)
     for r in rows:
@@ -154,7 +192,9 @@ def choose(rows: list[dict]) -> dict:
     eligible = [p for p in stats if stats[p][0] <= limit]
     prior, smooth = max(eligible, key=lambda p: (p[1], p[0]))
     return {"prior": prior, "smooth": smooth, "mean": stats[(prior, smooth)][0], "se": stats[(prior, smooth)][1],
-            "best": list(best), "best_mean": stats[best][0], "best_se": stats[best][1]}
+            "best": list(best), "best_mean": stats[best][0], "best_se": stats[best][1],
+            "eligible": [{"prior": p[0], "smooth": p[1], "mean": stats[p][0], "se": stats[p][1]}
+                         for p in sorted(eligible)]}
 
 
 def main() -> int:
@@ -170,15 +210,17 @@ def main() -> int:
     for game in GAMES:
         journal = args.work_dir / "runs" / game / "matches.db"
         inputs, items = load(journal)
+        tables = fold_tables(items)
         print(f"{game}: {len(items)} matches", flush=True)
         for prior in PRIOR_GRID:
             for smooth in SMOOTH_GRID:
                 start = time.monotonic()
-                res = evaluate(inputs, items, prior, smooth)
+                res = evaluate(inputs, items, prior, smooth, tables)
                 rows.append({"game": game, "prior": prior, "smooth": smooth, **res,
                              "seconds": round(time.monotonic() - start, 1)})
                 mean = sum(res["loss"]) / max(sum(res["weight"]), 1e-12)
-                print(f"  prior {prior:>4} smooth {smooth:>5}: log-loss {mean:.5f} (skipped {res['skipped']})",
+                print(f"  prior {prior:>4} smooth {smooth:>5}: log-loss {mean:.5f} (skipped {res['skipped']}, "
+                      f"self-play {res['self_play']})",
                       flush=True)
     decision = choose(rows)
     print(json.dumps(decision))

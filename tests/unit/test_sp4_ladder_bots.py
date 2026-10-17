@@ -1,9 +1,12 @@
 """Ladder bots of known strength (SP4 criterion 3.3, T8.2): epsilon is validated, epsilon 0 is the base bot,
 the tron bot avoids walls, and against a fixed field (RandomBot + the bot at epsilon 0.1) the mean pairwise
-score falls with epsilon on the real MatchRunner. Bands: at the plan's measurement (tic_tac_toe 0.742 /
-0.532 / 0.315, tron 3p 0.872 / 0.435 / 0.326 for epsilon 0 / 0.5 / 1 over 400 / 300 games) adjacent gaps
-are >= 0.1 with a per-game sd <= 0.5, so 200 / 150 games give an SE of the gap <= 0.05: an inversion is
-a > 2 SE event (and the observed gaps are 2-4 times larger)."""
+score falls with epsilon on the real MatchRunner, for all four ladder epsilons 0 / 0.25 / 0.5 / 1.
+
+Bands (statistics-test rule): measured over 30 seeds of exactly this test's setup (200 tic-tac-toe / 150 tron
+games per bot), mean scores tic_tac_toe 0.750 / 0.634 / 0.523 / 0.285, tron 3p 0.830 / 0.554 / 0.427 / 0.309.
+The weakest asserted adjacent gap has z = mean / sd >= 3.9 (tic_tac_toe 0 vs 0.25: 0.116 +- 0.030; the
+others 4.0-12.0), so one gap inverts with probability <= 5e-5 (normal tail) and any of the six with
+<= 2e-4 < 1e-3; no inversion in the 30 seeds (smallest gap 0.042). Seed 3 is fixed."""
 from __future__ import annotations
 
 import functools
@@ -75,7 +78,7 @@ def _mean_score(results, agent: str) -> float:
 def test_strength_falls_with_epsilon_against_a_fixed_field(env_cls, cls, layout, games):
     spec = env_cls().spec
     scores = []
-    for eps in (0.0, 0.5, 1.0):
+    for eps in (0.0, 0.25, 0.5, 1.0):
         models = {"c": _player(spec, cls, epsilon=eps), "random": _player(spec, "colosseum.players.RandomBot"),
                   "ref": _player(spec, cls, epsilon=0.1)}
         seats = [SeatAssignment(a, "fixed", False) for a in ("c", "random", "ref")]
@@ -86,4 +89,4 @@ def test_strength_falls_with_epsilon_against_a_fixed_field(env_cls, cls, layout,
             lineups = [Lineup(layout, seats[k % 3:] + seats[:k % 3]) for k in range(games)]
         results = play_lineups(env_fn=env_cls, models=models, lineups=lineups, num_envs=8, seed=3)
         scores.append(_mean_score(results, "c"))
-    assert scores[0] > scores[1] > scores[2], scores
+    assert scores[0] > scores[1] > scores[2] > scores[3], scores

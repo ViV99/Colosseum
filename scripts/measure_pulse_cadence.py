@@ -12,6 +12,10 @@ snapshots (field: the anchors) and ``eval`` of the winner against ``random`` (60
 Rule ``decide_trend``: ``RHO_MIN = max(0.3, floor_0.05(min rho - 0.1))``; ``GAIN_MIN = 0``; the
 winner-vs-random bar stays the SP3 one (0.95) and is reported, not tuned.
 
+A missing counter fails the cadence check and a seed without a rho (fewer than 3 rated snapshots) fails the
+calibration, each with a reason in the decision; the JSON is written either way and the exit code is 1 when
+no value was decided.
+
 Usage::
 
     env -u PYTHONPATH .venv/bin/python scripts/measure_pulse_cadence.py --every 1 2 5 --blocks 25 \
@@ -42,17 +46,44 @@ def _system_counter(run, name: str) -> int | None:
 
 
 def decide_cadence(rows: list[dict]) -> dict:
+    """The smallest ``every`` that passes; ``reasons`` says why every smaller (and failing) one did not. A missing
+    ``pulse_skipped_snapshots`` counter (None: no ``system`` record had it) fails: unknown is not "none skipped"."""
+    reasons: dict[int, str] = {}
     for row in sorted(rows, key=lambda r: r["every"]):
-        if (row["pulse_skipped"] or 0) <= 1 and row["evaluated"] >= MIN_EVALUATED:
-            return {"every": row["every"], "row": row}
-    return {"every": None, "row": None}
+        if row["pulse_skipped"] is None:
+            reasons[row["every"]] = "no pulse_skipped_snapshots counter in the system records"
+        elif row["pulse_skipped"] > 1:
+            reasons[row["every"]] = f"pulse_skipped {row['pulse_skipped']} > 1"
+        elif row["evaluated"] < MIN_EVALUATED:
+            reasons[row["every"]] = f"{row['evaluated']} evaluated snapshots < {MIN_EVALUATED}"
+        else:
+            return {"every": row["every"], "row": row, "reasons": reasons}
+    return {"every": None, "row": None, "reasons": reasons}
+
+
+def _valid_rho(value) -> bool:
+    return value is not None and not math.isnan(value)
 
 
 def decide_trend(rows: list[dict]) -> dict:
+    """``RHO_MIN`` from the seeds' Spearman rho (module docstring). A seed without a rho (None / nan: fewer than 3
+    rated snapshots, or constant ratings) fails the calibration: ``rho_min`` None with the reasons."""
     rhos = [r["spearman"] for r in rows]
-    rho_min = max(RHO_FLOOR, math.floor((min(rhos) - 0.1) / 0.05) * 0.05) if rhos else None
+    reasons = [f"seed {r.get('seed')}: no Spearman rho (fewer than 3 rated snapshots or constant ratings)"
+               for r in rows if not _valid_rho(r["spearman"])]
+    if not rows:
+        reasons.append("no calibration rows")
+    rho_min = None
+    if not reasons:
+        rho_min = max(RHO_FLOOR, math.floor((min(rhos) - 0.1) / 0.05 + 1e-9) * 0.05)
     return {"rho_min": rho_min, "gain_min": 0.0, "rhos": rhos, "gains": [r["gain"] for r in rows],
-            "vs_random": [r["vs_random_win"] for r in rows], "confirmed": [r["confirmed"] for r in rows]}
+            "vs_random": [r["vs_random_win"] for r in rows], "confirmed": [r["confirmed"] for r in rows],
+            "reasons": reasons}
+
+
+def _finite(value):
+    """JSON-safe float: nan / inf -> None (strict JSON has no NaN)."""
+    return None if value is None or not math.isfinite(value) else float(value)
 
 
 def main() -> int:
@@ -77,10 +108,11 @@ def main() -> int:
                          "pulse_versions": run.pulse_versions,
                          "pulse_skipped": _system_counter(run, "pulse_skipped_snapshots"),
                          "pulse_evaluated": _system_counter(run, "pulse_evaluated_snapshots"),
-                         "train_s": round(run.seconds["train"], 1), "spearman": run.trend.spearman,
-                         "gain": run.trend.gain})
+                         "train_s": round(run.seconds["train"], 1), "spearman": _finite(run.trend.spearman),
+                         "gain": _finite(run.trend.gain)})
             print(json.dumps(rows[-1]), flush=True)
         out.update(rows=rows, decision=decide_cadence(rows))
+        passed = out["decision"]["every"] is not None
     else:
         (every,) = args.every
         rows = []
@@ -94,16 +126,18 @@ def main() -> int:
             version = int(winner.rsplit("@v", 1)[1])
             pairs = pk.evaluate(run.config, run.run.root / "checkpoints" / pk.MAIN / f"ckpt_v{version}", [pk.RANDOM],
                                 work / "winner-eval.json", layout="2p", num_matches=60)
-            rows.append({"seed": seed, "every": every, "spearman": run.trend.spearman, "gain": run.trend.gain,
+            rows.append({"seed": seed, "every": every, "spearman": _finite(run.trend.spearman),
+                         "gain": _finite(run.trend.gain),
                          "evaluated": len(run.pulse_versions), "winner": winner,
                          "confirmed": bool(group["select"]["confirmed"]),
                          "vs_random_win": pairs[pk.RANDOM]["win_rate"], "train_s": round(run.seconds["train"], 1)})
             print(json.dumps(rows[-1]), flush=True)
         out.update(rows=rows, decision=decide_trend(rows))
+        passed = out["decision"]["rho_min"] is not None
     print(json.dumps(out["decision"], indent=1))
     if args.json:
-        args.json.write_text(json.dumps(out, indent=2) + "\n")
-    return 0
+        args.json.write_text(json.dumps(out, indent=2, allow_nan=False) + "\n")
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

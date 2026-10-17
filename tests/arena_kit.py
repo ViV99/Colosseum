@@ -69,12 +69,13 @@ def ladder_config(game: LadderGame) -> dict:
 
 
 def find_report(out: Path) -> dict:
-    """The tournament's ``report.json`` somewhere under ``out`` (``--output`` dir or ``<run>/tournaments/<name>``),
-    as ``report_view`` (contract amendment A26)."""
+    """The tournament's ``report.json`` under ``out`` (``--output`` dir or ``<run>/tournaments/<name>``), as
+    ``report_view`` (contract amendment A26); exactly one must exist (a second tournament in the same dir would
+    make the choice arbitrary)."""
     from colosseum.arena.tournament.modes import report_view
 
     found = sorted(Path(out).rglob("report.json"))
-    assert found, f"no report.json under {out}"
+    assert len(found) == 1, f"expected exactly one report.json under {out}, found {[str(p) for p in found]}"
     return report_view(json.loads(found[0].read_text()))
 
 
@@ -118,6 +119,7 @@ def run_select(game: LadderGame, workdir: Path, *, seed: int, blocks: int | None
     workdir = Path(workdir)
     config = kit.write_config(workdir / f"ladder-{game.name}.yaml", ladder_config(game))
     out = workdir / f"select-{game.name}-s{seed}-b{blocks}-c{confirm_blocks}"
+    assert not out.exists(), f"{out} exists: run_select needs a fresh --output dir (use another work dir)"
     args: list[Any] = ["tournament", "-c", config, "--mode", "select", "--layout", game.layout,
                        "--field", ",".join(FIELD), "--seed", seed, "--num-workers", num_workers,
                        "--num-envs", num_envs, "--output", out]
