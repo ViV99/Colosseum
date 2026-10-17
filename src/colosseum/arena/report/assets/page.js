@@ -111,7 +111,7 @@
       }
       const head = h("tr", {}, cols.map((c) => h("th", {
         class: c.num ? "num" : null, scope: "col",
-        "aria-sort": s && s.key === c.key ? (s.dir === "desc" ? "descending" : "ascending") : null,
+        "aria-sort": s && s.key === c.key ? (s.dir === "desc" ? "descending" : "ascending") : null, title: c.title || null,
         on: { click: () => { const cur = STATE[name][key + ":sort"]; STATE[name][key + ":sort"] = { key: c.key, dir: cur && cur.key === c.key && cur.dir === "asc" ? "desc" : "asc" }; draw(); } },
       }, c.label)));
       const body = rs.map((r) => h("tr", {}, cols.map((c) => {
@@ -352,7 +352,7 @@
         { key: "games", label: "games", num: true },
         { key: "p_best_lineage", label: "P(best of agent)", num: true, fmt: (v) => num(v, 2) },
         { key: "p_best_group", label: "P(best)", num: true, fmt: (v) => num(v, 2) },
-        { key: "lcb", label: "LCB", num: true, fmt: (v) => num(v, 0) },
+        { key: "lcb", label: "LCB", num: true, fmt: (v) => num(v, 0), title: "lower bound of the deviation from the lineage mean; used by top-k" },
       ], g.entities.filter((e) => !agent || e.lineage === agent), { key: "g" + gi, sort: { key: "rating", dir: "desc" } }));
       if (g.truncated) out.push(h("p", { class: "note" }, g.truncated + " more entities not shown (use the dashboard filters)."));
     });

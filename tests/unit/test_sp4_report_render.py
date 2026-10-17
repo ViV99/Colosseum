@@ -112,6 +112,9 @@ def test_every_section_is_drawn_in_a_browser(tmp_path):
     text = _visible(dom)
     assert "confirmed" in text and "not confirmed" not in text
     assert "snapshots: newest 5" in text                # summary.retention
+    # the LCB column is on the lineage-contrast scale, not the BT one next to it: its header says so
+    lcb_title = "lower bound of the deviation from the lineage mean; used by top-k"
+    assert f'<th class="num" scope="col" title="{lcb_title}">LCB' in dom
 
 
 def _hard_data() -> dict:
