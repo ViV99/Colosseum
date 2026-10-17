@@ -717,7 +717,7 @@ class ReportBuilder:
             return {"source": "none", "biased": False, "layouts": {}, "unevaluated": {},
                     "notes": [self._journal_note()]}
         fixed = set(cfg.fixed_agent_ids()) if cfg is not None else set()
-        field = set(cfg.evaluation.field or fixed) if pulse else fixed
+        field = set(cfg.evaluation.field if cfg.evaluation.field is not None else fixed) if pulse else fixed
         kinds = self.layout_kinds()
         layouts: dict[str, dict] = {}
         evaluated: dict[str, set[int]] = defaultdict(set)
@@ -734,7 +734,8 @@ class ReportBuilder:
                 layouts[name] = per_agent
         unevaluated: dict[str, list[int]] = {}
         if pulse:
-            plan = list(cfg.evaluation.agents) if cfg.evaluation.agents else list(cfg.get_trainable_agent_ids())
+            ev_agents = cfg.evaluation.agents            # as pulse_plan: null = every trainable agent, [] = none
+            plan = list(ev_agents) if ev_agents is not None else list(cfg.get_trainable_agent_ids())
             for agent in plan:
                 unevaluated[agent] = sorted(set(self._stored_versions(agent)) - evaluated[agent])
             for layout_entry in layouts.values():

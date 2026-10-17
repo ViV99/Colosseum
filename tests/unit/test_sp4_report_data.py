@@ -354,6 +354,20 @@ def test_pulse_anchors_of_a_score_game_and_agents_without_pulse_results(tmp_path
     assert any("no results" in n for n in anchors["notes"])
 
 
+def test_an_empty_evaluation_agent_list_marks_no_snapshot_unevaluated(tmp_path):
+    """``evaluation.agents: []`` evaluates no agent (as ``pulse_plan`` reads it; null = every trainable agent),
+    so no stored snapshot is listed as "unevaluated"."""
+    import yaml
+
+    run = write_run_dir(tmp_path, "wdl", evaluation=True)
+    path = run.root / "config.resolved.yaml"
+    cfg = yaml.safe_load(path.read_text())
+    cfg["evaluation"]["agents"] = []
+    path.write_text(yaml.safe_dump(cfg, sort_keys=False))
+    anchors = build_report_data(run.root)["sections"]["anchors"]
+    assert anchors["source"] == "pulse" and anchors["unevaluated"] == {}
+
+
 @pytest.mark.parametrize("content", [None, "agents: [unterminated"])
 def test_a_missing_or_unreadable_config_is_a_note(tmp_path, content):
     run = write_run_dir(tmp_path, "wdl")
