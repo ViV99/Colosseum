@@ -80,12 +80,14 @@ Z_95 = 1.959963984540054
 SCORE_CI_METHOD = "wilson-on-score (draw = half win; conservative approximation)"
 
 
-def parse_agent_spec(text: str, *, option: str = "-a") -> tuple[str, str | None]:
+def parse_agent_spec(text: str, *, option: str | None = "-a") -> tuple[str, str | None]:
     """``name`` (a scripted or frozen agent of the config) or ``name=path``: the player syntax of ``eval -a``,
-    ``record --player`` / ``--against`` and ``tournament -a``. ConfigError otherwise."""
+    ``record --player`` / ``--against`` and ``tournament -a``. ConfigError otherwise, its message prefixed by
+    ``option`` (None: no prefix, for a caller whose error names the option already)."""
     name, sep, path = text.partition("=")
     if not name or (sep and not path):
-        raise ConfigError(f"{option} {text!r}: expected an agent name of the config or name=path")
+        where = f"{option} {text!r}" if option else repr(text)
+        raise ConfigError(f"{where}: expected an agent name of the config or name=path")
     return name, (path if sep else None)
 
 

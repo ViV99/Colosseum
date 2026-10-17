@@ -203,7 +203,7 @@ def eval_cmd(
 
         cfg = load_config(config, _parse_overrides(overrides) or None)
         try:
-            specs = [parse_agent_spec(spec) for spec in agents]
+            specs = [parse_agent_spec(spec, option=None) for spec in agents]   # click names --agent
         except ConfigError as e:
             raise click.BadParameter(str(e), param_hint="'--agent'") from e
         report_v = validate_config(cfg, scope="play", players=[name for name, path in specs if path is None])
@@ -426,7 +426,7 @@ def tournament_cmd(config: str | None, candidates: tuple[str, ...], runs: tuple[
         from colosseum.eval import parse_agent_spec
 
         try:
-            parsed = tuple(parse_agent_spec(text) for text in candidates)
+            parsed = tuple(parse_agent_spec(text, option=None) for text in candidates)   # click names -a
         except ConfigError as e:
             raise click.BadParameter(str(e), param_hint="'-a'") from e
         options = TournamentOptions(

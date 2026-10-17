@@ -120,3 +120,36 @@ def test_match_runner_without_the_snapshot_fallback_needs_the_snapshot_itself():
             MatchRunner(vec_env=vec_env, lineups=[lineup], models=pool, snapshot_fallback=False)
     finally:
         vec_env.close()
+
+
+def test_a_command_line_pt_whose_roles_differ_suggests_the_config_entry_or_a_checkpoint_dir(tmp_path):
+    """B-M9: ``-a bc=x.pt`` on a game whose roles have different spaces ignores ``agents.bc.roles`` (a user path),
+    so the hint names ``-a bc`` (the config's entry) or a checkpoint dir, not that ignored field; the config's own
+    entry keeps its hint."""
+    pt = tmp_path / "x.pt"
+    torch.save({}, pt)
+    cfg = make_test_config("asymmetric", agents={"hunter": {"roles": ["hunter"]},
+                                                 "bc": frozen_agent(str(tmp_path / "bc.pt"), roles=["prey"])})
+    spec = env_spec(cfg)
+    with pytest.raises(ConfigError) as caught:
+        registry.load_frozen(cfg, "bc", pt, spec, use_entry=False)
+    message = str(caught.value)
+    assert str(pt) in message and "different spaces" in message
+    assert "-a bc" in message and "checkpoint dir" in message and "set agents.bc.roles" not in message
+    with pytest.raises(ConfigError) as unnamed:
+        registry.load_frozen(cfg, "z", pt, spec, use_entry=False)
+    assert "checkpoint dir" in str(unnamed.value) and "set agents.z.roles" not in str(unnamed.value)
+    bare = make_test_config("asymmetric", agents={"hunter": {"roles": ["hunter"]}, "bc": frozen_agent(str(pt))})
+    with pytest.raises(ConfigError, match=r"set agents\.bc\.roles"):
+        registry.load_frozen(bare, "bc", pt, env_spec(bare))                 # the entry's own path: its roles field
+
+
+def test_a_bad_agent_spec_names_its_option_once(tmp_path):
+    """T5.1a deferred: click's ``Invalid value for '--agent'`` already names the option; the message does not add
+    ``-a`` again (eval and tournament)."""
+    cfg = write_test_config(tmp_path / "cfg.yaml", "turns", agents={"main": {}, "rnd": scripted_agent()})
+    for command in (["eval", "-c", str(cfg)], ["tournament", "-c", str(cfg), "--output", str(tmp_path / "out")]):
+        result = CliRunner().invoke(main, [*command, "-a", "x="])
+        assert result.exit_code == 2, result.output
+        assert "'x=': expected an agent name of the config or name=path" in result.output
+        assert "-a 'x='" not in result.output

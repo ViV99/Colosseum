@@ -106,9 +106,11 @@ def _check_dir_entry(agent_id: str, entry: FrozenAgent | None, path: Path) -> No
                           f"networks; remove agents.{agent_id}.networks / roles (they are for .pt files)")
 
 
-def _pt_roles(config: ColosseumConfig, spec: GameSpec, name: str, path: Path, explicit: list[str] | None) -> list[str]:
+def _pt_roles(config: ColosseumConfig, spec: GameSpec, name: str, path: Path, explicit: list[str] | None, *,
+              user_path: bool = False) -> list[str]:
     """Roles of a ``.pt`` player: a trainable agent's roles; else ``explicit`` (one set of spaces); else every
-    role of the game, which then must share one set of spaces."""
+    role of the game, which then must share one set of spaces. ``user_path``: a path given on the command line,
+    where a frozen entry's ``roles`` do not apply (the hint says what does)."""
     if name in config.get_trainable_agent_ids():
         return resolve_agent_roles(config, spec)[name]
     if explicit is not None:
@@ -118,6 +120,16 @@ def _pt_roles(config: ColosseumConfig, spec: GameSpec, name: str, path: Path, ex
                               f"roles of an agent, so list roles with the same spaces")
         return list(explicit)
     roles = list(spec.roles)
+    if len({role_signature(spec.roles[r]) for r in roles}) > 1 and user_path:
+        entry = config.agent_entry(name) if name in config.agent_ids() else None
+        own = (f"play the config's entry with -a {name} (its agents.{name}.roles apply to its own path, not to a "
+               f"path on the command line)" if isinstance(entry, FrozenAgent) else
+               "add a frozen agent with that path and roles to the config and play it with -a <its name>")
+        raise ConfigError(
+            f"{path}: player {name!r}: a .pt file given on the command line plays every role of the game, but the "
+            f"roles {roles} have different spaces; {own}, give a checkpoint dir (its meta.json names the roles), "
+            f"or name the player after a trainable agent of the config"
+        )
     if len({role_signature(spec.roles[r]) for r in roles}) > 1:
         raise ConfigError(
             f"{path}: agent {name!r}: a .pt file plays every role of the game unless agents.{name}.roles says "
@@ -229,7 +241,8 @@ def load_frozen(config: ColosseumConfig, agent_id: str, path: str | Path, spec: 
             networks, networks_source = base, f"Checkpoint {p}: networks of the config"
         model_state = loaded["model_state"]
     elif p.is_file() and p.suffix == ".pt":
-        roles = _pt_roles(config, spec, agent_id, p, frozen_entry.roles if frozen_entry is not None else None)
+        roles = _pt_roles(config, spec, agent_id, p, frozen_entry.roles if frozen_entry is not None else None,
+                          user_path=not use_entry)
         networks = base
         if frozen_entry is not None and frozen_entry.networks:
             try:
