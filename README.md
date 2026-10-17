@@ -450,9 +450,9 @@ colosseum dashboard RUN [--host 127.0.0.1] [--port 8765] [--refresh 10]
   report, dashboard and tournament read it while training writes) with the weight versions of every seat at the
   episode's start and end. Old training matches are compacted into per-team-pair counts that keep the ratings exact,
   so the detailed part stays within `match_log.detail_window_mb`; below `match_log.min_free_disk_mb` of free disk new
-  training matches go to the counts only. A result that never reaches the journal is counted
-  (`dropped_match_results`); on very fast games a share of the results is dropped this way (`docs/benchmarks.md`,
-  «После SP4»).
+  training matches go to the counts only. Workers send match results in batches, and on the measured workloads
+  none is lost (`docs/benchmarks.md`, «После SP4»); a result that still never reaches the journal (an overloaded
+  main process) is counted in `dropped_match_results`, with a WARNING on the first.
 - **`colosseum tournament`** plays candidates (a run's stored snapshots, checkpoint dirs of any architecture or `.pt`
   weights with `-a name=path`, scripted / frozen agents with `-a name`) against a fixed field (`--field`; default
   every scripted / frozen agent of the config) in blocks: one seed, one composition and every admissible seat
@@ -534,17 +534,18 @@ Known limitations today:
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 2109 tests
-.venv/bin/python -m pytest -m slow -v                       # 14 tests, about ⟨T8.3:slow-suite-minutes⟩ min (see below)
+.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 2121 tests
+.venv/bin/python -m pytest -m slow -v                       # 14 tests, about 10 min (see below)
 .venv/bin/python -m pytest -m gpu -v                        # 25 tests, CUDA machine only, see docs/GPU_CHECKS.md
 ```
 
 The slow suite: the 7 demo-game learning tests, the SP3 unit_harvest pipeline test, 2 torch.compile checks, and four
 SP4 tests: the bot ladder on tic-tac-toe and on tron (`tournament --mode select` ranks bots of known strength in their
 true order and confirms the strongest), the pipeline with pulse and `select` on `unit_harvest_league.yaml` (the
-rating rises by version, the selected snapshot wins at least 95% against `random`, the report builds) and the disk
-bound (a tic-tac-toe run far longer than a 1 MB journal window stays within the window plus a slack, and its
-compacted counts give the same ratings as the full comparison table).
+rating rises by version, the selected snapshot, re-evaluated on fresh seeds, wins at least 95% against `random`, the
+report builds) and the disk bound (a tic-tac-toe run far longer than a 1 MB journal window stays within the window
+plus the parts compaction never touches plus a slack, and its compacted counts give the same ratings as the run's
+final live fit over the full in-memory comparison table).
 
 Layout:
 - `tests/unit`: pure functions and classes;
