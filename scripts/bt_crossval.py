@@ -10,10 +10,14 @@ so pairs across rating cells - e.g. predator_prey's hunter vs prey - are predict
 Pairs with an entity the training folds never saw are skipped (counted); self-play pairs (every entity
 cancels, only the seat bias is left) are left out of the score (counted). Score layouts have no pairs.
 
-Decision rule (fixed before the measurement, ``choose``): the grid point with the smallest mean held-out
-log-loss (games weighted equally); among the points within one standard error (over folds) of it, the one
+Decision rule (``RULE`` = "1-SE, paired by fold"; fixed before the measurement, ``choose``): the grid point
+with the smallest mean held-out log-loss (games weighted equally) is the best; a point is eligible when its
+mean exceeds the best's by at most one PAIRED standard error, the standard error of its per-fold differences
+from the best (``sd_k(L_p[k] - L_best[k]) / sqrt(FOLDS)``; the fold-to-fold variation all points share
+cancels, so the window measures only how consistently a point is worse). Among the eligible points the one
 with the largest ``smoothness`` (the spec wants few-game snapshots to lean on their neighbours: the most
 smoothing that predicts as well), then the largest ``prior_sigma`` (the weakest pull towards the anchor).
+(Controller ruling in the T8.2a review, before any T8.2b data: paired instead of each point's own SE.)
 
 Usage::
 
@@ -49,6 +53,7 @@ SMOOTH_GRID = (0.0, 1.0, 4.0, 16.0, 64.0)         # random-walk precision betwee
 FOLDS = 5
 ELO = 400.0 / math.log(10.0)                      # Elo units per logit (BTFit ratings are in Elo units)
 SOURCES = ("train", "pulse")
+RULE = "1-SE, paired by fold"
 
 
 def fold_of(key: str) -> int:
@@ -174,27 +179,29 @@ def evaluate(inputs, items, prior: float, smooth: float, tables: list | None = N
 
 def choose(rows: list[dict]) -> dict:
     """The decision rule (module docstring). ``rows``: ``{"game", "prior", "smooth", "loss": [per fold],
-    "weight": [per fold]}``; returns ``{"prior", "smooth", "mean", "se", "best": [prior, smooth], "best_mean",
-    "best_se", "eligible": [{prior, smooth, mean, se}]}`` (``eligible``: the points inside the 1-SE window)."""
+    "weight": [per fold]}``; returns ``{"rule", "prior", "smooth", "mean", "paired_se", "best": [prior, smooth],
+    "best_mean", "points": [{prior, smooth, mean, diff, paired_se}], "eligible": [same]}`` (``diff``: mean minus
+    the best's mean; ``eligible``: the points with ``diff <= paired_se``)."""
     games = sorted({r["game"] for r in rows})
     by_point: dict[tuple[float, float], list[float]] = defaultdict(lambda: [0.0] * FOLDS)
     for r in rows:
         for k in range(FOLDS):
             per_game = r["loss"][k] / r["weight"][k] if r["weight"][k] else 0.0
             by_point[(r["prior"], r["smooth"])][k] += per_game / len(games)
-    stats = {}
+    means = {point: sum(folds) / FOLDS for point, folds in by_point.items()}
+    best = min(means, key=means.get)
+    points = {}
     for point, folds in by_point.items():
-        mean = sum(folds) / FOLDS
-        sd = math.sqrt(sum((f - mean) ** 2 for f in folds) / (FOLDS - 1))
-        stats[point] = (mean, sd / math.sqrt(FOLDS))
-    best = min(stats, key=lambda p: stats[p][0])
-    limit = stats[best][0] + stats[best][1]
-    eligible = [p for p in stats if stats[p][0] <= limit]
+        diffs = [f - b for f, b in zip(folds, by_point[best])]
+        mean_diff = sum(diffs) / FOLDS
+        sd = math.sqrt(sum((d - mean_diff) ** 2 for d in diffs) / (FOLDS - 1))
+        points[point] = {"prior": point[0], "smooth": point[1], "mean": means[point], "diff": mean_diff,
+                         "paired_se": sd / math.sqrt(FOLDS)}
+    eligible = [p for p in points if points[p]["diff"] <= points[p]["paired_se"]]
     prior, smooth = max(eligible, key=lambda p: (p[1], p[0]))
-    return {"prior": prior, "smooth": smooth, "mean": stats[(prior, smooth)][0], "se": stats[(prior, smooth)][1],
-            "best": list(best), "best_mean": stats[best][0], "best_se": stats[best][1],
-            "eligible": [{"prior": p[0], "smooth": p[1], "mean": stats[p][0], "se": stats[p][1]}
-                         for p in sorted(eligible)]}
+    return {"rule": RULE, "prior": prior, "smooth": smooth, "mean": means[(prior, smooth)],
+            "paired_se": points[(prior, smooth)]["paired_se"], "best": list(best), "best_mean": means[best],
+            "points": [points[p] for p in sorted(points)], "eligible": [points[p] for p in sorted(eligible)]}
 
 
 def main() -> int:

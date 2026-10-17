@@ -189,5 +189,29 @@ def test_crossval_decision_lists_the_points_inside_the_one_se_window():
                       for k in range(crossval.FOLDS)]}
             for p in crossval.PRIOR_GRID for s in crossval.SMOOTH_GRID]
     decision = crossval.choose(rows)
+    assert decision["rule"] == "1-SE, paired by fold"
     assert [(e["prior"], e["smooth"]) for e in decision["eligible"]] == [(1.0, 4.0), (2.0, 4.0)]
     assert (decision["prior"], decision["smooth"]) == (2.0, 4.0)
+    assert len(decision["points"]) == len(rows) and all("paired_se" in p for p in decision["points"])
+
+
+def _fold_rows(points: dict) -> list[dict]:
+    return [{"game": "g", "prior": p, "smooth": s, "weight": [100.0] * crossval.FOLDS,
+             "loss": [100.0 * v for v in folds]} for (p, s), folds in points.items()]
+
+
+def test_crossval_window_is_the_paired_se_of_the_fold_differences():
+    """The folds share a large variation (best: 0.60 +- 0.035 SE over folds). A point that is 0.01 worse in
+    EVERY fold is consistently worse (paired SE 0): out, although an unpaired 1-SE window (0.035) would take it
+    and its larger smoothness. A point 0.01 worse on average with noisy differences (paired SE 0.0105) is in."""
+    best = [0.60, 0.70, 0.50, 0.65, 0.55]
+    decision = crossval.choose(_fold_rows({
+        (1.0, 0.0): best,
+        (1.0, 64.0): [v + 0.01 for v in best],
+        (1.0, 16.0): [v + d for v, d in zip(best, (0.03, -0.01, 0.02, -0.02, 0.03))]}))
+    assert decision["best"] == [1.0, 0.0]
+    by_point = {(p["prior"], p["smooth"]): p for p in decision["points"]}
+    assert by_point[(1.0, 64.0)]["paired_se"] == pytest.approx(0.0, abs=1e-12)
+    assert by_point[(1.0, 16.0)]["paired_se"] == pytest.approx(0.010488, abs=1e-5)
+    assert [(e["prior"], e["smooth"]) for e in decision["eligible"]] == [(1.0, 0.0), (1.0, 16.0)]
+    assert (decision["prior"], decision["smooth"]) == (1.0, 16.0)
