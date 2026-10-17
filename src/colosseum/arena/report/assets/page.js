@@ -359,12 +359,16 @@
     return out.concat(notes(s.notes));
   };
 
+  /* Live mode: the agent select asks the dashboard for that agent's snapshot map (and, for score layouts, the
+     cross-play compositions with that agent: api/matrix?agent=); the layout is chosen here, from the full answer. */
   R.matrix = function (s) {
     const layouts = layoutsOf(s), out = [];
-    if (!layouts.length) return [h("p", { class: "note" }, "No matches yet.")].concat(notes(s.notes));
+    const agentPick = CFG.live && (s.agents || []).length
+      ? select("matrix", "agent", "agent", [""].concat(s.agents), () => refresh("matrix")) : null;
+    if (!layouts.length) return [agentPick ? h("div", { class: "controls" }, agentPick) : null, h("p", { class: "note" }, "No matches yet.")].concat(notes(s.notes));
     const L = st("matrix", "layout", layouts[0]);
     const lay = s.layouts[L] || s.layouts[layouts[0]];
-    out.push(h("div", { class: "controls" }, select("matrix", "layout", "layout", layouts, rerender("matrix"))));
+    out.push(h("div", { class: "controls" }, select("matrix", "layout", "layout", layouts, rerender("matrix")), agentPick));
     if (lay.kind === "score") {
       out.push(h("h3", {}, "Cross-play: team composition → mean score"));
       out.push(table("matrix", [{ key: "composition", label: "composition" }, { key: "mean", label: "mean score", num: true, fmt: (v) => num(v, 3) },
@@ -620,31 +624,37 @@
     body.dataset.rendered = "1";
   }
   function rerender(name) { return () => mount(name); }
+  /* The filters a live refresh sends. Ratings and the matrix layout are filtered here, on the full answer (it is
+     bounded per layout), so their selects keep every layout and agent; the matrix sends its agent (the snapshot
+     map is built for it), the matches their filters (the latest rows that match). */
   function query(name) {
-    const f = STATE[name] || {}, keys = { ratings: ["layout", "agent"], matrix: ["layout", "agent"], matches: ["agent", "layout", "source", "outcome"] }[name] || [];
+    const f = STATE[name] || {}, keys = { matrix: ["agent"], matches: ["agent", "layout", "source", "outcome"] }[name] || [];
     const q = keys.filter((k) => f[k]).map((k) => encodeURIComponent(k) + "=" + encodeURIComponent(f[k])).join("&");
     return q ? "?" + q : "";
   }
   let inflight = 0;
+  const SEQ = {};            // per section: only the answer to the latest request is drawn
   function refresh(name) {
     inflight++;
+    const seq = SEQ[name] = (SEQ[name] || 0) + 1;
     return fetch("api/" + name + query(name), { cache: "no-store" }).then((r) => (r.ok ? r.json() : Promise.reject(new Error("HTTP " + r.status))))
-      .then((s) => { if (JSON.stringify(s) !== JSON.stringify(DATA.sections[name])) { DATA.sections[name] = s; mount(name); } })
+      .then((s) => { if (seq === SEQ[name] && JSON.stringify(s) !== JSON.stringify(DATA.sections[name])) { DATA.sections[name] = s; mount(name); } })
       .catch((e) => { document.getElementById("live-status").textContent = "live · update failed: " + e.message; })
       .finally(() => { inflight--; });
   }
+  const EVERY = Math.max(2, CFG.refresh_sec);
   function tick() {
     if (inflight) return;
     Promise.all(ORDER.map(refresh)).then(() => {
-      document.getElementById("live-status").textContent = "live · refreshed every " + CFG.refresh_sec + " s · last " + new Date().toLocaleTimeString();
+      document.getElementById("live-status").textContent = "live · refreshed every " + EVERY + " s · last " + new Date().toLocaleTimeString();
     });
   }
   document.getElementById("nav").replaceChildren(...ORDER.filter((n) => DATA.sections[n]).map((n) => h("a", { href: "#sec-" + n }, TITLES[n])));
   for (const n of ORDER) mount(n);
   document.body.dataset.ready = "1";
   if (CFG.live) {
-    document.getElementById("live-status").textContent = "live · refreshed every " + CFG.refresh_sec + " s";
-    setInterval(tick, Math.max(2, CFG.refresh_sec) * 1000);
+    document.getElementById("live-status").textContent = "live · refreshed every " + EVERY + " s";
+    setInterval(tick, EVERY * 1000);
   } else if (DATA.generated) {
     document.getElementById("live-status").textContent = "static report · " + DATA.generated;
   }

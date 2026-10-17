@@ -399,6 +399,22 @@ def test_score_compositions_are_capped_and_filtered_by_agent(tmp_path):
     greedy = section(run.root, "ratings", agent="greedy")["layouts"]["solo"]
     assert [c["composition"] for c in greedy["compositions"]] == ["greedy"]
     assert [e["entity"] for e in greedy["entities"]] == ["greedy"]
+    # the matrix's agent filter also filters the score cross-play (T7.1 deferred, ruling C-I1)
+    cross = section(run.root, "matrix", agent="greedy")["layouts"]["solo"]["cross_play"]
+    assert [c["composition"] for c in cross] == ["greedy"]
+
+
+def test_the_matrix_lists_the_trainable_agents_and_draws_the_chosen_ones_snapshots(tmp_path):
+    """The dashboard's matrix agent control (ruling C-I1) offers the config's trainable agents (``agents``, the same
+    whatever the filter) and ``agent=`` picks whose snapshot map is drawn."""
+    from report_kit import write_multi_run_dir
+
+    run = write_multi_run_dir(tmp_path)
+    plain = section(run.root, "matrix")
+    assert plain["agents"] == ["main", "second"] and set(plain["layouts"]) == {"2p", "3p"}
+    second = section(run.root, "matrix", agent="second")
+    assert second["agents"] == ["main", "second"] and second["layouts"]["2p"]["snapshots"]["agent"] == "second"
+    assert any(e.startswith("second@v") for e in second["layouts"]["2p"]["snapshots"]["axis"])
 
 
 def test_pulse_anchors_of_a_score_game_and_agents_without_pulse_results(tmp_path):

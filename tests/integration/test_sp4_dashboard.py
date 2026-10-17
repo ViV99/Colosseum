@@ -1,7 +1,8 @@
 """``colosseum dashboard`` (SP4 spec block 5, T7.3): the live page and ``/api/<section>`` JSON on an
 ephemeral port, filters, errors that do not stop the server, live BT while running, slow builds that never
 block other requests, a dead builder thread, the Host guard, bind errors and the non-loopback warning, the
-CLI's port handling and Ctrl+C (exit 130)."""
+CLI's port handling and Ctrl+C (exit 130), and the live page's own layout and agent choices across refreshes
+(headless Chrome)."""
 from __future__ import annotations
 
 import json
@@ -9,6 +10,7 @@ import logging
 import os
 import re
 import select
+import shutil
 import signal
 import subprocess
 import sys
@@ -25,7 +27,7 @@ from cli_runner import REPO_ROOT, child_env
 from colosseum.arena.report.data import SECTIONS
 from colosseum.arena.report.server import make_server
 from colosseum.core.errors import ConfigError
-from report_kit import write_run_dir
+from report_kit import write_multi_run_dir, write_run_dir
 
 
 @contextmanager
@@ -135,6 +137,83 @@ def test_a_slow_build_answers_building_and_never_blocks_other_requests(tmp_path,
         code, _, body = _get(base + "/api/matrix")
         assert code == 200 and "layouts" in json.loads(body)
         assert len(calls) <= 2
+
+
+CHROME = next((shutil.which(n) for n in ("google-chrome", "chromium", "chromium-browser") if shutil.which(n)), None)
+# Injected into the live page: once a refresh has completed ("last" in the live status), choose the 3p layout in
+# Ratings and the agent "second" in the matrix, through the selects' own change events (as a user does).
+_ACT = """<script>
+(function () {
+  function pick(sec, label, value) {
+    const s = document.querySelector("#sec-" + sec + ' select[aria-label="' + label + '"]');
+    if (!s) { document.body.dataset.missing = (document.body.dataset.missing || "") + sec + "/" + label + " "; return; }
+    s.value = value;
+    s.dispatchEvent(new Event("change"));
+  }
+  const timer = setInterval(function () {
+    if (!document.getElementById("live-status").textContent.includes("last")) return;
+    clearInterval(timer);
+    pick("ratings", "layout", "3p");
+    pick("matrix", "agent", "second");
+    document.body.dataset.acted = "1";
+  }, 100);
+})();
+</script>"""
+
+
+def _section_html(dom: str, name: str) -> str:
+    m = re.search(rf'<section id="sec-{name}".*?</section>', dom, re.S)
+    assert m, name
+    return m.group(0)
+
+
+def _options(section_html: str, label: str) -> tuple[list[str], list[str]]:
+    """(option values, selected values) of the section's select labelled ``label``."""
+    m = re.search(rf'<select aria-label="{label}"[^>]*>(.*?)</select>', section_html, re.S)
+    assert m, label
+    return (re.findall(r'<option value="([^"]*)"', m.group(1)),
+            re.findall(r'<option value="([^"]*)" selected=""', m.group(1)))
+
+
+@pytest.mark.skipif(CHROME is None, reason="no headless Chrome")
+def test_the_live_page_keeps_its_layout_and_agent_choices_across_refreshes(tmp_path, monkeypatch):
+    """Ruling C-I1: in live mode the page filters Ratings and the matrix layout itself (its refresh query carries no
+    ``layout``), so every layout stays selectable after a refresh, and the matrix's agent select asks the server for
+    that agent's snapshot map (``api/matrix?agent=``). Every answer differs (a counter note), so every refresh
+    redraws the sections; the choices made after the first refresh survive the later ones."""
+    import colosseum.arena.report.server as server_mod
+
+    run = write_multi_run_dir(tmp_path)
+    real_render = server_mod.render_html
+    monkeypatch.setattr(server_mod, "render_html",
+                        lambda *a, **k: real_render(*a, **k).replace("</body>", _ACT + "</body>"))
+    with serving(run.root, refresh_sec=2) as (base, server):
+        calls = []
+        real_section = server.builder.section
+
+        def section(name, **filters):
+            calls.append((name, dict(filters)))
+            out = real_section(name, **filters)
+            out.setdefault("notes", []).append(f"build {len(calls)}")
+            return out
+
+        monkeypatch.setattr(server.builder, "section", section)
+        proc = subprocess.run([CHROME, "--headless=new", "--no-sandbox", "--disable-gpu", "--dump-dom",
+                               "--virtual-time-budget=9000", base + "/"], capture_output=True, text=True, timeout=120)
+    dom = proc.stdout
+    assert proc.returncode == 0 and 'data-ready="1"' in dom, proc.stderr[-2000:]
+    assert 'data-acted="1"' in dom and "data-missing" not in dom
+    assert "last" in re.search(r'id="live-status"[^>]*>([^<]*)<', dom).group(1)
+    ratings, matrix = _section_html(dom, "ratings"), _section_html(dom, "matrix")
+    assert _options(ratings, "layout") == (["2p", "3p"], ["3p"])          # both layouts, the choice kept
+    assert "3p · group" in ratings and "2p · group" not in ratings
+    assert _options(matrix, "layout") == (["2p", "3p"], ["2p"])
+    assert _options(matrix, "agent") == (["", "main", "second"], ["second"])
+    assert "Snapshots of second" in matrix
+    assert not [c for c in calls if c[0] in ("ratings", "matrix") and "layout" in c[1]]
+    assert ("matrix", {"agent": "second"}) in calls
+    assert [c for c in calls if c[0] == "ratings"][-1] == ("ratings", {})
+    assert len([c for c in calls if c[0] == "ratings"]) >= 3             # the page, then at least two refreshes
 
 
 def test_make_server_refuses_a_non_run_dir_and_a_busy_port(tmp_path):

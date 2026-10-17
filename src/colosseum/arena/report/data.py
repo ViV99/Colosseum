@@ -726,10 +726,15 @@ class ReportBuilder:
 
     # ----- matrix -----
     def _matrix(self, agent: str | None = None, layout: str | None = None) -> dict:
+        """Per layout: the lineage heat map, the snapshot map of ``agent`` (default: the trainable agent rated
+        highest on the layout) and, for ``score`` layouts, the cross-play compositions (those with a member of
+        ``agent`` when given). ``agents``: the config's trainable agents, whatever the filter (the dashboard's
+        agent control)."""
         notes: list[str] = []
+        agents = [aid for aid, kind in self.agent_kinds().items() if kind == "trainable"]
         table = self.table()
         if table is None:
-            return {"min_games": MIN_CELL_GAMES, "layouts": {}, "notes": [self._journal_note()]}
+            return {"min_games": MIN_CELL_GAMES, "agents": agents, "layouts": {}, "notes": [self._journal_note()]}
         ratings = self._ratings()
         out: dict[str, dict] = {}
         for name, kind in self.layout_kinds().items():
@@ -737,6 +742,8 @@ class ReportBuilder:
                 continue
             if kind == "score":
                 entry = ratings["layouts"].get(name, {})
+                if agent:
+                    entry = self._filter_agent(entry, agent)
                 out[name] = {"kind": "score", "cross_play": entry.get("compositions", []),
                              "truncated": int(entry.get("compositions_truncated", 0))}
                 continue
@@ -762,7 +769,7 @@ class ReportBuilder:
             if skipped:
                 notes.append(f"{name}: {skipped} team pairs with members of several agents are not in the matrix.")
             out[name] = entry
-        return {"min_games": MIN_CELL_GAMES, "layouts": out, "notes": notes}
+        return {"min_games": MIN_CELL_GAMES, "agents": agents, "layouts": out, "notes": notes}
 
     @staticmethod
     def _lineage_order(layout_ratings: Mapping) -> dict[str, tuple]:

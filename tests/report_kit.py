@@ -8,12 +8,16 @@ known strengths with a fixed seed. Three outcome kinds: ``wdl`` (toy game ``turn
 ``rank`` (``ffa``, ``3p``), ``score`` (``solo``, ``solo``).
 
 ``sample_report_data`` is a hand-made report data dict covering every section (render tests need no journal).
+``write_multi_run_dir`` adds a second layout (``3p``) and a second trainable agent (``second``) to a ``wdl`` run dir
+(the live dashboard's filters); ``page_data`` / ``select_groups`` read the data embedded in a report page.
 """
 from __future__ import annotations
 
+import copy
 import json
 import math
 import os
+import re
 import uuid
 from collections.abc import Sequence
 from dataclasses import dataclass
@@ -138,8 +142,10 @@ def write_run_dir(tmp_path: Path, kind: str = "wdl", *, name: str = "synthetic",
                   status: str | None = "finished", pid: int | None = None, live_bt: bool = False,
                   evaluation: bool = False, pulse_versions: Sequence[int] = (), per_pair: int = 30,
                   train_records: int = 201, decreasing_ts: bool = True, partial_last_line: bool = False,
-                  stored_versions: Sequence[int] = (160, 180, 200), bootstrap_samples: int = 20) -> SyntheticRun:
-    """A finished (or ``status``) run dir of the given outcome ``kind`` under ``tmp_path / name``."""
+                  stored_versions: Sequence[int] = (160, 180, 200), bootstrap_samples: int = 20,
+                  trainable: Sequence[str] = ("main",)) -> SyntheticRun:
+    """A finished (or ``status``) run dir of the given outcome ``kind`` under ``tmp_path / name``; ``trainable``: the
+    config's trainable agents (only ``main`` plays the journal's matches)."""
     from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLog, RunInfo
     from colosseum.core.run_state import write_run_state
 
@@ -147,7 +153,8 @@ def write_run_dir(tmp_path: Path, kind: str = "wdl", *, name: str = "synthetic",
     root = Path(tmp_path) / name
     root.mkdir(parents=True)
     # greedy is not a RandomBot, so the default anchor (the first RandomBot of the config) is ``random``
-    agents = {"main": {}, "greedy": scripted_agent("game_helpers.ConstantBot"), "random": scripted_agent()}
+    agents = {**{aid: {} for aid in trainable}, "greedy": scripted_agent("game_helpers.ConstantBot"),
+              "random": scripted_agent()}
     cfg = make_test_config(game, agents=agents, run={"name": name, "dir": str(tmp_path)},
                            checkpoint={"interval": INTERVAL}, ratings={"bootstrap_samples": bootstrap_samples},
                            evaluation={"enabled": evaluation})
@@ -199,6 +206,58 @@ def write_run_dir(tmp_path: Path, kind: str = "wdl", *, name: str = "synthetic",
         write_run_state(root, status, pid if pid is not None else os.getpid(),
                         exit_code=None if status == "running" else (0 if status == "finished" else 1))
     return SyntheticRun(root, kind, layout, results, run_id)
+
+
+def as_agent(results: Sequence[MatchResult], agent: str, tag: str) -> list[MatchResult]:
+    """Copies of ``results`` with ``main``'s seats played by ``agent``; uids get ``/<tag>`` (still unique)."""
+    out = []
+    for result in results:
+        result = copy.deepcopy(result)
+        result.uid = f"{result.uid}/{tag}"
+        for seat in result.seats:
+            if seat.agent_id == "main":
+                seat.agent_id = agent
+        out.append(result)
+    return out
+
+
+def append_results(run: SyntheticRun, results: Sequence[MatchResult]) -> None:
+    """Append ``results`` to the run dir's journal (under the run's id)."""
+    from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLog, RunInfo
+
+    log = MatchLog(run.root / MATCH_LOG_FILE, RunInfo(run_id=run.run_id, name=run.root.name, parent_run_id=None,
+                                                      game=KINDS[run.kind][0], config_hash="synthetic",
+                                                      checkpoint_interval=INTERVAL))
+    try:
+        log.append(list(results))
+    finally:
+        log.close()
+
+
+def write_multi_run_dir(tmp_path: Path, *, per_pair: int = 8) -> SyntheticRun:
+    """A finished ``wdl`` run dir with two layouts (``2p``; ``3p``, a rank layout of main, greedy and random) and
+    two trainable agents (``main`` plays both layouts, ``second`` the ``2p`` layout)."""
+    run = write_run_dir(tmp_path, "wdl", per_pair=per_pair, trainable=("main", "second"))
+    rank = make_results("rank", run_id=run.run_id, per_pair=per_pair, seed=1)
+    second = as_agent(make_results("wdl", run_id=run.run_id, per_pair=per_pair, seed=2), "second", "second")
+    append_results(run, [*as_agent(rank, "main", "3p"), *second])
+    return run
+
+
+def page_data(page: str) -> dict:
+    """The report data embedded in a report page (``render.render_html``)."""
+    m = re.search(r'<script type="application/json" id="colosseum-data">(.*?)</script>', page, re.S)
+    assert m, "the page embeds no report data"
+    return json.loads(m.group(1))
+
+
+def select_groups(page: str, tournament: str) -> list[dict]:
+    """The role groups with a selection (``select`` not null) of the tournament item named ``tournament`` in a
+    report page's tournaments section; AssertionError when the section has no item of that name."""
+    items = [item for item in page_data(page)["sections"]["tournaments"]["items"] if item["name"] == tournament]
+    assert len(items) == 1, f"tournament {tournament!r}: {len(items)} items in the report"
+    layouts = items[0]["report"].get("layouts") or {}
+    return [g for lay in layouts.values() for g in (lay.get("groups") or {}).values() if g.get("select")]
 
 
 def sample_report_data() -> dict:
