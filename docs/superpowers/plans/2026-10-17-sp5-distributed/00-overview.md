@@ -101,7 +101,7 @@ These apply to every task.
 - **The hub's TLS certificate is the CA certificate itself** (contract §Security; Question Q1): a separate server certificate signed by the CA (spec 2.1) gives the node no portable way to obtain the CA certificate before it trusts the hub (Python 3.12's `ssl` exposes only the leaf). With the CA as the server certificate the node fetches it unverified (`ssl.get_server_certificate`), checks its SPKI fingerprint against the token, then uses it as the gRPC root; the curl one-liner pins the same key. Node certificates are still issued by the CA.
 - **Stale generations are fenced by a version cap** (Question Q2): results and chunks of a superseded learner generation `g` are rejected only above `cap(g)` (the highest version the hub accepted from `g` before it assigned `g + 1`); versions up to the cap were announced, are unique, and stay valid. Spec 7.2 rejects "results of seats of a stale generation"; the cap rule rejects exactly the versions that could collide.
 - **Epochs reach the runner through `Lineup.epoch`** (Question Q3): spec 4.3 / 7.6 need the epoch in every training match id and episode seed, which `LoopIO` alone cannot carry. `Lineup` gains `epoch`, `MatchRunner` / `RolloutLoop` gain an optional `cell_seed_fn` keyword and `RolloutLoop` an optional `uid_prefix` (the `n<node>/` uid segment); with the defaults both behave exactly as in SP4 (R4's contract tests stay valid).
-- **`train`'s local node (R12) keeps today's capacity:** every trainable agent's learner is placed on it (a GPU takes any number of learners, as today; CPU learners are unlimited); evaluators: 1 when `evaluation.enabled`, else 0; no data port without `--listen`. Spec 2.6's slot defaults apply to `join` nodes.
+- **`train`'s local node (R12) keeps today's capacity:** every trainable agent's learner is placed on it (a GPU takes any number of learners, as today; CPU learners are unlimited); evaluators: one slot from T5.1, run on demand (A10); no data port without `--listen`. Spec 2.6's slot defaults apply to `join` nodes.
 - **lz4 only for frames that leave the machine.** Spec 4.9's adaptive per-agent compression is applied by senders whose target is another machine (node router, relay, weight downloads stay uncompressed by default); a worker's frame to a learner on its own machine is never compressed (criterion 2).
 - **`tournament --hub ADDR|RUN_DIR`:** `tournament` already uses `--run` for candidate runs, so the spec 3.3 rule "`--run RUN` names the hub" is spelled `--hub RUN_DIR` there (a directory means "read its `hub.json`").
 - **`hub token --rotate` refuses while a hub of this identity runs** (stop it first); spec 2.1 does not say what a running hub does with a rotated CA.
@@ -125,7 +125,7 @@ These apply to every task.
 - `src/colosseum/bootstrap/__init__.py`, `bundle.py`, `requirements.py`, `torch_select.py` (T6.1); `installer.py`, `loader.py` (T6.2).
 - `scripts/measure_frame_decode.py` (T1.1), `scripts/measure_weight_cache.py` (T1.5), `scripts/measure_hub_load.py`, `scripts/measure_scaling.py` (T7.4).
 - `tests/fixtures/sp4/` — SP4 run-dir fixture + `make_sp4_run.py` + `manifest.json` (T0.1).
-- Test support: `tests/net_kit.py` (T1.3), `tests/hub_kit.py` (T2.3), `tests/node_kit.py` (T2.4), `tests/cluster_kit.py` (T3.1), `tests/fault_proxy.py` (T3.2).
+- Test support: `tests/net_kit.py` (T1.3), `tests/hub_kit.py` (T2.3), `tests/node_kit.py` (T2.4), `tests/cluster_kit.py`, `tests/fault_proxy.py` (T3.1), `tests/eval_kit.py` (T5.1), `tests/join_kit.py` (T6.2), `tests/ssh_kit.py` (T8.1) (A4, A36).
 - `deployment/Dockerfile.node`, `deployment/compose.yaml`, `deployment/compose.node.yaml` (T7.3); `deployment/k8s/{hub,node-cpu,node-gpu,token-secret}.yaml` (T8.4).
 - `docs/DISTRIBUTED_GUIDE.md` (T7.5).
 
@@ -206,9 +206,10 @@ Hostile-input rules (decode raises `FrameError(reason)` before allocating): head
 ```python
 class FrameError(ValueError):
     reason: str                       # short machine reason ("header_too_large", "overlap", "dtype", ...)
+    def __init__(self, reason: str, message: str = "") -> None   # A16
 def payload_byte_cap(max_message_mb: int) -> int
 def encode_frame(tree: Any, *, kind: str = "tree", meta: Mapping[str, Any] | None = None, compress: bool = False) -> bytes
-def decode_frame(buf: bytes | memoryview, *, cap: int, copy: bool = False) -> tuple[Any, dict]   # (tree, meta); zero-copy np.frombuffer views unless copy
+def decode_frame(buf: bytes | memoryview, *, cap: int, copy: bool = False, kind: str | None = None) -> tuple[Any, dict]   # (tree, meta); zero-copy views unless copy (A16)
 def peek_meta(buf: bytes | memoryview) -> tuple[str, dict]          # (kind, meta) from the header only (routing; no arrays)
 class Lz4Probe:                        # per (sender, agent): adaptive lz4 (spec 4.9)
     def __init__(self, *, min_ratio: float = LZ4_MIN_RATIO, probe_frames: int = LZ4_PROBE_FRAMES,
@@ -228,15 +229,18 @@ class ChunkMeta:
     node: int                # sender node number (-1 local tests)
     worker: int
 def encode_chunk(chunk: TrajectoryChunk, *, generation: int, node: int, worker: int, compress: bool = False) -> bytes
-def decode_chunk(buf: bytes | memoryview, *, cap: int) -> tuple[TrajectoryChunk, ChunkMeta]
+def decode_chunk(buf: bytes | memoryview, *, cap: int, validator: ChunkValidator | None = None) -> tuple[TrajectoryChunk, ChunkMeta]   # A17
 class ChunkError(ValueError):
     reason: Literal["invalid", "stale", "stale_generation"]
+    def __init__(self, reason: str, detail: str = "") -> None   # A16
 class ChunkValidator:
     """Spec 4.9 checks on the learner: validate_slot_structure; obs / global_state / action / mask leaf shapes
     [S, ...] and dtypes against the agent's RoleSpec; finite behavior_logp (and behavior_unit_logp) on ACT slots;
     zero rewards on BOOT / PAD; teacher_action inside the action space and has_teacher bool, both or neither;
     agent_id == the learner's agent."""
-    def __init__(self, role_spec: RoleSpec, *, agent_id: str, teacher: bool) -> None
+    def __init__(self, role_spec: RoleSpec, *, agent_id: str, teacher: bool, chunk_length: int | None = None,
+                 state_template: Any = None) -> None                # A17
+    def check(self, payload: dict, agent_id: str, policy_version: int | None = None) -> None   # numpy payload (A17)
     def validate(self, chunk: TrajectoryChunk) -> None            # raises ChunkError("invalid")
 @dataclass(frozen=True)
 class WeightsMeta:
@@ -329,19 +333,19 @@ message VersionAnnounce { VersionInfo info; }
 message VersionInfo { string agent_id; int64 generation; int64 version; int64 size; string digest; int32 node;
   repeated string addresses; bool relay_only; bool teacher_active; }
 message Event { string kind; string proc; int32 exit_code; string error_kind; string message; string context;
-  bytes log_tail; string log_path; }   // kind: proc_died | child_error | slot_disabled | learner_failed | warning
+  bytes log_tail; string log_path; }   // kinds and the added fields of every message: A1
 message Command { string kind; LearnerAssignment learner; string reason; string code_hash; int32 evaluators; }
-  // kind: start_learner | stop_learner | set_evaluators | release | stop_run | update_code
+  // kind: start_learner | stop_learner | set_evaluators | release | stop_run | update_code | cancel_leases (A1)
 message LearnerAssignment { string agent_id; int64 generation; int64 version_floor; string device;
   string weights_blob; string trainer_state_blob; int64 env_steps; }
 message Announce { repeated VersionInfo versions; repeated Eviction evictions; repeated AgentState agents;
   int64 env_steps; bool collect_allowed; }
 message Eviction { string agent_id; string checkpoint_id; }
 message BlobRequest { string kind; string agent_id; string ident; int64 since_version; }
-  // kind: snapshot | fixed | teacher | init | recovery | trainer_state | latest
+  // kind: snapshot | fixed | teacher | init | latest | start | eval (recovery / trainer_state only until T4.1: A28)
 message UploadPart { oneof p { UploadHeader header; bytes data; } }
 message UploadHeader { string kind; string agent_id; int64 generation; int64 version; int64 total_size; string digest;
-  string request_id; }   // kind: checkpoint | final | recovery | relay_latest
+  string request_id; }   // kind: checkpoint | final | recovery | relay_latest | agent_file (A1)
 message UploadReply { bool accepted; string reason; string checkpoint_id; }
 message ChunkFrame { string agent_id; int32 target_node; int64 generation; bytes frame; }
 message ChunkSummary { int64 received; int64 dropped; }
@@ -368,6 +372,7 @@ def results_from_batch(p: pb.ResultBatch) -> list[MatchResult]
 def lineup_to_proto(l: Lineup) -> pb.LineupProto
 def lineup_from_proto(p: pb.LineupProto) -> Lineup
 def version_to_proto(v: VersionInfo) -> pb.VersionInfo; def version_from_proto(p) -> VersionInfo
+# VersionInfo (the dataclass of hub.state below, with to_dict / from_dict) and EVENT_KINDS are defined here (A1, A7)
 ```
 
 ### `colosseum.core.types` changes (T1.2; used from T2.2)
@@ -398,11 +403,11 @@ Identity dirs (`data_home()` = `$XDG_DATA_HOME` or `~/.local/share`; `cache_home
     rotated/<n>/                      (the previous CA after --rotate)
 <data_home>/colosseum/node/<ca fingerprint>/   node identity                               0700
     node.key (0600)  node.crt  node.json  {"node_id", "number", "name", "secret" (0600 file mode), "hub_addresses": [...]}
-<cache_home>/colosseum/bundles/<code hash>/   envs/<requirements hash>/   logs/<ca8>/<run_id>/   (T6.x, T4.4)
+<cache_home>/colosseum/bundles/<code hash>/   envs/<env key>/ (A32)   hub-bundles/   logs/<ca8>/<run_id>/, logs/<ca8>/join.log   (T6.x, T4.4, T7.2)
 ```
 
 - Token: `cst1.<secret>.<fp>`; secret = 32 random bytes, base64url without padding (43 chars); fp = lowercase hex SHA-256 of the CA certificate's SubjectPublicKeyInfo (DER) (64 chars); regex `^cst1\.[A-Za-z0-9_-]{43}\.[0-9a-f]{64}$`. `ca8` = `fp[:8]`. The curl one-liner's `--pinnedpubkey 'sha256//<b64>'` is the standard base64 of the same digest.
-- `nodes.json`: `{"version": 1, "next_number": int, "nodes": {node_id: {"number", "name", "machine_id", "tags", "secret_sha256", "cert_serial", "persistent": bool, "registered_run": run_id}}}` (node ids are 32 hex chars chosen by the hub at registration; numbers ≥ 1 never reused; names unique, `-2`, `-3` on collision). `banned.json`: `{"version": 1, "banned": [{"node_id", "machine_id", "name"}]}`.
+- `nodes.json`: `{"version": 1, "next_number": int, "nodes": {node_id: {"number", "name", "machine_id", "tags", "secret_sha256", "cert_serial", "persistent": bool, "registered_run": run_id}}}` (node ids are 32 hex chars chosen by the hub at registration; numbers ≥ 1 never reused; 0 = `train`'s ephemeral local node, never stored (A9); names unique, `-2`, `-3` on collision). `banned.json`: `{"version": 1, "banned": [{"node_id", "machine_id", "name"}]}`.
 - gRPC metadata keys: `x-colosseum-token` (token secret), `x-colosseum-node` (node id), `x-colosseum-node-secret`. Fixed server names `colosseum-hub` / `colosseum-node` (`grpc.ssl_target_name_override`).
 
 ```python
@@ -428,7 +433,9 @@ class HubIdentity:
     def issue_node_certificate(self, node_id: str, public_key_pem: bytes) -> bytes
     def server_credentials(self) -> grpc.ServerCredentials           # TLS, no client auth (R1)
 class NodeBook:                                           # nodes.json + banned.json; thread-safe reads
-    def register(self, *, machine_id: str, name: str, tags: Sequence[str], node_id: str | None) -> tuple[NodeRecord, str]   # (record, new secret)
+    def register(self, *, machine_id: str, name: str, tags: Sequence[str], node_id: str | None, persistent: bool = True,
+                 run_id: str = "") -> tuple[NodeRecord, str]   # (record, new secret)
+    def add_ephemeral(self, name: str, machine_id: str) -> tuple[NodeRecord, str]   # number 0, in memory (A8, A9)
     def verify(self, node_id: str, secret: str) -> NodeRecord | None
     def ban(self, node_id: str) -> None; def is_banned(self, node_id: str | None, machine_id: str | None) -> bool
     def remove(self, node_id: str) -> None
@@ -451,11 +458,12 @@ def server_options(max_message_mb: int) -> list[tuple[str, Any]]
 class AuthInterceptor(grpc.ServerInterceptor):
     """R1. Open: Bootstrap/Info, Bootstrap/Script. Token secret: Bootstrap/Bundle, Hub/Register, Hub/Admin*.
     Node id + node secret (NodeBook.verify, not banned): every other Hub method. NodeData: the mTLS peer CN must be a
-    known, not banned node id. Refusal = UNAUTHENTICATED / PERMISSION_DENIED with a hint in details."""
+    known, not banned node id. Refusal = UNAUTHENTICATED / PERMISSION_DENIED with a hint in details.
+    (A8: NodeData is refused on the hub port; data ports use DataPortInterceptor(allowed).)"""
     def __init__(self, token_secret: Callable[[], str], nodes: NodeBook) -> None
 PART_BYTES = 1 << 20                                     # blob part size (T2.3)
-def send_parts(data: bytes | Path, *, meta_json: str = "") -> Iterator[pb.BlobPart]
-def receive_parts(parts: Iterable[pb.BlobPart], *, cap: int, into: Path | None = None) -> tuple[bytes | Path, str]   # digest checked
+def send_parts(data: bytes | memoryview | Path, *, meta_json: str = "", digest: str | None = None) -> Iterator[pb.BlobPart]   # A22
+def receive_parts(parts: Iterable[pb.BlobPart], *, cap: int, into: Path | None = None) -> tuple[bytes | Path | None, str]   # digest checked; None = not_modified
 ```
 
 ### `colosseum.core.config` (T1.4)
@@ -509,7 +517,7 @@ Files in `shm_dir()` (`$COLOSSEUM_SHM_DIR`, else `/dev/shm` on Linux, else `<tem
 | `{P}-{agent}-v{N}` | weights frame (`encode_weights`, kind `latest`) | the agent's learner on this machine, or the node for a version fetched from another machine |
 | `{P}-{agent}.latest` | JSON `{"segment", "version", "generation", "size", "digest", "teacher_active"}`, atomic replace | same single writer as the segments |
 | `{P}-{agent}-{checkpoint_id}` | weights frame (kind `snapshot`) | node |
-| `{P}-blob-{blob_id}` | weights frame (kind `fixed` / `teacher` / `init` / `recovery`) | node |
+| `{P}-blob-{kind}-{blob_id}` | weights frame of a hub blob (`fixed` / `teacher` / `init` / `eval`; key `blob_key`, A18) | node |
 | `{P}.lock` | JSON `{"pid", "proc_start"}` of the node process | node |
 
 Segments are immutable; a reader `mmap`s read-only and builds `np.frombuffer` views; a reader that finds the pointer's segment gone re-reads the pointer (bounded retries). The writer of `latest` keeps the newest 2 versions and deletes older ones (POSIX: deleting after a reader's `mmap` is safe). Cleanup removes only files of prefixes whose lock names a dead process (`process_alive` semantics). Free space is checked before every write (`size × 2 + 64 MiB`), else `CacheFullError` (ERROR hint: `docker --shm-size`, `emptyDir: Memory`). `digest` = `hashlib.blake2b(frame, digest_size=16).hexdigest()`.
@@ -522,7 +530,7 @@ def cache_prefix(ca_fingerprint: str, run_id: str, node: int) -> str
 class CacheKey:
     kind: Literal["latest", "snapshot", "blob"]
     agent_id: str = ""
-    ident: str = ""                     # checkpoint id (snapshot) or blob id (blob); "" for latest
+    ident: str = ""                     # checkpoint id (snapshot), f"{kind}-{blob_id}" (blob, A18), "" for latest
 @dataclass(frozen=True)
 class CachedWeights:
     key: CacheKey
@@ -689,8 +697,8 @@ class BudgetCounter:                   # spec 4.4
     def value(self) -> int
     def state(self) -> dict
 @dataclass(frozen=True)
-class VersionInfo:
-    agent_id: str; generation: int; version: int; size: int; digest: str; node: int
+class VersionInfo:                     # defined in colosseum.net.messages (T1.2), re-exported here (A7)
+    agent_id: str; generation: int; version: int; size: int; digest: str; node: int   # node -1: parked (A27)
     addresses: tuple[str, ...] = (); relay_only: bool = False; teacher_active: bool = False
 class VersionRegistry:                 # spec 4.5, 7.2
     def new_generation(self, agent_id: str) -> int          # increments; records cap(previous) = max accepted version
@@ -702,7 +710,8 @@ class VersionRegistry:                 # spec 4.5, 7.2
     def state(self) -> dict; @classmethod def from_state(cls, d: dict) -> VersionRegistry
 class ResultIntake:                    # spec 4.3, R8
     def __init__(self, *, journal: bool) -> None
-    def check(self, result: MatchResult, *, spec: GameSpec, agents: Collection[str], versions: VersionRegistry) -> str | None
+    def check(self, result: MatchResult, *, spec: GameSpec, agents: Collection[str], versions: VersionRegistry,
+              node: int | None = None, uid_prefix: str | None = None) -> str | None
        # None = valid; "invalid" (layout / seats / roles / unknown agent / non-finite numbers / ...), "stale_generation"
     def begin(self, node_id: str, session_id: str, seq: int) -> bool       # False: seq acked or in flight (skip)
     def committed(self, node_id: str, session_id: str, seq: int) -> None   # -> ack
@@ -715,14 +724,15 @@ def save_hub_state(path: Path, data: HubStateData, *, fsync: bool) -> None; def 
 HUB_STATE_FILE = "hub_state.json"; HUB_STATE_VERSION = 1
 ```
 
-`hub_state.json`: `{"version": 1, "run_id", "env_steps", "sessions": {"<node_id>/<session_id>": cumulative}, "epoch_reserved_until": int, "versions": {agent: {"generation", "max_version", "caps": {"<gen>": cap}, "latest": VersionInfo dict}}, "counters": {"worker_restarts", "learner_restarts", "lineup_fetch_failed", "relay_bytes", "dropped_chunks": {...}, "dropped_match_results": {...}}, "nodes_lost": int}` — written atomically on every metrics tick (`fsync` only for epoch reservations) and at the end (T2.5); loaded by `--resume` (T4.3).
+`hub_state.json`: the schema of A3 (`counters` = `{"book", "intake_book"}`, the `CounterBook` states of A2; `learners` from T4.1) — written atomically on every metrics tick (`fsync` only for epoch reservations) and at the end (T2.5); loaded by `--resume` (T4.3).
 
 ### `colosseum.hub.server` — gRPC servicers and inbox events (T2.3; relay T3.2; bootstrap T6.2; evaluation T5.1)
 
 ```python
-def build_server(*, inbox: queue.SimpleQueue, identity: HubIdentity | None, insecure: bool, listen: Sequence[str],
+def build_server(*, inbox: queue.SimpleQueue, identity: HubIdentity, insecure: bool, listen: Sequence[str],
                  loopback_plain: bool, blobs: BlobStore, max_message_mb: int,
-                 bootstrap: BootstrapService | None = None) -> tuple[grpc.Server, dict[str, int]]   # bound ports by address
+                 bootstrap: BootstrapService | None = None, relay: RelayHub | None = None, latest: LatestRelay | None = None,
+                 policy: Callable[[], RegistrationPolicy] | None = None) -> tuple[grpc.Server, dict[str, int]]   # A22
 class SessionHandle:                   # one live session stream
     node_id: str; session_id: str
     def send(self, msg: pb.HubMessage) -> None          # thread-safe; per-session outbound queue (bounded; overflow closes the session)
@@ -730,7 +740,7 @@ class SessionHandle:                   # one live session stream
 class BlobStore:                       # read-only file serving + lazy frame conversion (servicer threads)
     def __init__(self, run_dir: RunDir) -> None
     def frame_path(self, kind: str, agent_id: str, ident: str) -> Path | None   # runs/<name>/blobs/<kind>-<agent>-<ident>.frame
-    def register_fixed(self, blob_id: str, frame: bytes) -> None                # main loop at start (frozen / teacher / init)
+    def register_fixed(self, blob_id: str, frame: bytes, *, kind: str, agent_id: str) -> None   # main loop at start; more methods: A22
 # inbox events (dataclasses; servicer threads -> main loop)
 @dataclass class SessionOpened: handle: SessionHandle; hello: pb.Hello
 @dataclass class SessionClosed: node_id: str; session_id: str; reason: str
@@ -738,7 +748,7 @@ class BlobStore:                       # read-only file serving + lazy frame con
 @dataclass class RegisterIn: request: pb.RegisterRequest; peer: str; reply: concurrent.futures.Future
 @dataclass class UploadIn: header: pb.UploadHeader; path: Path; node_id: str; reply: concurrent.futures.Future   # spooled in runs/<name>/.incoming/
 @dataclass class AdminIn: command: str; args: dict; reply: concurrent.futures.Future | queue.SimpleQueue
-@dataclass class RelayEvent: kind: str; node_id: str; value: int                       # relay byte / drop counters (T3.2)
+# RelayEvent: not used (A22: relay counters come from RelayHub.stats())
 ```
 
 Result path: the servicer converts a `ResultBatch` with `results_from_batch` in its thread and posts `NodeMessageIn` with the converted list attached (`message`, `results: list[MatchResult]`); the main loop applies `ResultIntake.check`, stamps `env_steps` (hub counter at intake), and submits (R8 below).
@@ -749,9 +759,9 @@ Result path: the servicer converts a `ResultBatch` with `results_from_batch` in 
 @dataclass(frozen=True)
 class LocalNodeOptions:                # R12: train's local node (a child of the hub)
     workers: int                       # rollout.num_workers
-    evaluators: int                    # 1 with evaluation.enabled, else 0
+    evaluators: int                    # 0 until T5.1, then 1 (a slot run on demand, A10); from_config(config, run_dir)
     log_dir: Path                      # runs/<name>/logs
-    data_port: bool                    # True only with train --listen
+    data_port: bool                    # True only with train --listen (-> NodeOptions.data_port = -1)
 @dataclass(frozen=True)
 class HubOptions:
     mode: Literal["train", "hub", "idle"] = "train"
@@ -763,6 +773,7 @@ class HubOptions:
     identity_dir: Path | None = None   # default security.hub_identity_dir()
     nodes_file: Path | None = None     # T8.1
     dashboard_port: int | None = None  # T7.1
+    bootstrap: bool = True             # T6.3: False = no BootstrapService (cluster_kit; A10)
 class Hub:
     def __init__(self, config: ColosseumConfig, run_dir: RunDir, *, options: HubOptions, validated: bool = False) -> None
     @property
@@ -770,7 +781,7 @@ class Hub:
     def request_stop(self) -> None     # thread-safe (bench, tests); exit code 0
     def launch(self) -> int            # 0 / 1 / 130 / 143
 def run_training(config_path: str | None, overrides: dict | None = None, *, resume: str | None = None,
-                 listen: str | None = None, nodes_file: str | None = None) -> int
+                 listen: str | None = None, nodes_file: str | None = None) -> int   # keywords added by their tasks (A10)
 def run_hub(config_path: str | None, overrides: dict | None = None, *, resume: str | None = None, idle: bool = False,
             listen: str | None = None, port: int | None = None, insecure: bool = False, nodes_file: str | None = None,
             dashboard: int | None = None) -> int
@@ -805,12 +816,12 @@ def running_hubs(identity_dir: Path) -> list[HubInfo]           # live pids only
 ```python
 @dataclass(frozen=True)
 class HubTarget: address: str; tls: bool; ca_pem: bytes | None; token: Token
-def resolve_hub(*, hub: str | None, run: str | None, token: str | None, token_file: str | None) -> HubTarget
+def resolve_hub(*, hub: str | None, run: str | None, token: str | None, token_file: str | None, insecure: bool = False) -> HubTarget
    # spec 3.3: --hub ADDR (+ token) > --run RUN (hub.json) > the single running hub of this machine (registry);
    # several running: SecurityError listing them; on the hub machine the local identity supplies the token
-def call(target: HubTarget, command: str, args: Mapping[str, Any] | None = None, *, timeout: float = 30.0) -> dict
+def call(target: HubTarget, command: str, args: Mapping[str, Any] | None = None, *, timeout: float = 30.0) -> dict   # {code, text, data} (A5)
 def stream(target: HubTarget, command: str, args: Mapping[str, Any] | None = None) -> Iterator[dict]
-ADMIN_COMMANDS = ("nodes.list", "nodes.remove", "tournament.submit", "tournament.status", "tournament.cancel",
+ADMIN_COMMANDS = ("hub.status", "nodes.list", "nodes.remove", "tournament.submit", "tournament.status", "tournament.cancel",
                   "nodes.add", "nodes.update_code", "agents.add", "agents.freeze", "agents.remove", "agents.list")
 ```
 
@@ -820,7 +831,7 @@ ADMIN_COMMANDS = ("nodes.list", "nodes.remove", "tournament.submit", "tournament
 @dataclass(frozen=True)
 class LearnerSlot: node: int; device: str                 # "cpu" | "cuda:N" | "mps"
 @dataclass(frozen=True)
-class NodeCapacity: node: int; name: str; tags: tuple[str, ...]; gpus: tuple[int, ...]; cpu_learners: int; unlimited: bool
+class NodeCapacity: node: int; name: str; tags: tuple[str, ...]; gpus: tuple[int, ...]; cpu_learners: int; unlimited: bool; mps: bool = False
 @dataclass(frozen=True)
 class PlacementPlan: assigned: dict[str, LearnerSlot]; pending: list[str]; reasons: dict[str, str]
 def place(agents: Mapping[str, LearnerConfig], nodes: Sequence[NodeCapacity], *, current: Mapping[str, LearnerSlot],
@@ -844,8 +855,9 @@ class Lease: lease_id: str; node: int; block_ids: tuple[str, ...]; deadline: flo
 class BlockQueue:                      # pure; hub clock
     def submit(self, tasks: Sequence[BlockTask]) -> None
     def lease(self, node: int, slots: int, now: float, lease_sec: float) -> list[tuple[Lease, list[BlockTask]]]
-    def complete(self, lease_id: str, block_id: str, results: list[MatchResult], now: float) -> Literal["accepted", "late", "unknown"]
-    def expire(self, now: float) -> list[str]; def drop_node(self, node: int) -> list[str]; def cancel(self, owner: str) -> list[str]
+    def complete(self, lease_id: str, block_id: str, results: list[MatchResult], now: float) -> Literal["accepted", "late", "cancelled", "unknown"]
+    def expire(self, now: float) -> list[str]; def drop_node(self, node: int) -> list[str]
+    def cancel(self, owner: str) -> tuple[list[str], dict[int, list[str]]]   # (block ids, {node: [lease ids]}); more: A31
 class HubPulse: ...                    # PulseFeeder snapshots -> blocks; T5.1 (replaces the pulse child, R6)
 class HubTournament: ...               # a tournament driven in its own thread; play() -> inbox + future; T5.2
 ```
@@ -871,7 +883,8 @@ class NodeOptions:
     no_learners: bool = False; gpus: tuple[int, ...] | None = None; name: str | None = None; tags: tuple[str, ...] = ()
     once: bool = False; identity_root: Path | None = None; log_dir: Path | None = None
     local: bool = False                # train's local node (R12): unlimited learner slots, no Bootstrap, hub's sys.path
-    data_port: int | None = None       # None: no data port
+    data_port: int | None = None       # None: no data port; 0 ephemeral; -1 distributed.data_port (A23)
+    # added: credentials, shutdown_grace_sec (T2.4), data_addresses (T3.1), code_hash, bundle_dir (T6.3): A23
 class NodeAgent:
     def __init__(self, options: NodeOptions) -> None
     def run(self) -> int               # exit codes of spec 7.5 (join)
@@ -900,7 +913,7 @@ def log_tail(path: Path, limit: int = LOG_TAIL_BYTES) -> bytes
 def worker_target(**kwargs) -> None; def learner_target(**kwargs) -> None; def evaluator_target(**kwargs) -> None
 # node.router (T3.2)
 class ChunkRouter: ...                 # frames for remote learners: direct data-port stream per target node, else relay
-class DataServer: ...                  # NodeData servicer (mTLS): Chunks -> local learner connections, GetLatest from the cache
+# DataServer lives in node.dataport (T3.1; Chunks T3.2): A25
 ```
 
 Node rules that cross tasks:
@@ -995,7 +1008,7 @@ Exit codes (spec 7.5): `hub` / `train` 0 budget reached (or `request_stop`) / 1 
 ```python
 # bootstrap.bundle (T6.1)
 @dataclass(frozen=True)
-class Bundle: path: Path; code_hash: str; files: tuple[str, ...]; size: int
+class Bundle: path: Path; code_hash: str; files: tuple[str, ...]; size: int; python_path: tuple = (); skipped: tuple = ()   # A32
 def build_bundle(project_dir: Path, *, include: Sequence[str], exclude: Sequence[str], max_file_mb: float,
                  out_dir: Path) -> Bundle      # tar of colosseum/ (package dir), the project dir (minus runs/, .venv/,
                                                # .git/, __pycache__/, .superpowers/, files > max_file_mb, exclude) and
@@ -1003,15 +1016,15 @@ def build_bundle(project_dir: Path, *, include: Sequence[str], exclude: Sequence
                                                # code_hash = sha256 hex of the archive bytes
 def unpack_bundle(archive: Path, code_hash: str, *, cache_root: Path) -> Path   # <cache>/colosseum/bundles/<hash>/ (verified)
 # bootstrap.requirements (T6.1)
-EXCLUDED = ("torch", "nvidia-*", "triton", "colosseum")
+EXCLUDED = ("torch", "nvidia-*", "triton", "colosseum", "cuda-*", "pytorch-triton*")
 def node_requirements(*, override: Path | None) -> tuple[list[str], str]   # (pinned list, requirements hash)
 # bootstrap.torch_select (T6.1)
-def torch_spec(hub_torch: str, hub_build: str, probe: Hardware) -> tuple[str, str | None, str | None]   # (requirement, index url, warning)
+def torch_spec(hub_torch: str, hub_build: str, *, platform: NodePlatform, gpus: Sequence[NvidiaGpu]) -> TorchChoice   # A32
 # bootstrap.installer / loader (T6.2)
-def installer_script(*, hub_address: str, fingerprint: str, insecure: bool) -> bytes
+def installer_script(*, insecure: bool, python: str, grpcio: str, uv_version: str = UV_VERSION) -> bytes   # address: COLOSSEUM_HUB (A32)
    # whole body inside _colosseum_install() { ... }; the last line `_colosseum_install "$@" # colosseum-installer-end`
-def one_liner(address: str, fingerprint: str) -> str   # the spec 2.2 printf | curl ... | tail -c +6 | COLOSSEUM_TOKEN=... sh
-def loader_main(argv: Sequence[str]) -> int            # stdlib + grpcio; Info -> bundle + uv env -> exec node agent
+def one_liner(address: str, token: str, *, insecure: bool) -> str   # printf | curl ... | tail -c +6 | COLOSSEUM_HUB=... COLOSSEUM_TOKEN=... sh
+def loader_main(argv: Sequence[str], *, environ=None, exec_fn=None) -> int   # stdlib + grpcio; Info -> bundle + uv env -> exec node agent
 ```
 
 ---
@@ -1021,14 +1034,15 @@ def loader_main(argv: Sequence[str]) -> int            # stdlib + grpcio; Info -
 | Module | What | Task |
 |---|---|---|
 | `tests/conftest.py` `_isolate_colosseum_dirs` (autouse) | `XDG_DATA_HOME`, `XDG_CACHE_HOME`, `COLOSSEUM_SHM_DIR` → `tmp_path/{xdg-data,xdg-cache,shm}` | T1.3 |
-| `tests/game_helpers.py` | `SP4_RUN`, `copy_sp4_run(tmp_path)` | T0.1 |
+| `tests/game_helpers.py` | `SP4_RUN`, `copy_sp4_run(tmp_path)`, `owner_sequence` (A4) | T0.1 |
 | `tests/fixtures/sp4/` | SP4 run dir made by unchanged code + `make_sp4_run.py` + `manifest.json` (like `fixtures/sp3/`) | T0.1 |
-| `tests/net_kit.py` | `hub_identity(tmp_path)`, `node_identity(tmp_path, ca_fp)`, `loopback_server(servicers, credentials)` (binds port 0), `tls_channel(...)` | T1.3 |
+| `tests/net_kit.py` | `hub_identity`, `node_identity`, `register`, `echo_handlers`, `loopback_server(credentials=None, *, interceptors=(), handlers=None)` (binds port 0), `channel(...)`, `call`, `call_stream` (A4) | T1.3 |
 | `tests/hub_kit.py` | `FakeNode` (in-process client of the real hub server: register, session, send batches, read grants / acks), `MiniHubLoop` (a minimal loop over `hub.state` for T2.3), `make_result(...)` | T2.3 |
 | `tests/node_kit.py` | `FakeHub` (in-process `Hub` servicer: scripted Welcome / grants / commands, records messages, serves blobs), `toy_node_options(tmp_path, ...)`, toy-game configs from `game_helpers` | T2.4 |
-| `tests/cluster_kit.py` | localhost clusters: start a hub (`cli_runner.run_in_session` or in-process `Hub`), start `NodeAgent`s in threads or (after T6.3) `join` processes with their own identity roots; wait helpers by counters | T3.1 |
-| `tests/fault_proxy.py` | `TcpFaultProxy(target)`: `drop()`, `delay(sec)`, `cut(sec)`, `restore()`; bound port 0 | T3.2 |
-| `tests/cli_runner.py` | `hub_cmd(...)`, `start_hub(...)`, later `join_cmd(...)` | T2.5, T6.3 |
+| `tests/cluster_kit.py` | in-process clusters (`start_hub`, `start_node`, `cluster`, …) and `hub_process(...)` over `cli_runner.start_hub`; `start_join` (T7.4) (A4) | T3.1 |
+| `tests/fault_proxy.py` | `TcpFaultProxy(target=None)`: `set_target`, `drop()`, `delay(sec)`, `cut(sec)`, `stall()`, `restore()`; bound port 0 (A4) | T3.1 |
+| `tests/cli_runner.py` | `hub_cmd`, `start_hub`, `wait_for_hub_json`, `hub_address` (T2.5); `tournament_hub_cmd` (T5.2); `node_env`, `join_cmd`, `start_join` (T6.3) (A4) | T2.5, T5.2, T6.3 |
+| `tests/eval_kit.py`, `tests/join_kit.py`, `tests/ssh_kit.py` | as parts 05, 06, 08 define them (A4) | T5.1, T6.2, T8.1 |
 
 Every module above goes into `known-first-party` in the task that creates it.
 
@@ -1036,7 +1050,186 @@ Every module above goes into `known-first-party` in the task that creates it.
 
 ## Contract amendments
 
-Binding once written; they override the contract above where they differ. The reconciliation of parts 01–08 against this overview adds them here (with the pre-flight rulings P1, P2, … in the SDD workspace) before execution starts.
+Binding (reconciliation of parts 01–08, 2026-10-18; controller decisions D1–D17 of `reconciliation-decisions.md`). They override the contract above and every part where they differ; a part's text that contradicts an amendment is wrong, and its brief says so. Vocabulary (D17): amendments **A1, A2, …** (here); controller rulings **R1–R18** and the accepted writers' rulings **W<part>-<n>** (numbered as in the part: part 01's "P1-1" → `W01-1`, part 02's "3." → `W02-3`, part 04's "P25" → `W04-25`) in the ledger; pre-flight rulings **P1, P2, …** in the SDD workspace. Every part's "Additions and deviations" not contradicted below are accepted; the ones other tasks rely on are restated here.
+
+### Protocol
+
+- **A1 (D1; T1.2 writes, every later task only uses).** `colosseum_v1.proto` is complete after T1.2: the outline above plus every row below (field numbers fixed here; the `Bootstrap` messages keep declaration-order numbers 1, 2, …; nothing is renumbered). No later task edits or regenerates the proto unless a need appears that no row covers (then it appends with the next free number and says so in its report); the "Modify: proto" lines of T2.3, T3.1, T3.2, T4.1, T5.1, T5.2, T7.1, T8.1, T8.2 are void (they extend T1.2's round-trip test only if they want). `PROTOCOL_VERSION` stays `(1, 0)`. T1.2's `test_sp5_messages.py` round-trips every row. T6.2 owns the test comparing the loader's own `Bootstrap` field numbers with the descriptors.
+
+  | Message | Addition | First user |
+  |---|---|---|
+  | `Heartbeat` | `map<string, int64> counters = 6` (node-cumulative per session; names A2) | T2.4 |
+  | `Heartbeat` | `repeated PathState paths = 7` | T3.2 |
+  | `PathState` (new) | `int32 node = 1; string path = 2` (`direct` \| `relay`) | T3.2 |
+  | `DataAddresses` (new) | `repeated string data_addresses = 1` | T3.1 |
+  | `NodeMessage.m` | `DataAddresses addresses = 10` | T3.1 |
+  | `Welcome` | `repeated string banned_node_ids = 12`; `bool no_workers = 13`; `int64 agents_version = 14` | T3.1 (filled T6.3); T5.2; T8.2 |
+  | `Announce` | `repeated string banned_node_ids = 6`; `int64 agents_version = 7` (0 = unchanged); `string config_json = 8`; `repeated FixedBlob fixed = 9` | T3.1 / T6.3; T8.2 |
+  | `Event` | `int64 generation = 9` (learner events; 0 otherwise) | T4.1 |
+  | `Hello` | `repeated string leases = 16`; `string ssh_id = 17` | T5.1; T8.1 |
+  | `BlockLease` | `int32 num_envs = 4` | T5.1 |
+  | `BlockResult` | `string error_kind = 6` (`""` \| `abandoned` \| `crash` \| `missing_weights` \| `contract` \| `player` \| `config`) | T5.1 |
+  | `BlockAck` (new) | `string lease_id = 1; repeated string block_ids = 2` | T5.1 |
+  | `HubMessage.m` | `BlockAck block_ack = 7` | T5.1 |
+  | `Command` | `repeated string lease_ids = 6` | T5.1 |
+  | `LearnerAssignment` | `int64 start_env_steps = 8` (0 for agents of the first config) | T8.2 |
+
+  Documented string values (comments in the `.proto`; `colosseum.net.messages.EVENT_KINDS` (T1.2) is the tuple of every `Event.kind`, the one validity list T4.4 checks): `Event.kind` = `proc_died`, `child_error`, `slot_disabled`, `learner_failed`, `warning`, `run_stopped` (T2.4), `node_stopped`, `node_leaving` (T4.4), `code_updated`, `code_update_failed` (T8.3). `Command.kind` = `start_learner`, `stop_learner`, `set_evaluators`, `release` (T6.3: stop as at the end of a run, exit 0), `stop_run`, `update_code`, `cancel_leases` (T5.1); `Command.reason` of `stop_learner` ∈ `superseded` (no final upload), `stop_run`, `freeze`, `remove` (final snapshot uploaded), `restart` (a recovery point instead, T8.3); of `stop_run` = `grace=<sec>`. `BlobRequest.kind` = `snapshot`, `fixed`, `teacher`, `init`, `latest`, `start` (T4.1), `eval` (T5.1), plus until T4.1 `recovery` / `trainer_state` (A28). `UploadHeader.kind` = `checkpoint`, `final`, `recovery`, `relay_latest` (T3.2), `agent_file` (T8.2, token-authenticated, A35). Refusals at registration are gRPC status, not messages (A33). Runtime floors `grpcio>=1.84`, `protobuf>=7.35.1`; `message Empty {}` serves `Bootstrap/Info`; `Bootstrap/Script` stays undeclared (R2).
+
+### Counters, `hub_state.json`, test support
+
+- **A2 (D2; T2.1 creates the book).** `colosseum.metrics.counters.CounterBook` (part 03 T3.1's code and `test_sp5_counter_book.py`, moved to **T2.1**) plus `by_source_prefix(prefix) -> dict[str, int]` (per name, the sum of the last cumulative values of every source whose key starts with `prefix`; per-node views use `f"{node_id}/"`). The hub owns `Hub._book` (T2.5; sources `"<node_id>/<session_id>"` from `Heartbeat.counters`, `"hub/<Hub._incarnation>"` from `RelayHub.stats()` on the metrics tick, and direct `add()` for hub events) and `MetricsHub.intake_book` (created by **T2.5** with `MetricsHub.on_intake_stats(agent_id, generation, depth, dropped)`, which `_on_metrics_batch` calls for every `IntakeStats`: depth → queue depths, `dropped` → `intake_book.report(f"learner/{agent}/{generation}", {f"dropped_chunks.{r}": n})`; T3.3 adds `stale` and `chunk_drops()`). Part 07's `counters["node_counters"]` / `["node_results"]` do not exist: per-node values are book sources and the per-node names below. The hub never derives a run total from events or a second dict. Canonical names (cumulative; dotted names nest one level in `grouped()`):
+
+  | Name | Side (source) | Meaning | Task |
+  |---|---|---|---|
+  | `lineup_fetch_failed` | node | grants whose snapshot / blob / first-latest fetch failed | T2.4 (T3.1 across machines) |
+  | `dropped_results_node_buffer` | node | results dropped by the full unacked buffer (= `Heartbeat.dropped_results`, kept; the hub reads only the counter). Part 07's `results_dropped_buffer` is this name | T2.4 |
+  | `worker_restarts` | node | worker and evaluator restarts the node made (drained exits excluded, T8.2). The hub does **not** count `proc_died` events (T2.5's and T4.2's `worker_restarts += 1` are void) | T2.4 (policy T4.2) |
+  | `results_sent` | node | results put into a `ResultBatch` the first time (resends not counted) | T7.1 |
+  | `weight_fetches`, `weight_fetch_bytes`, `weight_fetch_failed`, `weight_fetch_not_modified`, `weight_fetch_redundant` | node | network fetches of latest weights (all agents) | T3.1 |
+  | `weight_fetches/<agent>`, `weight_versions/<agent>` | node | the same per agent; distinct versions published from them (criterion 4) | T7.1 (counted at T3.1's fetch points) |
+  | `data_port.latest_served`, `data_port.latest_not_modified`, `data_port.peer_refused` | node | `DataServer` | T3.1 |
+  | `chunks_sent.direct`, `chunks_sent.relay`, `chunks_delivered`, `relay_frames_received` | node | router | T3.2 |
+  | `dropped_chunks.{disconnect,no_learner,invalid,overflow}` | node (router) and hub (`hub/<inc>`: relay `overflow` / `disconnect`) | frames lost between machines | T3.2 |
+  | `relay_frames`, `relay_bytes`, `relay_uploads`, `relay_uploads_refused` | hub (`hub/<inc>`) | relay | T3.2 |
+  | `snapshot_holds`, `node_messages.invalid` | hub (`add`) | evicted-snapshot holds; malformed node messages (data addresses, …) | T3.1 |
+  | `dropped_match_results_by_reason.{invalid,stale_generation,writer}` | hub (`add`) | intake drops, dead-writer results | T2.5 |
+  | `results_journaled.<node number>` | hub (`add`) | results journaled (accounted) per node | T7.1 |
+  | `learner_restarts` | hub (`add`, on every re-assignment after a died learner) | the node never restarts learners itself (W04-6) | T4.2 |
+  | `lineup_redraw_failed` | hub | 16 rejected redraws in a row (A26) | T4.1 |
+  | `dropped_uploads.{stale_generation,invalid,not_newer}`, `dropped_announcements.{stale_generation,not_newer,invalid}` | hub | | T4.1, T4.2, T4.4 |
+  | `dropped_metrics.invalid`, `dropped_events.invalid` | hub | | T4.4 |
+  | `dropped_chunks.{invalid,disconnect,stale,stale_generation}` | learner (`intake_book`, `learner/<agent>/<generation>`) | intake drops (`stale` T3.3; `stale_generation` real from T4.1) | T2.2 / T2.5, T3.3 |
+  | `dropped_chunks_no_learner`, `dropped_chunks_disconnect`, `dropped_results`, `dropped_reward_episodes` | worker (`WorkerStats.counters` → `SystemStats` keyed (node, worker, incarnation); not a book) | | T2.2, SP4 |
+
+  `system` mapping (T7.1): `dropped_chunks.<r>` = book + `intake_book` + workers' `dropped_chunks_<r>`, all six reasons present; `dropped_match_results_by_reason` = `{"node_buffer": book["dropped_results_node_buffer"], "invalid", "stale_generation", "writer"}`; `dropped_match_results` = workers' `dropped_results` + that dict's sum + the writer's `match_log.dropped` (part 07 note 7); `relay_bytes`, `lineup_fetch_failed`, `worker_restarts`, `learner_restarts` = book totals; `nodes_lost` = `HubStateData.nodes_lost` (a field, not a book name).
+
+- **A3 (D2, D16; T2.1 / T2.5 write, T4.1 adds `learners`, T4.3 loads).** `hub_state.json`, the one schema: `{"version": 1, "run_id", "env_steps", "sessions": {"<node_id>/<session_id>": int}, "epoch_reserved_until": int, "versions": VersionRegistry.state() (parked infos never saved, A27), "counters": {"book": Hub._book.state(), "intake_book": MetricsHub.intake_book.state()}, "nodes_lost": int, "learners": LearnerTable.state(local_nodes=...)}` (`learners` from T4.1; absent before). `counters` is saved and loaded whole: unknown keys survive a resume (D16); T4.3 restores both books with `CounterBook.from_state`. Written atomically on every metrics tick and at the end (`fsync` only for epoch reservations, R7). Tests read totals through `cluster_kit.hub_counter(hub, name)` (book totals) or `read_hub_state(...)["counters"]["book"]["totals"]`; T2.5's `counters={"worker_restarts", …, "dropped_match_results": dict(self._drops)}` is replaced.
+
+- **A4 (D3).** Test-support ownership (a later task that needs a knob a kit lacks adds it in its own task and reports it):
+
+  | Module (owner) | Names |
+  |---|---|
+  | `tests/conftest.py` | `_isolate_colosseum_dirs` (T1.3); the `docker` skip (T7.3) |
+  | `tests/game_helpers.py` | `SP4_FIXTURES`, `SP4_TTT_TINY`, `SP4_RUN`, `sp4_manifest`, `copy_sp4_run` and **`owner_sequence(workers, envs, agents, rounds)`** (T0.1; the baseline test and T2.1 / T2.5 import it from here, not from a test module); `queue_learner_io` (T2.2); `PulseFailBot` (T5.1) |
+  | `tests/net_kit.py` (T1.3) | `hub_identity`, `node_identity`, `register(hub, node, ...)`, `echo_handlers`, `loopback_server(credentials=None, *, interceptors=(), handlers=None) -> (server, port)`, `channel(port, credentials=None, server_name=HUB_SERVER_NAME)`, `call`, `call_stream` (not `tls_channel`) |
+  | `tests/hub_kit.py` (T2.3) | `FakeNode(address, *, token, ca_pem=None, insecure=False)`: `register`, `open(session_id, *, live_cells=(), last_acked=0)`, `send(**oneof)`, `cut`, `close`, `wait_for(kind, n=1, timeout=10)`, `download(kind, agent, ident)`, `upload(header, data)`; `MiniHubLoop`; `make_result`. Added by their first user (T4.1): `open(..., hello_fields=None)` (slots, hardware, learners, data addresses, name, tags), `pause_heartbeats()` / `resume_heartbeats()`, `wait_until(predicate, timeout)`; T6.3: `refuse_*` knobs |
+  | `tests/node_kit.py` (T2.4) | `FakeHub(tmp_path, config, *, ttl_sec=1.0)` (`welcome`, `grant`, `hold_acks`, `serve_blob`, `not_found`, `send_command`, `announce`, `close_session`, `stop_server`, `restart_server`, `messages(kind)`, recorded uploads), `toy_node_options`; `run_node_main(options_json)` (T4.4); lease / ack scripting (T5.1). Part 03's `close_sessions()` and part 04's `drop_session()` mean `close_session()` |
+  | `tests/cluster_kit.py` (T3.1) | `CLUSTER_TINY`, `wait_until`, `cluster_config`, `HubThread` (`hub`, `thread`, `root`, `address`, `token`, `insecure`, `exit_codes`, `stop()`), `start_hub(tmp_path, config, *, insecure=False, name="cluster")`, `NodeThread`, `start_node(...)`, `cluster(...)`, `read_hub_state(hub_or_root)`, `hub_counter(hub_or_root, name)`, `hub_version`, `journal_results_by_node`, and **`hub_process(config, tmp_path, name, *, overrides=None, args=())`** → `HubProc` (`address`, `token_file`, `root`, `env`, `wait(timeout)`, `interrupt()`, `tail()`; over `cli_runner.start_hub`; until T6.3 the token file is written from `HubIdentity.load_or_create(<the child's identity dir>).token`). `start_join(tmp_path, address, token_file, *, identity, args)` is added by T7.4 over the `cli_runner` join helpers. Part 04's `hub_in_thread` / `node_in_thread` / `.result()` mean `start_hub` / `start_node` / `stop()` + `exit_codes` |
+  | `tests/fault_proxy.py` (**T3.1**) | `TcpFaultProxy(target=None, *, host="127.0.0.1")`: `set_target`, `delay`, `cut`, `drop`, `stall`, `restore`, `close`, `port`, `connections_seen`, `bytes_forwarded`; no `retarget` (T4.3 uses `set_target`) |
+  | `tests/cli_runner.py` | T2.5: `hub_cmd(config, run_parent, name, overrides=None, *, port=0, insecure=True, listen="127.0.0.1", args=())` (a `None` / `False` keyword emits no flag), `start_hub(<same>, cwd=None, env=None) -> (Popen, run_root)` (own session), `wait_for_hub_json(run_root, timeout) -> HubInfo`, `hub_address(run_root, timeout=30.0) -> str`; T5.2: `tournament_hub_cmd`; T6.3: `node_env(tmp_path, name)`, `join_cmd(address, *, token_file, name, workers=1, evaluators=0, cpu_learners=1, once=True, extra=())`, `start_join(cmd, env, cwd=None)` |
+  | `tests/eval_kit.py` (T5.1), `tests/join_kit.py` (T6.2), `tests/ssh_kit.py` (T8.1), `tests/report_kit.py` (`sample_report_data` with `nodes` and `training.lag`, T7.1) | as their parts define them |
+
+### Hub process
+
+- **A5 (D4; T2.5).** `hub.admin.call(target, command, args=None, *, timeout=30.0) -> {"code": int, "text": str, "data": Any}`; `hub.admin.stream(...)` yields the same dicts plus `"done": bool`; `resolve_hub(*, hub, run, token, token_file, insecure=False)`; `ADMIN_COMMANDS` gains `"hub.status"` (T2.5). The `hub` click group runs a hub only when invoked without a subcommand and requires `-c` only then (`hub token` needs no config). Admin data shapes: `nodes.list` / `nodes.remove` (T6.3, part 06), `nodes.add` and the `"ssh"` rows (T8.1), `tournament.*` (T5.2), `agents.*` (T8.2), `nodes.update_code` (T8.3) as their parts define.
+
+- **A6 (D5, R5; T2.5 creates, later tasks extend).** Hub method names other parts rely on: `_on_message(ev)` dispatches each `NodeMessage` oneof to its own handler — `_on_heartbeat` (registry, budget, `self._book.report`), `_on_lineup_request`, `_on_result_batch`, `_on_metrics_batch`, `_on_version`, `_on_event`, `_on_data_addresses` (T3.1), the evaluation calls (T5.1; part 05's `_on_node_message` is `_on_message`); `_on_node_lost(entry, *, reason="lost", relocate_now=False)` (T2.5; T4.2 adds relocation; `node_leaving` (W04-24) and `nodes remove` (T6.3) call it with `relocate_now=True`); `_broadcast_announce()` (T2.5, the periodic `Announce`; part 03's "flush-style" sending) and `_announce_agents()` (T4.1, an immediate one); **`_fail_run(message: str, *, context: str = "") -> None`** (T2.5: ERROR, exit code 1, stop; replaces T2.5's `self._fatal = ...` assignments; used by reported child errors (W02-1), typed pulse block errors (T5.1), every-agent-failed (W04-27), unplaceable agents in `train` (W04-26)); **`_count_drop(node: int, group: str, reason: str, what: str, n: int = 1)`** (T2.5, replacing `_drop`: `self._book.add(f"{group}.{reason}", n)` + one WARNING per (node, group, reason); `_drop_writer` stays; T4.4 routes the remaining intake paths through it); `self._incarnation` (uuid4 hex per `launch`); `_node_rows()` (T6.3, A33), `_node_views()` / `_cluster_snapshot()` (T7.1), `_start_dashboard()` / `_stop_dashboard()` (T7.1), `_shutdown` / `_stop_nodes` / `_write_log_tail` (T4.4), `_resume_hub_state` / `_load_hub_state` / `_replay_journal` / `_resume_start_sources` (T4.3), `_on_tournament_blocks` / `_on_tournament_finished` (T5.2). `Hub.launch()` runs off the main thread (signal handlers installed only on the main thread), as `cluster_kit` needs.
+
+- **A7 (D6; T1.2).** `VersionInfo` (frozen dataclass, contract fields) is defined in `colosseum.net.messages` with `to_dict()` / `from_dict()` (part 02 T2.1's code moves there); `colosseum.hub.state` imports and re-exports it and does not redefine it.
+
+- **A8 (D7; T1.3).** T1.3 also creates `NodeBook.add_ephemeral(name, machine_id) -> (NodeRecord, secret)` (number 0, in memory, never in `nodes.json`; T2.5 no longer edits `security.py`), makes `HubIdentity.load_or_create` safe against two processes creating it at once (lock file or create-in-temp + atomic rename; tested), and puts `("grpc.so_reuseport", 0)` into `server_options`. Accepted part 01 notes 6–7: `NodeRecord`; `NodeBook.register(*, machine_id, name, tags, node_id, persistent=True, run_id="")` re-registers a known `node_id` with its number and name and a new secret, raises `SecurityError` for a banned node or machine; `NodeBook.{records, get, reload, set_cert_serial}`; `rotate()` keeps the same `NodeBook` object and moves `nodes.json` and `banned.json` away (so a rotation clears bans: W06-6 settled); `NodeIdentity.{key_pem, cert_pem, registered, hub_addresses, forget}`, `save_registration(reply, *, hub_addresses=())`, the node dir keeps `ca.crt`; `AuthInterceptor` refuses `NodeData/*` on the hub port; node data ports use `DataPortInterceptor(allowed: Callable[[str], bool])` (the contract docstring's "NodeData: …" clause is void); `grpc_util.{KEEPALIVE_MS, KEEPALIVE_TIMEOUT_MS, OPEN_METHODS, TOKEN_METHODS, token_metadata, node_metadata, metadata_value, node_id_of, peer_common_name}`.
+
+- **A9 (part 02 note 11; T1.3, T2.5).** `train`'s local node is node number **0** (`add_ephemeral`), with `data_path="local"`, uids `<run_id>/train/n0/...` and cache / socket names `...-n0-...`; registered nodes are numbered from 1 and never reuse a number. `train --listen` keeps the local node at 0.
+
+- **A10 (D10, part 02 notes 12–13, part 05 note 13; T2.5, T5.1).** `LocalNodeOptions.from_config(config, run_dir)` (T2.5): `workers = rollout.num_workers`, `evaluators` = 0 until T5.1 and **1 from T5.1 on** (one slot always; the hub runs it on demand: `Welcome.evaluators` / `set_evaluators` > 0 only while the pulse is on or a hub-run tournament is active, W05-2; R18's "1 iff `evaluation.enabled`" is revised), `log_dir = run_dir.logs`, `data_port = True` only with `train --listen` (→ `NodeOptions.data_port = -1`). `run_training(config_path, overrides=None, *, listen=None)` and `run_hub(config_path, overrides=None, *, listen=None, port=None, insecure=False)` in T2.5; `resume` (T4.3), `idle` (T5.2), `dashboard` (T7.1), `nodes_file` (T8.1) are added by their tasks, with `HubOptions.{resume, nodes_file, dashboard_port}` likewise. `HubOptions.bootstrap: bool = True` (T6.3): `False` builds no `BootstrapService` (the registration policy's `code_hash` is then `""`, so only source nodes are accepted); `cluster_kit.start_hub` passes `False` (T6.3 edits it) so in-process clusters never bundle the repository.
+
+- **A11 (part 02 notes 14, 15, 17; part 03 assumption 3; T2.5, T3.1).** Until T4.1, `hub` mode places every learner on the first node that connects with learner capacity. Until T3.2 the hub strips `collect` from seats of agents whose learner is not on the requesting node (it grants such a node non-collecting lineups; part 02 note 14's "no lineups" is replaced by this, which part 03's T3.1 tests need). `hub.registry`: `HubInfo.loopback_tls`, `to_json`, `from_dict`, `this_process_info`, `alive`, `RUNNING_DIR`. `MatchLogWriter.dead`; a tokened `submit` refused by a full writer is never counted in `WriterStats.dropped`. `Coordinator.lineup_for(owner)`, `save_league_state(path, *, env_steps, journal_row=None)` are T2.5's.
+
+- **A12 (W02-1, W04-25, part 02 note 18, part 04 P6; T2.4, T2.5, T4.2).** A worker or evaluator that reports a `ChildError` stops the run (exit 1) through `_fail_run`; only deaths without a report (signal, OOM) restart, by the node, within `WORKER_RESTARTS`, counted in the node's `worker_restarts` (A2). A learner death stops the run until T4.2; from T4.2 the node reports `proc_died` / `learner_failed` with `Event.generation` and the hub re-assigns (new generation, start point A28), counting `learner_restarts`; no learner restart while the hub is away. Ported SP2 tests follow W04-25.
+
+- **A13 (D11; T1.1, T7.4).** Criterion 5 passes by W01-1 (bytes → checked numpy payload, ratio of medians ≥ 10 against today's lz4 wire); `scripts/measure_frame_decode.py` also prints the full path to a built `TrajectoryChunk` for both sides (old: unpack + `validate_chunk_payload` + `from_payload`; new: frame decode + checks + `from_payload`); T7.4's rerun and the acceptance report show both numbers.
+
+- **A14 (D12; T2.5, T7.6).** No `test_sp5_two_trains_slow.py`. T2.5 adds the fast contract test `tests/integration/test_sp5_two_hubs.py::test_two_train_hubs_on_one_machine_do_not_collide` (two `Hub` objects in `train` mode in one test, with idle in-process nodes or none, no loaded workers or learners): distinct ephemeral loopback ports, distinct `hub.json` and running-registry entries, non-colliding run-scoped shm and socket prefixes, both serving sessions at once. T7.6's runbook for criterion 6 adds a step: two real `colosseum train` at once on the quiet machine, outside the suite.
+
+- **A15 (D13).** Behaviour changes of SP1–SP4 the acceptance report lists for the owner: W02-1 (reported Python exceptions of workers stop the run), W04-25 (restarts replace "a dead child fails the run"), W04-15 (only the newest final of the current run id is protected), W05-1 (the pulse backlog drops only snapshots not started), W08-4 (`update-code` keeps the node agent process and spawns children on the new bundle), part 08 note 10 (`Hub/Upload` accepts the token for `agent_file` only), W06-5 (the token on stdout, redacted in `main.log`), W07-1 (dashboard as a hub child process), W01-2 (no mask-legality check of recorded actions).
+
+### Frames, chunks, caches
+
+- **A16 (D14, part 01 note 1; T1.1).** Checkpoint frames carry exactly the meta keys `agent_id`, `policy_version`, `final`, `kind` (`periodic` \| `final` \| `recovery`), `generation`; `decode_checkpoint` refuses any other key set; readers (T2.5 `_on_upload`, T4.2 `RecoveryStore`, T4.1 start blobs) use these names. Constructors: `FrameError(reason, message="")`, `ChunkError(reason, detail="")` (part 04's one-argument calls are valid). Frame additions: `decode_frame(buf, *, cap, copy=False, kind=None)` (`copy=True` = one private copy of the data region with writable views), `frame_sizes(buf) -> (raw, stored)` (for `Lz4Probe.observe`), `lookup_class`, `Lz4Probe.enabled`, `MAX_NDIM`, `FLAG_LZ4`, `FRAME_KINDS`, `DTYPES`; NaN / Infinity refused in headers and scalars.
+
+- **A17 (part 01 notes 2–3, W01-2; T1.1, T2.2, T3.3).** `ChunkValidator(role_spec, *, agent_id, teacher, chunk_length=None, state_template=None)` with `check(payload, agent_id, policy_version=None)` (numpy payload) and `validate(chunk)` (built chunks; queue path, tests); `decode_chunk(buf, *, cap, validator=None)` runs frame → checks → chunk and raises `ChunkError("invalid", "frame:<reason>: …")` for frame errors too; `chunk_meta`, `check_payload_fields`, `WEIGHTS_KINDS`, `CHECKPOINT_KINDS`; `core.types.check_slot_arrays(...)` (T1.1 edits `core/types.py` for it, A36). **`ConnectionIntake._accept` (T2.2) is: `peek_meta` → misroute and generation rule on the header (T3.3 adds the lag rule there) → `decode_chunk(frame, cap=…, validator=self._validator)`**; it never calls `validator.validate` on a built chunk. `node.learner_main` builds the validator with `chunk_length=config.rollout.chunk_length` and `state_template=state_to_numpy(model.initial_state(1))`.
+
+- **A18 (part 01 note 9, part 02 note 7, part 05 note 7, part 03 note 11; T1.5).** Cache keys of hub blobs: `colosseum.node.weights.blob_key(kind, agent_id, blob_id) -> CacheKey("blob", agent_id, f"{kind}-{blob_id}")` for `kind` ∈ `fixed`, `teacher`, `init`, `eval`, and `split_blob_key(key) -> (kind, blob_id)` (the `BlobRequest` of a key); T1.5's blob ident regex becomes `^(fixed|teacher|init|eval)-[A-Za-z0-9_][A-Za-z0-9_.-]{0,159}$` and the file `{P}-blob-{ident}`. T2.4's `f"{kind}-{blob_id}"` is this rule; T5.1's eval blobs use `blob_key("eval", agent_id, blob_id)` (`player_ref_to_proto` sends the raw `blob_id`, `player_ref_from_proto` rebuilds the key). Also T1.5: `CacheLockedError`, `release_node_lock`, `segment_name`, `pointer_name`, `frame_digest`, `KEEP_LATEST`, `READ_RETRIES`, `SPACE_MARGIN_BYTES`; T3.1: `WeightCacheReader.open_latest(agent_id) -> (BinaryIO, pointer dict) | None`.
+
+- **A19 (part 01 note 8, part 03 notes 13, 19; T1.4, T3.3).** `translate_transport(data)` with one WARNING per load; `TRANSPORT_IGNORED_KEYS`, `TRANSPORT_RENAMED_KEYS`; `DistributedConfig` checks `node_lost_after_sec > heartbeat_sec` and `learner_relocate_after_sec >= node_lost_after_sec`; `learner.device` ∈ `auto|cpu|cuda|cuda:N|mps`. T3.3 adds the `LearnerConfig` check `max_policy_lag < weight_push_interval − 1` → `ConfigError` (and edits `core/config.py` for it).
+
+### Hub state, local connections, server, node
+
+- **A20 (part 02 note 1, part 03 note 6, part 04 notes 3, 12, part 08 note 8; T2.1 and the named tasks).** `hub.state` names others use: `NodeHello` (T2.5's `hub.server.hello_from_proto` converts), `NodeRegistry.connect(..., *, data_path="relay")`, `disconnect`, `remove`, `by_id`, `all`; `EpochAllocator(reserved_until, on_reserve, *, block=EPOCH_BLOCK)`, `reserved_until`; `CellTable(epochs)`, `grant`, `owners(exclude=)`, `drop_cells`, `get`, `drop_worker` (T4.2); `restrict_collecting`; `BudgetCounter.add`; `ResultIntake.check(result, *, spec, agents, versions, node=None, uid_prefix=None)`, `accounts_at_intake`, `count_drop`, `dropped`, `open(node_id, session_id, last_acked)`, `is_acked`, `forget_node`; `DROP_REASONS`; `version_source`, `SnapshotHolds`, `snapshot_refs` (T3.1); `collect_allowed`, `strip_collect` (T3.2); `VersionRegistry.park` / `unpark` / `parked` (T4.1); `OwnerRotation.set_agents` (T8.2). `OwnerRotation` reproduces SP4's sequence for simultaneous expiry only (W02-2).
+
+- **A21 (part 02 notes 3–5, part 03 note 14, part 05 note 8, part 08 note 11; T2.2 and the named tasks).** `net.local` additions: `ControlChannel` (`ConnectionIntake` and `NodeOutputs` take it instead of a raw `Connection`), `FrameSender`, `listener_socket`, `RUNTIME_DIR_ENV`, `MAX_SOCKET_PATH`, `SEND_SLICE_SEC`, `PROGRESS_INTERVAL_SEC`, `INTAKE_REPORT_SEC`; `WorkerIO` gains `pump`, `take_lineups`, `idle`, `counters`, `send_progress`, `send_error`, `close`, `stats_fn`, `dropped` and keywords `results_batch`, `results_flush_sec`, `clock`; `LearnerOutputs.checkpoints`, `finish(stop_event)`; `ConnectionIntake.value`, `close`, `stop_reason` (T4.1), `max_policy_lag=None` (T3.3); `ChunkIntake.note_policy_version` (T3.3); `EvalTask`, `EvalCancel`, `EvalDone`, `EvalFailed` (T5.1); `Drain(reason, timeout_sec)` (T8.2). `RolloutLoop(..., snapshot_fallback=True)` (node workers pass False); `learner.learner.set_policy_version`, `_publish_weights` (replaces `_push_weights`), `lag_metrics` (T3.3). `learner_process` keywords: `version_floor`, `recovery_interval_sec` (T2.2), `send_final: Callable[[], bool] | None = None` (T4.1), `clock=time.monotonic` (T4.2); `utils.seeding.learner_seed(seed, agent_index, generation=1)` (T4.1).
+
+- **A22 (part 02 notes 6–7, part 03 notes 5, 8, 13, 16, part 04 notes 3–4, part 05 note 7, part 06 notes 9, 11, part 08 note 10).** `hub.server`: `build_server(*, inbox, identity: HubIdentity, insecure, listen, loopback_plain, blobs, max_message_mb, bootstrap=None, relay=None, latest=None, policy=None)` (identity required; `relay` / `latest` T3.2, `policy` T6.3; T6.2 adds `BootstrapServicer` / `add_bootstrap` / `BOOTSTRAP_SERVICE` and one registration line); `LOOPBACK_KEY`, `SERVER_THREADS`, `OUTBOUND_QUEUE_SIZE`, `UPLOAD_REPLY_TIMEOUT_SEC`, `REGISTER_REPLY_TIMEOUT_SEC`, `StopRequested`, `NodeMessageIn.results` / `error`, `SessionOpened.warnings` (T6.3); `RelayEvent` is not used (relay counters come from `RelayHub.stats()`, A2). `BlobStore` (one class, methods by task): `frame_path(kind, agent_id, ident)` (T2.3; snapshots fall back to `checkpoints/.evicted/`, T3.1), `register_fixed(blob_id, frame, *, kind, agent_id)` and `blob_ident(kind, agent_id, data)` (T2.3), `forget(kind, agent_id, ident)` (T3.1), `parked_path(agent)` = `blobs/latest-<agent>-parked.frame` and `start_path(agent, ident)` = `blobs/start-<agent>-<ident>.frame` (T4.1), `register_weights(blob_id, weights_file, *, agent_id, networks, roles)` / `unregister(blob_id)` (T5.1); files `runs/<name>/blobs/<kind>-<agent>-<ident>.frame` (`trainer_state`: `.bin`). `Download` dispatch: `snapshot`, `fixed`, `teacher`, `init` (T2.3), `recovery` / `trainer_state` (T2.5, until T4.1), `latest` (parked first, T4.1; else relayed, T3.2), `start` (T4.1), `eval` (T5.1). `Upload`: `checkpoint` / `final` (T2.5) and `recovery` (T4.2) post `UploadIn`; `relay_latest` is handled in the servicer by `LatestRelay` (T3.2); `agent_file` (T8.2). `grpc_util`: `send_parts(data: bytes | memoryview | Path, *, meta_json="", digest=None)`, `receive_parts` returns `(None, meta)` for `not_modified`, `BlobError`, `blob_digest`, `not_modified_part` (T2.3).
+
+- **A23 (part 02 notes 9–10, part 03 notes 9–10, part 04 notes 11, 18, part 06 note 12, part 08 note 2).** `NodeOptions` fields (frozen dataclass; contract fields plus): `credentials: tuple[str, int, str] | None = None`, `shutdown_grace_sec: float | None = None` (T2.4); `data_addresses: tuple[str, ...] | None = None` and `data_port` meaning `None` none / `0` ephemeral / `-1` the hub config's `distributed.data_port` (`join`'s and `train --listen`'s default) (T3.1); `code_hash: str = ""`, `bundle_dir: Path | None = None` (T6.3). `NodeAgent(options, *, exec_fn=os.execve)` (T6.3); accessors `counters()`, `fetch_history()` (T3.1), `paths()`, `data_port()` (T3.2); `ResultBuffer`, `CellTracker`, `LINEUP_RETRY_SEC`, `METRICS_FLUSH_SEC`, `LOCAL_CHILD_GRACE_SEC` (T2.4), `PENDING_EVENTS_MAX = 100` (T4.2), `join_slots`, `build_agent_parser`, `options_from_args`, `join_argv`, `_reexec_loader`, `_switch_run` (T6.3); env vars `COLOSSEUM_SSH_ID` / `COLOSSEUM_SSH_SESSION` (T8.1). `node.session`: `SessionUp`, `SessionLost`, `backoff_delays`, `hello` is a callable (T2.3); `HubSession.away_for()`, `slow_retry(on)` (T4.4); `SessionRefused`, `SessionUnauthenticated`, `SessionBanned`, `SessionKeyMismatch` (T6.3). `learner.factory.teacher_from_frozen`, `init_from_blob` (T2.4).
+
+- **A24 (D8, part 02 note 10, part 04 note 17, part 08 notes 11, 15).** `node.hardware`: probes `affinity_cores`, `cgroup_quota_cores`, `physical_cores_raw`, `nvidia_gpus`, `torch_versions`; `Hardware.torch_version` / `torch_build` come from `colosseum.bootstrap.torch_select.torch_identity()` (T6.1), so hub and node compare the same strings. `node.procs.ChildSupervisor`: `start(spec) -> int` (T8.3 adds `code: ChildCode | None = None`), `exited`, `may_restart`, `stop_all`, `get`, `incarnation`, `names`, `sentinels`, `restart`, `forget` (T2.4; the target gets `incarnation`); a drained exit (code 0 while draining) is neither a failure nor a restart (T8.2); `ChildCode`, `child_code`, `DRAIN_TIMEOUT_SEC` (T8.2 / T8.3); `watch_parent` re-exported from `utils.process` (T4.4: `PARENT_WATCH_SEC`, `start_parent_watchdog`, `watch_parent`); `core.run_state.process_start_ticks` portable (T4.4).
+
+- **A25 (D15, part 03 notes 2–5, 7, 21; T3.1, T3.2).** New modules: `colosseum.node.fetch` (`FetchPlanner`, `FetchJob`, `FetchStats`) and `colosseum.node.dataport` (`DataServer` with `start(port, credentials=, host=) -> int`, `stop`, `set_node`, `counters`; `probe_direct`, `fetch_latest`, `fetch_latest_relay` (T3.2), `read_latest_reply`, `check_fetched`, `FetchError`, `FetchedLatest`, `data_addresses`, `frame_digest`, `DATA_PORT_TRIES`, `DATA_SERVER_THREADS`) in **T3.1**; `DataServer.Chunks` (T3.2). `colosseum.node.router` (T3.2) holds only the outbound path (`ChunkRouter`, `RouteTable`, `RemoteRoute`, `TargetSender`, `RouteReader`, `LocalDelivery`, `RelayReceiver`, `Counters`, constants); the contract's `node.router.DataServer` is void. `colosseum.hub.relay` (T3.2: `RelayHub`, `InboxHandle`, `LatestRelay`, `RelayedVersion`, constants). `CheckpointManager.{set_eviction_hold, held_dir, release_held, clear_held}`, `EVICTED_DIR` (T3.1); `.evicted/` is cleared at every hub start.
+
+### Learners, failures, resume
+
+- **A26 (part 04 notes 1–2, 6, 8; T4.1).** `hub.placement`: `NodeCapacity.mps: bool = False`; `PlacementPlan.new(current)`; `parse_device`, `requested_slot`, `capacity_from_hello(node, name, tags, slots, gpu_kinds, *, unlimited)`; `LearnerTable` / `LearnerEntry` / `Reconciled`, `LEARNER_STATUSES` (`pending`, `starting`, `running`, `relocating`, `failed`), `TABLE_STATE_VERSION = 1`, `CPU` / `CUDA` / `MPS`; `place(...)` keeps the contract signature; `describe_plan` / `describe_distributed` are T7.2's. `LearnerTable.can_collect` is true for `starting` and `running` (W04-5). `colosseum.hub.hub.LINEUP_REDRAWS = 16` (W04-4). `train` records gain `learner_node`, `generation`; `system` gains `pending_agents` (T4.1) and `failed_agents` (T4.2).
+
+- **A27 (part 04 note 3; resolves a conflict with A9).** A parked `VersionInfo` (an agent without a learner, played with hub-held weights) has **`node = -1`** (not 0: node 0 is `train`'s local node, whose `FetchPlanner` skips versions of its own node number), `generation = 0`, `relay_only = True`, no addresses; `is_stale(agent, 0 | None, v)` is False; it is never saved in `hub_state.json`; `Download(kind="latest")` serves `BlobStore.parked_path(agent)` (with `since_version` → `not_modified`).
+
+- **A28 (part 04 note 4; resolves T2.5 vs T4.1).** Learner start blobs. Until T4.1, T2.5 names a `training.resume_from` state with `LearnerAssignment.weights_blob` = a blob id of kind `recovery` (the model frame) and `trainer_state_blob` = a blob id of kind `trainer_state` (`.bin`), and an `init` state through `Welcome.fixed` (`kind="init"`). From T4.1 on, `weights_blob` ∈ {`""`, `init`, `start:resume`, `start:recovery`, `start:ckpt_v<N>`}, every `start:*` blob is one checkpoint frame (`encode_checkpoint(..., kind="recovery", generation=0)` for synthesized starts, or the stored recovery point) fetched with `BlobRequest(kind="start", ident=<resume|recovery|ckpt_v<N>>)`, `trainer_state_blob` is always `""`, and T4.1 removes the `recovery` / `trainer_state` download kinds and T2.5's resume-state blobs. The version floor is max(registry floor, newest stored snapshot + 1, recovery point + 1) on the hub and the node's cached latest + 1 (W04-7).
+
+- **A29 (part 04 notes 10–11, 13–16, 20, part 01 assumption T4.3, part 08 assumption 5; T4.2, T4.3).** New modules `colosseum.hub.recovery` (`RecoveryStore(run_root)`, `RecoveryPoint`, `read_frame_meta`, `RECOVERY_DIR` / `RECOVERY_FRAME` / `RECOVERY_META`; `RunDir.recovery_dir`) and `colosseum.node.uploads` (`UploadQueue`, `Upload`, `UPLOAD_CONCURRENCY = 2`: every checkpoint frame of a learner goes through it, finals never dropped) (T4.2); `colosseum.hub.resume` (`ResumePlan`, `prepare_resume`, `commit_resume`, `check_not_running`, `check_resumed_agents`, `config_diff`, `flatten`, `next_backup_path`, `start_env_steps`, `resume_port`, `AGENTS_STATE_FILE`, `DIFF_LINES_MAX`, and the hook `_apply_agents_state` that T8.2 fills) (T4.3). Journal: `READABLE_SCHEMA_VERSIONS = (1, 2)`, `meta.next_match_id` (row ids never reused), `MatchRow.node`, `MatchLogReader.results_after`, `folded_after`, `last_row`, `max_env_steps` (reader and writer). Coordinator: `LeagueStateInfo`, `league_replay_window`, `loaded_league_state`, `replay_results(results) -> (replayed, skipped)` next to `league_state_journal_row()`. Retention protects only the newest final of the current run id (W04-15). `hub --resume` without `--port` listens on the previous `hub.json` port. An in-place resume drops the saved config's `transport` key before applying `--set`.
+
+- **A30 (part 07 note 5; T4.4, T7.1).** The node's stop order is: stop children → flush results → wait for acks within the grace → **a final `Heartbeat`** (T7.1 adds it to T4.4's stop path) → `Event(kind="run_stopped")` → close.
+
+### Evaluation, joining, metrics, part 08
+
+- **A31 (part 05 notes 1, 3–6, 8–12, 14; T5.1, T5.2).** `PlayerRef` and `BlockTask` live in `colosseum.net.messages` (re-exported by `hub.evaluation`); `BlockTask.lineups` / `players` are tuples, plus `num_envs: int = 8`; `PULSE_PRIORITY = 1`, `TOURNAMENT_PRIORITY = 0` and the `player_ref_*` / `block_task_*` / `lease_to_proto` converters. Lease protocol: `BlockLeaseRequest.free_slots` is an increment; one `BlockLease` per grant, round robin; every `BlockResult` is acked (`BlockAck`) and resent until acked; `Hello.leases` names held leases. `BlockQueue.complete(...)` returns `"accepted" | "late" | "cancelled" | "unknown"`, `cancel(owner) -> (block ids, {node: [lease ids]})`, plus `want`, `unwant`, `waiting`, `dispatch`, `release`, `keep_only`, `forget`, `take_failed`, `task`, `leases_of`, `queued`, `live`, `stats`; `MAX_BLOCK_ATTEMPTS = 3`. `HubEvaluation`, `HubPulse` (replaces `PulseFeeder.pump`; `PulseRequest.weights: str`; `pulse_target`, `pulse_main`, `PulseResults` deleted), `colosseum.node.leases`, `evaluator_main.{evaluator_loop, CachePlayerPool, MissingWeights, play_task, CONNECT_TIMEOUT_SEC, POLL_SEC}`; engine renames `MatchPlacement`, `error_kind`. Run-dir `eval/pulse/<agent>/<ckpt>/`, `hub_tournaments.json`, `tournaments/<name>/submitted-config.yaml`; `evaluator-<i>.log` replaces `pulse.log`. CLI `tournament --hub ADDR|RUN_DIR [--token T] [--token-file F] [--cancel NAME]`. A typed evaluator error is never a `ChildError`; a typed error in a pulse block calls `_fail_run` (A6).
+
+- **A32 (D9, part 06 notes 1–8; T6.1, T6.2, T8.1).** `torch_spec(hub_torch, hub_build, *, platform: NodePlatform, gpus: Sequence[NvidiaGpu]) -> TorchChoice(requirement, backend, cuda_driver, warning)`; `installer_script(*, insecure, python, grpcio, uv_version=UV_VERSION) -> bytes` (address from `COLOSSEUM_HUB`, token from `COLOSSEUM_TOKEN`, extra arguments to `join`); `one_liner(address, token, *, insecure) -> str` (`... | COLOSSEUM_HUB='<addr>' COLOSSEUM_TOKEN='<token>' sh`); `join_command`; `loader_main(argv, *, environ=None, exec_fn=None)` (self-contained: stdlib + grpcio, own `Bootstrap` codec; `COLOSSEUM_NODE_PYTHON`, `COLOSSEUM_UV`). `Bundle(path, code_hash, files, size, python_path=(), skipped=())`, `build_bundle(..., roots=None)`, layout `bundle.json` + `project/` + `pkg/<i>/`; `requirements.EXCLUDED` adds `cuda-*`, `pytorch-triton*` (and local-path distributions); environments `envs/<key>/`, `key = sha256(requirements_hash|python|torch_version|backend)[:24]`; `BootstrapService(...)` + `make_bootstrap_service(...)`. T8.1 runs the installer as `ssh ... 'sh -s -- <join flags>'` with `COLOSSEUM_HUB=127.0.0.1:<remote port>` and `COLOSSEUM_TOKEN` exported by its stdin preamble (part 08 assumption 1 adapts).
+
+- **A33 (part 06 notes 10–13, part 08 notes 3, 16; T6.3, T8.1, T8.3).** New modules `colosseum.net.registration` (`RegistrationPolicy`, `Refusal`, `parse_refusal`, `check_hello`, `need_bytes`, `is_loopback_peer`, `REFUSAL_REASONS`, `CACHE_HEADROOM_BYTES`) and `colosseum.hub.joining`. Refusals are gRPC `FAILED_PRECONDITION` with JSON details `{"refused", "message", "code_hash"}` before `Welcome`; an empty `Hello.code_hash` is accepted only from a loopback peer (W06-2). `Hub._node_rows()` (T6.3) is the one base row of a node — `{"number", "name", "node_id", "state": online|lost|removed|offline, "hardware", "roles", "data_path", "last_heartbeat_age_sec", "tags", "code_hash"}` — used by `nodes list` and, extended (A34), by `nodes.json`; T8.1 adds `"ssh"` rows to `nodes.list` data. `_reexec_loader()` is used only for a code-hash refusal at (re)connect; `Command(update_code)` does not re-exec the agent (W08-4; part 06 assumption 10 is void).
+
+- **A34 (part 07 notes 1–3, 6–9, 11–12, 15–18, part 03 note 18, part 05 note 11; T7.1, T7.2, T7.3, T7.4).** `colosseum.metrics.nodes` (T7.1) builds `nodes.json` rows from `Hub._node_rows()` plus `env_steps_per_sec`, `results_per_sec`, `load`, `env_steps`, `results_journaled` (book `results_journaled.<n>`), `results_sent`, `results_dropped` (`dropped_results_node_buffer`), `weight_fetches` (`{agent: {"fetches", "versions"}}` from `weight_fetches/<agent>`, `weight_versions/<agent>`); `by_node` cells gain `state`. `REQUIRED_KEYS["system"]` is extended **by T7.1** with `nodes`, `nodes_lost`, `by_node`, `relay_bytes`, `dropped_chunks`, `dropped_match_results_by_reason`, `lineup_fetch_failed`, `worker_restarts`, `learner_restarts`, `pending_agents`, `failed_agents`, `live_ratings`, `evaluation` (`HubEvaluation.stats()`; its cumulative fields count since the hub process started — leases are not persisted, W05-5); `system` also carries, not required, `dropped_uploads`, `dropped_announcements`, `dropped_metrics`, `dropped_events` (book groups) and `lineup_redraw_failed`. `REQUIRED_KEYS["train"]` is unchanged (`policy_lag_p50` / `_p95` / `_max`, `dropped_stale_chunks`, `learner_node`, `generation` are always written but not required). `SystemStats.snapshot(..., cluster=None)`, `MetricsHub.maybe_tick(..., cluster=None)` / `close(..., cluster=None)`, `ConsoleReporter.nodes_line`; report `SECTIONS` gains `"nodes"` after `"system"`, training `"lag"`; `dashboard_child(run_dir, port, conn)`; `hub --dashboard [PORT]` only on `colosseum hub`. T7.2: `utils.logging.setup_process_logging(..., keep_until_file=False)`, `PendingRecords`, `flush_pending`, `discard_pending`, `PENDING_LIMIT`, the node's pre-`Welcome` log `<cache_home>/colosseum/logs/<ca8>/join.log`, `cli.REMOVED_COMMANDS` (hidden commands, exit 2), `placement.describe_distributed`. T7.3: `deployment/node-entrypoint.sh`, targets `node` / `hub`, the `docker` marker implies `slow`. T7.4: `scripts/measure_common.py`; `node.learner_main.algorithm_factory` / `node.worker_main.collect_chunks` only if missing. The slow-suite count is what the suite has after T7.4 (T7.5 writes the real number; part 07 note 18's "16" is void).
+
+- **A35 (part 08 notes 1–15, 17).** New modules `colosseum.hub.ssh` (T8.1), `colosseum.hub.agents`, `colosseum.hub.jobs` (T8.2), `colosseum.hub.update`, `colosseum.bootstrap.codecheck` (T8.3), `tests/ssh_kit.py`. `Membership` (in `league.base`, exported by `colosseum.league`) and the `membership=` keyword of `MatchmakerContext.from_config`, `validate_matchmaking`, `describe_mix`, `validate_config` (train scope), `Coordinator(...)`; `MatchmakerContext.start_env_steps`, `owner_env_steps(owner)`; `BaseMatchmaker.on_agents_changed(context) -> BaseMatchmaker` (returns the matchmaker to use); `Coordinator.on_agents_changed(config, player_roles, membership)`, `Coordinator.membership`; `PfspStats.owners` / `add_owner` / `remove_owner`, `RatingBook.agent_ids` / `add_agents`, `LiveRatings.set_agents`, `MetricsHub.agent_ids` / `set_agents`; `RolloutLoop.episode_counts()`; `AGENT_VALIDATION`, `AGENT_VALIDATION_TIMEOUT_SEC`; `agents_state.json` as T8.2 defines; `AuthInterceptor` (T8.2 edits `grpc_util`) lets `Hub/Upload` authenticate with the token secret, and the servicer then accepts only `UploadHeader.kind == "agent_file"` (part 08 note 10); `bootstrap.bundle.member_for`; `SshLink.finish()`; the K8s `Namespace` lives in `hub.yaml`.
+
+### Corrections to the file structure and the task index
+
+- **A36 (index; last).** The «File structure» and «Task index» above change as follows (main files; parts list the rest):
+
+  | Task | Add / change |
+  |---|---|
+  | T0.1 | M `.gitignore`; `owner_sequence` in `tests/game_helpers.py` (A4) |
+  | T1.1 | M `core/types.py` (`check_slot_arrays` only; A17); the criterion-5 script prints both rules (A13) |
+  | T1.2 | the complete proto (A1); `EVENT_KINDS`, `VersionInfo` with `to_dict` / `from_dict` (A7) |
+  | T1.3 | `NodeBook.add_ephemeral`, race-safe `HubIdentity.load_or_create`, `so_reuseport` (A8) |
+  | T1.4 | M `tests/unit/test_bench_throughput.py` |
+  | T1.5 | integrated after T1.1 (imports `net.chunks`); `blob_key`, `split_blob_key` (A18) |
+  | T2.1 | C `src/colosseum/metrics/counters.py` (`CounterBook` + `by_source_prefix`), `tests/unit/test_sp5_counter_book.py` (moved from T3.1; A2) |
+  | T2.2 | M `tests/game_helpers.py` (`queue_learner_io`) and the four ported learner test files (part 02); intake order (A17) |
+  | T2.3 | no proto change (A1) |
+  | T2.4 | M `learner/factory.py`; uses `bootstrap.torch_select.torch_identity` (A24) |
+  | T2.5 | M `metrics/hub.py` (`on_intake_stats`, `intake_book`), `tests/cli_runner.py` (A4 names); no `net/security.py` edit (A8); test `tests/integration/test_sp5_two_hubs.py` instead of `test_sp5_two_trains_slow.py` (A14) |
+  | T3.1 | C `node/fetch.py`, `node/dataport.py`, `tests/fault_proxy.py`; no `metrics/counters.py`, no proto; M `node/weights.py`, `hub/state.py`, `coordinator/checkpoint_manager.py`, `pyproject.toml` |
+  | T3.2 | C `hub/relay.py`; M `node/dataport.py` (`Chunks`), `hub/state.py`; no `tests/fault_proxy.py`, no proto |
+  | T3.3 | M `node/learner_main.py` (one keyword), `core/config.py` (one validator) |
+  | T4.1 | M `hub/state.py`, `hub/server.py`, `learner/learner.py`, `utils/seeding.py`; no proto |
+  | T4.2 | C `hub/recovery.py`, `node/uploads.py`; M `node/learner_main.py`, `hub/server.py`, `hub/state.py`, `core/run_dir.py`, `tests/integration/test_sp2_lifecycle.py` (`node/procs.py` only if the restart policy needs it) |
+  | T4.3 | C `hub/resume.py`; M `arena/retention.py` |
+  | T4.4 | M `node/logs.py`, `tests/node_kit.py` |
+  | T5.1 | C `node/leases.py`, `tests/eval_kit.py`; M `net/messages.py`, `net/local.py`, `arena/tournament/engine.py`, `core/config.py`, `hub/server.py`, `tests/game_helpers.py`, `pyproject.toml`; ported `test_sp4_pulse.py`, `test_sp4_pulse_runs.py`; no proto |
+  | T5.2 | M `node/agent.py` (`no_workers`), `tests/cli_runner.py` (`tournament_hub_cmd`); no proto |
+  | T6.2 | C `tests/join_kit.py`; M `pyproject.toml` |
+  | T6.3 | C `net/registration.py`, `hub/joining.py`; M `hub/server.py`, `node/session.py`, `tests/hub_kit.py` / `tests/node_kit.py` knobs, `tests/cluster_kit.py` (`bootstrap=False`, A10) |
+  | T7.1 | C `metrics/nodes.py`; M `node/agent.py`, `tests/report_kit.py`; no proto |
+  | T7.2 | M `utils/logging.py`, `hub/placement.py`, `hub/hub.py` (start-up only), `node/agent.py` (start-up logging) |
+  | T7.3 | C `deployment/node-entrypoint.sh`; M `tests/conftest.py`, `tests/unit/test_example_configs.py` |
+  | T7.4 | C `scripts/measure_common.py`, `docs/benchmarks/sp5-*`; M `tests/cluster_kit.py` (`start_join`); maybe `node/learner_main.py`, `node/worker_main.py` |
+  | T7.6 | the two-`train` runbook step (A14) |
+  | T8.1 | C `hub/ssh.py`, `tests/ssh_kit.py`; M `node/agent.py`, `pyproject.toml`; no proto |
+  | T8.2 | C `hub/agents.py`, `hub/jobs.py`; the part 08 file list; no proto |
+  | T8.3 | C `bootstrap/codecheck.py`, `hub/update.py`; M `hub/admin.py`, `node/procs.py`, `node/evaluator_main.py`, `node/learner_main.py` |
+
+  Parallel splits after these changes: **group A** — `core/types.py`: T1.2 the three dataclass fields, T1.1 only `validate_slot_structure` / `check_slot_arrays` (disjoint hunks); `pyproject.toml` `[project].dependencies` is touched by T1.2 (grpcio, protobuf) and T1.3 (cryptography): the controller merges the list at cherry-pick; T1.5 is developed on and integrated after T1.1. **T2.1 ‖ T2.2** — disjoint (T2.1: `hub/state.py`, `metrics/counters.py`, their tests). **T3.2 ‖ T3.3** — disjoint (neither edits the proto or `fault_proxy.py`; `metrics/hub.py` is T3.3's only, building on T2.5's `on_intake_stats`; `hub/hub.py` is T3.2's only). **T4.3 ‖ T4.4** — as part 04 says (`hub/hub.py` by function; `_count_drop` exists since T2.5, so T4.4 only adds call sites; `cli.py`, `arena/*`, `coordinator/*`, `core/run_dir.py` T4.3; `node/*`, `utils/process.py`, `core/run_state.py`, `tests/node_kit.py` T4.4). **T7.1 ‖ T7.2** — as part 07 says; T7.1 no longer touches the proto; `pyproject.toml` only T7.2. **T6.2 alongside T3.1–T5.2** — `hub/server.py`: T6.2 adds `BootstrapServicer`, `add_bootstrap` and one registration line inside `build_server`, next to T3.2's `relay=` / `latest=` keywords of the same function (adjacent hunks; the controller integrates in task order); `pyproject.toml` `known-first-party` gets `cluster_kit` / `fault_proxy` (T3.1), `eval_kit` (T5.1) and `join_kit` (T6.2) on one line: union at cherry-pick.
 
 ---
 
