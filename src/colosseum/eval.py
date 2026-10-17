@@ -269,6 +269,8 @@ def play_lineups(
     observer: MatchObserver | None = None,
     pool: PlayerPool | None = None,
     source: str = "train",
+    context: str = "eval, ",
+    match_id_prefix: str = "eval",
 ) -> list[MatchResult]:
     """Play every lineup once, to completion; one ``MatchResult`` per lineup, in completion order.
 
@@ -283,7 +285,8 @@ def play_lineups(
     ``(agent_id, network_id)``: the tournament's; its models must already be in eval mode, ``play_lineups`` does
     not touch them). A lineup's ``seed`` / ``block`` / ``uid`` are kept (``MatchRunner`` resets with the lineup's
     seed and copies block and uid into the result); ``source`` is the results' ``source``. Snapshot seats are
-    served by the pool itself (``snapshot_fallback=False``).
+    served by the pool itself (``snapshot_fallback=False``). ``context`` (ending with ``", "``) prefixes every
+    error message and ``match_id_prefix`` the match ids (``MatchRunner``); a tournament worker passes its own.
     """
     if (models is None) == (pool is None):
         raise ValueError("play_lineups: pass exactly one of models and pool")
@@ -319,7 +322,7 @@ def play_lineups(
                     served = pool
                 runner = MatchRunner(vec_env=vec_env, lineups=lineups[:n], models=served, observer=collector,
                                      seed=seed, max_idle_steps=max_idle_steps, deterministic=deterministic,
-                                     context="eval, ", match_id_prefix="eval", source=source,
+                                     context=context, match_id_prefix=match_id_prefix, source=source,
                                      snapshot_fallback=False)
             except BaseException:
                 vec_env.close()

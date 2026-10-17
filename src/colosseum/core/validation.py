@@ -229,7 +229,7 @@ def _repeat(tree: Any, n: int) -> Any:
     return None if tree is None else tree_to_torch(tree_stack([tree] * n))
 
 
-def _check_model(model: Any, role: RoleSpec, sample: tuple | None, where: str) -> None:
+def check_model(model: Any, role: RoleSpec, sample: tuple | None, where: str) -> None:
     """``step`` on observations of the role and ``unroll`` on a synthetic chunk with BOOT/PAD
     slots, resets and ``global_state`` (spec block 9), plus SP1's state checks."""
     obs_spec = ObsSpec.from_space(role.observation_space)
@@ -316,6 +316,9 @@ def _check_model(model: Any, role: RoleSpec, sample: tuple | None, where: str) -
         if policy_only.value is not None:
             raise ConfigError(f"{where}: unroll(with_value=False) must return value=None (BC and the kickstart "
                               f"teacher run the policy path only)")
+
+
+_check_model = check_model    # the SP2/SP3 name (validate_config, eval, tests that patch eval._check_model)
 
 
 def _check_kickstart_teachers(config: ColosseumConfig, spec: GameSpec, agent_configs: dict[str, ColosseumConfig],

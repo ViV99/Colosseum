@@ -2,6 +2,8 @@
 top by the run journal's lower bound), candidates vs field, the lazy LRU pool, (de)serialization."""
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 
@@ -163,3 +165,90 @@ def test_top_snapshots_survive_a_journal_write_between_reads(tmp_path, monkeypat
     monkeypatch.setattr(bt, "bootstrap_data", write_then_read)
     lcb = top_snapshot_lcb(root, "main", cfg, env_spec(cfg), rng=np.random.default_rng(0))
     assert landed == ["2p"] and set(lcb) == {"ckpt_v10", "ckpt_v20"}
+
+
+def test_top_snapshots_rank_by_the_lower_bound_not_the_mean(tmp_path):
+    """v2000 wins 3 of 4 games (the highest BT mean, a wide interval), v20 wins 70 % of 400 (a lower mean, well
+    measured): ``top:1`` picks v20. Outcomes are exact counts and the bootstrap seed is fixed, so the test is
+    deterministic (margin of the lower bounds at seed 0: about 47 Elo; 11-47 over seeds 1-6)."""
+    from colosseum.arena import bt
+    from colosseum.arena.live import rating_inputs
+
+    root, cfg = write_fake_run(tmp_path / "run", versions=(10, 20, 2000),
+                               agents={"main": {}, "rnd": scripted_agent()}, checkpoint={"interval": 10})
+    spec = env_spec(cfg)
+    log = MatchLog(root / MATCH_LOG_FILE, RunInfo("r", "run", None, cfg.env.env_class, "h", 10))
+    plan = {10: (300, 90), 20: (400, 280), 2000: (4, 3)}            # version: (games, wins)
+    log.append([_match(i, v, i < wins) for v, (n, wins) in plan.items() for i in range(n)])
+    table = log.comparison_table()
+    log.close()
+    options, fixed_agents, random_bot = rating_inputs(cfg)
+    fit = bt.fit(table, "2p", sources=("train",), options=options, fixed_agents=fixed_agents, random_bot=random_bot)
+    assert fit.rating["main@v2000"] > fit.rating["main@v20"]          # the mean prefers v2000
+    request = PlayerRequest(user=(), runs=(RunSelection(root, snapshots="top:1"),), field=None)
+    candidates, _field = resolve_players(cfg, spec, request, fixed=load_fixed_players(cfg, spec),
+                                         rng=np.random.default_rng(0))
+    assert [p.name for p in candidates] == ["main@v20"]
+
+
+def test_top_snapshots_of_a_score_game_use_the_mean_score_bound(tmp_path):
+    """A one-team (``score``) game: ``top:N`` ranks by the lower bound of the mean team score."""
+    root, cfg = write_fake_run(tmp_path / "run", "solo", versions=(10, 20, 30), checkpoint={"interval": 10})
+    spec = env_spec(cfg)
+    rng = np.random.default_rng(0)
+    means = {10: 1.0, 20: 3.0, 30: 2.0}
+    results = []
+    for version, mean in means.items():
+        for i in range(30):
+            score = float(mean + rng.normal(0.0, 0.3))
+            results.append(MatchResult(
+                match_id=f"s{version}-{i}", layout="solo", outcome_kind="score",
+                seats=[SeatResult(0, "player", 0, "main", "latest", score, version_start=version, version_end=version)],
+                teams=[TeamResult(0, 1.0, score)], episode_length=3, uid=f"s{version}-{i}", source="train",
+                env_steps=i))
+    log = MatchLog(root / MATCH_LOG_FILE, RunInfo("r", "run", None, cfg.env.env_class, "h", 10))
+    log.append(results)
+    log.close()
+    request = PlayerRequest(user=(), runs=(RunSelection(root, snapshots="top:2"),), field=None)
+    candidates, field = resolve_players(cfg, spec, request, fixed=load_fixed_players(cfg, spec),
+                                        rng=np.random.default_rng(0), allow_empty_field=True)
+    assert [p.name for p in candidates] == ["main@v20", "main@v30"] and field == []
+
+
+def test_an_a_player_named_like_a_config_agent_stays_a_candidate(tmp_path):
+    """``-a bc=other`` next to the config's frozen ``bc`` (default field): both play, under distinct names and,
+    since their displays would collide, the -a player shows its full name."""
+    from game_helpers import frozen_agent
+
+    base = _cfg()
+    own = write_ckpt_dir(tmp_path / "own", base, "main", policy_version=3)
+    other = write_ckpt_dir(tmp_path / "other", base, "main", policy_version=4, seed=1)
+    cfg = _cfg(bc=frozen_agent(own))
+    spec = env_spec(cfg)
+    request = PlayerRequest(user=(("bc", str(other)),), runs=(), field=None)
+    candidates, field = resolve_players(cfg, spec, request, fixed=load_fixed_players(cfg, spec))
+    key = f"bc#{entity_hash(other)}"
+    assert [(p.name, p.display) for p in candidates] == [(key, key)]
+    assert [(p.name, p.display) for p in field] == [("rnd", "rnd"), ("bc", "bc")]
+    alone = resolve_players(cfg, spec, PlayerRequest(user=(("x", str(other)),), runs=(), field=None),
+                            fixed=load_fixed_players(cfg, spec))[0]
+    assert [(p.name, p.display) for p in alone] == [(f"x#{entity_hash(other)}", "x")]   # no collision: short
+
+
+def test_repeated_names_and_aliases_are_refused(tmp_path, monkeypatch):
+    first, cfg = write_fake_run(tmp_path / "a" / "run", versions=(10,), agents={"main": {}, "rnd": scripted_agent()})
+    second, _ = write_fake_run(tmp_path / "b" / "run", versions=(5,), agents={"main": {}, "rnd": scripted_agent()})
+    spec = env_spec(cfg)
+    fixed = load_fixed_players(cfg, spec)
+    ckpt = write_ckpt_dir(tmp_path / "x", cfg, "main", policy_version=7)
+    again = str(first / "checkpoints" / "main" / "ckpt_v10")
+    twice = PlayerRequest(user=(("p", str(ckpt)), ("rnd", None), ("p", again)), runs=(), field=None)
+    with pytest.raises(ConfigError, match="-a 'p' is given more than once"):
+        resolve_players(cfg, spec, twice, fixed=fixed)
+    same_dir_name = PlayerRequest(user=(), runs=(RunSelection(first), RunSelection(second)), field=None)
+    with pytest.raises(ConfigError, match="alias 'run' is used twice"):
+        resolve_players(cfg, spec, same_dir_name, fixed=fixed)
+    monkeypatch.chdir(second)                                         # --run . : the alias is the dir's name
+    here = PlayerRequest(user=(), runs=(RunSelection(first, alias="a"), RunSelection(Path("."))), field=None)
+    candidates, _field = resolve_players(cfg, spec, here, fixed=fixed)
+    assert [p.name for p in candidates] == ["main@v10", "run/main@v5"]

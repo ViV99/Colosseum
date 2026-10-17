@@ -2,6 +2,9 @@
 back in the main process, errors with their context, a dead worker named with its log."""
 from __future__ import annotations
 
+import multiprocessing as mp
+import queue
+
 import pytest
 
 from colosseum.arena.tournament.engine import TournamentError, make_tasks, play_blocks
@@ -59,20 +62,31 @@ def test_blocks_are_played_whole_by_two_workers(tmp_path):
     assert [len(t) for t in make_tasks(blocks, num_envs=2)] == [4, 4, 4, 1]   # >= 4 * 2 matches per task
 
 
+def _no_workers_left() -> bool:
+    return not [p for p in mp.active_children() if p.name.startswith("tournament-worker")]
+
+
 def test_a_bot_error_in_a_worker_is_a_player_error_in_the_main_process(tmp_path):
     cfg, spec, players = _setup(tmp_path, bad=scripted_agent("game_helpers.PlayerErrorBot"))
     blocks = [_block(0, ("main", "ckpt_v5"), ("bad", "fixed"))]
-    with pytest.raises(PlayerError, match="bad"):
+    with pytest.raises(PlayerError, match="bad") as caught:
         play_blocks(cfg, spec, players, blocks, num_workers=1, num_envs=1, deterministic=True,
                     on_block=lambda *_: None, log_dir=tmp_path / "logs")
+    message = str(caught.value)
+    assert message.startswith("tournament, worker 0, env 0, seat ")              # SP2 context, tournament prefix
+    assert f"match {blocks[0].lineups[0].uid} of block {blocks[0].id}" in message
+    assert str(tmp_path / "logs" / "tournament-worker-0.log") in message
+    assert _no_workers_left()
 
 
 def test_a_dead_worker_names_its_log(tmp_path):
     cfg, spec, players = _setup(tmp_path, crash=scripted_agent("game_helpers.CrashBot"))
     blocks = [_block(0, ("main", "ckpt_v5"), ("crash", "fixed"))]
-    with pytest.raises(TournamentError, match="tournament-worker-0"):
+    with pytest.raises(TournamentError, match="tournament-worker-0") as caught:
         play_blocks(cfg, spec, players, blocks, num_workers=1, num_envs=1, deterministic=True,
                     on_block=lambda *_: None, log_dir=tmp_path / "logs")
+    assert str(tmp_path / "logs" / "tournament-worker-0.log") in str(caught.value)
+    assert _no_workers_left()
 
 
 def test_blocks_need_a_lineup_of_their_own_per_episode(tmp_path):
@@ -90,3 +104,23 @@ def test_blocks_need_a_lineup_of_their_own_per_episode(tmp_path):
     with pytest.raises(ValueError, match="scheduled twice"):
         play_blocks(cfg, spec, players, [copied], num_workers=1, num_envs=1, deterministic=True,
                     on_block=lambda *_: None)
+
+
+def test_seats_must_be_tournament_players_and_errors_keep_their_base_class(tmp_path):
+    from colosseum.arena.tournament.engine import _drain, _error_kind
+    from colosseum.core.errors import ConfigError, DataError
+
+    cfg, spec, players = _setup(tmp_path)
+    with pytest.raises(TournamentError, match="not tournament players"):
+        play_blocks(cfg, spec, players, [_block(0, ("main", "ckpt_v7"), ("rnd", "fixed"))], num_workers=1,
+                    num_envs=1, deterministic=True, on_block=lambda *_: None)
+    assert _no_workers_left()
+    assert _error_kind(DataError("bad data")) == "ConfigError" and _error_kind(PlayerError("x")) == "PlayerError"
+    assert issubclass(DataError, ConfigError)
+    q = mp.get_context("spawn").Queue()
+    for item in ("a", "b"):
+        q.put(item)
+    assert _drain(q) == ["a", "b"]                         # the final drain before "tasks unplayed"
+    with pytest.raises(queue.Empty):
+        q.get_nowait()
+    q.close()

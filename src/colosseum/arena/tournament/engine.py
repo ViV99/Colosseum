@@ -1,16 +1,18 @@
 """Tournament engine (SP4 spec block 3): whole blocks played in local worker processes on ``MatchRunner``.
 
-``play_blocks`` checks the blocks (``check_blocks``: every lineup its own uid, the block's seed and id), splits
-them into tasks of whole blocks (``make_tasks``: at least ``TASK_MATCHES * num_envs`` matches each, so env batches
-are rarely half empty), starts ``min(num_workers, tasks)`` spawn processes and feeds them the tasks through a
-queue. A worker (``run_child``: log ``<log_dir>/tournament-worker-<i>.log``, SIGINT ignored, dies with the
-parent) plays a task with ``eval.play_lineups`` on a ``LazyPlayerPool`` (``source`` = ``tournament``; torch
-sampling seeded with the task's first block seed) and sends the results back grouped by block. The main process
-calls ``on_block(block_id, results)`` for every block of a task once the whole task is back (tasks in the order
-they finish, blocks of a task in schedule order, results sorted by uid): a block is never reported in part. A
-worker's ConfigError, EnvContractError or PlayerError is re-raised in the main process with its message; a worker
-that dies otherwise raises ``TournamentError`` naming its log. On every exit (also a KeyboardInterrupt in the
-main process) the workers are stopped: ``stop_event``, ``STOP_GRACE_SEC``, then terminate / kill.
+``play_blocks`` checks the blocks (``check_blocks``: every lineup its own uid, the block's seed and id, every seat
+a known player), splits them into tasks of whole blocks (``make_tasks``: at least ``TASK_MATCHES * num_envs``
+matches each, so env batches are rarely half empty), starts ``min(num_workers, tasks)`` spawn processes and feeds
+them the tasks through a queue. A worker (``run_child``: log ``<log_dir>/tournament-worker-<i>.log``, SIGINT
+ignored, dies with the parent) plays a task with ``eval.play_lineups`` on a ``LazyPlayerPool`` (``source`` =
+``tournament``; torch sampling seeded with the task's first block seed) and sends the results back grouped by
+block. The main process calls ``on_block(block_id, results)`` for every block of a task once the whole task is
+back (tasks in the order they finish, blocks of a task in schedule order, results sorted by uid): a block is never
+reported in part. A worker's ConfigError, EnvContractError or PlayerError (or a subclass: the nearest of the
+three) is re-raised in the main process with its message (context ``tournament, worker W, env E, ...``) plus the
+worker, the match uid and block and the worker's log; a worker that dies otherwise raises ``TournamentError``
+naming its log. On every exit (also a KeyboardInterrupt in the main process) the workers are stopped:
+``stop_event``, ``STOP_GRACE_SEC``, then terminate / kill.
 
 Results carry ``source``, the lineup's ``seed``, ``block`` and ``uid`` (T1.1); a seat's ``version_start`` /
 ``version_end`` is ``N`` for ``ckpt_v<N>`` and None for fixed players; ``env_steps`` is None.
@@ -27,6 +29,7 @@ import functools
 import logging
 import multiprocessing as mp
 import queue
+import re
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
@@ -37,7 +40,7 @@ from colosseum.arena.tournament.schedule import Block
 from colosseum.coordinator.checkpoint_manager import read_weights_file
 from colosseum.core.config import ColosseumConfig
 from colosseum.core.errors import ConfigError, EnvContractError, PlayerError
-from colosseum.core.types import MatchResult
+from colosseum.core.types import Lineup, MatchResult
 from colosseum.envs.game import GameSpec
 from colosseum.networks.model import PolicyModel
 from colosseum.players.registry import FrozenSpec, build_frozen_model, make_bot
@@ -124,11 +127,14 @@ class LazyPlayerPool:
                 del self._models[key]
 
 
-def check_blocks(blocks: Sequence[Block]) -> None:
+def check_blocks(blocks: Sequence[Block], *, players: Iterable[TournamentPlayer] | None = None) -> None:
     """Every lineup of a block carries the block's seed and id and its own uid, unique over ``blocks``: one lineup is
     one episode (``play_lineups`` plays each once), and the journal treats a repeated uid as a duplicate, so a
-    schedule must stage a new lineup for every episode. ValueError otherwise."""
+    schedule must stage a new lineup for every episode (ValueError otherwise). With ``players``, every seat's
+    ``(agent_id, network_id)`` must be one of theirs (TournamentError: a schedule bug, caught before any worker
+    starts)."""
     seen: set[str] = set()
+    known = None if players is None else {(p.agent_id, p.network_id) for p in players}
     for block in blocks:
         if len(block.lineups) != len(block.rotations):
             raise ValueError(f"block {block.id}: {len(block.lineups)} lineups for {len(block.rotations)} rotations")
@@ -140,6 +146,11 @@ def check_blocks(blocks: Sequence[Block]) -> None:
                 raise ValueError(f"block {block.id}: match uid {lineup.uid!r} is scheduled twice; every episode "
                                  f"needs a lineup of its own")
             seen.add(lineup.uid)
+            unknown = [] if known is None else \
+                sorted({(s.agent_id, s.network_id) for s in lineup.seats} - known)
+            if unknown:
+                raise TournamentError(f"match {lineup.uid}: seats {unknown} are not tournament players "
+                                      f"({sorted(known)})")
 
 
 def make_tasks(blocks: Sequence[Block], num_envs: int) -> list[list[Block]]:
@@ -174,6 +185,43 @@ def _worker_target(*, worker_id: int, log_dir: str | None = None, **kwargs: Any)
     run_child(f"tournament-worker-{worker_id}", log_dir, _worker_main, worker_id=worker_id, **kwargs)
 
 
+class _Placement:
+    """``MatchObserver`` that knows which lineup every env plays (the match an error happened in)."""
+
+    def __init__(self, lineups: Sequence[Lineup], num_envs: int) -> None:
+        self.current = dict(enumerate(lineups[:min(num_envs, len(lineups))]))
+
+    def on_act(self, env, seat, record) -> None:
+        pass
+
+    def on_rewards(self, env, rewards) -> None:
+        pass
+
+    def on_terminated(self, env, seats) -> None:
+        pass
+
+    def on_lineup_applied(self, env, old, new) -> None:
+        self.current[env] = new
+
+    def on_episode_end(self, env, end) -> None:
+        pass
+
+    def where(self, message: str, context: str, blocks: Sequence[Block]) -> str:
+        """``match <uid> of block <id>`` for an error message that starts with ``<context>env <E>``; else the
+        task's blocks."""
+        found = re.match(re.escape(context) + r"env (\d+)", message)
+        lineup = self.current.get(int(found.group(1))) if found is not None else None
+        if lineup is not None:
+            return f"match {lineup.uid} of block {lineup.block}"
+        ids = [b.id for b in blocks]
+        return f"one of blocks {ids[0]} .. {ids[-1]}" if len(ids) > 1 else f"block {ids[0]}"
+
+
+def _error_kind(error: Exception) -> str:
+    """The name of the nearest class of ``_ERRORS`` in the error's MRO (a ``DataError`` is a ``ConfigError``)."""
+    return next(cls.__name__ for cls in type(error).__mro__ if _ERRORS.get(cls.__name__) is cls)
+
+
 def _worker_main(*, worker_id: int, config: ColosseumConfig, players: list[TournamentPlayer], tasks: Any, results: Any,
                  stop_event: Any, num_envs: int, deterministic: bool, source: str) -> None:
     from colosseum.core.registry import env_spec, make_env
@@ -183,6 +231,7 @@ def _worker_main(*, worker_id: int, config: ColosseumConfig, players: list[Tourn
     configure_torch_threads(1)
     spec = env_spec(config)
     pool = LazyPlayerPool(players, spec)
+    context = f"{source}, worker {worker_id}, "
     while not stop_event.is_set():
         try:
             item = tasks.get(timeout=0.2)
@@ -191,14 +240,17 @@ def _worker_main(*, worker_id: int, config: ColosseumConfig, players: list[Tourn
         if item is None:
             return
         index, blocks = item
+        lineups = [lu for b in blocks for lu in b.lineups]
+        placement = _Placement(lineups, num_envs)
         try:
-            pool.reserve({(s.agent_id, s.network_id) for b in blocks for lu in b.lineups for s in lu.seats})
-            played = play_lineups(env_fn=lambda: make_env(config), pool=pool,
-                                  lineups=[lu for b in blocks for lu in b.lineups], num_envs=num_envs,
+            pool.reserve({(s.agent_id, s.network_id) for lu in lineups for s in lu.seats})
+            played = play_lineups(env_fn=lambda: make_env(config), pool=pool, lineups=lineups, num_envs=num_envs,
                                   seed=blocks[0].seed, deterministic=deterministic,
-                                  max_idle_steps=config.env.max_idle_steps, source=source)
+                                  max_idle_steps=config.env.max_idle_steps, observer=placement, source=source,
+                                  context=context, match_id_prefix=source)
         except (ConfigError, EnvContractError, PlayerError) as e:
-            _put(results, ("error", index, type(e).__name__, str(e)), stop_event)
+            _put(results, ("error", index, worker_id, _error_kind(e), str(e),
+                           placement.where(str(e), context, blocks)), stop_event)
             raise
         by_block: dict[str, list[MatchResult]] = {}
         for result in played:
@@ -208,15 +260,33 @@ def _worker_main(*, worker_id: int, config: ColosseumConfig, players: list[Tourn
             return
 
 
-def _error_after_failure(results: Any, failure: Any) -> Exception:
+def _typed_error(msg: tuple, supervisor: ProcessSupervisor) -> Exception:
+    """The main-process error of a worker's ``("error", task, worker, kind, message, where)`` message."""
+    _kind, _index, worker, kind, message, where = msg
+    log = supervisor.log_path(f"tournament-worker-{worker}")
+    return _ERRORS[kind](f"{message}\n(tournament-worker-{worker}, {where}"
+                         f"{'' if log is None else f'; log {log}'})")
+
+
+def _error_after_failure(results: Any, failure: Any, supervisor: ProcessSupervisor) -> Exception:
     """The error a dead worker sent before dying (a typed one), else a TournamentError naming its log."""
     try:
         while True:
             msg = results.get(timeout=1.0)
             if msg[0] == "error":
-                return _ERRORS[msg[2]](msg[3])
+                return _typed_error(msg, supervisor)
     except queue.Empty:
         return TournamentError(f"tournament {failure.message()}")
+
+
+def _drain(results: Any) -> list[tuple]:
+    """Every message still in the results queue (workers that exited flushed theirs before exiting)."""
+    out = []
+    try:
+        while True:
+            out.append(results.get(timeout=0.2))
+    except queue.Empty:
+        return out
 
 
 def play_blocks(config: ColosseumConfig, spec: GameSpec, players: Mapping[str, TournamentPlayer] | Sequence,
@@ -229,12 +299,25 @@ def play_blocks(config: ColosseumConfig, spec: GameSpec, players: Mapping[str, T
         return
     if num_workers < 1 or num_envs < 1:
         raise ValueError(f"play_blocks: need num_workers >= 1 and num_envs >= 1, got {num_workers}, {num_envs}")
-    check_blocks(blocks)
     player_list = list(players.values()) if isinstance(players, Mapping) else list(players)
+    check_blocks(blocks, players=player_list)
     tasks = make_tasks(blocks, num_envs)
     ctx = mp.get_context("spawn")
     task_q, result_q, stop = ctx.Queue(), ctx.Queue(), ctx.Event()
     supervisor = ProcessSupervisor(stop, log_dir=log_dir)
+    pending = set(range(len(tasks)))
+
+    def handle(msg: tuple) -> None:
+        if msg[0] == "error":
+            raise _typed_error(msg, supervisor)
+        _kind, index, by_block = msg
+        for block in tasks[index]:
+            got = sorted(by_block.get(block.id, []), key=lambda r: r.uid)
+            if len(got) != len(block.lineups):
+                raise TournamentError(f"block {block.id}: {len(got)} results for {len(block.lineups)} matches")
+            on_block(block.id, got)
+        pending.discard(index)
+
     try:
         for index, task in enumerate(tasks):
             task_q.put((index, task))
@@ -248,26 +331,22 @@ def play_blocks(config: ColosseumConfig, spec: GameSpec, players: Mapping[str, T
                 source=source))
             start_process(proc)
             supervisor.add(f"tournament-worker-{w}", proc)
-        pending = set(range(len(tasks)))
         while pending:
             try:
                 msg = result_q.get(timeout=0.2)
             except queue.Empty:
                 failure = supervisor.first_failure(nonzero_only=True)
                 if failure is not None:
-                    raise _error_after_failure(result_q, failure) from None
+                    raise _error_after_failure(result_q, failure, supervisor) from None
                 if not supervisor.alive():
-                    raise TournamentError(f"tournament workers exited with {len(pending)} tasks unplayed") from None
+                    for late in _drain(result_q):      # results sent just before the workers exited
+                        handle(late)
+                    if pending:
+                        where = "" if log_dir is None else f"; see the tournament-worker-*.log files in {log_dir}"
+                        raise TournamentError(f"tournament workers exited with {len(pending)} tasks unplayed"
+                                              f"{where}") from None
                 continue
-            if msg[0] == "error":
-                raise _ERRORS[msg[2]](msg[3])
-            _kind, index, by_block = msg
-            for block in tasks[index]:
-                got = sorted(by_block.get(block.id, []), key=lambda r: r.uid)
-                if len(got) != len(block.lineups):
-                    raise TournamentError(f"block {block.id}: {len(got)} results for {len(block.lineups)} matches")
-                on_block(block.id, got)
-            pending.discard(index)
+            handle(msg)
     finally:
         stop.set()
         supervisor.wait_all(STOP_GRACE_SEC)

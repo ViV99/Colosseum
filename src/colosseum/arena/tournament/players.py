@@ -37,7 +37,7 @@ import json
 import logging
 import re
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -173,13 +173,13 @@ def snapshot_player(ckpt_dir: str | Path, *, agent: str, prefix: str, spec: Game
     dump = networks.model_dump(mode="json", by_alias=True)
     key = json_key(dump, roles)
     if key not in validated:          # one model check per architecture, with this snapshot's weights
-        from colosseum.core.validation import _check_model
+        from colosseum.core.validation import check_model
 
         frozen = FrozenSpec(agent_id=agent, roles=tuple(roles), networks=dump,
                             model_state=read_weights_file(path / MODEL_FILE), source=str(path),
                             networks_source=f"Checkpoint {path}: networks")
         model = build_frozen_model(None, frozen, spec)      # also checks the weights against the architecture
-        _check_model(model, agent_role_spec(spec, roles), None, f"snapshot {path}")
+        check_model(model, agent_role_spec(spec, roles), None, f"snapshot {path}")
         validated.add(key)
     agent_id = f"{prefix}{agent}"
     return TournamentPlayer(
@@ -318,6 +318,10 @@ def resolve_players(config: ColosseumConfig, spec: GameSpec, request: PlayerRequ
     rng = rng if rng is not None else np.random.default_rng(0)
     validated: set[str] = set()
     link = link if link is not None else (lambda _i, _sel, info: info.path)
+    given = [name for name, _path in request.user]
+    repeated = sorted({name for name in given if given.count(name) > 1})
+    if repeated:
+        raise ConfigError(f"-a {repeated[0]!r} is given more than once ({repeated}); give every -a player its own name")
     users: dict[str, TournamentPlayer] = {}
     for name, path in request.user:
         users[name] = config_player(config, spec, name, fixed) if path is None else \
@@ -328,7 +332,7 @@ def resolve_players(config: ColosseumConfig, spec: GameSpec, request: PlayerRequ
         run = Path(sel.path)
         run_config = load_run_config(run)
         agent = run_agent(run, run_config, sel.agent)
-        alias = sel.alias if sel.alias is not None else run.name
+        alias = sel.alias if sel.alias is not None else run.resolve().name    # "--run ." too
         check_path_component(alias, "--run alias")
         if alias in aliases:
             raise ConfigError(f"--run alias {alias!r} is used twice; give the runs different aliases (alias=runs/x)")
@@ -378,8 +382,8 @@ def resolve_players(config: ColosseumConfig, spec: GameSpec, request: PlayerRequ
                 raise ConfigError(f"--field {name!r}: {sel.path} has no stored snapshot ckpt_v{match.group('version')} "
                                   f"of {agent} (newest: {[c.checkpoint_id for c in infos][-5:]})")
             field_players.append(snapshot(i, sel, prefix, agent, rc, info))
-    in_field = {p.name for p in field_players} | {p.display for p in field_players}
-    candidates = [p for p in [*users.values(), *selected] if p.name not in in_field and p.display not in in_field]
+    in_field = {p.name for p in field_players}     # an -a player in --field is that same player: names suffice
+    candidates = [p for p in [*users.values(), *selected] if p.name not in in_field]
     names = [p.name for p in [*candidates, *field_players]]
     duplicates = sorted({n for n in names if names.count(n) > 1})
     if duplicates:
@@ -389,7 +393,17 @@ def resolve_players(config: ColosseumConfig, spec: GameSpec, request: PlayerRequ
     if not field_players and not allow_empty_field:
         raise ConfigError("the field is empty: name opponents with --field (agents of the config, -a players or "
                           "snapshots), or add scripted / frozen agents to the config")
-    return candidates, field_players
+    everyone = [*candidates, *field_players]
+    return _unique_displays(candidates, everyone), _unique_displays(field_players, everyone)
+
+
+def _unique_displays(players: list[TournamentPlayer], everyone: Sequence[TournamentPlayer]) -> list[TournamentPlayer]:
+    """``players`` with every display that another player of ``everyone`` shares replaced by the full name (``-a
+    bc=other.pt`` next to the config's ``bc``: ``bc#1a2b3c4d`` and ``bc``), so reports that show displays stay
+    unambiguous. Names are unique already."""
+    displays = [p.display for p in everyone]
+    return [replace(p, display=p.name) if p.display != p.name and displays.count(p.display) > 1 else p
+            for p in players]
 
 
 def player_to_dict(player: TournamentPlayer) -> dict[str, Any]:
