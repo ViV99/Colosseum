@@ -91,7 +91,7 @@ agents:
     roles: [player]                                # для .pt; по умолчанию все роли с одинаковыми пространствами
 ```
 
-Frozen-агент может быть якорем, источником `init.from` (раздел 8), учителем kickstart и игроком в `eval` / `record` по имени. Архитектура своя (не обязана совпадать с обучаемым агентом). Для папки чекпоинта `roles` и `networks` указывать нельзя. Чекпоинты SP2 подходят: их `meta.json` содержит сеть, роли и сигнатуру.
+Frozen-агент может быть якорем, источником `init.from` (раздел 8), учителем kickstart и игроком в `eval` / `record` / `tournament` по имени. Архитектура своя (не обязана совпадать с обучаемым агентом). Для папки чекпоинта `roles` и `networks` указывать нельзя. Чекпоинты SP2 подходят: их `meta.json` содержит сеть, роли и сигнатуру. `networks` и `roles` frozen-записи относятся только к её собственному `path`: `-a bc_net=other.pt` в `eval`, `record` (`--player` / `--against`) и `tournament` их не наследует — такой `.pt` строится с глобальной `networks` и всеми ролями игры (для имени обучаемого агента, как раньше, — с его архитектурой и ролями).
 
 ## 5. Лига из нескольких агентов
 
@@ -232,11 +232,15 @@ matchmaking:
 checkpoint:
   interval: 1000        # снимок каждые N шагов обучения
   keep_last: 20         # последние 20 (бывший pool_size)
-  keep_every: 10        # и каждый 10-й навсегда (версия кратна interval · keep_every); 0 = выкл.
+  keep_every: 10        # и каждый 10-й (версия кратна interval · keep_every); 0 = выкл.
+  keep_top_k: 0         # SP4: > 0 — ещё k лучших по нижней границе рейтинга (нужен match_log)
+  top_k_quantile: 0.1
+  top_k_min_games: 200
+  max_snapshots: 100    # SP4: потолок на агента; null — без потолка
   save_optimizer: true
 ```
 
-Финальный снимок не удаляется никогда. `trainer_state.pt` есть только у снимков в окне `keep_last` (resume нужен только с последних). Удалённый снимок пропадает из кандидатов матчмейкера и PFSP-статистики, воркеры выгружают его модель. Resume из папки запуска (`training.resume_from: runs/<run>`) переносит хранимые снимки в новый запуск (hardlink или копия), так что пул соперников переживает resume; из папки чекпоинта или `.pt` пул начинается пустым. Resume из снимка без `trainer_state.pt` (вне окна `keep_last`, например снимок `keep_every`) восстанавливает только веса и версию политики: оптимизатор новый, прогрев критика (`critic_warmup_steps`) проходит ещё раз, а λ kickstart затухает с начала; если это не нужно, задайте для такого resume `init.critic_warmup_steps: 0` (глобально или у агента) и нужную секцию `kickstart`. Перенесённые hardlink-снимки — те же файлы, что в старом запуске: не редактируйте их на месте ни в одном из двух запусков (удалять папки можно). Лучшие снимки по рейтингу (top-k) — в SP4; до тех пор держите их через `keep_every` или как frozen-агентов.
+Финальный снимок текущего запуска не вытесняется никогда; финальные снимки запусков, из которых этот возобновлён, становятся обычными снимками. `trainer_state.pt` есть только у снимков в окне `keep_last` (resume нужен только с последних). Удалённый снимок пропадает из кандидатов матчмейкера и PFSP-статистики, воркеры выгружают его модель. Resume из папки запуска (`training.resume_from: runs/<run>`) переносит хранимые снимки в новый запуск (hardlink или копия), так что пул соперников переживает resume; из папки чекпоинта или `.pt` пул начинается пустым. Resume из снимка без `trainer_state.pt` (вне окна `keep_last`, например снимок `keep_every`) восстанавливает только веса и версию политики: оптимизатор новый, прогрев критика (`critic_warmup_steps`) проходит ещё раз, а λ kickstart затухает с начала; если это не нужно, задайте для такого resume `init.critic_warmup_steps: 0` (глобально или у агента) и нужную секцию `kickstart`. Перенесённые hardlink-снимки — те же файлы, что в старом запуске: не редактируйте их на месте ни в одном из двух запусков (удалять папки можно). С SP4 `keep_top_k` хранит k снимков с наибольшей нижней границей BT-рейтинга (с защитой новых снимков до `top_k_min_games` игр), закреплённые снимки (`colosseum pin`, `tournament --pin`) не вытесняются никогда, а `max_snapshots` ограничивает число снимков агента, и при превышении первыми уходят снимки только по `keep_every`. Правило целиком, порядок вытеснения и закрепление — [`ARENA_GUIDE.md`](ARENA_GUIDE.md), раздел 5.
 
 ## 13. Что печатает `validate`
 
@@ -252,6 +256,9 @@ colosseum validate -c configs/examples/unit_harvest_league.yaml
     2p, team 0: step 0: latest 0.50, snapshots 0.20, rivals 0.00, anchors 0.30
     2p, team 1: step 0: latest 0.50, snapshots 0.20, rivals 0.00, anchors 0.30
     anchors: greedy 1, random 1
+  match log: on (detail window 512 MB, min free disk 2048 MB, compaction every 60 s)
+  ratings: Bradley-Terry over train and pulse matches, refit every 60 s, anchor 'random' (the first RandomBot agent); bootstrap 200
+  agent 'main': snapshots: newest 10 (keep_last, with trainer state); every 1000th version (keep_every 10); the final one of this run; pinned; top-k off; at most 100 per agent (over the cap: keep_every snapshots oldest first)
   agent 'greedy' (scripted examples.unit_harvest.bots.HarvestBot): roles ['player']; played 16 decisions in layouts ['2p']
   agent 'random' (scripted colosseum.players.RandomBot): roles ['player']; played 16 decisions in layouts ['2p']
 Config is valid.
@@ -272,18 +279,23 @@ colosseum validate -c configs/examples/unit_harvest_league.yaml --set agents.mai
     2p, team 0: step 0: latest 0.50, snapshots 0.20, rivals 0.00, anchors 0.30
     2p, team 1: step 0: latest 0.50, snapshots 0.20, rivals 0.00, anchors 0.30
     anchors: greedy 1, random 1
+  match log: on (detail window 512 MB, min free disk 2048 MB, compaction every 60 s)
+  ratings: Bradley-Terry over train and pulse matches, refit every 60 s, anchor 'random' (the first RandomBot agent); bootstrap 200
+  agent 'main': snapshots: newest 10 (keep_last, with trainer state); every 1000th version (keep_every 10); the final one of this run; pinned; top-k off; at most 100 per agent (over the cap: keep_every snapshots oldest first)
   agent 'main': init from bc.pt (strict): 20 tensors
   agent 'greedy' (scripted examples.unit_harvest.bots.HarvestBot): roles ['player']; played 16 decisions in layouts ['2p']
   agent 'random' (scripted colosseum.players.RandomBot): roles ['player']; played 16 decisions in layouts ['2p']
 Config is valid.
 ```
 
-Для каждого обучаемого агента и варианта партии — доли категорий для каждой команды соперников (`team N` — команда, против которой играет владелец) после перераспределения пустых в начальной и конечной точке расписаний (здесь расписаний нет, поэтому только `step 0`) и список якорей с весами; для скриптовых агентов — роли и сколько решений бот сделал в пробной игре; для `init` — откуда берутся веса и (при `strict: false`) какие тензоры не загрузились.
+Для каждого обучаемого агента и варианта партии — доли категорий для каждой команды соперников (`team N` — команда, против которой играет владелец) после перераспределения пустых в начальной и конечной точке расписаний (здесь расписаний нет, поэтому только `step 0`) и список якорей с весами; настройки журнала матчей и рейтингов (якорь шкалы) и итоговое правило хранения снимков каждого агента (SP4, [`ARENA_GUIDE.md`](ARENA_GUIDE.md)); с `evaluation.enabled: true` — строка `pulse:` с полем, раскладками и числом матчей на снимок; для скриптовых агентов — роли и сколько решений бот сделал в пробной игре; для `init` — откуда берутся веса и (при `strict: false`) какие тензоры не загрузились.
 
 ## 14. Метрики и рейтинги
 
-- Scripted и frozen агенты — отдельные сущности в ELO, матрице win-rate и `role_win_rates` (`ratings.json`): «main против greedy» видно сразу. Снимки засчитываются своему агенту (рейтинги снимков — SP4).
-- PFSP-таблица (счёт и число игр latest владельца против каждого игрока) — в `ratings.json`, по вариантам.
+- Scripted и frozen агенты — отдельные сущности в ELO, матрице win-rate и `role_win_rates` (`ratings.json`): «main против greedy» видно сразу. В этих таблицах SP2/SP3 снимки по-прежнему засчитываются своему агенту; онлайн-ELO — индикатор прогресса, не рейтинг для отбора.
+- **Рейтинги снимков (SP4).** Из журнала матчей (`runs/<name>/matches.db`) считается рейтинг Bradley–Terry с доверительными интервалами для каждой сущности: версии агента (`main@v1200`), scripted и frozen агенты — по имени. Живой рейтинг пересчитывается во время обучения раз в `ratings.refit_interval_sec` и пишется в `ratings.json` → `bt`, в консоль (`bt <рейтинг> ± <половина 95 % интервала>` последней корзины агента) и в записи `ratings` файла `metrics.jsonl`; отчёт и дашборд (`colosseum report`, `colosseum dashboard`) показывают его с bootstrap-интервалами. Ноль шкалы — якорь (по умолчанию первый `RandomBot` конфига). Сущности, шкала, группы ролей и как читать интервалы — [`ARENA_GUIDE.md`](ARENA_GUIDE.md), раздел 3.
+- PFSP-таблица (счёт и число игр latest владельца против каждого игрока) — в `ratings.json`, по вариантам. Записи `ratings` в `metrics.jsonl` с SP4 несут вместо неё сводку `pfsp_summary` по владельцу (`players`, `min_score`, `max_score`); полная таблица — только в `ratings.json`.
+- ELO, win-rate, `wr_vs_past` и PFSP с SP4 переживают resume из папки запуска: состояние лиги пишется в `runs/<name>/league_state.json` на каждом такте метрик и в конце запуска, и новый запуск загружает файл родителя (у папки SP3 его нет — статистика начинается пустой, INFO в логе). Состояние своего матчмейкера (`on_result`) не сохраняется.
 - Доли **сыгранных** эпизодов по категориям и якорям, по агентам и вариантам — в `metrics.jsonl` (записи `episodes`, поле `opponents.<вариант>`: `teams` — число команд соперников, разыгранных для агента как владельца данных; `categories` — доли `latest` / `snapshots` / `rivals` / `anchors` / `fallback`; `anchors` — доля каждого якоря среди всех команд) и в WandB (`episodes/<agent>/opponents/<вариант>/...`). Пример из прогона конвейера README (запись сокращена до этих полей):
 
 ```json
@@ -295,8 +307,8 @@ Config is valid.
 
 ## 15. Ограничения
 
-- Распределённый режим (`run-learner` / `run-workers`) — только latest-веса обучаемых агентов (объём SP2) и только игры, где каждый агент играет все роли включённых вариантов: scripted и frozen агенты, `init`, прогрев критика, свой матчмейкер, override `matchmaking` и `kickstart` на агента и учитель kickstart, кроме одного глобального `.pt` с архитектурой ученика, там — ошибка конфига с пометкой SP5; любая смесь соперников сводится к «только latest», а `teammates: mixed` игнорируется (одно предупреждение).
-- Top-k снимков, рейтинги снимков, OpenSkill / Bradley–Terry, `colosseum tournament` — SP4.
+- Распределённый режим (`run-learner` / `run-workers`) — только latest-веса обучаемых агентов (объём SP2) и только игры, где каждый агент играет все роли включённых вариантов: scripted и frozen агенты, `init`, прогрев критика, свой матчмейкер, override `matchmaking` и `kickstart` на агента и учитель kickstart, кроме одного глобального `.pt` с архитектурой ученика, там — ошибка конфига с пометкой SP5; любая смесь соперников сводится к «только latest», а `teammates: mixed` игнорируется (одно предупреждение). Журнал матчей и рейтинги снимков распределённые роли не пишут; `evaluation.enabled: true` и `checkpoint.keep_top_k > 0` там — ошибка конфига с пометкой SP5, а `max_snapshots` работает, вытесняя снимки от старых к новым (FIFO, без рейтингов).
+- Чего нет в SP4 ([`ARENA_GUIDE.md`](ARENA_GUIDE.md) описывает то, что есть): распределённого турнира, оценки во время обучения (pulse) и журнала матчей на других машинах — до SP5; турниров Swiss / king-of-the-hill, SPRT-гейта сабмита и α-Rank / Nash averaging (при циклах — матрица результатов и худший соперник); модели ничьих Davidson и точного Plackett–Luce для FFA (ничья = 0.5, FFA — по парам команд); выбора top-k по разнообразию стратегий (top-k — по нижней границе рейтинга).
 - Рекуррентный учитель kickstart с другой раскладкой состояния, батчевый API скриптовых ботов, эксплойтеры — позже, по необходимости (свой матчмейкер закрывает экзотику).
 
 ## 16. Совместимость с SP2
@@ -311,4 +323,4 @@ Config is valid.
 - **Один обучаемый агент с `mode: league` и `self_play_ratio: 0.0`** переводится в `opponents: {latest: 0, snapshots: 0, rivals: 1, anchors: 0}`. Других обучаемых агентов нет, категория `rivals` пуста, и проверка конфига отклоняет его (ни одной заполнимой категории с положительной долей); SP2 в этом случае молча играл self-play. Запишите `opponents` явно, например `{latest: 0.8, snapshots: 0.2, rivals: 0.0, anchors: 0.0}`.
 - **Путь учителя kickstart** — файл `.pt` или папка чекпоинта. SP2 принимал любой файл весов (например, `teacher.pth`); такой файл нужно переименовать в `.pt`.
 
-Чтобы вернуть смесь SP2 для конфига без ручек, задайте её явно: `opponents: {latest: 0.5, snapshots: 0.5, rivals: 0, anchors: 0}` и `pfsp: {weighting: uniform}`; `checkpoint.keep_every: 0` возвращает чистый FIFO (финальный снимок всё равно хранится).
+Чтобы вернуть смесь SP2 для конфига без ручек, задайте её явно: `opponents: {latest: 0.5, snapshots: 0.5, rivals: 0, anchors: 0}` и `pfsp: {weighting: uniform}`; `checkpoint.keep_every: 0` возвращает чистый FIFO (финальный снимок текущего запуска всё равно хранится).

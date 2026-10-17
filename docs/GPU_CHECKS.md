@@ -144,6 +144,8 @@ NEW=$(ls -d runs/gpu-check-amp/checkpoints/main/ckpt_v* | sort -V | tail -1)
 
 После проверки: `rm -rf gpu-check runs/gpu-check-amp`.
 
+Скорость обучения на машине с GPU меряйте `scripts/bench_throughput.py`: с SP4 он по умолчанию считает по счётчикам (`--clock counters`: глобальный счётчик шагов сред и новейшие записи `train` / `system`, опрашиваемые по `time.monotonic()`), поэтому работает и там, где настенные часы скачут (WSL2: [отчёт](superpowers/reports/2026-10-15-gpu-checks.md), §8). Прежний способ — окна по полю `ts` записей — остался как `--clock ts`; на машине владельца он завершался ошибкой при каждом запуске, поэтому замер 2026-10-15 шёл по итоговым счётчикам (`docs/benchmarks.md`, «Лёрнер на CUDA и на CPU»), а замер SP4 — уже по `--clock counters` (`docs/benchmarks.md`, «После SP4»).
+
 ## Ручная проверка WandB (без GPU)
 
 Автотесты WandB используют подмену модуля `wandb`, поэтому настоящий WandB проверяется вручную, один раз, на любой машине.
