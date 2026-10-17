@@ -11,6 +11,7 @@ import functools
 import hashlib
 import json
 import math
+import os
 import queue
 import shutil
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -1519,3 +1520,39 @@ def bt_table(results: Sequence, interval: int = 1):
     for result in results:
         table.add_result(result, [rating_version(s.network_id, s.version_start, interval) for s in result.seats])
     return table
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T5.1): tournament support
+# ---------------------------------------------------------------------------
+
+
+class CrashBot(ScriptedBot):
+    """Kills its own process (``os._exit(3)``) at the first ``act``: a tournament worker dying mid-task."""
+
+    def act(self, obs, mask, info):
+        os._exit(3)
+
+
+class PlayerErrorBot(ScriptedBot):
+    """Raises at the first ``act``: the match core turns that into a PlayerError with its context."""
+
+    def act(self, obs, mask, info):
+        raise RuntimeError("bot failure on purpose")
+
+
+def write_fake_run(root, game: str = "turns", *, agent: str = "main", versions=(10, 20, 30),
+                   agents: dict | None = None, **sections):
+    """A run dir as ``colosseum train`` leaves it, without training: ``config.resolved.yaml`` of
+    ``make_test_config(game, agents=agents or {agent: {}}, **sections)`` and ``checkpoints/<agent>/ckpt_v<N>`` for
+    every version (``write_ckpt_dir``; seed = position, so the weights differ). Returns ``(root, config)``."""
+    import yaml
+
+    root = Path(root)
+    config = make_test_config(game, agents=agents if agents is not None else {agent: {}}, **sections)
+    (root / "checkpoints" / agent).mkdir(parents=True)
+    (root / "config.resolved.yaml").write_text(
+        yaml.safe_dump(config.model_dump(mode="json", by_alias=True), sort_keys=False))
+    for i, version in enumerate(versions):
+        write_ckpt_dir(root / "checkpoints" / agent, config, agent, policy_version=version, seed=i)
+    return root, config
