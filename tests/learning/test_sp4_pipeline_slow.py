@@ -18,6 +18,7 @@ import pipeline_kit as pk
 from cli_runner import run_in_session
 from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLog
 from demo_learning import LEARNING_SEED
+from report_kit import select_groups
 
 pytestmark = [pytest.mark.slow, pytest.mark.timeout(1800), pytest.mark.usefixtures("restore_global_rng")]
 
@@ -72,4 +73,6 @@ def test_pulse_trend_select_and_report(tmp_path):
     proc = run_in_session([sys.executable, "-m", "colosseum", "report", str(run.run.root)], timeout=300)
     assert proc.returncode == 0, proc.stderr[-2000:]
     page = (run.run.root / "report.html").read_text()
-    assert 'id="sec-tournaments"' in page and f'"{TOURNAMENT}"' in page
+    assert 'id="sec-tournaments"' in page
+    # the embedded data (not any JSON string equal to the name): the tournament's item with its select group
+    assert [g["select"]["winner"] for g in select_groups(page, TOURNAMENT)] == [select["winner"]]

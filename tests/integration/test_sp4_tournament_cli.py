@@ -16,9 +16,11 @@ from click.testing import CliRunner
 
 import colosseum.arena.tournament.run as run_module
 from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLog
+from colosseum.arena.report.render import write_report
 from colosseum.arena.tournament.players import entity_hash
 from colosseum.cli import main
 from game_helpers import copy_sp3_run, scripted_agent, write_fake_run, write_test_config
+from report_kit import select_groups
 
 AGENTS = {"main": {}, "rnd": scripted_agent(), "ones": scripted_agent("game_helpers.ConstantBot", value=1)}
 # TurnTakingGame pays the acting seat's action to the other seat: always 0 wins, always 1 gives everything away
@@ -70,6 +72,10 @@ def test_select_on_a_run_writes_the_journal_and_reports_and_pins_the_confirmed_w
     for name in ("tournament.yaml", "report.json", "report.txt", "report.html"):
         assert (tdir / name).is_file()
     assert (tdir / "logs" / "tournament.log").is_file()
+    # the run's report embeds the tournament with its select group (report_kit.select_groups: the slow pipeline
+    # test reads the run report of a real select tournament the same way)
+    page = write_report(root).read_text()
+    assert [g["select"]["winner"] for g in select_groups(page, "sel")] == ["main@v30"]
     blocks, results = journal(root / MATCH_LOG_FILE, "sel")
     assert len(blocks) == data["games"]["blocks"] and len(results) == data["games"]["matches"]
     assert len({r.uid for r in results}) == len(results) and {r.source for r in results} == {"tournament"}

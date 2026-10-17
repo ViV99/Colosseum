@@ -24,7 +24,7 @@ from colosseum.arena.report.render import (
     write_tournament_html,
 )
 from colosseum.core.errors import ConfigError
-from report_kit import sample_report_data, write_run_dir
+from report_kit import page_data, sample_report_data, select_groups, write_run_dir
 
 ASSETS = ("page.html", "page.css", "page.js")
 URL = re.compile(r"(?:https?:)?//[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -270,6 +270,11 @@ def test_a_tournament_output_dir_builds_a_page(tmp_path):
     assert set(data["sections"]) == set(SECTIONS)
     assert [item["name"] for item in data["sections"]["tournaments"]["items"]] == ["sel"]
     assert data["sections"]["tournaments"]["items"][0]["report"]["winner"] == "main@v2000"
+    # report_kit's reader of a page's tournament item (the slow pipeline test asserts with it)
+    assert page_data(path.read_text()) == data
+    assert [g["select"]["winner"] for g in select_groups(path.read_text(), "sel")] == ["main@v2000"]
+    with pytest.raises(AssertionError, match="'other': 0 items"):
+        select_groups(path.read_text(), "other")
 
 
 def test_a_tournament_dir_gets_a_tournament_only_page(tmp_path):
