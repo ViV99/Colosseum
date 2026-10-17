@@ -46,7 +46,9 @@ from colosseum.core.types import MatchResult
 from colosseum.eval import wilson_interval
 
 SELF = "(self)"
-# Provisional: T8.2 measures the bootstrap size on the bot ladder and the controller fixes it as a ruling.
+# T8.2 ruling: stays 2000. All 60 T8.2 ladder tournaments ran with B = 2000 and found the true winner and
+# ``confirmed`` 10/10 at every grid point; the Monte Carlo SE of the 2.5 % quantile at B = 2000 is about 0.0035;
+# the bootstrap seed is fixed.
 PAIRED_BOOTSTRAP_SAMPLES = 2000
 _CHUNK = 250                      # replicates per vectorized chunk (memory bound)
 

@@ -107,7 +107,10 @@ def test_true_anchored_differences_fall_in_the_95_percent_intervals(name):
     tolerance 0.10). Every entity has at least 200 comparisons; prior and smoothness are the module's. Calibration
     (T2.1, 15 independent runs of 20 replications per scenario, seeds 1000k..1000k+19): mean coverage 0.945-0.990,
     run-to-run sd at most 0.030, so 0.85 lies at least 3.4 sd below every scenario's mean: a correct implementation
-    fails with probability below 1e-3 (normal approximation, per scenario)."""
+    fails with probability below 1e-3 (normal approximation, per scenario). That calibration used the provisional
+    prior / smoothness 4.0 / 0.5; with the T8.2 values 8.0 / 1.0 one run of 20 replications (seeds 0..19) gave nearly
+    the same per-scenario coverage: 0.977 / 0.966 / 0.996 / 0.950 / 0.950 / 0.967 (4.0 / 0.5: 0.977 / 0.963 / 0.996 /
+    0.950 / 0.950 / 0.967)."""
     hits = total = 0
     for seed in range(REPLICATIONS):
         strengths, results, kwargs = SCENARIOS[name](np.random.default_rng(seed))
