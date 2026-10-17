@@ -300,8 +300,8 @@ failure logs one warning and disables WandB; it never stops training.
   (finished blocks are kept); `colosseum report`: 0 / 1 / 2 / 130; `colosseum dashboard`: 1 (not a run dir, port taken),
   2, 130 (Ctrl-C); `colosseum pin`: 0 / 1 / 2.
 - `colosseum train` writes `run_state.json`: `running` with its pid at the start, `finished` on exit codes 0 / 130 /
-  143, `stopped` (exit code 130) for a Ctrl-C during the start, `failed` otherwise. Report and dashboard show a `running`
-  run whose process is gone as `stopped`.
+  143, `stopped` (exit code 130) for a Ctrl-C during the start, `failed` otherwise. Report and dashboard show a
+  `running` run whose process is gone as `stopped`.
 
 ## Configuration reference
 
@@ -366,9 +366,11 @@ agent by name. They come with 95% intervals, a lower bound and `P(best)`, in Elo
 (`ratings.anchor`; default the first `RandomBot` agent, else the mean of the scripted / frozen agents, else `v0` of the
 first trainable agent), per role group and connected component. During training a background thread refits them every
 `ratings.refit_interval_sec` (Laplace intervals) into `ratings.json` (`bt`), the `ratings` records and the console line
-(`bt <rating> ± <half the 95% interval>`); reports fit the journal with bootstrap intervals. A run-dir resume continues
-the journal (the parent's counts, tournament and pulse matches are imported) and loads the parent's
-`league_state.json`, so online ELO and PFSP statistics continue too. Details: [`docs/ARENA_GUIDE.md`](docs/ARENA_GUIDE.md).
+(`bt <rating> ± <half the 95% interval>`). Report and dashboard show the live ratings from `ratings.json` while the run
+is running, and a fit of the journal with bootstrap intervals once it has stopped. A run-dir resume starts a new
+journal that imports the parent's counts and its tournament and pulse matches (the parent's detailed training matches
+are folded into counts), and loads the parent's `league_state.json`, so online ELO and PFSP statistics continue too.
+Details: [`docs/ARENA_GUIDE.md`](docs/ARENA_GUIDE.md).
 
 **Resume.** `training.resume_from` accepts a checkpoint dir, a previous run dir (each agent takes its latest
 checkpoint there) or a `.pt` state dict (weights only, e.g. from `colosseum bc`). An explicit resume is strict: a
@@ -451,14 +453,14 @@ colosseum dashboard RUN [--host 127.0.0.1] [--port 8765] [--refresh 10]
   training matches go to the counts only. A result that never reaches the journal is counted
   (`dropped_match_results`); on very fast games a share of the results is dropped this way (`docs/benchmarks.md`,
   «После SP4»).
-- **`colosseum tournament`** plays candidates (a run's stored snapshots, checkpoints of any architecture with
-  `-a name=path`, scripted / frozen agents with `-a name`) against a fixed field (`--field`; default every scripted /
-  frozen agent of the config) in blocks: one seed, one composition and every admissible seat rotation, the same seeds
-  for every candidate. `--mode select` screens by successive halving on one seed set and confirms the finalists on
-  fresh seeds; the winner is `confirmed` when the 95% interval of its difference to the runner-up excludes 0, and
-  `confirmed: false` lists the indistinguishable finalists (exit code 0: the choice is yours). Matches go to the first
-  `--run`'s journal, reports to `runs/x/tournaments/<name>/` (without `--run`: `--output DIR`); the same `--name`
-  continues an interrupted tournament. `--pin` pins a confirmed winner snapshot.
+- **`colosseum tournament`** plays candidates (a run's stored snapshots, checkpoint dirs of any architecture or `.pt`
+  weights with `-a name=path`, scripted / frozen agents with `-a name`) against a fixed field (`--field`; default
+  every scripted / frozen agent of the config) in blocks: one seed, one composition and every admissible seat
+  rotation, the same seeds for every candidate. `--mode select` screens by successive halving on one seed set and
+  confirms the finalists on fresh seeds; the winner is `confirmed` when the 95% interval of its difference to the
+  runner-up excludes 0, and `confirmed: false` lists the indistinguishable finalists (exit code 0: the choice is
+  yours). Matches go to the first `--run`'s journal, reports to `runs/x/tournaments/<name>/` (without `--run`:
+  `--output DIR`); the same `--name` continues an interrupted tournament. `--pin` pins a confirmed winner snapshot.
 - **`colosseum pin`** pins a stored snapshot (or unpins it with `--remove`, or lists them with `--list`): retention
   never evicts a pinned snapshot, also across resumes. `checkpoint.keep_top_k` keeps the snapshots with the highest
   lower bound of their live rating, and `checkpoint.max_snapshots` caps the snapshots per agent.
@@ -532,7 +534,7 @@ Known limitations today:
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 2104 tests
+.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 2109 tests
 .venv/bin/python -m pytest -m slow -v                       # 14 tests, about ⟨T8.3:slow-suite-minutes⟩ min (see below)
 .venv/bin/python -m pytest -m gpu -v                        # 25 tests, CUDA machine only, see docs/GPU_CHECKS.md
 ```

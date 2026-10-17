@@ -149,11 +149,13 @@ def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
 
 @main.command("eval")
 @click.option("--config", "-c", required=True, type=click.Path(exists=True),
-              help="Config YAML: its env is used for every match; agents.<name> / networks build .pt agents")
+              help="Config YAML: its env is used for every match; a trainable agents.<name> or the global "
+                   "networks build .pt agents")
 @click.option("--agent", "-a", "agents", required=True, multiple=True,
               help="name=path or name. path is a checkpoint dir (architecture and roles from its meta.json) or "
-                   "a .pt state_dict (architecture and roles of agents.<name>, else the global networks playing "
-                   "every role). A bare name is a scripted or frozen agent of the config. Repeatable.")
+                   "a .pt state_dict (architecture and roles of the trainable agents.<name>, else the global "
+                   "networks playing every role; a frozen entry of that name is not used for a path given here). "
+                   "A bare name is a scripted or frozen agent of the config. Repeatable.")
 @click.option("--layout", "layouts", multiple=True,
               help="Layout to evaluate (repeatable). Default: every layout the agents can fill.")
 @click.option("--num-matches", "-n", default=100, type=click.IntRange(min=1), show_default=True,
@@ -352,8 +354,9 @@ def _run_selection(item: dict):
 @click.option("--config", "-c", default=None, type=click.Path(exists=True, dir_okay=False),
               help="Config YAML (its env and agents); default: the first --run's config.resolved.yaml")
 @click.option("-a", "--candidate", "candidates", multiple=True,
-              help="Candidate: name=path (a checkpoint dir or .pt of any architecture) or a scripted / frozen agent "
-                   "of the config. Repeatable.")
+              help="Candidate: name=path (a checkpoint dir of any architecture, or a .pt built like eval's: the "
+                   "trainable agents.<name>, else the global networks) or a scripted / frozen agent of the config. "
+                   "Repeatable.")
 @click.option("--run", "runs", multiple=True,
               help="[alias=]runs/x: candidates are its stored snapshots (repeatable; --agent / --snapshots after a "
                    "--run apply to it). Matches go to the first run's matches.db, reports to its tournaments/<name>/.")
@@ -390,8 +393,9 @@ def tournament_cmd(config: str | None, candidates: tuple[str, ...], runs: tuple[
                    blocks: int | None, halving_blocks: int | None, confirm_blocks: int | None, finalists: int | None,
                    num_workers: int, num_envs: int, deterministic: bool, seed: int, name: str | None,
                    output: str | None, pin: bool, overrides: tuple[str, ...]) -> None:
-    """Compare candidates (run snapshots, checkpoints of any architecture, scripted / frozen agents) on common
-    seeds with seat rotations, and select the best (--mode select: screening, then confirmation on fresh seeds).
+    """Compare candidates (run snapshots, checkpoint dirs of any architecture, .pt weights, scripted / frozen
+    agents) on common seeds with seat rotations, and select the best (--mode select: screening, then confirmation
+    on fresh seeds).
 
     The config is checked in the "play" scope (like eval). Exit code: 0 done (also a select whose winner is not
     confirmed), 1 config, player or env error, a dead worker or a --pin winner the run evicted meanwhile (the
