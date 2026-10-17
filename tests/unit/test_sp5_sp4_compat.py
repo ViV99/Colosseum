@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import json
 
+import torch
 from click.testing import CliRunner
 
 from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLogReader
@@ -18,6 +19,8 @@ from game_helpers import SP4_RUN, SP4_TTT_TINY, copy_sp4_run, sp4_manifest, tree
 
 SP4_META_KEYS = {"agent_id", "checkpoint_id", "config_hash", "env_steps", "final", "networks", "pinned",
                  "policy_version", "role_signature", "roles", "run_id", "timestamp"}
+SP4_TRAINER_KEYS = {"consumed_samples", "critic_warmup_done", "kickstart", "optimizer", "policy_version", "progress",
+                    "scaler"}                                       # APPO.state_dict() of SP4
 
 
 def test_the_run_fixture_is_an_sp4_run_dir():
@@ -60,6 +63,20 @@ def test_every_sp4_snapshot_loads_read_only_with_its_architecture():
         ckpt = load_checkpoint_dir(SP4_RUN / "checkpoints" / manifest["agent"] / f"ckpt_v{version}")
         model = build_network(NetworkConfig.model_validate(ckpt["meta"]["networks"]), spec.roles["player"])
         check_model_state(model, ckpt["model_state"], f"ckpt_v{version}")
+    assert tree_digest(SP4_RUN) == before
+
+
+def test_every_sp4_trainer_state_loads_weights_only():
+    """``trainer_state.pt`` (only in the ``keep_last`` window) loads with ``weights_only=True`` (no pickle of
+    arbitrary objects) and holds what SP4's APPO saves; loading only reads the fixture."""
+    manifest = sp4_manifest()
+    before = tree_digest(SP4_RUN)
+    agent_dir = SP4_RUN / "checkpoints" / manifest["agent"]
+    assert manifest["with_trainer_state"]
+    for version in manifest["with_trainer_state"]:
+        state = torch.load(agent_dir / f"ckpt_v{version}" / "trainer_state.pt", map_location="cpu", weights_only=True)
+        assert isinstance(state, dict) and set(state) == SP4_TRAINER_KEYS, version
+        assert state["policy_version"] == version
     assert tree_digest(SP4_RUN) == before
 
 

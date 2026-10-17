@@ -1,8 +1,8 @@
 """Owner rotation and lineups on today's code (SP5 T0.1, spec §6 "Контрактные тесты до переноса", block 4.2): the
 sequence of owners the launcher produces over several refreshes for 1-3 workers, 1-3 envs per worker and 1-3
 trainable agents; every lineup's owner collects; the launcher's refresh advances one round and uses global env
-offsets. T2.1 runs ``owner_sequence``'s expectation against ``hub.state.OwnerRotation`` (one node, every cell expiring
-at once); T2.5 ports the launcher test to the hub (same assertions)."""
+offsets. The expectation is ``game_helpers.owner_sequence``; T2.1 runs it against ``hub.state.OwnerRotation`` (one
+node, every cell expiring at once); T2.5 ports the launcher test to the hub (same assertions)."""
 from __future__ import annotations
 
 import queue
@@ -10,7 +10,7 @@ import queue
 import pytest
 
 from colosseum.launcher import Launcher
-from game_helpers import make_coordinator, make_test_config
+from game_helpers import make_coordinator, make_test_config, owner_sequence
 
 ROUNDS = 5
 CASES = [(workers, envs, agents) for workers in (1, 2, 3) for envs in (1, 2, 3) for agents in (1, 2, 3)]
@@ -30,12 +30,6 @@ def _owner(lineup) -> str:
     return owners.pop()
 
 
-def owner_sequence(workers: int, envs: int, agents: int, rounds: int = ROUNDS) -> list[list[list[str]]]:
-    """``[round][worker][env]`` -> owner: what ``trainable[(g + round) % n]`` gives for global env ``g = w * E + e``."""
-    ids = ["a", "b", "c"][:agents]
-    return [[[ids[(w * envs + e + r) % agents] for e in range(envs)] for w in range(workers)] for r in range(rounds)]
-
-
 @pytest.mark.parametrize("workers, envs, agents", CASES)
 def test_the_owner_sequence_over_refreshes(tmp_path, workers, envs, agents):
     """The launcher's order: initial lineups at round 0 (``_start_children``), then per refresh ``next_round`` and one
@@ -46,7 +40,7 @@ def test_the_owner_sequence_over_refreshes(tmp_path, workers, envs, agents):
         if r:
             coord.next_round()
         seen.append([[_owner(lu) for lu in coord.generate_lineups(envs, env_offset=w * envs)] for w in range(workers)])
-    assert seen == owner_sequence(workers, envs, agents)
+    assert seen == owner_sequence(workers, envs, agents, ROUNDS)
     flat = [o for rnd in seen for worker in rnd for o in worker]
     counts = {aid: flat.count(aid) for aid in set(flat)}
     if (workers * envs) % agents == 0:

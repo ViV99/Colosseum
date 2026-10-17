@@ -1243,6 +1243,14 @@ def copy_sp4_run(tmp_path) -> Path:
     return dst
 
 
+def owner_sequence(workers: int, envs: int, agents: int, rounds: int = 5) -> list[list[list[str]]]:
+    """The SP4 owner-rotation expectation (SP5 T0.1, ``test_sp5_rotation_baseline.py``; reused by T2.1 / T2.5):
+    ``[round][worker][env]`` -> owner, i.e. what ``trainable[(g + round) % n]`` gives for global env ``g = w * E + e``
+    with trainable agents ``a``, ``b``, ``c`` (the first ``agents`` of them)."""
+    ids = ["a", "b", "c"][:agents]
+    return [[[ids[(w * envs + e + r) % agents] for e in range(envs)] for w in range(workers)] for r in range(rounds)]
+
+
 # ---------------------------------------------------------------------------
 # SP3 (T1.2): scripted bots and config entries for fixed players
 # ---------------------------------------------------------------------------

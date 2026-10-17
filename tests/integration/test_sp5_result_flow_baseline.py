@@ -29,10 +29,13 @@ def _finished_episodes(run) -> int:
 
 
 def _journal_rows(path) -> int:
+    """Training matches in the journal (detailed rows + compacted pair counts; other sources are not counted)."""
     conn = sqlite3.connect(path)
     try:
-        detailed = conn.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
-        counted = conn.execute("SELECT COALESCE(SUM(n), 0) FROM counts WHERE kind = 0").fetchone()[0]
+        detailed = conn.execute("SELECT COUNT(*) FROM matches m JOIN entities e ON e.id = m.source "
+                                "WHERE e.kind = 'source' AND e.name = 'train'").fetchone()[0]
+        counted = conn.execute("SELECT COALESCE(SUM(c.n), 0) FROM counts c JOIN entities e ON e.id = c.source "
+                               "WHERE c.kind = 0 AND e.kind = 'source' AND e.name = 'train'").fetchone()[0]
     finally:
         conn.close()
     return detailed + counted                     # tic-tac-toe: one team pair per match

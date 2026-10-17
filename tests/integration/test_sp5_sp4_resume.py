@@ -31,6 +31,7 @@ def test_training_resumes_from_the_sp4_run_dir_as_a_child_run(tmp_path):
     assert "snapshot pool carried over" in log
     copied = manifest["journal"]["by_source"]["pulse"] + manifest["journal"]["by_source"]["tournament"]
     assert f"{copied} tournament / pulse matches copied" in log
+    assert f"{manifest['journal']['by_source']['train']} detailed training matches folded into counts" in log
     assert read_run_id(run.root) != manifest["run_id"]
     with MatchLogReader(run.root / MATCH_LOG_FILE) as reader:
         assert [r.run_id for r in reader.runs()][1:] == [manifest["run_id"]]
