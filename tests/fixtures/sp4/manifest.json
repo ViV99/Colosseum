@@ -1,0 +1,47 @@
+{
+  "agent": "main",
+  "anchor": "random",
+  "layout": "2p",
+  "run_id": "90568ddecc684bc3acff51a0f385b0b4",
+  "versions": [
+    40,
+    80,
+    120,
+    160,
+    180,
+    183
+  ],
+  "final_version": 183,
+  "pinned": [
+    180
+  ],
+  "with_trainer_state": [
+    160,
+    180,
+    183
+  ],
+  "env_steps": 8544,
+  "league_env_steps": 8544,
+  "journal": {
+    "by_source": {
+      "pulse": 12,
+      "tournament": 8,
+      "train": 1114
+    },
+    "schema_version": 1,
+    "counts_rows": 0
+  },
+  "tournament": "t0",
+  "files": [
+    "checkpoints",
+    "config.resolved.yaml",
+    "league_state.json",
+    "matches.db",
+    "metrics.jsonl",
+    "pulse_state.json",
+    "ratings.json",
+    "run.json",
+    "run_state.json",
+    "tournaments"
+  ]
+}

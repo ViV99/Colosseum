@@ -1,0 +1,57 @@
+# SP4-form config of the SP4 run-dir fixture (tests/fixtures/sp4/run), SP5 task T0.1: tic-tac-toe with a tiny MLP, a
+# trainable agent 'main' and a RandomBot anchor 'random'; the journal, live ratings and pulse are on, so the run dir
+# holds matches.db (training, pulse and, after the generator's tournament, tournament matches), league_state.json and
+# pulse_state.json. keep_last 3 + keep_every 2 at interval 20 leave snapshots with and without trainer_state.pt.
+run:
+  name: null
+  dir: "runs"
+env:
+  env_class: "examples.tic_tac_toe.game.TicTacToeGame"
+  kwargs: {}
+networks:
+  encoder_class: "examples.tic_tac_toe.models.TicTacToeEncoder"
+  core: null
+  policy_class: "examples.tic_tac_toe.models.TicTacToePolicy"
+  value_class: "examples.tic_tac_toe.models.TicTacToeValue"
+  kwargs: {hidden: 16, latent: 8}
+algorithm:
+  learning_rate: 1.0e-3
+  lr_schedule: "constant"
+rollout:
+  chunk_length: 16
+  num_workers: 1
+  envs_per_worker: 4
+  weight_sync_interval_sec: 0.5
+  match_refresh_interval_sec: 1.0
+learner:
+  device: "cpu"
+  queue_size: 16
+  batch_chunks: 2
+training:
+  total_timesteps: 6000
+  seed: 0
+matchmaking:
+  opponents: {latest: 0.5, snapshots: 0.3, rivals: 0.0, anchors: 0.2}
+  anchors: [random]
+checkpoint:
+  interval: 20
+  keep_last: 3
+  keep_every: 2
+  save_optimizer: true
+evaluation:
+  enabled: true
+  field: [random]
+  every: 2
+  blocks: 2
+  num_envs: 2
+ratings:
+  refit_interval_sec: 2.0
+metrics:
+  use_wandb: false
+  log_interval: 5
+  console_interval_sec: 1.0
+agents:
+  main: {}
+  random:
+    kind: scripted
+    class: "colosseum.players.RandomBot"

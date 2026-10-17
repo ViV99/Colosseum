@@ -1,0 +1,268 @@
+{
+  "bt": {
+    "2p": {
+      "@anchors": {
+        "player/0": {
+          "anchor": "random",
+          "members": [
+            "random"
+          ],
+          "rule": "random_bot"
+        }
+      },
+      "@bias": {
+        "0": 50.593283624231425,
+        "1": -50.593283624231425
+      },
+      "@fit": {
+        "approximate": false,
+        "converged": true,
+        "iterations": 4
+      },
+      "@transitivity": {
+        "dof": 8,
+        "flag": false,
+        "g2": 5.1338058138146705,
+        "p_value": 0.7431837603149052,
+        "pairs_tested": 15,
+        "worst_pairs": [
+          {
+            "a": "main@v100",
+            "b": "main@v100",
+            "games": 84,
+            "residual": 1.1958686124515754,
+            "team_a": 0,
+            "team_b": 1
+          },
+          {
+            "a": "main@v60",
+            "b": "main@v20",
+            "games": 68,
+            "residual": -0.9474565087075747,
+            "team_a": 0,
+            "team_b": 1
+          },
+          {
+            "a": "main@v0",
+            "b": "random",
+            "games": 113,
+            "residual": -0.7052189247395914,
+            "team_a": 0,
+            "team_b": 1
+          },
+          {
+            "a": "main@v60",
+            "b": "random",
+            "games": 65,
+            "residual": 0.7017295593438584,
+            "team_a": 0,
+            "team_b": 1
+          },
+          {
+            "a": "main@v0",
+            "b": "main@v20",
+            "games": 71,
+            "residual": 0.6910323359778572,
+            "team_a": 0,
+            "team_b": 1
+          }
+        ]
+      },
+      "player": [
+        {
+          "anchor": false,
+          "ci_high": 142.07057000813725,
+          "ci_low": -14.22914488479271,
+          "component": 0,
+          "entity": "main@v40",
+          "games": 150,
+          "lcb": -0.9540354720390833,
+          "lineage": "main",
+          "p_best": 0.283,
+          "p_best_lineage": 0.283,
+          "rating": 63.92071256167227,
+          "se": 39.873108925929806,
+          "version": 40
+        },
+        {
+          "anchor": false,
+          "ci_high": 107.61570827720675,
+          "ci_low": -9.399361972671905,
+          "component": 0,
+          "entity": "main@v100",
+          "games": 247,
+          "lcb": -7.607912648356065,
+          "lineage": "main",
+          "p_best": 0.094,
+          "p_best_lineage": 0.094,
+          "rating": 49.10817315226742,
+          "se": 29.851331752235907,
+          "version": 100
+        },
+        {
+          "anchor": false,
+          "ci_high": 89.6225246693284,
+          "ci_low": -41.71859636806961,
+          "component": 0,
+          "entity": "main@v20",
+          "games": 168,
+          "lcb": -44.8507663813103,
+          "lineage": "main",
+          "p_best": 0.063,
+          "p_best_lineage": 0.063,
+          "rating": 23.95196415062939,
+          "se": 33.50600370042512,
+          "version": 20
+        },
+        {
+          "anchor": false,
+          "ci_high": 226.77684565118983,
+          "ci_low": -181.73891841514256,
+          "component": 0,
+          "entity": "main@v120",
+          "games": 4,
+          "lcb": -114.61275976656731,
+          "lineage": "main",
+          "p_best": 0.256,
+          "p_best_lineage": 0.256,
+          "rating": 22.518963618023623,
+          "se": 104.21512009624989,
+          "version": 120
+        },
+        {
+          "anchor": false,
+          "ci_high": 122.41175207418448,
+          "ci_low": -89.15119629699149,
+          "component": 0,
+          "entity": "main@v160",
+          "games": 58,
+          "lcb": -65.25759882867506,
+          "lineage": "main",
+          "p_best": 0.058,
+          "p_best_lineage": 0.058,
+          "rating": 16.630277888596503,
+          "se": 53.97113162281489,
+          "version": 160
+        },
+        {
+          "anchor": false,
+          "ci_high": 215.48986017550843,
+          "ci_low": -186.29594349608882,
+          "component": 0,
+          "entity": "main@v80",
+          "games": 4,
+          "lcb": -120.62196776249989,
+          "lineage": "main",
+          "p_best": 0.229,
+          "p_best_lineage": 0.229,
+          "rating": 14.596958339709788,
+          "se": 102.49826191726798,
+          "version": 80
+        },
+        {
+          "anchor": false,
+          "ci_high": 56.508432339242574,
+          "ci_low": -31.590794759916335,
+          "component": 0,
+          "entity": "main@v0",
+          "games": 294,
+          "lcb": -48.591336631316075,
+          "lineage": "main",
+          "p_best": 0.015,
+          "p_best_lineage": 0.015,
+          "rating": 12.458818789663118,
+          "se": 22.47470560532601,
+          "version": 0
+        },
+        {
+          "anchor": true,
+          "ci_high": 0.0,
+          "ci_low": 0.0,
+          "component": 0,
+          "entity": "random",
+          "games": 496,
+          "lcb": 0.0,
+          "lineage": "random",
+          "p_best": 0.0,
+          "p_best_lineage": 1.0,
+          "rating": 0.0,
+          "se": 0.0,
+          "version": null
+        },
+        {
+          "anchor": false,
+          "ci_high": 47.07381683450551,
+          "ci_low": -60.2894557178156,
+          "component": 0,
+          "entity": "main@v60",
+          "games": 199,
+          "lcb": -71.3199669524747,
+          "lineage": "main",
+          "p_best": 0.002,
+          "p_best_lineage": 0.002,
+          "rating": -6.607819441655046,
+          "se": 27.389093217831782,
+          "version": 60
+        }
+      ]
+    }
+  },
+  "env_steps": 8544,
+  "layouts": {
+    "2p": {
+      "cross_play": {},
+      "elo": {
+        "main": 1298.0910849600998,
+        "random": 1101.9089150399002
+      },
+      "games": {
+        "main": {
+          "random": 484
+        },
+        "random": {
+          "main": 484
+        }
+      },
+      "outcome_kind": "wdl",
+      "past_games": {
+        "main": 314,
+        "random": 0
+      },
+      "pfsp": {
+        "main": {
+          "main@ckpt_v40": {
+            "games": 146.0,
+            "score": 0.48407589714636
+          },
+          "random@fixed": {
+            "games": 484.0,
+            "score": 0.5619044927526672
+          }
+        }
+      },
+      "role_win_rates": {
+        "player": {
+          "main": {
+            "random": 0.5433884297520661
+          },
+          "random": {
+            "main": 0.45661157024793386
+          }
+        }
+      },
+      "scores": {},
+      "win_rates": {
+        "main": {
+          "random": 0.5433884297520661
+        },
+        "random": {
+          "main": 0.45661157024793386
+        }
+      },
+      "wr_vs_past": {
+        "main": 0.5493630573248408,
+        "random": null
+      }
+    }
+  }
+}

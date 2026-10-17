@@ -1,0 +1,218 @@
+{
+  "format": 1,
+  "kind": "tournament",
+  "name": "t0",
+  "mode": "gauntlet",
+  "seed": 0,
+  "deterministic": false,
+  "ci_level": 0.95,
+  "bootstrap_samples": 2000,
+  "settings": {
+    "blocks": 2,
+    "halving_blocks": 8,
+    "confirm_blocks": 100,
+    "finalists": 3
+  },
+  "candidates": [
+    {
+      "name": "main@v180",
+      "display": "main@v180",
+      "kind": "snapshot",
+      "lineage": "main",
+      "roles": [
+        "player"
+      ],
+      "source": "/tmp/tmp6e_mt79m/sp4_run/tournaments/t0/snapshots/0-sp4_run/main/ckpt_v180"
+    },
+    {
+      "name": "main@v183",
+      "display": "main@v183",
+      "kind": "snapshot",
+      "lineage": "main",
+      "roles": [
+        "player"
+      ],
+      "source": "/tmp/tmp6e_mt79m/sp4_run/tournaments/t0/snapshots/0-sp4_run/main/ckpt_v183"
+    }
+  ],
+  "field": [
+    {
+      "name": "random",
+      "display": "random",
+      "kind": "scripted",
+      "lineage": "random",
+      "roles": [
+        "player"
+      ],
+      "source": "agents.random"
+    }
+  ],
+  "layouts": [
+    {
+      "layout": "2p",
+      "outcome_kind": "wdl",
+      "metric": "pairwise",
+      "weight": 1.0,
+      "dropped": []
+    }
+  ],
+  "tables": [
+    {
+      "stage": "A",
+      "layout": "2p",
+      "group": "player",
+      "metric": "pairwise",
+      "columns": [
+        "random"
+      ],
+      "column_weights": [
+        1.0
+      ],
+      "candidate_weights": {},
+      "rows": [
+        {
+          "name": "main@v180",
+          "score": 0.75,
+          "ci95": [
+            0.5,
+            1.0
+          ],
+          "worst": {
+            "opponent": "random",
+            "score": 0.75
+          },
+          "games": 4,
+          "blocks": 2,
+          "repeated": [],
+          "bt": {
+            "rating": 154.34341350283415,
+            "ci95": [
+              154.34341350283415,
+              537.5343730609221
+            ],
+            "p_best": 0.775
+          }
+        },
+        {
+          "name": "main@v183",
+          "score": 0.625,
+          "ci95": [
+            0.5,
+            0.75
+          ],
+          "worst": {
+            "opponent": "random",
+            "score": 0.625
+          },
+          "games": 4,
+          "blocks": 2,
+          "repeated": [],
+          "bt": {
+            "rating": 123.97567563627743,
+            "ci95": [
+              123.97567563627742,
+              411.80114120269707
+            ],
+            "p_best": 0.225
+          }
+        }
+      ],
+      "matrix": {
+        "main@v180": {
+          "random": {
+            "score": 0.75,
+            "ci95": [
+              0.5,
+              1.0
+            ],
+            "games": 4,
+            "blocks": 2,
+            "repeated": false
+          }
+        },
+        "main@v183": {
+          "random": {
+            "score": 0.625,
+            "ci95": [
+              0.5,
+              0.75
+            ],
+            "games": 4,
+            "blocks": 2,
+            "repeated": false
+          }
+        }
+      }
+    }
+  ],
+  "rounds": [],
+  "selection": null,
+  "bt": {
+    "2p": {
+      "anchor": [
+        {
+          "group": "player",
+          "component": 0,
+          "anchor": "random"
+        }
+      ],
+      "entities": [
+        {
+          "name": "main@v180",
+          "rating": 154.34341350283415,
+          "ci95": [
+            154.34341350283415,
+            537.5343730609221
+          ],
+          "p_best": 0.775,
+          "games": 4
+        },
+        {
+          "name": "main@v183",
+          "rating": 123.97567563627743,
+          "ci95": [
+            123.97567563627742,
+            411.80114120269707
+          ],
+          "p_best": 0.225,
+          "games": 4
+        },
+        {
+          "name": "random",
+          "rating": 0.0,
+          "ci95": [
+            0.0,
+            0.0
+          ],
+          "p_best": 0.0,
+          "games": 8
+        }
+      ],
+      "transitivity": {
+        "flag": false,
+        "g2": 0.0,
+        "dof": 0,
+        "p_value": null,
+        "pairs_tested": 0,
+        "worst_pairs": []
+      },
+      "converged": true
+    }
+  },
+  "games": {
+    "matches": 8,
+    "blocks": 4,
+    "by_stage": {
+      "A": {
+        "blocks": 4,
+        "matches": 8
+      }
+    }
+  },
+  "flags": {
+    "repeated_pairs": [],
+    "non_transitive": [],
+    "self_excluded": []
+  },
+  "elapsed_sec": 1.1808337999973446
+}

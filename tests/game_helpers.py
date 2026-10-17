@@ -1221,6 +1221,29 @@ def tree_digest(root) -> dict[str, str]:
 
 
 # ---------------------------------------------------------------------------
+# SP5 (T0.1): SP4 compatibility fixture (read-only input; copy before writing — and before opening its journal)
+# ---------------------------------------------------------------------------
+
+
+SP4_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "sp4"
+SP4_TTT_TINY = SP4_FIXTURES / "sp4_ttt_tiny.yaml"
+SP4_RUN = SP4_FIXTURES / "run"
+
+
+def sp4_manifest() -> dict:
+    """What the SP4 run fixture holds (``tests/fixtures/sp4/manifest.json``, written by its generator)."""
+    return json.loads((SP4_FIXTURES / "manifest.json").read_text())
+
+
+def copy_sp4_run(tmp_path) -> Path:
+    """A writable copy of the SP4 run fixture under ``tmp_path``. SQLite creates ``-wal`` / ``-shm`` files next to a
+    journal it opens, so a test opens ``matches.db`` only in such a copy."""
+    dst = Path(tmp_path) / "sp4_run"
+    shutil.copytree(SP4_RUN, dst)
+    return dst
+
+
+# ---------------------------------------------------------------------------
 # SP3 (T1.2): scripted bots and config entries for fixed players
 # ---------------------------------------------------------------------------
 

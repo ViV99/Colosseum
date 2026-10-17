@@ -1,0 +1,121 @@
+format: 1
+name: t0
+id: 48c32093070449679298e9e40a4756ed
+created: '2026-10-18T03:20:07'
+request:
+  mode: gauntlet
+  candidates: []
+  runs:
+  - path: /tmp/tmp6e_mt79m/sp4_run
+    alias: null
+    agent: null
+    snapshots: last:2
+  field: null
+  layouts: []
+  blocks: 2
+  halving_blocks: 8
+  confirm_blocks: 100
+  finalists: 3
+  seed: 0
+  deterministic: false
+  overrides: {}
+  env:
+    env_class: examples.tic_tac_toe.game.TicTacToeGame
+    kwargs: {}
+    max_idle_steps: 1000
+players:
+- name: main@v180
+  display: main@v180
+  kind: snapshot
+  agent_id: main
+  network_id: ckpt_v180
+  roles:
+  - player
+  lineage: main
+  source:
+    kind: model
+    origin: /tmp/tmp6e_mt79m/sp4_run/tournaments/t0/snapshots/0-sp4_run/main/ckpt_v180
+    weights: /tmp/tmp6e_mt79m/sp4_run/tournaments/t0/snapshots/0-sp4_run/main/ckpt_v180/model.pt
+    networks:
+      model_class: null
+      encoder_class: examples.tic_tac_toe.models.TicTacToeEncoder
+      core: null
+      policy_class: examples.tic_tac_toe.models.TicTacToePolicy
+      value_class: examples.tic_tac_toe.models.TicTacToeValue
+      critic_encoder_class: null
+      kwargs:
+        hidden: 16
+        latent: 8
+    bot: null
+  version: 180
+  run: /tmp/tmp6e_mt79m/sp4_run
+  run_agent: main
+- name: main@v183
+  display: main@v183
+  kind: snapshot
+  agent_id: main
+  network_id: ckpt_v183
+  roles:
+  - player
+  lineage: main
+  source:
+    kind: model
+    origin: /tmp/tmp6e_mt79m/sp4_run/tournaments/t0/snapshots/0-sp4_run/main/ckpt_v183
+    weights: /tmp/tmp6e_mt79m/sp4_run/tournaments/t0/snapshots/0-sp4_run/main/ckpt_v183/model.pt
+    networks:
+      model_class: null
+      encoder_class: examples.tic_tac_toe.models.TicTacToeEncoder
+      core: null
+      policy_class: examples.tic_tac_toe.models.TicTacToePolicy
+      value_class: examples.tic_tac_toe.models.TicTacToeValue
+      critic_encoder_class: null
+      kwargs:
+        hidden: 16
+        latent: 8
+    bot: null
+  version: 183
+  run: /tmp/tmp6e_mt79m/sp4_run
+  run_agent: main
+- name: random
+  display: random
+  kind: scripted
+  agent_id: random
+  network_id: fixed
+  roles:
+  - player
+  lineage: random
+  source:
+    kind: bot
+    origin: agents.random
+    weights: null
+    networks: null
+    bot:
+      class_path: colosseum.players.RandomBot
+      kwargs: {}
+  version: null
+  run: null
+  run_agent: null
+candidates:
+- main@v180
+- main@v183
+field:
+- random
+layouts:
+- 2p
+layout_weights:
+  2p: 1.0
+seeds:
+  seed: 0
+  domains:
+    A:
+    - 1430768866
+    - 1085326435
+    - 1959893673
+    B:
+    - 3092287395
+    - 2657443126
+    - 2589688731
+    P:
+    - 3864061562
+    - 3693125538
+    - 3582481936

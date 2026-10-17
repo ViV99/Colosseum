@@ -37,5 +37,11 @@ wandb/
 !/tests/fixtures/sp3/run/checkpoints/
 !/tests/fixtures/sp3/run/checkpoints/**
 
+# SP4 run-dir fixture (SP5 T0.1): committed SP4 snapshots and tournament snapshot links inside an SP4-shaped run dir
+!/tests/fixtures/sp4/run/checkpoints/
+!/tests/fixtures/sp4/run/checkpoints/**
+!/tests/fixtures/sp4/run/tournaments/
+!/tests/fixtures/sp4/run/tournaments/**
+
 # SDD workspace (scratch, deleted after each merge)
 .superpowers/

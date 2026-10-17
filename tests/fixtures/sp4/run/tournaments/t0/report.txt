@@ -1,0 +1,8 @@
+Tournament t0 (gauntlet, seed 0): 8 matches in 4 blocks
+== stage A, layout 2p, group player
+  main@v180                    0.750 [0.500, 1.000]  worst random 0.750  games 4
+  main@v183                    0.625 [0.500, 0.750]  worst random 0.625  games 4
+== BT ratings, layout 2p (anchor player: random)
+  main@v180                      +154.3 [+154.3, +537.5]  P(best) 0.78  games 4
+  main@v183                      +124.0 [+124.0, +411.8]  P(best) 0.23  games 4
+  random                           +0.0 [+0.0, +0.0]  P(best) 0.00  games 8

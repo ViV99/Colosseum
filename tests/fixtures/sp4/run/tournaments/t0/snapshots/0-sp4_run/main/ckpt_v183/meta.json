@@ -1,0 +1,27 @@
+{
+  "agent_id": "main",
+  "checkpoint_id": "ckpt_v183",
+  "config_hash": "6788fa8ee9462d6e",
+  "env_steps": 8544,
+  "final": true,
+  "networks": {
+    "core": null,
+    "critic_encoder_class": null,
+    "encoder_class": "examples.tic_tac_toe.models.TicTacToeEncoder",
+    "kwargs": {
+      "hidden": 16,
+      "latent": 8
+    },
+    "model_class": null,
+    "policy_class": "examples.tic_tac_toe.models.TicTacToePolicy",
+    "value_class": "examples.tic_tac_toe.models.TicTacToeValue"
+  },
+  "pinned": false,
+  "policy_version": 183,
+  "role_signature": "obs=<root>:float32[3,3,3]|act=<root>:discrete(9)|gs=none",
+  "roles": [
+    "player"
+  ],
+  "run_id": "90568ddecc684bc3acff51a0f385b0b4",
+  "timestamp": 1792275603.9844725
+}
