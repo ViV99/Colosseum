@@ -26,7 +26,7 @@ from colosseum.arena.bt import (
     score_summary,
     transitivity_test,
 )
-from colosseum.arena.comparisons import ComparisonTable, PairStat, match_pairs
+from colosseum.arena.comparisons import ComparisonTable, match_pairs
 from colosseum.arena.matchlog import MatchLog, RunInfo
 from game_helpers import bt_table, make_match_result, synthetic_bt_matches, synthetic_journal_results
 
@@ -452,7 +452,6 @@ def test_fits_from_the_journal_match_the_in_memory_table_before_and_after_compac
         assert max(abs(other.rating[e] - reference.rating[e]) for e in reference.rating) < 1e-6
         assert max(abs(other.se[e] - reference.se[e]) for e in reference.se) < 1e-6
         assert other.bias[0] == pytest.approx(reference.bias[0], abs=1e-6)
-    assert PairStat(1, 1.0, 1.0).n == 1
 
 
 # ---------------------------------------------------------------------------
