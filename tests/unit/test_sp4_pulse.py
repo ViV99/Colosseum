@@ -364,3 +364,19 @@ def test_a_stop_during_play_ends_the_pulse_without_sending_the_snapshot(monkeypa
     got = _run_pulse_in_process(cfg, [PulseRequest("main", "ckpt_v1", 1, 10, _numpy_state(cfg, "main"))],
                                 monkeypatch, stop=stop)
     assert got == [] and 20 <= stop.calls < 200
+
+
+def test_one_team_games_need_no_pulse_field_and_two_team_games_still_do(monkeypatch):
+    """B-I1 (spec block 6: a score layout's pulse games are the homogeneous team, the field adds cross-play): a
+    solo game without scripted / frozen agents plans, prints and plays its pulse with an empty field; a two-team
+    game's empty field stays the same ConfigError."""
+    cfg = make_test_config("solo", agents={"main": {}}, evaluation={"enabled": True, "blocks": 2, "num_envs": 2})
+    (line,) = [x for x in validate_config(cfg).lines if x.startswith("pulse:")]
+    assert "field []" in line and "2 matches per snapshot of 'main'" in line
+    (message,) = _run_pulse_in_process(cfg, [PulseRequest("main", "ckpt_v3", 3, 30, _numpy_state(cfg, "main"))],
+                                       monkeypatch)
+    assert {r.uid for r in message.results} == {f"pulse-0123456789ab/P/solo/main@v3/-/{k}/r0" for k in (0, 1)}
+    assert message.complete and {s.agent_id for r in message.results for s in r.seats} == {"main"}
+    two = make_test_config("turns", agents={"main": {}}, evaluation={"enabled": True})
+    with pytest.raises(ConfigError, match="evaluation.field is empty: the config has no scripted / frozen agents"):
+        pulse_plan(two, env_spec(two), resolve_player_roles(two, env_spec(two)))

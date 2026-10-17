@@ -385,12 +385,14 @@ def _new_tournament(options: TournamentOptions, config: ColosseumConfig, spec, t
     fixed_names = [n for n in config.fixed_agent_ids()
                    if options.field is None or n in options.field or n in bare]
     report_v = validate_config(config, scope="play", players=fixed_names)
+    layouts, weights = _layouts(options, config, spec, first_config)
     request_players = PlayerRequest(user=tuple(options.candidates), runs=tuple(options.runs), field=options.field)
+    # an empty field: round-robin plays the pairs; one-team layouts play the homogeneous team (B-I1)
     cand, fld = resolve_players(config, spec, request_players, fixed=report_v.fixed, link=tdir.link,
                                 rng=np.random.default_rng(options.seed),
-                                allow_empty_field=options.mode == "round-robin")
+                                allow_empty_field=options.mode == "round-robin"
+                                or all(spec.num_teams(L) == 1 for L in layouts))
     players = {p.name: _absolute_player(p) for p in [*cand, *fld]}
-    layouts, weights = _layouts(options, config, spec, first_config)
     tdir.write({
         "format": TOURNAMENT_FORMAT, "name": options.name, "id": uuid.uuid4().hex,
         "created": datetime.now().isoformat(timespec="seconds"),   # informational

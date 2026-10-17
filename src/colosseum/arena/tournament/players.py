@@ -18,8 +18,9 @@ Candidates and field (``resolve_players``; Part 2 rulings D14, D15, D20):
   of the config, or a snapshot reference ``[alias/]agent@v<N>`` of a ``--run`` (any stored snapshot, not only
   the selected ones);
 - candidates are every ``-a`` player and every selected run snapshot that is not in the field;
-- an empty candidate list, an empty field (except round-robin), a duplicate name, an unknown ``--field`` name,
-  two runs with one alias, an alias that is not a path component: ConfigError.
+- an empty candidate list, an empty field (unless ``allow_empty_field``: round-robin, or only one-team layouts),
+  a duplicate name, an unknown ``--field`` name, two runs with one alias, an alias that is not a path
+  component: ConfigError.
 
 Snapshot selection (``--snapshots``): ``all``; ``last:N`` (newest N); ``every:K`` (every K-th stored snapshot,
 counting from the newest, which is always in); ``top:N`` (the N best by the lower bound of the BT rating from

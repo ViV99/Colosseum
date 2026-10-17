@@ -130,8 +130,9 @@ def pulse_blocks(spec: GameSpec, layouts: Sequence[str], candidate: str, field: 
 
 def pulse_plan(config: ColosseumConfig, spec: GameSpec, player_roles: Mapping[str, Sequence[str]]) -> PulsePlan:
     """The evaluated agents (roles, networks, layouts) and the field, checked (spec block 6: the field names exist
-    and are scripted / frozen agents of the config, the agents are trainable, the roles cover the layouts).
-    ConfigError otherwise."""
+    and are scripted / frozen agents of the config, the agents are trainable, the roles cover the layouts, the
+    field is not empty unless every planned layout has one team: those play the homogeneous team). ConfigError
+    otherwise."""
     from colosseum.league.lineups import playable_layouts
 
     ev = config.evaluation
@@ -146,9 +147,6 @@ def pulse_plan(config: ColosseumConfig, spec: GameSpec, player_roles: Mapping[st
         if name not in fixed:
             raise ConfigError(f"evaluation.field: {name!r} is not a scripted or frozen agent of the config ({fixed}); "
                               f"the config names agents only (snapshots are named on the command line: SP3 ruling 9)")
-    if not field:
-        raise ConfigError("evaluation.field is empty: the config has no scripted / frozen agents; add one "
-                          "(e.g. kind: scripted, class: colosseum.players.RandomBot) or disable evaluation")
     if ev.layouts is not None:
         unknown = sorted(set(ev.layouts) - set(spec.layouts))
         if unknown:
@@ -164,6 +162,9 @@ def pulse_plan(config: ColosseumConfig, spec: GameSpec, player_roles: Mapping[st
         if not layouts:
             raise ConfigError(f"evaluation: agent {name!r} (roles {list(roles)}) has a seat in none of the layouts "
                               f"{ev.layouts or sorted(spec.layouts)}")
+        if not field and any(spec.num_teams(L) >= 2 for L in layouts):   # one-team layouts need no field (B-I1)
+            raise ConfigError("evaluation.field is empty: the config has no scripted / frozen agents; add one "
+                              "(e.g. kind: scripted, class: colosseum.players.RandomBot) or disable evaluation")
         try:
             pulse_blocks(spec, layouts, f"{name}@v0", field, _plan_seats(name, roles, field, player_roles), blocks=1,
                          seed=0, prefix="pulse")

@@ -279,3 +279,22 @@ def test_usage_errors_exit_with_2(tmp_path, args, message):
     args = [subst.get(a, a) for a in args]
     result = invoke(*args)
     assert result.exit_code == 2 and message in result.output
+
+
+def test_one_team_games_need_no_field_and_two_team_games_still_do(tmp_path):
+    """B-I1 (spec block 3: a score block is the candidate's homogeneous team; the field only adds cross-play): a
+    solo game whose config has no scripted / frozen agent selects among its snapshots with an empty field; a
+    two-team game's empty field stays the same ConfigError."""
+    root, _cfg = write_fake_run(tmp_path / "solo", "solo", versions=(10, 20, 30))
+    result = invoke("--run", root, "--mode", "select", "--halving-blocks", 1, "--confirm-blocks", 2, "--finalists",
+                    2, "--num-envs", 2, "--name", "solo")
+    assert result.exit_code == 0, result.output
+    data = report(root, "solo")
+    assert data["field"] == [] and data["selection"]["player"]["winner"].startswith("main@v")
+    assert {t["metric"] for t in data["tables"]} == {"score"} and all(t["columns"] == ["(self)"]
+                                                                     for t in data["tables"])
+    two, _cfg = write_fake_run(tmp_path / "turns", "turns", versions=(10,))
+    refused = invoke("--run", two, "--blocks", 1, "--num-envs", 2, "--name", "empty")
+    assert refused.exit_code == 1
+    assert "the field is empty: name opponents with --field (agents of the config, -a players or snapshots)" \
+        in refused.output
