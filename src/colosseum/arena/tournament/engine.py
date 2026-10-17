@@ -11,8 +11,11 @@ back (tasks in the order they finish, blocks of a task in schedule order, result
 reported in part. A worker's ConfigError, EnvContractError or PlayerError (or a subclass: the nearest of the
 three) is re-raised in the main process with its message (context ``tournament, worker W, env E, ...``) plus the
 worker, the match uid and block and the worker's log; a worker that dies otherwise raises ``TournamentError``
-naming its log. On every exit (also a KeyboardInterrupt in the main process) the workers are stopped:
-``stop_event``, ``STOP_GRACE_SEC``, then terminate / kill.
+naming its log. A dead worker is noticed before the next message (also while the others keep the queue full):
+the others are stopped at once, and the blocks they finish while the main process looks for the dead worker's
+error (at most ``STOP_GRACE_SEC``) are still reported, so a resume does not replay them. On every exit (also a
+KeyboardInterrupt in the main process) the workers are stopped: ``stop_event``, ``STOP_GRACE_SEC``, then
+terminate / kill.
 
 Results carry ``source``, the lineup's ``seed``, ``block`` and ``uid`` (T1.1); a seat's ``version_start`` /
 ``version_end`` is ``N`` for ``ckpt_v<N>`` and None for fixed players; ``env_steps`` is None.
@@ -30,6 +33,7 @@ import logging
 import multiprocessing as mp
 import queue
 import re
+import time
 from collections import OrderedDict
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
@@ -274,15 +278,23 @@ def _typed_error(msg: tuple, supervisor: ProcessSupervisor) -> Exception:
                          f"{'' if log is None else f'; log {log}'})")
 
 
-def _error_after_failure(results: Any, failure: Any, supervisor: ProcessSupervisor) -> Exception:
-    """The error a dead worker sent before dying (a typed one), else a TournamentError naming its log."""
-    try:
-        while True:
-            msg = results.get(timeout=1.0)
-            if msg[0] == "error":
-                return _typed_error(msg, supervisor)
-    except queue.Empty:
-        return TournamentError(f"tournament {failure.message()}")
+def _error_after_failure(results: Any, failure: Any, supervisor: ProcessSupervisor,
+                         handle: Callable[[tuple], None]) -> Exception:
+    """The error a dead worker sent before dying (a typed one), else a TournamentError naming its log. The blocks
+    other workers finish meanwhile still go to ``handle`` (the journal); the search ends after ``STOP_GRACE_SEC``,
+    or earlier once no worker is alive and the queue is empty."""
+    deadline = time.monotonic() + STOP_GRACE_SEC
+    while (left := deadline - time.monotonic()) > 0:
+        try:
+            msg = results.get(timeout=min(0.2, left))
+        except queue.Empty:
+            if not supervisor.alive():
+                break
+            continue
+        if msg[0] == "error":
+            return _typed_error(msg, supervisor)
+        handle(msg)
+    return TournamentError(f"tournament {failure.message()}")
 
 
 def _drain(results: Any) -> list[tuple]:
@@ -293,6 +305,31 @@ def _drain(results: Any) -> list[tuple]:
             out.append(results.get(timeout=0.2))
     except queue.Empty:
         return out
+
+
+def _collect(results: Any, supervisor: ProcessSupervisor, stop: Any, pending: set[int],
+             handle: Callable[[tuple], None], log_dir: str | Path | None) -> None:
+    """Handle the workers' messages until no task is ``pending``. A dead worker is looked for before every
+    message, not only when the queue is empty (the others may keep it full): then ``stop`` is set first, so the
+    other workers end after their current task, and the error is raised (``_error_after_failure``)."""
+    while pending:
+        failure = supervisor.first_failure(nonzero_only=True)
+        if failure is not None:
+            stop.set()
+            raise _error_after_failure(results, failure, supervisor, handle) from None
+        try:
+            msg = results.get(timeout=0.2)
+        except queue.Empty:
+            # all exited: unplayed tasks are an error, unless one died (the next iteration names it)
+            if not supervisor.alive() and supervisor.first_failure(nonzero_only=True) is None:
+                for late in _drain(results):      # results sent just before the workers exited
+                    handle(late)
+                if pending:
+                    where = "" if log_dir is None else f"; see the tournament-worker-*.log files in {log_dir}"
+                    raise TournamentError(f"tournament workers exited with {len(pending)} tasks unplayed"
+                                          f"{where}") from None
+            continue
+        handle(msg)
 
 
 def play_blocks(config: ColosseumConfig, spec: GameSpec, players: Mapping[str, TournamentPlayer] | Sequence,
@@ -337,22 +374,7 @@ def play_blocks(config: ColosseumConfig, spec: GameSpec, players: Mapping[str, T
                 source=source))
             start_process(proc)
             supervisor.add(f"tournament-worker-{w}", proc)
-        while pending:
-            try:
-                msg = result_q.get(timeout=0.2)
-            except queue.Empty:
-                failure = supervisor.first_failure(nonzero_only=True)
-                if failure is not None:
-                    raise _error_after_failure(result_q, failure, supervisor) from None
-                if not supervisor.alive():
-                    for late in _drain(result_q):      # results sent just before the workers exited
-                        handle(late)
-                    if pending:
-                        where = "" if log_dir is None else f"; see the tournament-worker-*.log files in {log_dir}"
-                        raise TournamentError(f"tournament workers exited with {len(pending)} tasks unplayed"
-                                              f"{where}") from None
-                continue
-            handle(msg)
+        _collect(result_q, supervisor, stop, pending, handle, log_dir)
     finally:
         stop.set()
         supervisor.wait_all(STOP_GRACE_SEC)
