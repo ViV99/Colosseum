@@ -279,6 +279,9 @@ class Lineup:
     Optional (SP4): ``seed`` is the explicit episode seed (tournament, pulse; None = ``MatchRunner``'s derived
     seed), ``block`` the design block copied into ``MatchResult.block``, ``uid`` a deterministic match uid
     (None = the runner makes one). A lineup with a ``uid`` is meant to be played once.
+
+    ``epoch`` (SP5): the cell epoch of a hub-granted training lineup; with an epoch the runner's match id is
+    ``w<W>_e<E>_g<epoch>_ep<K>`` and the episode seed comes from the cell seed (T2.2).
     """
 
     layout: str
@@ -286,6 +289,7 @@ class Lineup:
     seed: int | None = None
     block: str | None = None
     uid: str | None = None
+    epoch: int | None = None  # SP5: the cell's epoch (hub training lineups, spec 4.2); None elsewhere
 
 
 @dataclass
@@ -296,7 +300,8 @@ class SeatResult:
     ``ckpt_v<N>``: N; ``fixed``: None; None also when the runner has no version source). ``version_start`` is the
     version at the env's reset (read right after it); the worker may sync weights between the reset and the
     episode's first decision, so that decision can already use weights one sync newer. ``version_end`` is read when
-    the result is made."""
+    the result is made. ``generation`` (SP5): the learner generation of the seat's weights at the episode end
+    (``latest`` seats; the hub fences stale generations, spec 7.2)."""
 
     seat: int
     role: str
@@ -308,6 +313,7 @@ class SeatResult:
     source: str = ""
     version_start: int | None = None
     version_end: int | None = None
+    generation: int | None = None  # SP5: learner generation of the seat's weights at the episode end (latest seats)
 
 
 @dataclass
@@ -327,7 +333,7 @@ class MatchResult:
     uid in a tournament; ``match_id`` is unique only within one runner); ``source`` is one of ``MATCH_SOURCES``;
     ``seed`` the episode seed when known; ``env_steps`` the global env-step counter when the result was received
     (stamped by the training main process; a pulse match carries its snapshot's); ``block`` the tournament / pulse
-    design block (None in training).
+    design block (None in training). ``node`` (SP5): the node number of the worker that played it.
     """
 
     match_id: str
@@ -341,6 +347,7 @@ class MatchResult:
     seed: int | None = None
     env_steps: int | None = None
     block: str | None = None
+    node: int | None = None  # SP5: node number of the worker that played it (None: SP4 rows, local runs)
 
 
 @dataclass

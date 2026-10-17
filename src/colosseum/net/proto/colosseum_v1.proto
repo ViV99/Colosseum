@@ -1,0 +1,533 @@
+// Colosseum wire protocol v1 (SP5 spec block 4.1, 4.9; plan 00-overview "colosseum.net.proto", amendment A1).
+//
+// Generated code is committed: scripts/gen_proto.sh (grpcio-tools, -I src) writes colosseum_v1_pb2.py and
+// colosseum_v1_pb2_grpc.py next to this file. Versions, counters and sizes are int64; field numbers are never reused
+// (a removed field is `reserved`); a change that old peers cannot read raises PROTOCOL_VERSION's major
+// (colosseum.net.messages), which Bootstrap/Info and Hello compare. New fields take the next free number.
+//
+// Large data (weights, snapshots, bundles, checkpoints) never travels on the Session stream: Upload / Download /
+// GetLatest move it in BlobPart / UploadPart pieces of colosseum.net.grpc_util.PART_BYTES. Array payloads inside
+// `bytes` fields are colosseum.net.frame frames, never pickle.
+//
+// /colosseum.v1.Bootstrap/Script is not declared here: it is a generic handler with identity serializers that returns
+// the installer script's raw bytes (ruling R2), so `curl ... | tail -c +6` strips exactly the 5-byte gRPC prefix.
+// The Bootstrap messages (BootstrapInfo, BundleRequest, BlobPart) are numbered in declaration order and are only ever
+// extended: the self-contained loader (colosseum.bootstrap.loader) has its own codec for them.
+
+syntax = "proto3";
+
+package colosseum.v1;
+
+message Empty {}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Bootstrap (no auth: Info; token secret: Bundle)
+// ---------------------------------------------------------------------------------------------------------------
+
+service Bootstrap {
+  rpc Info(Empty) returns (BootstrapInfo);
+  rpc Bundle(BundleRequest) returns (stream BlobPart);
+}
+
+message BootstrapInfo {
+  uint32 protocol_major = 1;
+  uint32 protocol_minor = 2;
+  string code_hash = 3;
+  string requirements_hash = 4;
+  repeated string requirements = 5;
+  string python = 6;              // "3.12"
+  string torch_version = 7;       // "2.14.1"
+  string torch_build = 8;         // "cu130" | "cpu" | ""
+  int64 bundle_size = 9;
+}
+
+message BundleRequest { string code_hash = 1; }
+
+// One piece of a blob. The first part carries total_size and meta_json (and not_modified for GetLatest); the last
+// part carries the digest (blake2b-128 hex of the whole blob).
+message BlobPart {
+  bytes data = 1;
+  int64 offset = 2;
+  int64 total_size = 3;
+  bool last = 4;
+  string digest = 5;
+  bool not_modified = 6;
+  string meta_json = 7;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// Hub (token secret: Register, Admin*; node id + node secret: everything else)
+// ---------------------------------------------------------------------------------------------------------------
+
+service Hub {
+  rpc Register(RegisterRequest) returns (RegisterReply);
+  rpc Session(stream NodeMessage) returns (stream HubMessage);
+  rpc Upload(stream UploadPart) returns (UploadReply);
+  rpc Download(BlobRequest) returns (stream BlobPart);
+  rpc RelaySend(stream ChunkFrame) returns (ChunkSummary);
+  rpc RelayInbox(stream RelayCredit) returns (stream RelayItem);
+  rpc Admin(AdminRequest) returns (AdminReply);
+  rpc AdminStream(AdminRequest) returns (stream AdminReply);
+}
+
+// Refusals at registration are gRPC status codes (FAILED_PRECONDITION with JSON details), not messages.
+message RegisterRequest {
+  string public_key_pem = 1;
+  string machine_id = 2;
+  string name = 3;
+  repeated string tags = 4;
+  string node_id = 5;             // "" = a new node
+}
+
+message RegisterReply {
+  string node_id = 1;
+  int32 number = 2;
+  string name = 3;
+  string certificate_pem = 4;
+  string node_secret = 5;
+  string ca_pem = 6;
+}
+
+message NodeMessage {
+  oneof m {
+    Hello hello = 1;
+    Heartbeat heartbeat = 2;
+    LineupRequest lineup_request = 3;
+    ResultBatch results = 4;
+    MetricsBatch metrics = 5;
+    VersionAnnounce version = 6;
+    Event event = 7;
+    BlockLeaseRequest lease_request = 8;
+    BlockResult block_result = 9;
+    DataAddresses addresses = 10;
+  }
+}
+
+message HubMessage {
+  oneof m {
+    Welcome welcome = 1;
+    LineupGrants grants = 2;
+    Ack ack = 3;
+    Command command = 4;
+    Announce announce = 5;
+    BlockLease lease = 6;
+    BlockAck block_ack = 7;
+  }
+}
+
+message Hello {
+  string node_id = 1;
+  string session_id = 2;          // new on every start of the node process
+  uint32 protocol_major = 3;
+  uint32 protocol_minor = 4;
+  string code_hash = 5;
+  Hardware hardware = 6;
+  Slots slots = 7;
+  repeated string data_addresses = 8;
+  string run_id = 9;              // "" = no run yet
+  repeated LiveCell live_cells = 10;
+  int64 env_steps = 11;           // cumulative for this session
+  int64 last_acked_seq = 12;
+  repeated RunningLearner learners = 13;
+  string name = 14;
+  repeated string tags = 15;
+  repeated string leases = 16;    // evaluation leases the node holds
+  string ssh_id = 17;             // "" = not started over SSH
+}
+
+message Hardware {
+  int32 logical_cores = 1;
+  int32 physical_cores = 2;
+  int64 memory_bytes = 3;
+  repeated Gpu gpus = 4;
+  string os = 5;
+  string platform = 6;
+  string python = 7;
+  string torch_version = 8;
+  string torch_build = 9;
+  int64 shm_free_bytes = 10;
+  int64 cache_free_bytes = 11;
+}
+
+message Gpu {
+  int32 index = 1;
+  string name = 2;
+  int64 memory_bytes = 3;
+  string kind = 4;                // cuda | mps
+}
+
+message Slots {
+  int32 workers = 1;
+  int32 evaluators = 2;
+  int32 cpu_learners = 3;
+  repeated int32 gpus = 4;
+  bool no_learners = 5;
+  int32 envs_per_worker = 6;
+}
+
+message LiveCell {
+  int32 worker = 1;
+  int32 env = 2;
+  int64 epoch = 3;
+  int32 incarnation = 4;
+}
+
+message RunningLearner {
+  string agent_id = 1;
+  int64 generation = 2;
+  int64 version = 3;
+}
+
+message Welcome {
+  int32 node_number = 1;
+  string run_id = 2;
+  string config_json = 3;
+  repeated AgentState agents = 4;
+  repeated VersionInfo versions = 5;
+  repeated Eviction evictions = 6;
+  repeated LearnerAssignment learners = 7;
+  int32 evaluators = 8;
+  int64 env_steps = 9;
+  repeated FixedBlob fixed = 10;
+  bool collect_allowed = 11;
+  repeated string banned_node_ids = 12;
+  bool no_workers = 13;
+  int64 agents_version = 14;
+}
+
+message AgentState {
+  string agent_id = 1;
+  string kind = 2;                // trainable | scripted | frozen
+  string status = 3;              // active | pending | failed | frozen | removed
+  int64 start_env_steps = 4;
+}
+
+message FixedBlob {
+  string agent_id = 1;
+  string blob_id = 2;
+  string kind = 3;                // fixed | teacher | init
+}
+
+message Heartbeat {
+  int64 env_steps = 1;            // cumulative for this session
+  int64 dropped_results = 2;      // cumulative: node result buffer overflow
+  repeated ProcState procs = 3;
+  double load = 4;
+  repeated string cached_keys = 5;
+  map<string, int64> counters = 6;   // node-cumulative per session (colosseum.metrics.counters names)
+  repeated PathState paths = 7;
+}
+
+message ProcState {
+  string name = 1;
+  string state = 2;
+  int32 restarts = 3;
+}
+
+// How this node currently reaches another node's data port.
+message PathState {
+  int32 node = 1;
+  string path = 2;                // direct | relay
+}
+
+// The node's data-port addresses, sent when they change after Hello.
+message DataAddresses { repeated string data_addresses = 1; }
+
+message LineupRequest { repeated CellRequest cells = 1; }
+
+message CellRequest {
+  int32 worker = 1;
+  int32 env = 2;
+  int64 epoch = 3;                // 0 = none yet
+  int32 incarnation = 4;
+}
+
+message LineupGrants { repeated Grant grants = 1; }
+
+message Grant {
+  int32 worker = 1;
+  int32 env = 2;
+  int64 epoch = 3;
+  double ttl_sec = 4;             // 0 = the whole run
+  LineupProto lineup = 5;
+}
+
+message LineupProto {
+  string layout = 1;
+  repeated SeatProto seats = 2;
+  optional int64 seed = 3;
+  optional string block = 4;
+  optional string uid = 5;
+  optional int64 epoch = 6;
+}
+
+message SeatProto {
+  string agent_id = 1;
+  string network_id = 2;
+  bool collect = 3;
+  string source = 4;
+}
+
+message ResultBatch {
+  int64 seq = 1;                  // per session, from 1
+  repeated MatchResultProto results = 2;
+}
+
+// The SP4 match record (SP4 spec block 1) plus the node and each seat's learner generation.
+message MatchResultProto {
+  string match_id = 1;
+  string layout = 2;
+  string outcome_kind = 3;
+  repeated SeatResultProto seats = 4;
+  repeated TeamResultProto teams = 5;
+  int64 episode_length = 6;
+  string uid = 7;
+  string source = 8;
+  optional int64 seed = 9;
+  optional int64 env_steps = 10;
+  optional string block = 11;
+  optional int32 node = 12;
+}
+
+message SeatResultProto {
+  int32 seat = 1;
+  string role = 2;
+  int32 team = 3;
+  string agent_id = 4;
+  string network_id = 5;
+  double reward = 6;
+  optional int64 eliminated_step = 7;
+  string source = 8;
+  optional int64 version_start = 9;
+  optional int64 version_end = 10;
+  optional int64 generation = 11;
+}
+
+message TeamResultProto {
+  int32 team = 1;
+  double rank = 2;
+  double score = 3;
+}
+
+message MetricsBatch {
+  repeated TrainMetrics train = 1;
+  repeated WorkerStats workers = 2;
+  repeated IntakeStats intake = 3;
+}
+
+message TrainMetrics {
+  string agent_id = 1;
+  int64 generation = 2;
+  int64 train_step = 3;
+  map<string, double> values = 4;
+}
+
+message WorkerStats {
+  int32 worker = 1;
+  int32 incarnation = 2;
+  map<string, int64> counters = 3;
+}
+
+message IntakeStats {
+  string agent_id = 1;
+  int64 generation = 2;
+  int32 depth = 3;
+  map<string, int64> dropped = 4;
+}
+
+message Ack { repeated int64 seqs = 1; }
+
+message VersionAnnounce { VersionInfo info = 1; }
+
+message VersionInfo {
+  string agent_id = 1;
+  int64 generation = 2;
+  int64 version = 3;
+  int64 size = 4;
+  string digest = 5;
+  int32 node = 6;                 // -1 = parked (hub-held weights of an agent without a learner)
+  repeated string addresses = 7;
+  bool relay_only = 8;
+  bool teacher_active = 9;
+}
+
+message Event {
+  // proc_died | child_error | slot_disabled | learner_failed | warning | run_stopped | node_stopped | node_leaving |
+  // code_updated | code_update_failed (colosseum.net.messages.EVENT_KINDS)
+  string kind = 1;
+  string proc = 2;
+  int32 exit_code = 3;
+  string error_kind = 4;
+  string message = 5;
+  string context = 6;
+  bytes log_tail = 7;
+  string log_path = 8;
+  int64 generation = 9;           // learner events; 0 otherwise
+}
+
+message Command {
+  // start_learner | stop_learner | set_evaluators | release (stop as at the end of a run, exit 0) | stop_run |
+  // update_code | cancel_leases
+  string kind = 1;
+  LearnerAssignment learner = 2;
+  // stop_learner: superseded (no final upload) | stop_run | freeze | remove (final snapshot uploaded) |
+  // restart (a recovery point instead); stop_run: grace=<sec>
+  string reason = 3;
+  string code_hash = 4;
+  int32 evaluators = 5;
+  repeated string lease_ids = 6;  // cancel_leases
+}
+
+message LearnerAssignment {
+  string agent_id = 1;
+  int64 generation = 2;
+  int64 version_floor = 3;
+  string device = 4;
+  string weights_blob = 5;
+  string trainer_state_blob = 6;
+  int64 env_steps = 7;
+  int64 start_env_steps = 8;      // 0 for agents of the first config
+}
+
+message Announce {
+  repeated VersionInfo versions = 1;
+  repeated Eviction evictions = 2;
+  repeated AgentState agents = 3;
+  int64 env_steps = 4;
+  bool collect_allowed = 5;
+  repeated string banned_node_ids = 6;
+  int64 agents_version = 7;       // 0 = unchanged
+  string config_json = 8;
+  repeated FixedBlob fixed = 9;
+}
+
+message Eviction {
+  string agent_id = 1;
+  string checkpoint_id = 2;
+}
+
+message BlobRequest {
+  // snapshot | fixed | teacher | init | latest | start | eval (recovery | trainer_state only until T4.1)
+  string kind = 1;
+  string agent_id = 2;
+  string ident = 3;
+  int64 since_version = 4;
+}
+
+message UploadPart {
+  oneof p {
+    UploadHeader header = 1;
+    bytes data = 2;
+  }
+}
+
+message UploadHeader {
+  string kind = 1;                // checkpoint | final | recovery | relay_latest | agent_file (token-authenticated)
+  string agent_id = 2;
+  int64 generation = 3;
+  int64 version = 4;
+  int64 total_size = 5;
+  string digest = 6;
+  string request_id = 7;
+}
+
+message UploadReply {
+  bool accepted = 1;
+  string reason = 2;
+  string checkpoint_id = 3;
+}
+
+message ChunkFrame {
+  string agent_id = 1;
+  int32 target_node = 2;
+  int64 generation = 3;
+  bytes frame = 4;                // a colosseum.net.frame "chunk" frame, forwarded undecoded
+}
+
+message ChunkSummary {
+  int64 received = 1;
+  int64 dropped = 2;
+}
+
+message RelayCredit {
+  int32 frames = 1;
+  string node_id = 2;
+}
+
+message RelayItem {
+  oneof i {
+    ChunkFrame chunk = 1;
+    LatestRequest pull = 2;
+  }
+}
+
+message LatestRequest {
+  string agent_id = 1;
+  int64 since_version = 2;
+  string request_id = 3;
+}
+
+message BlockLeaseRequest { int32 free_slots = 1; }   // an increment of the node's free evaluator slots
+
+message BlockLease {
+  string lease_id = 1;
+  double lease_sec = 2;
+  repeated BlockSpec blocks = 3;
+  int32 num_envs = 4;
+}
+
+message BlockSpec {
+  string block_id = 1;
+  string source = 2;              // pulse | tournament
+  repeated LineupProto lineups = 3;
+  repeated PlayerRefProto players = 4;
+  bool deterministic = 5;
+}
+
+message PlayerRefProto {
+  string name = 1;
+  string agent_id = 2;
+  string network_id = 3;
+  repeated string roles = 4;
+  string kind = 5;                // neural | scripted
+  string blob_id = 6;
+  string networks_json = 7;
+  string bot_class = 8;
+  string bot_kwargs_json = 9;
+}
+
+message BlockResult {
+  string lease_id = 1;
+  string block_id = 2;
+  repeated MatchResultProto results = 3;
+  bool failed = 4;
+  string error = 5;
+  string error_kind = 6;          // "" | abandoned | crash | missing_weights | contract | player | config
+}
+
+// The hub's acknowledgement of BlockResults (a node resends a BlockResult until it is acked).
+message BlockAck {
+  string lease_id = 1;
+  repeated string block_ids = 2;
+}
+
+message AdminRequest {
+  string command = 1;
+  string args_json = 2;
+}
+
+message AdminReply {
+  int32 code = 1;
+  string text = 2;
+  string data_json = 3;
+  bool done = 4;
+}
+
+// ---------------------------------------------------------------------------------------------------------------
+// NodeData: a node's data port (mutual TLS with hub-issued node certificates)
+// ---------------------------------------------------------------------------------------------------------------
+
+service NodeData {
+  rpc Chunks(stream ChunkFrame) returns (ChunkSummary);
+  rpc GetLatest(LatestRequest) returns (stream BlobPart);   // first part: not_modified, or a weights frame's meta
+}

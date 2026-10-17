@@ -5,8 +5,8 @@
 #   scripts/setup-dev.sh --gpu    torch from the default PyPI index (CUDA build on Linux)
 #
 # Installs uv into ~/.local/bin if it is missing, creates .venv with Python 3.12,
-# installs torch, then the project in editable mode with the grpc, dev and
-# examples extras. Never touches the system Python.
+# installs torch, then the project in editable mode with the dev and examples
+# extras. Never touches the system Python.
 set -euo pipefail
 
 GPU=0
@@ -57,8 +57,8 @@ else
   echo ">>> torch $CURRENT already installed"
 fi
 
-echo ">>> installing colosseum (editable) with extras grpc, dev, examples"
-uv pip install --python "$PY" -e ".[grpc,dev,examples]"
+echo ">>> installing colosseum (editable) with extras dev, examples"
+uv pip install --python "$PY" -e ".[dev,examples]"
 
 "$PY" - <<'PYEOF'
 import torch
