@@ -359,3 +359,31 @@ def test_select_with_one_finalist_warns_that_nothing_can_be_confirmed(caplog):
     assert report["selection"]["player"]["confirmed"] is False
     (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
     assert "--finalists 1" in line and "colosseum pin" in line
+
+
+def test_round_robin_marks_repeated_pairs_under_deterministic():
+    """B-M1 (T5.3 deferred; spec block 3: repeated games count as one block): a deterministic round-robin pair whose
+    blocks all repeat gets the Wilson interval of one observation and a REPEATED mark, both ways, and is listed once
+    in ``flags.repeated_pairs``, as the gauntlet does; a pair with varying games and a stochastic run get none."""
+    from colosseum.arena.tournament.modes import report_text
+    from colosseum.eval import wilson_interval
+
+    spec = TurnTakingGame().spec
+    strengths = {"main@v1": 100.0, "main@v2": 0.0, "greedy": 0.0}
+    report = play("round-robin", spec, strengths, ["main@v1", "main@v2"], ["greedy"], deterministic=True, blocks=10)
+    (table,) = report["tables"]
+    m = table["matrix"]
+    lo, hi = wilson_interval(1.0, 1)
+    assert m["main@v1"]["greedy"]["score"] == 1.0 and m["main@v1"]["greedy"]["repeated"] is True
+    assert m["main@v1"]["greedy"]["ci95"] == pytest.approx([lo, hi])
+    assert m["greedy"]["main@v1"]["repeated"] is True and m["greedy"]["main@v1"]["ci95"] == pytest.approx([1 - hi,
+                                                                                                         1 - lo])
+    assert m["main@v2"]["greedy"]["repeated"] is False and m["main@v2"]["greedy"]["ci95"][0] > lo   # games vary
+    assert sorted(report["flags"]["repeated_pairs"]) == [["2p", "main@v1", "greedy"], ["2p", "main@v1", "main@v2"]]
+    rows = {r["name"]: r for r in table["rows"]}
+    assert rows["main@v1"]["repeated"] == ["greedy", "main@v2"] and rows["greedy"]["repeated"] == ["main@v1"]
+    assert "Games repeat (not enough randomness): 2p: main@v1 vs greedy" in report_text(report)
+    json.dumps(report, allow_nan=False)
+    stochastic = play("round-robin", spec, strengths, ["main@v1", "main@v2"], ["greedy"], blocks=10)
+    assert stochastic["flags"]["repeated_pairs"] == []
+    assert not any(cell["repeated"] for cols in stochastic["tables"][0]["matrix"].values() for cell in cols.values())

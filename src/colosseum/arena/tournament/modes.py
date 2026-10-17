@@ -6,7 +6,7 @@ into tables (``stats``):
 - ``gauntlet``: every candidate plays ``blocks`` blocks per composition on stage A; tables per layout and role
   group, plus a layout-weighted combination per group when there are several layouts of one kind;
 - ``round-robin``: every pair of participants (candidates and field) plays ``blocks`` blocks per pair on stage
-  A (two-team layouts only, ruling C4); a score matrix with intervals;
+  A (two-team layouts only, ruling C4); a score matrix with intervals (a repeated pair counts as one block);
 - ``halving``: successive halving on stage A, per role group. Round ``r`` plays ``halving_blocks * 2**r`` new
   blocks per composition for the active candidates (indices continue, so every round has fresh seeds and
   every active candidate the same ones); ranking by the combined score over all blocks played so far; the
@@ -68,6 +68,7 @@ from colosseum.arena.tournament.stats import (
 from colosseum.core.errors import ConfigError
 from colosseum.core.types import MatchResult
 from colosseum.envs.game import GameSpec
+from colosseum.eval import wilson_interval
 
 logger = logging.getLogger(__name__)
 
@@ -338,6 +339,9 @@ def run(mode: str, *, spec: GameSpec, players: Mapping[str, Any], candidates: Se
             row["bt"] = None if e is None else {"rating": e["rating"], "ci95": e["ci95"], "p_best": e["p_best"]}
     repeated_pairs = sorted({(t["layout"], r["name"], col) for t in tables if "matrix" in t
                              for r in t["rows"] for col in r.get("repeated", [])})
+    if mode == "round-robin":         # both rows of a pair carry its mark: list the pair once, as scheduled
+        order = {n: i for i, n in enumerate(dict.fromkeys([*candidates, *field]))}
+        repeated_pairs = [x for x in repeated_pairs if order[x[1]] < order[x[2]]]
     self_excluded = ([] if mode == "round-robin" else
                      [[L, c] for L in settings.layouts for c in candidates
                       if c in field and (ctx.metric_of[L] == "pairwise" or spec.layout_size(L) >= 2)])
@@ -436,27 +440,34 @@ def _json_safe(obj: Any) -> Any:
 
 def _round_robin_tables(ctx: _Context, participants: Sequence[str]) -> list[dict]:
     """Pairwise matrix per layout: ``cells[a][b]`` = a's mean pairwise score against b (1 - b's against a), with a
-    bootstrap interval over the pair's blocks."""
+    bootstrap interval over the pair's blocks. Under ``deterministic`` a pair whose blocks (two or more) all gave
+    the same games is ``repeated``: it counts as one block (Wilson interval of one observation, as the gauntlet's
+    cells), and both rows list it in ``repeated``."""
     out = []
     for layout in ctx.settings.layouts:
-        per_pair: dict[tuple[str, str], list[float]] = {}
+        per_pair: dict[tuple[str, str], list[tuple[float, tuple]]] = {}
         for b in ctx.blocks:
             if b.layout != layout:
                 continue
-            values = block_values(b, ctx.results[b.id], ctx.names, "pairwise")
-            per_pair.setdefault((b.candidate, b.composition[0]), []).append(values[b.composition[0]][0])
+            mean, _n, signature = block_values(b, ctx.results[b.id], ctx.names, "pairwise")[b.composition[0]]
+            per_pair.setdefault((b.candidate, b.composition[0]), []).append((mean, signature))
         matrix: dict[str, dict[str, dict]] = {a: {} for a in participants}
-        for (a, b), vals in per_pair.items():
-            x = np.asarray(vals)
-            idx = ctx.rng.integers(len(x), size=(ctx.settings.bootstrap_samples, len(x)))
-            lo, hi = quantiles(x[idx].mean(axis=1), ctx.settings.level)
-            matrix[a][b] = {"score": float(x.mean()), "ci95": [lo, hi], "blocks": len(x)}
-            matrix[b][a] = {"score": float(1 - x.mean()), "ci95": [1 - hi, 1 - lo], "blocks": len(x)}
+        for (a, b), entries in per_pair.items():
+            x = np.asarray([v for v, _sig in entries])
+            repeated = ctx.settings.deterministic and len(entries) >= 2 and len({sig for _v, sig in entries}) == 1
+            if repeated:
+                lo, hi = wilson_interval(float(x.mean()), 1)
+            else:
+                idx = ctx.rng.integers(len(x), size=(ctx.settings.bootstrap_samples, len(x)))
+                lo, hi = quantiles(x[idx].mean(axis=1), ctx.settings.level)
+            matrix[a][b] = {"score": float(x.mean()), "ci95": [lo, hi], "blocks": len(x), "repeated": repeated}
+            matrix[b][a] = {"score": float(1 - x.mean()), "ci95": [1 - hi, 1 - lo], "blocks": len(x),
+                            "repeated": repeated}
         rows = []
         for a in participants:
             row = matrix[a]
             rows.append({"name": a, "score": float(np.mean([c["score"] for c in row.values()])) if row else 0.0,
-                         "opponents": len(row)})
+                         "opponents": len(row), "repeated": sorted(col for col, c in row.items() if c["repeated"])})
         rows.sort(key=lambda r: (-r["score"], participants.index(r["name"])))
         out.append({"stage": "A", "layout": layout, "group": "*", "metric": "pairwise",
                     "columns": list(participants), "rows": rows, "matrix": matrix})
