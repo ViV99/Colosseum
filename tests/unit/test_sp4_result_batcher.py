@@ -67,16 +67,18 @@ def test_a_due_batch_is_put_without_a_new_result():
     assert q.empty()
 
 
-def test_the_age_counts_from_the_last_put_and_a_caller_reading_can_be_passed():
+def test_the_age_counts_from_the_last_put():
     q: queue.Queue = queue.Queue()
     batcher, clock = _batcher(q)
     batcher.add(_result(0))
     clock.t += RESULTS_BATCH_SEC
     batcher.flush_if_due()                                        # put at t0 + 0.1
     batcher.add(_result(1))
-    batcher.flush_if_due(now=clock.t + RESULTS_BATCH_SEC * 0.9)   # 0.09 s after the last put: not due
+    clock.t += RESULTS_BATCH_SEC / 2                              # 0.05 s after the last put: not due
+    batcher.flush_if_due()
     assert _ids(q.get_nowait()) == ["w0_e0_ep0"] and q.empty()
-    batcher.flush_if_due(now=clock.t + RESULTS_BATCH_SEC)
+    clock.t += RESULTS_BATCH_SEC / 2
+    batcher.flush_if_due()
     assert _ids(q.get_nowait()) == ["w0_e0_ep1"]
 
 

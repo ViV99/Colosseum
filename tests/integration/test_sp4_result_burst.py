@@ -1,13 +1,16 @@
-"""A burst of match results larger than one pipe-full is not dropped (SP4 FX1; the cause measured by the drops
-diagnostic): the main process reads the results queue in one short burst per 0.2 s monitor pass, and the queue's
-64 KiB pipe holds only about 100-140 results. Results put one by one pile up in the producer's feeder buffer, which
-the queue's semaphore counts, until ``put_nowait`` raises ``Full``. Batches (``ResultBatcher``) keep the queue's
-item count far below its cap.
+"""Batching keeps the results queue's item count far below its cap (SP4 FX1): a burst of results five times the
+cap is put without a drop and in order, while per-item puts of the same burst against the same cap overflow it.
 
-Two spawned producers put the same burst at once, each on its own queue of the launcher's size, and both queues are
-read by the launcher's ``QueueReader`` every 0.2 s, as the monitor loop does. The control puts one result per item,
-as workers did before FX1, and must overflow: that shows the burst is one the old path drops. The other goes
-through ``ResultBatcher`` and must lose nothing and keep the order."""
+Two spawned producers put the same 5 000 results at once, each on its own queue of the launcher's size
+(``_RESULTS_QUEUE_SIZE`` = 1 000 items), and both queues are read by the launcher's ``QueueReader`` every 0.2 s, as
+the monitor loop does. The control puts one result per item and must drop; the other goes through
+``ResultBatcher`` (about 20 items) and must lose nothing.
+
+What this does not show: the mechanism of the drops before FX1. The control drops because an instant burst of
+5 000 items meets a 1 000-item cap, whatever the reader does (the old cap was 10 000, against which this burst does
+not overflow). The pre-FX1 drops came from sustained production against a drain that runs once per 0.2 s pass
+through a 64 KiB pipe; that evidence, and the check that batching removes them in real runs, are measurements:
+``docs/benchmarks.md``, section «После SP4» (the drops diagnostic and the FX1 check)."""
 from __future__ import annotations
 
 import multiprocessing as mp
@@ -19,9 +22,9 @@ from colosseum.core.types import MatchResult, SeatResult, TeamResult
 from colosseum.launcher import _RESULTS_QUEUE_SIZE
 from colosseum.worker.rollout_worker import ResultBatcher
 
-N = 5000                 # about 40 pipe-fulls of results, five times the queue's 1000 slots
+N = 5000                 # five times the queue's 1000 slots
 PASS_SEC = 0.2           # the monitor loop's sleep between passes
-MODES = ("one_by_one", "batched")
+MODES = ("per_item", "batched")
 
 
 def _result(i: int) -> MatchResult:
@@ -53,10 +56,10 @@ def _produce(results_queue, done, batched: bool) -> None:
 
 
 def _count(items: list, mode: str) -> int:
-    return len(items) if mode == "one_by_one" else sum(len(batch) for batch in items)
+    return len(items) if mode == "per_item" else sum(len(batch) for batch in items)
 
 
-def test_a_burst_larger_than_a_pipe_full_is_dropped_one_by_one_but_not_in_batches():
+def test_a_burst_above_the_queue_cap_is_dropped_per_item_but_not_in_batches():
     ctx = mp.get_context("spawn")
     queues = {mode: ctx.Queue(maxsize=_RESULTS_QUEUE_SIZE) for mode in MODES}
     done = {mode: ctx.Queue() for mode in MODES}
@@ -90,8 +93,8 @@ def test_a_burst_larger_than_a_pipe_full_is_dropped_one_by_one_but_not_in_batche
                 proc.join(timeout=5)
     assert all(proc.exitcode == 0 for proc in procs.values()), {m: p.exitcode for m, p in procs.items()}
     assert set(dropped) == set(MODES), (dropped, {m: _count(received[m], m) for m in MODES})
-    assert _count(received["one_by_one"], "one_by_one") + dropped["one_by_one"] == N
-    assert dropped["one_by_one"] > 0, "the burst no longer overflows a per-result queue of this size: raise N"
+    assert _count(received["per_item"], "per_item") + dropped["per_item"] == N
+    assert dropped["per_item"] > 0, "per-item puts of the burst no longer overflow a queue of this cap: raise N"
     batches = received["batched"]
     assert dropped["batched"] == 0 and all(isinstance(batch, list) for batch in batches)
     assert [r.uid for batch in batches for r in batch] == [f"RUN/train/w0_e0_ep{i}" for i in range(N)]

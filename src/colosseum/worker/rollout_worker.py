@@ -36,8 +36,9 @@ logger = logging.getLogger(__name__)
 # monitor pass (0.2 s), and the queue's pipe (64 KiB) holds only about 100-140 results; results put one by one pile
 # up in this process's feeder buffer, which the queue's semaphore counts, until the queue reports Full (the drops
 # diagnostic measured 73-79 % lost on the default tic-tac-toe config). A batch is one queue item, and the feeder
-# thread wakes (taking this process's GIL) once per batch, not once per match. Cost: results arrive up to 0.1 s
-# later.
+# thread wakes (taking this process's GIL) once per batch, not once per match. Cost: a result arrives up to 0.1 s
+# later, plus one loop step (the due check runs once per step); while a chunk waits for room in a full trajectory
+# queue, the check runs after every 0.5 s retry instead.
 RESULTS_BATCH_SEC = 0.1
 RESULTS_BATCH_MAX = 256
 
@@ -80,7 +81,8 @@ class ResultBatcher:
 
     ``add`` keeps a result and puts the batch as soon as ``max_results`` are pending; ``flush_if_due`` puts the
     pending results once ``max_age_sec`` has passed since the last put (the caller calls it regularly, also when no
-    match finishes: the worker does so once per loop step); ``flush`` puts whatever is pending (on exit). Never
+    match finishes: the worker does so once per loop step and after every retry of a chunk waiting for room in a
+    full trajectory queue); ``flush`` puts whatever is pending (on exit). Never
     blocks: a full queue drops the whole batch, and every result in it is counted in ``dropped`` (the first drop is
     a WARNING, later ones are only counted). ``clock`` (default ``time.monotonic``) is injectable for tests.
     """
@@ -102,10 +104,9 @@ class ResultBatcher:
         if len(self._pending) >= self._max_results:
             self.flush()
 
-    def flush_if_due(self, now: float | None = None) -> None:
-        """Put the pending results if ``max_age_sec`` has passed since the last put; ``now``: the caller's reading of
-        the same clock (saves a call)."""
-        if self._pending and (self._clock() if now is None else now) - self._last_put >= self._max_age_sec:
+    def flush_if_due(self) -> None:
+        """Put the pending results if ``max_age_sec`` has passed since the last put."""
+        if self._pending and self._clock() - self._last_put >= self._max_age_sec:
             self.flush()
 
     def flush(self) -> None:
@@ -184,6 +185,7 @@ def rollout_worker_process(
     (``flush_queue``) so that neither the last results nor the final counters are lost.
     """
     configure_torch_threads(torch_threads)
+    batcher = ResultBatcher(results_queue, worker_id) if results_queue is not None else None
 
     def send_chunk(chunk: TrajectoryChunk) -> None:
         payload = chunk.to_payload()  # numpy only across processes
@@ -193,12 +195,12 @@ def rollout_worker_process(
                 q.put(payload, timeout=0.5)
                 return
             except queue.Full:
+                if batcher is not None:   # the loop does not step meanwhile (a busy learner): due results still go
+                    batcher.flush_if_due()
                 continue
 
     def poll_weights(agent_id: str) -> WeightPayload | None:
         return drain_latest(weight_queues[agent_id])
-
-    batcher = ResultBatcher(results_queue, worker_id) if results_queue is not None else None
 
     def poll_command() -> WorkerCommand | None:
         return _drain_commands(command_queue)
@@ -235,7 +237,7 @@ def rollout_worker_process(
     def should_stop() -> bool:
         now = time.monotonic()
         if batcher is not None:
-            batcher.flush_if_due(now)   # once per loop step, also when no match finished
+            batcher.flush_if_due()   # once per loop step, also when no match finished
         if stats_queue is not None and now - last_stats[0] >= stats_interval_sec:
             last_stats[0] = now
             report_worker_stats(stats_queue, worker_id, worker_stats())

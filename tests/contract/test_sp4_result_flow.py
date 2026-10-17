@@ -238,6 +238,61 @@ def test_a_running_worker_puts_due_batches_below_the_size_cap(restore_torch_thre
     assert ids == [f"w0_e0_ep{i}" for i in range(len(ids))]
 
 
+class _CountingFullQueue(NumpyOnlyQueue):
+    """A one-slot trajectory queue nobody reads: counts the puts that gave up on Full (the worker's retries)."""
+
+    def __init__(self) -> None:
+        super().__init__(maxsize=1)
+        self.full_waits = 0
+
+    def put(self, item, block=True, timeout=None):
+        try:
+            super().put(item, block, timeout)
+        except queue.Full:
+            self.full_waits += 1
+            raise
+
+
+class _ManualClock:
+    def __init__(self) -> None:
+        self.t = 0.0
+
+    def __call__(self) -> float:
+        return self.t
+
+
+def test_a_due_batch_is_put_while_a_chunk_waits_for_a_full_trajectory_queue(restore_torch_threads, monkeypatch):
+    """The second chunk never fits (nobody reads the trajectory queue), so the loop stops stepping inside
+    ``send_chunk``'s retries; a batch that falls due then is still put, from the retry branch. The batcher's clock
+    is the test's: nothing is due until the worker is known to be retrying."""
+    clock = _ManualClock()
+    monkeypatch.setattr(rollout_worker, "ResultBatcher", partial(ResultBatcher, max_results=10**9, clock=clock))
+    trajectories, results, stop = _CountingFullQueue(), NumpyOnlyQueue(), threading.Event()
+    thread = threading.Thread(target=rollout_worker_process, kwargs=dict(
+        worker_id=0, env_fn=_solo_env, num_envs=1, chunk_length=3, agent_ids=["a"],
+        agent_roles={"a": ["player"]}, model_factories={"a": _solo_model},
+        trajectory_queues={"a": trajectories}, weight_queues={"a": NumpyOnlyQueue()}, stop_event=stop,
+        lineups=[Lineup("solo", [SeatAssignment("a")])], results_queue=results, seed=0,
+    ))
+    thread.start()
+    try:
+        deadline = time.monotonic() + 5
+        while trajectories.full_waits < 1 and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        assert trajectories.full_waits >= 1 and results.empty()         # retrying; nothing was due so far
+        clock.t = 1.0                                                    # now the pending results are due
+        while results.empty() and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        delivered_while_retrying = not results.empty() and thread.is_alive()
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+    assert delivered_while_retrying and not thread.is_alive()
+    batch = results.get_nowait()
+    assert isinstance(batch, list) and [r.match_id for r in batch] == [f"w0_e0_ep{i}" for i in range(len(batch))]
+    assert batch and results.empty()                  # the exit flush had nothing left: no episode ended meanwhile
+
+
 def test_latest_seat_versions_follow_weight_syncs_in_the_middle_of_an_episode():
     model = make_test_model(ROLE2)
     weights = state_dict_to_numpy(model.state_dict())
