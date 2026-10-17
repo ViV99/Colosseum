@@ -167,28 +167,34 @@ def test_top_snapshots_survive_a_journal_write_between_reads(tmp_path, monkeypat
     assert landed == ["2p"] and set(lcb) == {"ckpt_v10", "ckpt_v20"}
 
 
-def test_top_snapshots_rank_by_the_lower_bound_not_the_mean(tmp_path):
-    """v2000 wins 3 of 4 games (the highest BT mean, a wide interval), v20 wins 70 % of 400 (a lower mean, well
-    measured): ``top:1`` picks v20. Outcomes are exact counts and the bootstrap seed is fixed, so the test is
-    deterministic (margin of the lower bounds at seed 0: about 47 Elo; 11-47 over seeds 1-6)."""
+def test_top_snapshots_rank_by_the_lower_bound_not_the_mean(tmp_path, monkeypatch):
+    """``top:N`` follows the lower bound of the bootstrap, not the BT mean. Deterministic wiring check:
+    ``bt.bootstrap`` is replaced by one whose lower bounds reverse the fit's order (a real-data inversion of mean
+    and lower bound is not robust over bootstrap seeds: ~1.8 % failures for the best small design found)."""
     from colosseum.arena import bt
-    from colosseum.arena.live import rating_inputs
 
-    root, cfg = write_fake_run(tmp_path / "run", versions=(10, 20, 2000),
+    root, cfg = write_fake_run(tmp_path / "run", versions=(10, 20, 30),
                                agents={"main": {}, "rnd": scripted_agent()}, checkpoint={"interval": 10})
     spec = env_spec(cfg)
     log = MatchLog(root / MATCH_LOG_FILE, RunInfo("r", "run", None, cfg.env.env_class, "h", 10))
-    plan = {10: (300, 90), 20: (400, 280), 2000: (4, 3)}            # version: (games, wins)
+    plan = {10: (100, 30), 20: (100, 80), 30: (100, 55)}            # version: (games, wins)
     log.append([_match(i, v, i < wins) for v, (n, wins) in plan.items() for i in range(n)])
-    table = log.comparison_table()
     log.close()
-    options, fixed_agents, random_bot = rating_inputs(cfg)
-    fit = bt.fit(table, "2p", sources=("train",), options=options, fixed_agents=fixed_agents, random_bot=random_bot)
-    assert fit.rating["main@v2000"] > fit.rating["main@v20"]          # the mean prefers v2000
+    seen = []
+
+    def reversed_bounds(fit_, data, **kwargs):
+        seen.append(dict(fit_.rating))
+        lcb = {entity: -rating for entity, rating in fit_.rating.items()}
+        return bt.Uncertainty(ci95={}, lcb=lcb, p_best_lineage={}, p_best_group={}, p_top_k={}, p_top_k_group={})
+
+    monkeypatch.setattr(bt, "bootstrap", reversed_bounds)
     request = PlayerRequest(user=(), runs=(RunSelection(root, snapshots="top:1"),), field=None)
     candidates, _field = resolve_players(cfg, spec, request, fixed=load_fixed_players(cfg, spec),
                                          rng=np.random.default_rng(0))
-    assert [p.name for p in candidates] == ["main@v20"]
+    (rating,) = seen
+    snapshots = sorted(("main@v10", "main@v20", "main@v30"), key=rating.get)
+    assert snapshots == ["main@v10", "main@v30", "main@v20"]          # the mean prefers v20
+    assert [p.name for p in candidates] == ["main@v10"]               # the (reversed) lower bound wins
 
 
 def test_top_snapshots_of_a_score_game_use_the_mean_score_bound(tmp_path):
