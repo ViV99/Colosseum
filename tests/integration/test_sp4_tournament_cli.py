@@ -372,3 +372,28 @@ def test_journal_and_eviction_errors_are_config_errors_with_their_context(tmp_pa
     rerun = invoke(*args, "--name", "race")
     assert rerun.exit_code == 0, rerun.output
     assert [c["name"] for c in report(root, "race")["candidates"]] == ["main@v20"]
+
+
+def test_pin_says_evicted_only_when_the_snapshot_is_gone(tmp_path):
+    """B-M10 (T5.4 deferred): a --pin failure is worded as an eviction only when the snapshot dir is missing; any
+    other error (a malformed meta.json) is passed through as it is."""
+    from colosseum.arena.tournament.modes import TournamentReport
+    from colosseum.arena.tournament.players import PlayerSource, TournamentPlayer
+
+    root, _cfg = fake_run(tmp_path, versions=(10, 20))
+
+    def winner(version):
+        return TournamentPlayer(name=f"main@v{version}", display=f"main@v{version}", kind="snapshot",
+                                agent_id="main", network_id=f"ckpt_v{version}", roles=("player",), lineage="main",
+                                source=PlayerSource("model", origin=f"copy-of-v{version}"), version=version,
+                                run=str(root), run_agent="main")
+
+    players = {p.name: p for p in (winner(10), winner(20))}
+    (root / "checkpoints" / "main" / "ckpt_v10" / "meta.json").write_text("{not json")
+    shutil.rmtree(root / "checkpoints" / "main" / "ckpt_v20")
+    for name, evicted in (("main@v10", False), ("main@v20", True)):
+        report = TournamentReport({"selection": {"player": {"winner": name, "confirmed": True}}})
+        pinned, errors = run_module._pin(report, players)
+        assert pinned == [] and len(errors) == 1
+        assert ("evicted by the run" in errors[0]) is evicted, errors[0]
+        assert f"copy-of-v{name[-2:]}" in errors[0]

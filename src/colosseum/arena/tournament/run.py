@@ -532,7 +532,8 @@ def _pin(report: modes.TournamentReport,
          players: Mapping[str, TournamentPlayer]) -> tuple[list[str], list[str]]:
     """Pin every confirmed ``select`` winner that is a run snapshot (ruling C6); the others get a WARNING.
     Returns ``(pinned names, errors)``: a winner the run evicted while the tournament played cannot be pinned
-    (an error after the reports are written; its copy stays in the tournament's ``snapshots/``)."""
+    (an error after the reports are written; its copy stays in the tournament's ``snapshots/``); any other pin
+    error (the snapshot dir is still there) is reported as it is."""
     pinned: list[str] = []
     errors: list[str] = []
     for group, sel in (report.to_dict().get("selection") or {}).items():
@@ -553,9 +554,13 @@ def _pin(report: modes.TournamentReport,
                 raise ConfigError(f"{stored_dir} is gone")
             pin_snapshot(winner.run, winner.run_agent, winner.version)
         except ConfigError as e:
-            errors.append(f"--pin: the winner {winner.name} was evicted by the run {winner.run} while the "
-                          f"tournament played ({e}), so nothing was pinned; the tournament's copy is "
-                          f"{winner.source.origin}")
+            if stored_dir.is_dir():       # not an eviction (e.g. a malformed meta.json): the error as it is
+                errors.append(f"--pin: the winner {winner.name} could not be pinned in {winner.run} ({e}); the "
+                              f"tournament's copy is {winner.source.origin}")
+            else:
+                errors.append(f"--pin: the winner {winner.name} was evicted by the run {winner.run} while the "
+                              f"tournament played ({e}), so nothing was pinned; the tournament's copy is "
+                              f"{winner.source.origin}")
             logger.error(errors[-1])
             continue
         logger.info("--pin: pinned %s in %s", winner.name, winner.run)
