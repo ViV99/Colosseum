@@ -256,7 +256,13 @@ def list_snapshots(run_dir: str | Path) -> dict[str, list[CheckpointInfo]]:
 def pin_snapshot(run_dir: str | Path, agent_id: str, version: int, *, pinned: bool = True) -> Path:
     """Pin (unpin) snapshot ``ckpt_v<version>`` of ``agent_id`` in ``run_dir`` by ``set_pinned``; idempotent and
     safe while the run trains (its retention re-reads pins before every decision). Returns the snapshot dir.
-    ConfigError (not a run dir, an unknown agent or snapshot) naming the stored agents or snapshots."""
+    ConfigError (not a run dir, an unknown agent or snapshot) naming the stored agents or snapshots.
+
+    The race with a training run's eviction (which renames the dir away): a snapshot that disappears before or
+    while ``meta.json`` is rewritten, or (pinning) right after it, is a ConfigError that says so and points to the
+    tournaments' linked copies; an unpinned snapshot evicted right after the write is the expected outcome. The
+    check after the write narrows the window in which "pinned" is reported for a snapshot that is gone a moment
+    later (the trainer's retention may have read the pins just before the write); it cannot close it."""
     snapshots = list_snapshots(run_dir)
     if agent_id not in snapshots:
         raise ConfigError(f"{run_dir}: no snapshots of agent {agent_id!r}; agents with snapshots: {sorted(snapshots)}")
@@ -265,8 +271,25 @@ def pin_snapshot(run_dir: str | Path, agent_id: str, version: int, *, pinned: bo
     if checkpoint_id not in by_id:
         raise ConfigError(f"{run_dir}: agent {agent_id!r} has no stored snapshot {checkpoint_id} (newest stored: "
                           f"{list(by_id)[-10:]}); see colosseum pin {run_dir} --list")
-    set_pinned(by_id[checkpoint_id].path, pinned)
-    return by_id[checkpoint_id].path
+    path = by_id[checkpoint_id].path
+    try:
+        set_pinned(path, pinned)
+    except (OSError, ConfigError) as e:
+        if path.is_dir():
+            if isinstance(e, ConfigError):
+                raise
+            raise ConfigError(f"{path}: writing {META_FILE} failed ({type(e).__name__}: {e})") from e
+        raise _evicted_meanwhile(run_dir, agent_id, version, pinned) from e
+    if pinned and not path.is_dir():
+        raise _evicted_meanwhile(run_dir, agent_id, version, pinned)
+    return path
+
+
+def _evicted_meanwhile(run_dir: str | Path, agent_id: str, version: int, pinned: bool) -> ConfigError:
+    return ConfigError(f"{run_dir}: snapshot {agent_id}@v{version} was evicted by the training run while it was being "
+                       f"{'pinned' if pinned else 'unpinned'}; a copy may still be in "
+                       f"{Path(run_dir) / 'tournaments'}/*/snapshots/ (a tournament links its players' snapshots "
+                       f"there); see colosseum pin {run_dir} --list")
 
 
 class CheckpointManager:

@@ -613,7 +613,8 @@ def pin_cmd(run_dir: str, snapshot: str | None, remove: bool, list_: bool) -> No
     """Pin a stored snapshot (AGENT@vN) of a run dir so retention never evicts it, unpin it (--remove) or list
     the snapshots (--list). Safe while the run trains: its next retention pass sees the pin.
 
-    Exit code: 0 done, 1 config error (not a run dir, unknown agent or snapshot), 2 bad arguments.
+    Exit code: 0 done, 1 config error (not a run dir, unknown agent or snapshot, a snapshot the run evicted while
+    it was being pinned), 2 bad arguments.
     """
     from colosseum.coordinator.checkpoint_manager import list_snapshots, parse_snapshot_ref, pin_snapshot
     from colosseum.core.errors import ConfigError

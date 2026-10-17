@@ -77,6 +77,50 @@ def test_errors_name_the_problem_and_a_hint(tmp_path):
         pin_snapshot(root, "main", 99)
 
 
+def _evict_like_the_trainer(ckpt_dir):
+    ckpt_dir.rename(ckpt_dir.parent / f".tmp-evict-{ckpt_dir.name}-test")    # CheckpointManager._evict's first step
+
+
+@pytest.mark.parametrize("when", ["before the write", "after the write"])
+def test_a_snapshot_evicted_while_it_is_pinned_is_a_config_error_with_a_hint(tmp_path, monkeypatch, when):
+    """The race with a training run's eviction (final review A, M8): no traceback, no "Pinned" for a snapshot that is
+    gone, and a pointer to the tournaments' linked copies."""
+    import colosseum.coordinator.checkpoint_manager as checkpoint_manager
+
+    root = make_run(tmp_path)
+    original = checkpoint_manager.write_text_atomic
+
+    def racing_write(path, text):
+        if when == "before the write":
+            _evict_like_the_trainer(path.parent)
+        original(path, text)
+        if when == "after the write":
+            _evict_like_the_trainer(path.parent)
+
+    monkeypatch.setattr(checkpoint_manager, "write_text_atomic", racing_write)
+    result = invoke(root, "main@v20")
+    assert isinstance(result.exception, SystemExit)                     # a ConfigError exit, not a raw OSError
+    assert result.exit_code == 1 and "Traceback" not in result.output and "Pinned" not in result.output
+    assert "main@v20 was evicted" in result.output and "tournaments" in result.output and "--list" in result.output
+
+
+def test_an_unpin_followed_by_an_eviction_is_no_error(tmp_path, monkeypatch):
+    """Unpinning makes the snapshot evictable: an eviction right after the write is the expected outcome."""
+    import colosseum.coordinator.checkpoint_manager as checkpoint_manager
+
+    root = make_run(tmp_path)
+    assert invoke(root, "main@v20").exit_code == 0
+    original = checkpoint_manager.write_text_atomic
+
+    def write_then_evict(path, text):
+        original(path, text)
+        _evict_like_the_trainer(path.parent)
+
+    monkeypatch.setattr(checkpoint_manager, "write_text_atomic", write_then_evict)
+    result = invoke(root, "main@v20", "--remove")
+    assert result.exit_code == 0 and "Unpinned main@v20" in result.output
+
+
 def test_a_running_training_keeps_a_snapshot_pinned_from_outside(tmp_path):
     overrides = {"training.total_timesteps": "40000", "checkpoint.interval": "5", "checkpoint.keep_last": "2",
                  "checkpoint.keep_every": "0"}
