@@ -325,7 +325,7 @@
         { key: "entity", label: "entity" }, { key: "kind", label: "kind" }, { key: "mean", label: "mean score", num: true, fmt: (v) => num(v, 3) },
         { key: "ci", label: "95% CI", text: (r) => ci(r.ci, 3), sortv: (r) => (r.ci ? r.ci[0] : null) }, { key: "n", label: "matches", num: true },
       ], (lay.entities || []).filter((e) => !agent || e.lineage === agent), { key: "score", sort: { key: "mean", dir: "desc" } }));
-      if (lay.truncated) out.push(h("p", { class: "note" }, lay.truncated + " more entities not shown (use the dashboard filters)."));
+      if (lay.truncated) out.push(h("p", { class: "note" }, lay.truncated + " more entities not shown (the lowest mean scores)."));
       out.push(h("h3", {}, L + " · team compositions (cross-play)"));
       out.push(table("ratings", [
         { key: "composition", label: "composition" }, { key: "mean", label: "mean score", num: true, fmt: (v) => num(v, 3) },
@@ -354,7 +354,7 @@
         { key: "p_best_group", label: "P(best)", num: true, fmt: (v) => num(v, 2) },
         { key: "lcb", label: "LCB", num: true, fmt: (v) => num(v, 0), title: "lower bound of the deviation from the lineage mean; used by top-k" },
       ], g.entities.filter((e) => !agent || e.lineage === agent), { key: "g" + gi, sort: { key: "rating", dir: "desc" } }));
-      if (g.truncated) out.push(h("p", { class: "note" }, g.truncated + " more entities not shown (use the dashboard filters)."));
+      if (g.truncated) out.push(h("p", { class: "note" }, g.truncated + " more entities not shown (the lowest rated)."));
     });
     return out.concat(notes(s.notes));
   };
