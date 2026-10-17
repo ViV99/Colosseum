@@ -1,4 +1,4 @@
-# Sub-project execution process (as run in SP2 and SP3)
+# Sub-project execution process (as run in SP2, SP3 and SP4)
 
 Templates and the loop the controller (main session) used to execute the SP2 and SP3 plans; the templates are the SP3 versions (SP2's, without the shadow-package wording, with the final reviewers writing nothing but their own report). The SDD workspace (`.superpowers/sdd/<plan-name>/`) is git-ignored scratch, deleted after the merge; this directory keeps the reusable parts. Copy them into the next workspace and adapt the plan, spec and workspace names.
 
@@ -8,6 +8,7 @@ Templates and the loop the controller (main session) used to execute the SP2 and
 | [`reviewer-instructions.md`](reviewer-instructions.md) | Per-task reviewer: spec compliance, then code quality, read-only, from a review package. |
 | [`rereviewer-instructions.md`](rereviewer-instructions.md) | Scoped re-review of one fix round: a verdict on every finding plus new breakage in the fix diff. |
 | [`final-review-brief.md`](final-review-brief.md) | Shared brief of the three area reviewers of the whole-branch review. |
+| [`review-package.sh`](review-package.sh) | Writes a review package (commit list, stat, full diff with function context) of `BASE..HEAD`: `review-package.sh BASE HEAD OUTFILE`. SP4 used it because the superpowers `review-package` script is not installed on the owner's machine. |
 | [`brief.sh`](brief.sh) | Extracts one task's brief (part preamble, task text, part contract notes) from the plan parts into the workspace. `WS=... PLAN=... brief.sh T1.1`. |
 
 ## The loop
@@ -19,7 +20,7 @@ Templates and the loop the controller (main session) used to execute the SP2 and
 2. **Per task, in the plan's order.**
    1. `brief.sh <task>` writes the brief file.
    2. Dispatch one implementer (fresh subagent) with `implementer-instructions.md`, the brief and the applicable amendments. Its report goes to `task-<id>-report.md`; it replies with a short status: `DONE | DONE_WITH_CONCERNS | BLOCKED | NEEDS_CONTEXT`.
-   3. Build a review package with the superpowers `review-package` script (`skills/subagent-driven-development/scripts/review-package PLAN_FILE BASE HEAD [OUTFILE]`; BASE = the task's recorded base, not `HEAD~1`).
+   3. Build a review package with `review-package.sh BASE HEAD OUTFILE` (this directory; or the superpowers `review-package` script where it is installed: `skills/subagent-driven-development/scripts/review-package PLAN_FILE BASE HEAD [OUTFILE]`). BASE = the task's recorded base, not `HEAD~1`.
    4. Dispatch one reviewer with `reviewer-instructions.md`, the brief, the report and the package.
    5. On findings: fix rounds. Resume the same implementer with the findings, at most 5 rounds per task. After each round, a scoped re-review (`rereviewer-instructions.md`) on the `FIX_BASE..HEAD` package.
    6. The controller decides what is fixed now and what is deferred (Minor), and writes the ledger lines.
@@ -27,6 +28,14 @@ Templates and the loop the controller (main session) used to execute the SP2 and
 4. **Acceptance** against the spec's §3 criteria, as a report in `docs/superpowers/reports/`. The owner must accept it explicitly.
 5. **Handoff before the merge.** Move every durable item (rulings, deferred minors, review records) from the workspace into `docs/`. Then run a fresh-session readiness review: can a new session start the next sub-project from the repo docs alone? Fix its gaps.
 6. **Merge** with `git merge --no-ff` after the owner's explicit "yes", then delete the workspace.
+
+## SP4 additions
+
+- **Parallel tasks.** Independent tasks ran in parallel git worktrees (`<repo>-wt-<task>`, local branches, the main checkout's venv with `PYTHONPATH=<worktree>/src`). The controller cherry-picked each task onto the sub-project branch and ran the full fast suite after every integration. Measurements and slow tests ran alone on a quiet machine, one at a time.
+- **Split tasks.** A task too large for one implementer ran as two dispatches at a split point the plan names; each half was committed and reviewed on its own (SP4 ruling C12).
+- **Controller tasks.** A defect found outside the plan (SP4: dropped match results, FX1) gets a diagnostic first (the same measurement on `main` and on the branch), then a task with its own brief, review and fix rounds, recorded like a plan task.
+- **Fix wave in parts.** The single fix wave may run as parallel parts by review area (in worktrees from the same base), each with its own scoped re-review. Small re-review Minors go into one follow-up (SP4: FW-2) before the acceptance.
+- **Machine specifics.** The implementer template's «Machine specifics» block (`env -u PYTHONPATH`, wall-clock jumps, counters, background slow suite) is binding on the owner's machine.
 
 ## Ledger line formats (`progress.md`)
 

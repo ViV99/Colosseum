@@ -7,7 +7,9 @@ As in SP3, the final whole-branch review and its fix wave ran **before** the acc
 | File | What it is |
 |---|---|
 | [`fx1-drops-diagnostic.md`](fx1-drops-diagnostic.md) | The FX1 diagnostic. It measured `main` and the branch the same way. On the default tic-tac-toe config with 2 workers, `main` dropped 79 % of the match results and the branch 73 %; on the bench at 4 workers, 27–31 % and 7 %. The root cause is a once-per-pass drain of a 64 KiB pipe. Batching the results on the workers measured 0 drops at 99–102 % of `main`'s speed. |
+| [`fx1-proto-idle.diff`](fx1-proto-idle.diff) | The diagnostic's "idle drain" prototype (drain the results queue every 10 ms while the monitor idles), the measured next step for FX1 headroom beyond 4 workers (acceptance report, question 7). A record against the pre-FX1 launcher, not applicable as-is. |
 | [`task-FX1-report.md`](task-FX1-report.md) | The FX1 fix (`cf49651..d479f90`). Workers send results in batches of up to 256 results or 0.1 s; the queue holds 1 000 batches; drops are still counted per result. The check measurement showed 0 lost on both workloads, at 101.8 % / 99.9 % of `main`. Includes its fix round 1. |
+| [`preflight-report.md`](preflight-report.md) | The plan reconciliation and pre-flight report (2026-10-16): the contract amendments A1–A33 and the pre-flight rulings P1–P22 came from it; ruling C11 accepts its within-spec proposals, and its «Change or bend the approved spec» list and «Open risks» are kept here only. |
 | [`final-review-brief.md`](final-review-brief.md) | The shared brief of the three area reviewers. |
 | [`final-review-A.md`](final-review-A.md) | Area A: journal, ratings, live ratings, league state, retention, the result flow (with FX1), metrics. 0 Critical, 0 Important, 11 Minor. Among them: M3, workers played their factory weights as v0 until the first sync, and M7, an SP3 config with `keep_last` > 100 failed validation. |
 | [`final-review-B.md`](final-review-B.md) | Area B: tournament, pulse, eval / players, distributed guards. 0 Critical, 1 Important (I1: on all-one-team games, i.e. solo or cooperative, tournament and pulse refused an empty field), 10 Minor. |
@@ -27,4 +29,4 @@ The scoped re-reviews of the wave have no files of their own. One re-reviewer pe
 
 FW-2's diff was checked by the controller.
 
-Some workspace files that these records mention were not kept: task briefs and reports, `review-*.diff` packages, `progress.md`, and the reviewers' scratch scripts under `final-review/`. They are reproducible from git: the diffs are the named commit ranges, and every `Ruling` and deferred-minor line of `progress.md` is copied verbatim into the acceptance report.
+Some workspace files that these records mention were not kept: task briefs and reports, `review-*.diff` packages, `progress.md`, the reviewers' scratch scripts under `final-review/`, and the diagnostic's other prototypes and run data under `drops-diag/`. They are reproducible from git: the diffs are the named commit ranges, and every `Ruling` and deferred-minor line of `progress.md` is copied verbatim into the acceptance report.
