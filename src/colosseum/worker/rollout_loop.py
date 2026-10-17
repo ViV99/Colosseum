@@ -92,7 +92,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["FIRST_WEIGHTS_INFO_SEC", "FIRST_WEIGHTS_POLL_SEC", "LATEST_NETWORK_ID", "LoopIO", "RolloutLoop"]
 
 # The wait for the first weights (module docstring): poll slice, and the wait after which one INFO line is logged.
-FIRST_WEIGHTS_POLL_SEC = 0.05
+FIRST_WEIGHTS_POLL_SEC = 0.1
 FIRST_WEIGHTS_INFO_SEC = 5.0
 
 
