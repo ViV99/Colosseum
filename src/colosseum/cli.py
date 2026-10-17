@@ -572,6 +572,34 @@ def report_cmd(run: str, output: str | None) -> None:
     click.echo(f"Report written to {path}")
 
 
+@main.command("dashboard")
+@click.argument("run", type=click.Path(exists=True, file_okay=False))
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Address to listen on. No authentication: keep 127.0.0.1 and use an SSH tunnel from other machines")
+@click.option("--port", default=8765, type=click.IntRange(0, 65535), show_default=True,
+              help="Port (0: any free port, printed at start)")
+@click.option("--refresh", default=10, type=click.IntRange(min=1), show_default=True,
+              help="Seconds between page refreshes")
+def dashboard_cmd(run: str, host: str, port: int, refresh: int) -> None:
+    """Serve the run's report live: the same page as 'colosseum report', refreshed from /api/<section> JSON.
+    The match log is opened read-only; ratings come from ratings.json while the run trains.
+
+    Exit code: 1 not a run directory or the port is taken, 2 bad command-line arguments, 130 Ctrl+C.
+    """
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    with _config_errors():
+        from colosseum.arena.report.server import make_server
+
+        server = make_server(run, host=host, port=port, refresh_sec=refresh)
+    click.echo(f"Dashboard of {run} at http://{host}:{server.port}/ (Ctrl+C to stop)")
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()        # a KeyboardInterrupt propagates: "Interrupted", exit code 130
+
+
 @main.command("pin")
 @click.argument("run_dir", type=click.Path(exists=True, file_okay=False))
 @click.argument("snapshot", required=False)
