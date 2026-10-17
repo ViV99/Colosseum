@@ -563,7 +563,7 @@ def test_launcher_closes_metrics_file_when_final_drain_fails(tmp_path):
             return {}
 
     results = queue.Queue()
-    results.put(MatchResult("w0_e0_ep0", "2p", "wdl", [], [], 1))   # SP4: results are stamped with env_steps
+    results.put([MatchResult("w0_e0_ep0", "2p", "wdl", [], [], 1)])   # a worker's batch; stamped with env_steps
     launcher._coordinator = FailingCoordinator()
     launcher._results_queue, launcher._metrics_queue = results, queue.Queue()
     with pytest.raises(RuntimeError, match="boom"):

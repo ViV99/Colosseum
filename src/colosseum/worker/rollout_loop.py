@@ -89,7 +89,8 @@ class LoopIO:
 
     send_chunk: Callable[[TrajectoryChunk], None]
     poll_weights: Callable[[str], WeightPayload | None]
-    # Returns False when the result was dropped (counted in stats["dropped_results"]); None or True: delivered.
+    # Returns False when the result was dropped (counted in stats["dropped_results"]); None or True: delivered, or
+    # taken over by a caller that counts its own drops (the worker's ResultBatcher).
     report_result: Callable[[MatchResult], bool | None] | None = None
     poll_command: Callable[[], WorkerCommand | None] | None = None
     add_env_steps: Callable[[int], None] | None = None  # global env-step budget counter

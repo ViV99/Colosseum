@@ -34,7 +34,9 @@ def test_a_spawned_worker_seats_scripted_and_frozen_players_that_never_collect(t
     ))
     proc.start()
     try:
-        got = [results.get(timeout=60) for _ in range(4)]
+        got = []
+        while len(got) < 4:                       # the worker puts its results in batches (lists)
+            got.extend(results.get(timeout=60))
         chunks = [TrajectoryChunk.from_payload(trajectories.get(timeout=60)) for _ in range(2)]
     finally:
         stop.set()

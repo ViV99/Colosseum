@@ -21,6 +21,7 @@ import logging
 import multiprocessing as mp
 import os
 import queue
+import reprlib
 import signal
 import time
 from collections.abc import Callable, Mapping
@@ -33,7 +34,7 @@ from colosseum.coordinator.coordinator import LEAGUE_STATE_FILE, Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.ipc import QueueReader, SharedCounter, queue_depths, release_command_queues
 from colosseum.core.run_dir import RunDir
-from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, Lineup, SeatAssignment
+from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, Lineup, MatchResult, SeatAssignment
 from colosseum.envs.game import GameSpec, RoleSpec
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.players.registry import BotSpec, FixedPlayers
@@ -50,8 +51,12 @@ logger = logging.getLogger(__name__)
 _WEIGHT_QUEUE_SIZE = 1  # newest-wins mailbox per (agent, worker); see core.ipc.put_latest
 _CHECKPOINT_QUEUE_SIZE = 16
 _METRICS_QUEUE_SIZE = 100
-# Match results from all workers (SP4 spec block 1): a full queue drops results, and workers count the drops.
-_RESULTS_QUEUE_SIZE = 10_000
+# Match results from all workers (SP4 spec block 1), in batches: each item is a list of up to RESULTS_BATCH_MAX
+# results that one worker gathered over at most RESULTS_BATCH_SEC (worker.rollout_worker.ResultBatcher; one item per
+# match let the results pile up in the workers' feeder buffers between monitor passes until the queue was full, SP4
+# FX1). 1000 batches hold more results than the spec's 10 000 single ones (at most 256 000), and the memory stays
+# bounded. A full queue drops a whole batch; the worker counts every result in it.
+_RESULTS_QUEUE_SIZE = 1_000
 # One slot: a command that was put has been taken by the worker before the next one
 # can be put, so no command (and none of its new_checkpoints) is replaced unseen (D9).
 _COMMAND_QUEUE_SIZE = 1
@@ -60,6 +65,25 @@ _COMMAND_QUEUE_SIZE = 1
 _QUEUE_RELEASE_SEC = 1.0
 # Pulse results (SP4 T6.1): one message per evaluated snapshot; the pulse process puts with a blocking put.
 _PULSE_RESULTS_QUEUE_SIZE = 64
+
+
+def _flatten_result_batches(items: list) -> list[MatchResult]:
+    """The results of the batches drained from the results queue, in arrival order. Every item must be a list of
+    ``MatchResult`` (a worker's ``ResultBatcher`` batch); anything else is a programming error and raises
+    ``TypeError`` naming the item, before any result is fed."""
+    results: list[MatchResult] = []
+    for k, batch in enumerate(items):
+        if not isinstance(batch, list):
+            raise TypeError(f"Malformed item on the results queue: drained item {k} is a {type(batch).__name__} "
+                            f"({reprlib.repr(batch)}); workers put batches, each a list of MatchResult "
+                            f"(rollout_worker.ResultBatcher)")
+        for i, result in enumerate(batch):
+            if not isinstance(result, MatchResult):
+                raise TypeError(f"Malformed item on the results queue: item {i} of the batch is a "
+                                f"{type(result).__name__} ({reprlib.repr(result)}; drained item {k}, {len(batch)} "
+                                f"items); a batch is a list of MatchResult (rollout_worker.ResultBatcher)")
+        results.extend(batch)
+    return results
 
 
 # =====================================================================
@@ -794,11 +818,12 @@ class Launcher:
     def _drain_results(self) -> None:
         """Feed queued match results to the coordinator (ratings, PFSP), the hub and the journal writer (never
         blocking: a full writer queue drops and counts); a result without ``env_steps`` is stamped with the
-        global env-step counter at its arrival (spec block 1; a pulse result arrives with its snapshot's, T6.1)."""
+        global env-step counter at its arrival (spec block 1; a pulse result arrives with its snapshot's, T6.1).
+        Workers put batches (``_flatten_result_batches``); they are flattened in arrival order."""
         if self._results_queue is None:
             return
         workers = lambda: [n for n in self._supervisor.names if n.startswith("worker-")]  # noqa: E731
-        results = self._drain(self._results_queue, "results", workers)
+        results = _flatten_result_batches(self._drain(self._results_queue, "results", workers))
         if not results:
             return
         env_steps = int(self._env_step_counter.value)

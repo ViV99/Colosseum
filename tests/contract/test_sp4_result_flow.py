@@ -1,12 +1,16 @@
-"""Result flow (SP4 T0.1 on SP3 behaviour, extended by T1.1; spec section 6, §7 P0 and block 1): every finished
-episode is reported exactly once with a unique match id and uid, with the weights versions of every seat at the
-episode's start and end; the launcher stamps env_steps and feeds each drained result to the coordinator and the
-hub once; a full results queue never blocks a worker, and every drop is counted (a WARNING on the first)."""
+"""Result flow (SP4 T0.1 on SP3 behaviour, extended by T1.1 and FX1; spec section 6, §7 P0 and block 1): every
+finished episode is reported exactly once with a unique match id and uid, with the weights versions of every seat at
+the episode's start and end; workers put their results in batches (lists), and the launcher flattens them in arrival
+order, stamps env_steps and feeds each result to the coordinator, the hub and the journal writer once; anything else
+on the results queue fails loudly; a full results queue never blocks a worker, and every drop is counted (a WARNING
+on the first), also the drops of the last flush on exit."""
 from __future__ import annotations
 
 import logging
 import queue
 import threading
+import time
+from functools import partial
 
 import pytest
 import torch
@@ -22,7 +26,8 @@ from colosseum.core.types import (
     state_dict_to_numpy,
 )
 from colosseum.launcher import Launcher
-from colosseum.worker.rollout_worker import rollout_worker_process
+from colosseum.worker import rollout_worker
+from colosseum.worker.rollout_worker import ResultBatcher, rollout_worker_process
 from game_harness import Collected, GameFactory, lineup, make_loop, run_steps
 from game_helpers import NumpyOnlyQueue, Tick, TickGame, make_test_config, make_test_model, make_test_run_dir
 
@@ -123,27 +128,69 @@ class _HubRecorder:
         self.results.append(result)
 
 
-def test_the_launcher_feeds_each_drained_result_to_the_coordinator_and_the_hub_once(tmp_path):
+class _WriterRecorder:
+    """Only the journal writer's method."""
+
+    def __init__(self) -> None:
+        self.results: list[MatchResult] = []
+
+    def submit(self, results: list[MatchResult]) -> None:
+        self.results.extend(results)
+
+
+def _launcher_with_recorders(tmp_path, results_queue):
     config = make_test_config("turns")
     launcher = Launcher(config, make_test_run_dir(config, tmp_path))
-    results_queue: queue.Queue = queue.Queue()
-    sent = [_result(i) for i in range(5)]
-    sent[4].env_steps = 77                                      # a pulse result arrives with its snapshot's
-    for item in sent:
-        results_queue.put(item)
-    coordinator, hub = _CoordinatorRecorder(), _HubRecorder()
+    coordinator, hub, writer = _CoordinatorRecorder(), _HubRecorder(), _WriterRecorder()
     launcher._results_queue, launcher._coordinator, launcher._hub = results_queue, coordinator, hub
+    launcher._match_log_writer = writer
+    return launcher, coordinator, hub, writer
+
+
+def test_the_launcher_flattens_batches_and_feeds_each_result_to_the_coordinator_hub_and_writer_once(tmp_path):
+    results_queue: queue.Queue = queue.Queue()
+    sent = [_result(i) for i in range(7)]
+    sent[4].env_steps = 77                                      # a pulse result arrives with its snapshot's
+    for batch in (sent[:3], sent[3:4], sent[4:7]):              # three workers' batches, in arrival order
+        results_queue.put(list(batch))
+    launcher, coordinator, hub, writer = _launcher_with_recorders(tmp_path, results_queue)
     launcher._env_step_counter.add(1234)
     launcher._drain_results()
+    late = [_result(i) for i in range(7, 9)]
+    results_queue.put(late)                                     # a batch arriving at a later pass
+    launcher._env_step_counter.add(1000)
+    launcher._drain_results()
     launcher._drain_results()                                   # nothing new: nothing fed twice
-    assert [r.match_id for r in coordinator.results] == [r.match_id for r in sent]
-    assert [r.match_id for r in hub.results] == [r.match_id for r in sent]
-    assert [r.env_steps for r in coordinator.results] == [1234] * 4 + [77]     # stamped at arrival when unset
+    expected = [r.match_id for r in sent + late]
+    for recorder in (coordinator, hub, writer):
+        assert [r.match_id for r in recorder.results] == expected
+    assert [r.env_steps for r in coordinator.results] == [1234] * 4 + [77] + [1234] * 2 + [2234] * 2
+    assert launcher._results_received == len(expected)
 
 
-def test_a_full_results_queue_never_blocks_the_worker_and_every_drop_is_counted(restore_torch_threads, caplog):
+@pytest.mark.parametrize("item, what", [
+    (_result(0), "is a MatchResult"),                           # a bare result: not a batch
+    ([_result(0), {"kind": "worker_stats"}], "item 1 of the batch is a dict"),
+    ((_result(0),), "is a tuple"),
+])
+def test_a_results_queue_item_that_is_not_a_batch_of_match_results_fails_loudly(tmp_path, item, what):
+    results_queue: queue.Queue = queue.Queue()
+    results_queue.put([_result(5)])
+    results_queue.put(item)
+    launcher, coordinator, hub, writer = _launcher_with_recorders(tmp_path, results_queue)
+    with pytest.raises(TypeError, match="results queue") as info:
+        launcher._drain_results()
+    assert what in str(info.value) and "list of MatchResult" in str(info.value)
+    assert coordinator.results == hub.results == writer.results == []      # nothing fed from a broken drain
+
+
+def test_a_full_results_queue_never_blocks_the_worker_and_every_drop_is_counted(restore_torch_threads, caplog,
+                                                                              monkeypatch):
+    """Batches of 3 and no due-time flush: the first batch fills the queue, every later batch is dropped, the last
+    one by the flush on exit, which the final stats report (and the "finished" log line) must count."""
+    monkeypatch.setattr(rollout_worker, "ResultBatcher", partial(ResultBatcher, max_results=3, max_age_sec=3600.0))
     results, stats = NumpyOnlyQueue(maxsize=1), NumpyOnlyQueue()
-    with caplog.at_level(logging.WARNING, logger="colosseum.worker.rollout_worker"):
+    with caplog.at_level(logging.INFO, logger="colosseum.worker.rollout_worker"):
         rollout_worker_process(
             worker_id=0, env_fn=_solo_env, num_envs=2, chunk_length=3, agent_ids=["a"],
             agent_roles={"a": ["player"]}, model_factories={"a": _solo_model},
@@ -151,14 +198,44 @@ def test_a_full_results_queue_never_blocks_the_worker_and_every_drop_is_counted(
             stop_event=threading.Event(), max_env_steps=40, lineups=[Lineup("solo", [SeatAssignment("a")])] * 2,
             results_queue=results, stats_queue=stats, stats_interval_sec=3600.0, seed=0, run_id="RUN",
         )
-    assert results.qsize() == 1                                  # the first result; the others were dropped
+    assert results.qsize() == 1                                  # the first batch; the others were dropped
+    first = results.get_nowait()
+    assert [r.uid for r in first[:2]] == ["RUN/train/w0_e0_ep0", "RUN/train/w0_e1_ep0"] and len(first) == 3
     reports = [stats.get_nowait() for _ in range(stats.qsize())]
     final = reports[-1]                                          # the final report on exit
-    assert final["episodes"] > 1 and final["dropped_results"] == final["episodes"] - 1
-    assert final["dropped_results"] > 0
-    assert results.get_nowait().uid == "RUN/train/w0_e0_ep0"
+    assert final["episodes"] % 3 != 0                            # the flush on exit had results to drop
+    assert final["dropped_results"] == final["episodes"] - 3 > 0
     drops = [r for r in caplog.records if "results queue is full" in r.getMessage()]
     assert len(drops) == 1 and drops[0].levelno == logging.WARNING   # the first drop only
+    finished = [r.getMessage() for r in caplog.records if "finished." in r.getMessage()]
+    assert len(finished) == 1 and f"'dropped_results': {final['dropped_results']}" in finished[0]
+
+
+def test_a_running_worker_puts_due_batches_below_the_size_cap(restore_torch_threads, monkeypatch):
+    """The due-time flush is on the worker's loop path (``should_stop``): with an unreachable size cap, batches still
+    arrive while the worker runs (the flush on exit is only one)."""
+    monkeypatch.setattr(rollout_worker, "ResultBatcher", partial(ResultBatcher, max_results=10**9))
+    results, stop = NumpyOnlyQueue(), threading.Event()
+    thread = threading.Thread(target=rollout_worker_process, kwargs=dict(
+        worker_id=0, env_fn=_solo_env, num_envs=1, chunk_length=3, agent_ids=["a"],
+        agent_roles={"a": ["player"]}, model_factories={"a": _solo_model},
+        trajectory_queues={"a": NumpyOnlyQueue()}, weight_queues={"a": NumpyOnlyQueue()}, stop_event=stop,
+        lineups=[Lineup("solo", [SeatAssignment("a")])], results_queue=results, seed=0,
+    ))
+    thread.start()
+    try:
+        deadline = time.monotonic() + 10
+        while results.qsize() < 2 and thread.is_alive() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        running = thread.is_alive()
+    finally:
+        stop.set()
+        thread.join(timeout=10)
+    assert running and not thread.is_alive()
+    batches = [results.get_nowait() for _ in range(results.qsize())]
+    assert len(batches) >= 2 and all(isinstance(b, list) and b for b in batches)     # due ones (+ the exit flush)
+    ids = [r.match_id for b in batches for r in b]
+    assert ids == [f"w0_e0_ep{i}" for i in range(len(ids))]
 
 
 def test_latest_seat_versions_follow_weight_syncs_in_the_middle_of_an_episode():

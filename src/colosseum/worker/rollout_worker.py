@@ -26,9 +26,20 @@ from colosseum.players.registry import BotSpec, FixedPlayers
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, flush_queue
 from colosseum.worker.rollout_loop import LATEST_NETWORK_ID, LoopIO, RolloutLoop
 
-__all__ = ["LATEST_NETWORK_ID", "report_worker_stats", "rollout_worker_process"]
+__all__ = ["LATEST_NETWORK_ID", "RESULTS_BATCH_MAX", "RESULTS_BATCH_SEC", "ResultBatcher", "report_worker_stats",
+           "rollout_worker_process"]
 
 logger = logging.getLogger(__name__)
+
+# Match results travel to the main process in batches (lists), one per RESULTS_BATCH_SEC or RESULTS_BATCH_MAX
+# results, whichever comes first (SP4 FX1). Why: the main process reads the results queue in one short burst per
+# monitor pass (0.2 s), and the queue's pipe (64 KiB) holds only about 100-140 results; results put one by one pile
+# up in this process's feeder buffer, which the queue's semaphore counts, until the queue reports Full (the drops
+# diagnostic measured 73-79 % lost on the default tic-tac-toe config). A batch is one queue item, and the feeder
+# thread wakes (taking this process's GIL) once per batch, not once per match. Cost: results arrive up to 0.1 s
+# later.
+RESULTS_BATCH_SEC = 0.1
+RESULTS_BATCH_MAX = 256
 
 
 def _drain_commands(command_queue: Any) -> WorkerCommand | None:
@@ -62,6 +73,55 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
     if latest is None:
         return None
     return WorkerCommand(lineups=lineups, new_checkpoints=merged, evict=evict)
+
+
+class ResultBatcher:
+    """One worker's match results, put on the results queue as lists (see ``RESULTS_BATCH_SEC``).
+
+    ``add`` keeps a result and puts the batch as soon as ``max_results`` are pending; ``flush_if_due`` puts the
+    pending results once ``max_age_sec`` has passed since the last put (the caller calls it regularly, also when no
+    match finishes: the worker does so once per loop step); ``flush`` puts whatever is pending (on exit). Never
+    blocks: a full queue drops the whole batch, and every result in it is counted in ``dropped`` (the first drop is
+    a WARNING, later ones are only counted). ``clock`` (default ``time.monotonic``) is injectable for tests.
+    """
+
+    def __init__(self, q: Any, worker_id: int, *, max_results: int = RESULTS_BATCH_MAX,
+                 max_age_sec: float = RESULTS_BATCH_SEC, clock: Callable[[], float] = time.monotonic) -> None:
+        self._q = q
+        self._worker_id = worker_id
+        self._max_results = max_results
+        self._max_age_sec = max_age_sec
+        self._clock = clock
+        self._pending: list[MatchResult] = []
+        self._last_put = clock()
+        self._warned = False
+        self.dropped = 0
+
+    def add(self, result: MatchResult) -> None:
+        self._pending.append(result)
+        if len(self._pending) >= self._max_results:
+            self.flush()
+
+    def flush_if_due(self, now: float | None = None) -> None:
+        """Put the pending results if ``max_age_sec`` has passed since the last put; ``now``: the caller's reading of
+        the same clock (saves a call)."""
+        if self._pending and (self._clock() if now is None else now) - self._last_put >= self._max_age_sec:
+            self.flush()
+
+    def flush(self) -> None:
+        if not self._pending:
+            return
+        batch, self._pending = self._pending, []
+        self._last_put = self._clock()
+        try:
+            self._q.put_nowait(batch)
+        except queue.Full:
+            self.dropped += len(batch)
+            if not self._warned:
+                self._warned = True
+                logger.warning(f"Worker {self._worker_id}: the results queue is full; dropped {len(batch)} match "
+                               f"results (counted in dropped_match_results of the system metrics; further drops "
+                               f"are only counted)")
 
 
 def report_worker_stats(q, worker_id: int, stats: dict, timeout: float | None = None) -> None:
@@ -111,16 +171,17 @@ def rollout_worker_process(
 
     Chunk payloads (``TrajectoryChunk.to_payload()``) go to ``trajectory_queues[agent_id]``
     (blocking put that gives up when ``stop_event`` is set); weights are drained newest-wins
-    from ``weight_queues[agent_id]``; results are put non-blocking on ``results_queue`` (a full queue drops
-    the result: counted in the stats as ``dropped_results``, the first drop is a WARNING);
+    from ``weight_queues[agent_id]``; results are put non-blocking on ``results_queue`` in batches (lists of
+    ``MatchResult``, ``ResultBatcher``; a full queue drops the batch: its results are counted in the stats as
+    ``dropped_results``, the first drop is a WARNING);
     commands are drained (merged) from ``command_queue``. ``max_env_steps`` limits this
     worker's env steps (0 = until stopped). Env steps are added to ``env_step_counter``
     about every 0.5 s and once more on exit. ``fixed_players``: scripted and frozen agents, built
     inside this process (served under ``FIXED_NETWORK_ID``; they never collect). ``teachers``: scripted
     kickstart teachers by student agent (``BotSpec``, never instances; DAgger labels in the chunks).
-    ``run_id`` prefixes the match uids (``<run_id>/train/...``). On exit a final stats report is sent, and the
-    results and stats queues are flushed (``flush_queue``) so that neither the last results nor the final
-    counters are lost.
+    ``run_id`` prefixes the match uids (``<run_id>/train/...``). On exit the pending results are put, then a final
+    stats report is sent (it counts the drops of that last put), and the results and stats queues are flushed
+    (``flush_queue``) so that neither the last results nor the final counters are lost.
     """
     configure_torch_threads(torch_threads)
 
@@ -137,19 +198,7 @@ def rollout_worker_process(
     def poll_weights(agent_id: str) -> WeightPayload | None:
         return drain_latest(weight_queues[agent_id])
 
-    drop_warned = [False]
-
-    def report_result(result: MatchResult) -> bool:
-        try:
-            results_queue.put_nowait(result)
-            return True
-        except queue.Full:
-            if not drop_warned[0]:
-                drop_warned[0] = True
-                logger.warning(f"Worker {worker_id}: the results queue is full; dropped match result "
-                               f"{result.uid or result.match_id} (counted in dropped_match_results of the system "
-                               f"metrics; further drops are only counted)")
-            return False
+    batcher = ResultBatcher(results_queue, worker_id) if results_queue is not None else None
 
     def poll_command() -> WorkerCommand | None:
         return _drain_commands(command_queue)
@@ -158,7 +207,7 @@ def rollout_worker_process(
     io = LoopIO(
         send_chunk=send_chunk,
         poll_weights=poll_weights,
-        report_result=report_result if results_queue is not None else None,
+        report_result=batcher.add if batcher is not None else None,   # drops are counted by the batcher
         poll_command=poll_command if command_queue is not None else None,
         add_env_steps=counter.add if counter is not None else None,
     )
@@ -177,11 +226,19 @@ def rollout_worker_process(
     )
     last_stats = [time.monotonic()]
 
+    def worker_stats() -> dict[str, int]:
+        stats = loop.stats
+        if batcher is not None:
+            stats["dropped_results"] += batcher.dropped
+        return stats
+
     def should_stop() -> bool:
         now = time.monotonic()
+        if batcher is not None:
+            batcher.flush_if_due(now)   # once per loop step, also when no match finished
         if stats_queue is not None and now - last_stats[0] >= stats_interval_sec:
             last_stats[0] = now
-            report_worker_stats(stats_queue, worker_id, loop.stats)
+            report_worker_stats(stats_queue, worker_id, worker_stats())
         return stop_event.is_set()
 
     try:
@@ -190,8 +247,10 @@ def rollout_worker_process(
         if counter is not None:
             counter.flush()
         try:
+            if batcher is not None:
+                batcher.flush()           # the last results, before the final report counts their drops
             if stats_queue is not None:   # the final counters (dropped results, dropped reward episodes)
-                report_worker_stats(stats_queue, worker_id, loop.stats, timeout=1.0)
+                report_worker_stats(stats_queue, worker_id, worker_stats(), timeout=1.0)
             loop.close()
         finally:
             # The results and the final stats must reach the main process (it drains them until this process
@@ -203,4 +262,4 @@ def rollout_worker_process(
             for q in [*trajectory_queues.values(), results_queue, stats_queue]:
                 if q is not None and hasattr(q, "cancel_join_thread"):
                     q.cancel_join_thread()
-    logger.info(f"Worker {worker_id}: finished. {loop.stats}")
+    logger.info(f"Worker {worker_id}: finished. {worker_stats()}")
