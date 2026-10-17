@@ -27,8 +27,10 @@ no column where the two differ is a repeated pair of either (below). A lone fina
 
 Repeated games (``--deterministic`` only): a (candidate, column) pair whose every block gave the same
 outcomes and lengths (two or more blocks) is flagged. It counts as one block: its per-cell interval is the
-Wilson interval of one observation (pairwise) or the point itself (score), and a lead that rests on such a
-column is never ``confirmed`` (spec block 3: «Такие пары в ДИ и confirmed считаются одним блоком»; ruling D5).
+Wilson interval of one observation (pairwise) or no interval at all (score: one observation has no variance
+estimate, so no certainty is claimed), and a lead that rests on such a column is never ``confirmed`` (spec block
+3: «Такие пары в ДИ и confirmed считаются одним блоком»; ruling D5). Intervals that aggregate such a cell (a
+candidate's score, the layout combination, the winner's difference) are marked by the report (``repeated``).
 """
 
 from __future__ import annotations
@@ -258,14 +260,19 @@ def quantiles(x: np.ndarray, level: float = 0.95) -> tuple[float, float]:
 
 
 def cell_interval(table: CandidateTable, candidate: str, column: str, replicates: np.ndarray,
-                  level: float = 0.95) -> tuple[float, float]:
+                  level: float = 0.95) -> tuple[float, float] | None:
     """95 % interval of one cell from its bootstrap replicates ``[R, C, L]``; a repeated pair counts as one
-    block (Wilson of one observation for pairwise, the point for score)."""
+    block (Wilson of one observation for pairwise, None for score: no variance estimate)."""
     ci, j = table.candidates.index(candidate), table.columns.index(column)
     value = float(table.cells()[ci, j])
     if (candidate, column) in table.repeated:
-        return wilson_interval(value, 1) if table.metric == "pairwise" else (value, value)
+        return wilson_interval(value, 1) if table.metric == "pairwise" else None
     return quantiles(replicates[:, ci, j], level)
+
+
+def repeated_columns(tables: Sequence[CandidateTable], *names: str) -> list[tuple[str, str]]:
+    """``(layout, column)`` pairs where any of ``names`` has repeated games (sorted, unique)."""
+    return sorted({(t.layout, col) for t in tables for cand, col in t.repeated if cand in names})
 
 
 def repeated_conflict(tables: Sequence[CandidateTable], a: str, b: str) -> list[tuple[str, str]]:

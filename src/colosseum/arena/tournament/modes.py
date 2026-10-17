@@ -26,8 +26,11 @@ pairwise layout is fitted on the tournament's own matches (``bt_section``; rulin
 
 What the schedule could not seat (``schedule.DroppedComposition``) is listed per layout in the report
 (``layouts[i]["dropped"]``); a candidate that is also a field member plays the field without itself
-(``flags["self_excluded"]``). The builders' INFO lines about both are logged once per tournament, not once per
-halving round.
+(``flags["self_excluded"]``; the weights its score uses are in the table's ``candidate_weights``). Repeated
+deterministic games (``stats``) are marked next to every interval they enter: a row's ``repeated`` columns, a
+combined row's ``repeated`` ``[layout, column]`` pairs, a selection's ``diff_repeated``. The builders' INFO
+lines about dropped compositions and self-excluded candidates are logged once per tournament, not once per
+halving round. ``select`` with ``finalists=1`` logs one WARNING: nothing can be confirmed.
 """
 
 from __future__ import annotations
@@ -59,11 +62,14 @@ from colosseum.arena.tournament.stats import (
     cell_interval,
     combine,
     quantiles,
+    repeated_columns,
     select_winner,
 )
 from colosseum.core.errors import ConfigError
 from colosseum.core.types import MatchResult
 from colosseum.envs.game import GameSpec
+
+logger = logging.getLogger(__name__)
 
 MODES = ("gauntlet", "round-robin", "halving", "select")
 REPORT_FORMAT = 1
@@ -215,18 +221,28 @@ def _table_dict(ctx: _Context, table: CandidateTable, reps: np.ndarray) -> dict[
         })
     rows.sort(key=lambda r: (-r["score"], table.candidates.index(r["name"])))
     matrix = {c: {col: {"score": float(cells[i, j]),
-                        "ci95": list(cell_interval(table, c, col, reps, ctx.settings.level)),
+                        "ci95": _interval(cell_interval(table, c, col, reps, ctx.settings.level)),
                         "games": int(table.games[c][col]), "blocks": table.blocks_of(col, c),
                         "repeated": (c, col) in table.repeated}
                   for j, col in enumerate(table.columns) if table.has_cell(c, col)}
               for i, c in enumerate(table.candidates)}
+    weights, used = table.weights, table.candidate_weights
     return {"stage": table.stage, "layout": table.layout, "group": table.group, "metric": table.metric,
-            "columns": list(table.columns), "column_weights": [float(w) for w in table.weights],
+            "columns": list(table.columns), "column_weights": [float(w) for w in weights],
+            # the weights a candidate's score actually uses, where they differ (a candidate in the field)
+            "candidate_weights": {c: [float(w) for w in used[i]] for i, c in enumerate(table.candidates)
+                                  if not np.allclose(used[i], weights)},
             "rows": rows, "matrix": matrix}
 
 
-def _combined_dict(stage: str, group: str, combined, level: float) -> dict[str, Any]:
-    rows = [{"name": c, "score": float(combined.point[i]), "ci95": list(quantiles(combined.replicates[:, i], level))}
+def _interval(ci: tuple[float, float] | None) -> list[float] | None:
+    return None if ci is None else [float(ci[0]), float(ci[1])]
+
+
+def _combined_dict(stage: str, group: str, combined, level: float,
+                   tables: Sequence[CandidateTable]) -> dict[str, Any]:
+    rows = [{"name": c, "score": float(combined.point[i]), "ci95": list(quantiles(combined.replicates[:, i], level)),
+             "repeated": [list(x) for x in repeated_columns(tables, c)]}
             for i, c in enumerate(combined.candidates)]
     rows.sort(key=lambda r: (-r["score"], combined.candidates.index(r["name"])))
     return {"stage": stage, "layout": "*", "group": group, "rows": rows}
@@ -245,13 +261,17 @@ def _halving(ctx: _Context, group: str, names: list[str], group_of, rounds: list
         for layout in s.layouts:
             ctx.run(ctx.schedule(layout, active, blocks=size, stage="A", first_index=offset))
         tables = _stage_tables(ctx, "A", active, group, group_of)
-        point = combine(tables, s.layout_weights, samples=0, rng=ctx.rng).point
-        order = sorted(range(len(active)), key=lambda i: (-point[i], names.index(active[i])))
-        ranked = [active[i] for i in order]
+        comb = combine(tables, s.layout_weights, samples=0, rng=ctx.rng)
+        # by name: comb.candidates follow the blocks (round 0's input order), ``active`` is ranked
+        point = {name: float(v) for name, v in zip(comb.candidates, comb.point)}
+        missing = [n for n in active if n not in point]
+        if missing:
+            raise ValueError(f"halving round {r}: no stage A score for {missing}")
+        ranked = sorted(active, key=lambda n: (-point[n], names.index(n)))
         keep = len(active) if len(active) <= s.finalists else max(s.finalists, len(active) - len(active) // 2)
         rounds.append({"group": group, "round": r, "stage": "A", "blocks_per_composition": size,
                        "first_index": offset, "active": list(ranked),
-                       "scores": {active[i]: float(point[i]) for i in order},
+                       "scores": {n: point[n] for n in ranked},
                        "eliminated": ranked[keep:]})
         active = ranked[:keep]
         offset, size, r = offset + size, size * 2, r + 1
@@ -288,6 +308,9 @@ def run(mode: str, *, spec: GameSpec, players: Mapping[str, Any], candidates: Se
     started = time.monotonic()
     _check_settings(mode, spec, settings)
     candidates, field = list(dict.fromkeys(candidates)), list(dict.fromkeys(field))
+    if mode == "select" and settings.finalists == 1:
+        logger.warning("--mode select with --finalists 1: stage B has no runner-up, so the winner can never be "
+                       "confirmed; pin it by hand (colosseum pin) if you accept it")
     ctx = _Context(spec, players, candidates, field, settings, play)
     once = _OnceFilter()
     _schedule.logger.addFilter(once)
@@ -376,7 +399,7 @@ def _play_mode(ctx: _Context, mode: str) -> tuple[list[dict], list[dict], dict[s
             comb = combine(stage_tables, settings.layout_weights, samples=settings.bootstrap_samples, rng=ctx.rng,
                            replicates=[t.scores_of(r) for t, r in zip(stage_tables, reps)])
             if len(stage_tables) > 1:
-                tables.append(_combined_dict(stage, group, comb, settings.level))
+                tables.append(_combined_dict(stage, group, comb, settings.level, stage_tables))
             if selecting:
                 sel = select_winner(comb, stage_tables, level=settings.level)
                 selection[group] = {
@@ -384,6 +407,9 @@ def _play_mode(ctx: _Context, mode: str) -> tuple[list[dict], list[dict], dict[s
                     "diff": sel.diff, "diff_ci95": None if sel.diff_ci95 is None else list(sel.diff_ci95),
                     "indistinguishable": sel.indistinguishable,
                     "repeated_columns": [list(x) for x in sel.repeated_columns],
+                    # every repeated column of the winner or the runner-up: diff_ci95 rests on it in part
+                    "diff_repeated": [list(x) for x in repeated_columns(
+                        stage_tables, *[n for n in (sel.winner, sel.runner_up) if n is not None])],
                     "note": WINNER_BIAS_NOTE if sel.runner_up is not None else LONE_FINALIST_NOTE}
     return tables, rounds, selection
 
@@ -451,7 +477,7 @@ def report_text(data: Mapping[str, Any]) -> str:
             if "games" in r:
                 text += f"  games {r['games']}"
             if r.get("repeated"):
-                text += f"  REPEATED vs {', '.join(r['repeated'])}"
+                text += "  REPEATED vs " + ", ".join(x if isinstance(x, str) else "/".join(x) for x in r["repeated"])
             lines.append(text)
     for r in data["rounds"]:
         lines.append(f"-- halving {r['group']} round {r['round']}: {r['blocks_per_composition']} blocks/composition, "
@@ -462,6 +488,8 @@ def report_text(data: Mapping[str, Any]) -> str:
         if sel["diff_ci95"] is not None and sel["diff"] is not None and None not in sel["diff_ci95"]:
             lo, hi = sel["diff_ci95"]
             line += f"; vs {sel['runner_up']}: {sel['diff']:+.3f} [{lo:+.3f}, {hi:+.3f}]"
+        if sel.get("diff_repeated"):
+            line += "; REPEATED games in " + ", ".join(f"{L}: {c}" for L, c in sel["diff_repeated"])
         lines.append(line + ")")
         if sel["indistinguishable"]:
             lines.append(f"   indistinguishable from the winner: {', '.join(sel['indistinguishable'])}")

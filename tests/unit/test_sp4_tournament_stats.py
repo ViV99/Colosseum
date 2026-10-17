@@ -52,9 +52,27 @@ def test_paired_bootstrap_confirms_only_a_real_gap():
     tables = list(tables_for(blocks, FakeArena(spec, PLAYERS, strengths, seed=1)(blocks)).values())
     sel = select_winner(combine(tables, {"2p": 1.0}, samples=1000, rng=np.random.default_rng(2)), tables)
     assert sel.winner == "main@v10" and sel.confirmed and sel.diff_ci95[0] > 0
-    tables = list(tables_for(blocks, FakeArena(spec, PLAYERS, {**strengths, "main@v10": 0.0}, seed=3)(blocks)).values())
+    # equal strengths under common random numbers: identical games, the difference replicates are exactly 0
+    equal = FakeArena(spec, PLAYERS, {**strengths, "main@v10": 0.0}, seed=3, crn=True)
+    tables = list(tables_for(blocks, equal(blocks)).values())
     sel = select_winner(combine(tables, {"2p": 1.0}, samples=1000, rng=np.random.default_rng(4)), tables)
-    assert not sel.confirmed and sel.runner_up in sel.indistinguishable
+    assert not sel.confirmed and sel.runner_up in sel.indistinguishable and sel.diff_ci95 == (0.0, 0.0)
+
+
+def test_the_bootstrap_is_paired_across_candidates():
+    """Identical candidates on common random numbers have identical blocks; a paired bootstrap (the same index
+    draw for every candidate) gives replicate differences of exactly 0. With independent games the differences
+    spread (and an unpaired bootstrap would spread them even under common random numbers)."""
+    spec = TurnTakingGame().spec
+    strengths = {"main@v10": 0.0, "main@v20": 0.0, "greedy": 0.0, "random": -0.5}
+    blocks = gauntlet_blocks(spec, "2p", ["main@v10", "main@v20"], ["greedy", "random"], PLAYERS, blocks=40, seed=0,
+                             stage="B")
+    (table,) = tables_for(blocks, FakeArena(spec, PLAYERS, strengths, crn=True)(blocks)).values()
+    reps = table.bootstrap_scores(500, np.random.default_rng(0))
+    assert np.ptp(reps[:, 0]) > 0.05 and np.array_equal(reps[:, 0], reps[:, 1])
+    (table,) = tables_for(blocks, FakeArena(spec, PLAYERS, strengths, seed=1)(blocks)).values()
+    reps = table.bootstrap_scores(500, np.random.default_rng(0))
+    assert np.std(reps[:, 0] - reps[:, 1]) > 0.01
 
 
 def test_the_bootstrap_interval_covers_the_true_score():

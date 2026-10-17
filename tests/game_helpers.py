@@ -1622,10 +1622,12 @@ class FakeArena:
     draw on ``strengths`` (a team's strength is its player's; ranks by ``strength + Gumbel``, so
     ``P(a beats b) = sigmoid(s_a - s_b)``); a one-team layout scores ``mean strength + N(0, noise)``. Results are
     real ``MatchResult``s (uid, block, seed, source "tournament"); ``length`` is the episode length (int or
-    callable of the rng). ``calls`` lists the block ids of every call."""
+    callable of the rng). ``calls`` lists the block ids of every call. ``crn=True``: common random numbers, every
+    team's draw is seeded by ``(lineup seed, rotation, team)``, so equally strong players get identical outcomes on
+    the same seeds and rotations (and every call repeats them)."""
 
-    def __init__(self, spec, players, strengths, *, seed=0, noise=0.1, length=6):
-        self.spec, self.strengths, self.noise, self.length = spec, strengths, noise, length
+    def __init__(self, spec, players, strengths, *, seed=0, noise=0.1, length=6, crn=False):
+        self.spec, self.strengths, self.noise, self.length, self.crn = spec, strengths, noise, length, crn
         self.rng = np.random.default_rng(seed)
         self.names = {(p.agent_id, p.network_id): n for n, p in players.items()}
         self.calls: list[list[str]] = []
@@ -1641,12 +1643,17 @@ class FakeArena:
             rows = []
             for lu in b.lineups:
                 names = {seat_specs[s].team: self.names[(x.agent_id, x.network_id)] for s, x in enumerate(lu.seats)}
+                rotation = int(lu.uid.rsplit("/r", 1)[1])
+
+                def rng(team, lu=lu, rotation=rotation):
+                    return np.random.default_rng([lu.seed, rotation, team]) if self.crn else self.rng
+
                 if len(names) == 1:
                     value = float(np.mean([self.strengths[self.names[(x.agent_id, x.network_id)]]
-                                           for x in lu.seats])) + float(self.rng.normal(0.0, self.noise))
+                                           for x in lu.seats])) + float(rng(0).normal(0.0, self.noise))
                     teams = [TeamResult(0, 1.0, value)]
                 else:
-                    perf = {t: self.strengths[n] + float(self.rng.gumbel()) for t, n in names.items()}
+                    perf = {t: self.strengths[n] + float(rng(t).gumbel()) for t, n in names.items()}
                     order = sorted(perf, key=lambda t: -perf[t])
                     teams = [TeamResult(t, float(order.index(t) + 1), 0.0) for t in sorted(names)]
                 seats = [SeatResult(s, seat_specs[s].role, seat_specs[s].team, x.agent_id, x.network_id, 0.0)

@@ -55,9 +55,13 @@ def test_select_halves_then_confirms_the_strongest_on_fresh_seeds():
 def test_select_does_not_confirm_indistinguishable_finalists():
     spec = TurnTakingGame().spec
     flat = {"main@v1": 0.0, "main@v2": 0.0, "main@v3": 0.0, "greedy": 0.0}
-    report = play("select", spec, flat, ["main@v1", "main@v2", "main@v3"], ["greedy"], confirm_blocks=60)
+    players = synthetic_players(flat)
+    arena = FakeArena(spec, players, flat, crn=True)    # common random numbers: identical finalists, identical games
+    report = play("select", spec, flat, ["main@v1", "main@v2", "main@v3"], ["greedy"], confirm_blocks=60,
+                  arena=arena, players=players)
     sel = report["selection"]["player"]
     assert sel["confirmed"] is False and sel["runner_up"] in sel["indistinguishable"]
+    assert sel["diff"] == 0.0 and sel["diff_ci95"] == [0.0, 0.0]
 
 
 def test_halving_accumulates_rounds_and_stops_at_the_finalists():
@@ -250,3 +254,90 @@ def test_repeated_pairs_are_flagged_in_a_deterministic_select():
     cell = stage_b["matrix"]["main@v1"]["greedy"]
     assert cell["repeated"] is True and cell["ci95"][0] < 0.25      # one block's Wilson interval, not a point
     json.dumps(report, allow_nan=False)
+
+
+def test_halving_ranks_by_name_whatever_the_input_order():
+    """Regression (T5.3 review): the strongest candidate comes last in the input; it survives every round, and
+    every round's scores are the stage A scores over the blocks played so far."""
+    from colosseum.arena.tournament.stats import candidate_scores
+
+    spec = TurnTakingGame().spec
+    ladder = {"main@v1": -3.0, "main@v2": -2.0, "main@v3": 0.0, "main@v4": 1.0, "main@v5": 3.0, "greedy": 0.0}
+    players = synthetic_players(ladder)
+    arena = FakeArena(spec, players, ladder)
+    played: dict = {}
+    seen: list = []
+
+    def record(blocks):
+        out = arena(blocks)
+        played.update(out)
+        seen.extend(blocks)
+        return out
+
+    names = {(p.agent_id, p.network_id): n for n, p in players.items()}
+    for finalists in (1, 2):
+        played.clear()
+        seen.clear()
+        report = run("halving", spec=spec, players=players, candidates=[n for n in ladder if "@v" in n],
+                     field=["greedy"], settings=settings(halving_blocks=20, finalists=finalists), play=record).to_dict()
+        assert all("main@v5" in r["active"] and "main@v5" not in r["eliminated"] for r in report["rounds"])
+        assert report["rounds"][0]["eliminated"] == ["main@v2", "main@v1"]
+        for r in report["rounds"]:
+            upto = r["first_index"] + r["blocks_per_composition"]
+            blocks = [b for b in seen if b.candidate in r["active"] and b.index < upto]
+            (table,) = candidate_scores(blocks, played, names=names, lineage={n: p.lineage for n, p in players.items()},
+                                        group_of={(b.layout, b.candidate): "player" for b in blocks},
+                                        metric_of={"2p": "pairwise"}).values()
+            expected = dict(zip(table.candidates, table.scores().tolist()))
+            assert r["scores"] == pytest.approx(expected)
+            assert r["active"] == sorted(expected, key=lambda n: -expected[n])
+
+
+def test_repeated_score_pairs_claim_no_certainty_and_marks_follow_the_intervals():
+    spec = CoopGame(size=2).spec
+    strengths = {"main@v1": 1.0, "main@v2": 3.0, "helper": 0.0}
+    players = synthetic_players(strengths)
+    report = play("select", spec, strengths, ["main@v1", "main@v2"], ["helper"], layouts=["coop2"],
+                  layout_weights={"coop2": 1.0}, confirm_blocks=5, deterministic=True, players=players,
+                  arena=FakeArena(spec, players, strengths, noise=0.0))
+    table = next(t for t in report["tables"] if t["stage"] == "B")
+    cell = table["matrix"]["main@v2"]["(self)"]
+    assert cell["repeated"] is True and cell["ci95"] is None
+    assert table["rows"][0]["repeated"] == ["(self)", "helper"]
+    sel = report["selection"]["player"]
+    assert sel["confirmed"] is False and sel["diff_repeated"] == [["coop2", "(self)"], ["coop2", "helper"]]
+    from colosseum.arena.tournament.modes import report_text
+
+    assert "REPEATED games in coop2: (self)" in report_text(report)
+    json.dumps(report, allow_nan=False)
+
+
+def test_combined_rows_carry_the_repeated_columns():
+    spec = GameSpec(roles=TurnTakingGame().spec.roles,
+                    layouts={"2p": (SeatSpec("player", 0), SeatSpec("player", 1)),
+                             "2v": (SeatSpec("player", 0), SeatSpec("player", 1))})
+    strengths = {"main@v1": 100.0, "main@v2": -100.0, "greedy": 0.0}
+    report = play("gauntlet", spec, strengths, ["main@v1", "main@v2"], ["greedy"], layouts=["2p", "2v"],
+                  layout_weights={"2p": 1.0, "2v": 1.0}, blocks=4, deterministic=True)
+    (combined,) = [t for t in report["tables"] if t["layout"] == "*"]
+    assert {r["name"]: r["repeated"] for r in combined["rows"]} == {
+        "main@v1": [["2p", "greedy"], ["2v", "greedy"]], "main@v2": [["2p", "greedy"], ["2v", "greedy"]]}
+
+
+def test_a_self_excluded_candidate_reports_the_weights_it_uses():
+    spec = TurnTakingGame().spec
+    report = play("gauntlet", spec, LADDER, ["main@v5", "greedy"], ["greedy", "random", "main@v1"], blocks=4)
+    (table,) = report["tables"]
+    assert table["columns"] == ["greedy", "main@v1", "random"]
+    assert table["column_weights"] == pytest.approx([1 / 3, 1 / 3, 1 / 3])
+    assert set(table["candidate_weights"]) == {"greedy"}
+    assert table["candidate_weights"]["greedy"] == pytest.approx([0.0, 0.5, 0.5])
+
+
+def test_select_with_one_finalist_warns_that_nothing_can_be_confirmed(caplog):
+    spec = TurnTakingGame().spec
+    caplog.set_level(logging.WARNING, logger="colosseum.arena.tournament.modes")
+    report = play("select", spec, LADDER, ["main@v5", "main@v1"], ["greedy"], finalists=1, confirm_blocks=5)
+    assert report["selection"]["player"]["confirmed"] is False
+    (line,) = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert "--finalists 1" in line and "colosseum pin" in line
