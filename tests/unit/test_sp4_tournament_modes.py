@@ -387,3 +387,30 @@ def test_round_robin_marks_repeated_pairs_under_deterministic():
     stochastic = play("round-robin", spec, strengths, ["main@v1", "main@v2"], ["greedy"], blocks=10)
     assert stochastic["flags"]["repeated_pairs"] == []
     assert not any(cell["repeated"] for cols in stochastic["tables"][0]["matrix"].values() for cell in cols.values())
+
+
+def test_round_robin_refuses_mixed_role_groups_and_a_pairless_participant_has_no_score():
+    """B-M8 (spec block 3: «Смешанные группы в одной таблице — ConfigError с перечнем групп»): hunters and prey are
+    not ranked in one round-robin table; a participant without a playable pair gets ``score: null``, not 0."""
+    from colosseum.arena.tournament import modes
+
+    spec = AsymmetricGame().spec
+    strengths = {"h@v1": 1.0, "y@v1": -1.0, "both": 0.0}
+    roles = {"h@v1": ("hunter",), "y@v1": ("prey",), "both": ("hunter", "prey")}
+    with pytest.raises(ConfigError, match=r"role groups.*'hunter': \['h@v1'\].*'prey': \['y@v1'\]"):
+        play("round-robin", spec, strengths, ["h@v1"], ["y@v1"], roles=roles, layouts=["1v2"],
+             layout_weights={"1v2": 1.0}, blocks=2)
+    one_group = play("round-robin", spec, {"a@v1": 1.0, "b@v1": 0.0}, ["a@v1"], ["b@v1"], blocks=2, layouts=["1v2"],
+                     layout_weights={"1v2": 1.0}, roles={"a@v1": ("hunter", "prey"), "b@v1": ("hunter", "prey")})
+    assert {r["name"] for r in one_group["tables"][0]["rows"]} == {"a@v1", "b@v1"}
+    players = synthetic_players(strengths, roles)
+    ctx = modes._Context(spec, players, ["both"], ["h@v1"], settings(layouts=["1v2"], layout_weights={"1v2": 1.0},
+                                                                         blocks=2), FakeArena(spec, players, strengths))
+    ctx.run(ctx.round_robin("1v2", ["both", "h@v1"]))
+    (table,) = modes._round_robin_tables(ctx, ["both", "h@v1", "y@v1"])      # y@v1 played no block
+    rows = {r["name"]: r for r in table["rows"]}
+    assert rows["y@v1"]["score"] is None and rows["y@v1"]["opponents"] == 0
+    assert [r["name"] for r in table["rows"]][-1] == "y@v1"                  # unranked last
+    report = {"name": "t", "mode": "round-robin", "seed": 0, "deterministic": False, "tables": [table], "rounds": [],
+              "selection": None, "bt": {}, "flags": {"repeated_pairs": []}, "games": {"matches": 0, "blocks": 0}}
+    assert "y@v1" in modes.report_text(report)
