@@ -297,6 +297,7 @@ def test_cli_exit_codes_for_a_non_run_dir_and_bad_arguments(tmp_path):
     res = run_in_session([sys.executable, "-m", "colosseum", "dashboard", str(tmp_path), "--port", "0"], timeout=60)
     assert res.returncode == 1 and "not a run directory" in res.stderr
     run = write_run_dir(tmp_path, "wdl")
-    res = run_in_session([sys.executable, "-m", "colosseum", "dashboard", str(run.root), "--refresh", "0"],
-                         timeout=60)
-    assert res.returncode == 2
+    for refresh in ("0", "1"):              # the page refreshes at most every 2 s: --refresh is at least 2
+        res = run_in_session([sys.executable, "-m", "colosseum", "dashboard", str(run.root), "--refresh", refresh],
+                             timeout=60)
+        assert res.returncode == 2 and "--refresh" in res.stderr, refresh

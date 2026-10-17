@@ -589,8 +589,8 @@ def report_cmd(run: str, output: str | None) -> None:
               help="Address to listen on. No authentication: keep 127.0.0.1 and use an SSH tunnel from other machines")
 @click.option("--port", default=8765, type=click.IntRange(0, 65535), show_default=True,
               help="Port (0: any free port, printed at start)")
-@click.option("--refresh", default=10, type=click.IntRange(min=1), show_default=True,
-              help="Seconds between page refreshes")
+@click.option("--refresh", default=10, type=click.IntRange(min=2), show_default=True,
+              help="Seconds between page refreshes (at least 2)")
 def dashboard_cmd(run: str, host: str, port: int, refresh: int) -> None:
     """Serve the run's report live: the same page as 'colosseum report', refreshed from /api/<section> JSON.
     The match log is opened read-only; ratings come from ratings.json while the run trains.
