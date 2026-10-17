@@ -38,6 +38,15 @@ def report(root, name) -> dict:
     return json.loads((root / "tournaments" / name / "report.json").read_text())
 
 
+def no_play(monkeypatch):
+    """Every later block must come from the journal: playing one is a test failure (``append`` deduplicates
+    uids, so a replayed block would leave the journal unchanged and go unnoticed otherwise)."""
+    def refuse(*_args, **_kwargs):
+        raise AssertionError("a block was played again instead of being read from the journal")
+
+    monkeypatch.setattr(run_module, "play_blocks", refuse)
+
+
 def journal(db, name):
     reader = MatchLog.open_readonly(db)
     try:
@@ -46,7 +55,7 @@ def journal(db, name):
         reader.close()
 
 
-def test_select_on_a_run_writes_the_journal_and_reports_and_pins_the_confirmed_winner(tmp_path):
+def test_select_on_a_run_writes_the_journal_and_reports_and_pins_the_confirmed_winner(tmp_path, monkeypatch):
     root, _cfg = fake_run(tmp_path)
     result = invoke("--run", root, "--mode", "select", "--field", "rnd,ones", "--halving-blocks", 2,
                     "--confirm-blocks", 16, "--finalists", 2, "--num-workers", 2, "--num-envs", 2, "--seed", 3,
@@ -65,12 +74,33 @@ def test_select_on_a_run_writes_the_journal_and_reports_and_pins_the_confirmed_w
     assert len(blocks) == data["games"]["blocks"] and len(results) == data["games"]["matches"]
     assert len({r.uid for r in results}) == len(results) and {r.source for r in results} == {"tournament"}
     assert all(r.uid.startswith("sel/") and r.env_steps is None for r in results)
+    no_play(monkeypatch)
     again = invoke("--run", root, "--mode", "select", "--field", "rnd,ones", "--halving-blocks", 2,
                    "--confirm-blocks", 16, "--finalists", 2, "--num-workers", 1, "--num-envs", 2, "--seed", 3,
                    "--name", "sel")
     assert again.exit_code == 0, again.output
-    assert "0 played" in again.output                                   # every block came from the journal
+    assert f"Blocks: 0 played, {len(blocks)} from the journal" in again.output
     assert journal(root / MATCH_LOG_FILE, "sel")[0] == blocks
+    assert len(journal(root / MATCH_LOG_FILE, "sel")[1]) == len(results)
+
+
+def test_a_pinned_winner_evicted_during_the_tournament_is_reported_after_the_report(tmp_path, monkeypatch):
+    root, _cfg = fake_run(tmp_path)
+    original = run_module.BlockRunner._store
+
+    def evicting(self, block_id, results):
+        shutil.rmtree(root / "checkpoints" / "main" / "ckpt_v30", ignore_errors=True)   # the run evicts it
+        original(self, block_id, results)
+
+    monkeypatch.setattr(run_module.BlockRunner, "_store", evicting)
+    result = invoke("--run", root, "--mode", "select", "--field", "rnd,ones", "--halving-blocks", 2,
+                    "--confirm-blocks", 16, "--finalists", 2, "--num-envs", 2, "--seed", 3, "--name", "ev", "--pin")
+    assert result.exit_code == 1, result.output
+    copy = root / "tournaments" / "ev" / "snapshots" / f"0-{root.name}" / "main" / "ckpt_v30"
+    assert "winner main@v30 (confirmed" in result.output                 # the report comes first
+    assert "Pin error" in result.output and "evicted" in result.output and str(copy) in result.output
+    assert (root / "tournaments" / "ev" / "report.json").is_file() and (copy / "model.pt").is_file()
+    assert "Pinned" not in result.output
 
 
 def test_an_unconfirmed_select_winner_is_not_pinned_and_the_command_still_succeeds(tmp_path, caplog):
@@ -115,16 +145,42 @@ def test_an_interrupted_tournament_resumes_with_whole_blocks_only(tmp_path, monk
     assert changed.exit_code == 1 and "blocks" in changed.output and "tournament.yaml" in changed.output
 
 
-def test_tournament_snapshots_survive_eviction_by_the_run(tmp_path):
+def test_tournament_snapshots_survive_eviction_by_the_run(tmp_path, monkeypatch):
     root, _cfg = fake_run(tmp_path)
-    args = ["--run", root, "--field", "rnd", "--blocks", 1, "--num-envs", 2, "--name", "links"]
-    assert invoke(*args).exit_code == 0
+    args = ["--run", root, "--field", "rnd", "--blocks", 2, "--num-envs", 2, "--name", "links"]
+    original = run_module.BlockRunner._store
+    stored = []
+
+    def failing(self, block_id, results):
+        if len(stored) == 1:          # main@v10 has played one of its two blocks
+            raise RuntimeError("interrupted on purpose")
+        stored.append(block_id)
+        original(self, block_id, results)
+
+    monkeypatch.setattr(run_module.BlockRunner, "_store", failing)
+    assert isinstance(invoke(*args).exception, RuntimeError)
+    monkeypatch.setattr(run_module.BlockRunner, "_store", original)
     linked = root / "tournaments" / "links" / "snapshots" / f"0-{root.name}" / "main" / "ckpt_v10" / "model.pt"
     assert linked.is_file() and linked.stat().st_nlink >= 2              # a hard link (same file system)
-    shutil.rmtree(root / "checkpoints" / "main" / "ckpt_v10")             # the run evicts it
+    shutil.rmtree(root / "checkpoints" / "main" / "ckpt_v10")             # the run evicts it before the rest plays
     again = invoke(*args)
     assert again.exit_code == 0, again.output
-    assert linked.is_file() and "0 played" in again.output
+    assert "Blocks: 5 played, 1 from the journal" in again.output
+    blocks, results = journal(root / MATCH_LOG_FILE, "links")
+    v10 = {r.block for r in results if any(s.network_id == "ckpt_v10" for s in r.seats)}
+    assert len(v10) == 2 and v10 - set(stored)                           # its second block played from snapshots/
+    assert linked.is_file()
+
+
+def test_a_new_tournament_never_reuses_the_journal_blocks_of_a_removed_one(tmp_path):
+    root, _cfg = fake_run(tmp_path, versions=(10,))
+    args = ["--run", root, "--field", "rnd", "--blocks", 2, "--num-envs", 2, "--name", "t"]
+    assert invoke(*args, "--seed", 1).exit_code == 0
+    shutil.rmtree(root / "tournaments" / "t")
+    again = invoke(*args, "--seed", 99, "--deterministic")
+    assert again.exit_code == 1 and "already holds 2 blocks" in again.output and "another --name" in again.output
+    assert "remove it" not in again.output
+    assert not (root / "tournaments" / "t" / "tournament.yaml").exists()
 
 
 def test_tournament_yaml_stores_absolute_paths_and_resumes_from_another_cwd(tmp_path, monkeypatch):
@@ -145,10 +201,11 @@ def test_tournament_yaml_stores_absolute_paths_and_resumes_from_another_cwd(tmp_
     elsewhere = tmp_path / "elsewhere"
     elsewhere.mkdir()
     monkeypatch.chdir(elsewhere)
+    no_play(monkeypatch)
     again = invoke("--run", root, "--snapshots", "last:1", "-a", f"prev={tmp_path / rel}", "--field", "rnd",
                    "--blocks", 1, "--num-envs", 2, "--name", "cwd")
     assert again.exit_code == 0, again.output
-    assert "0 played" in again.output
+    assert "Blocks: 0 played, 2 from the journal" in again.output
 
 
 def test_the_env_of_the_tournament_config_must_be_the_runs(tmp_path):
@@ -159,13 +216,14 @@ def test_the_env_of_the_tournament_config_must_be_the_runs(tmp_path):
 
 
 def test_several_runs_with_aliases_and_snapshot_references_in_the_field(tmp_path):
-    first, _ = fake_run(tmp_path, "a", versions=(10, 30))
-    second, _ = fake_run(tmp_path, "b", versions=(5,))
-    result = invoke("--run", first, "--snapshots", "last:1", "--run", f"old={second}", "--field", "rnd,main@v10",
-                    "--blocks", 1, "--num-envs", 2, "--name", "multi")
+    first, _ = fake_run(tmp_path, "a", versions=(10, 20, 30))
+    second, _ = fake_run(tmp_path, "b", versions=(5, 7))
+    # --agent / --snapshots belong to the --run before them, also in the --opt=value form
+    result = invoke("--run", first, "--snapshots", "last:1", f"--run=old={second}", "--agent=main", "--snapshots=all",
+                    "--field", "rnd,main@v10", "--blocks", 1, "--num-envs", 2, "--name", "multi")
     assert result.exit_code == 0, result.output
     data = report(first, "multi")
-    assert [c["name"] for c in data["candidates"]] == ["main@v30", "old/main@v5"]
+    assert [c["name"] for c in data["candidates"]] == ["main@v30", "old/main@v5", "old/main@v7"]
     assert [f["name"] for f in data["field"]] == ["rnd", "main@v10"]
     assert (first / MATCH_LOG_FILE).is_file() and not (second / MATCH_LOG_FILE).exists()
 
@@ -213,9 +271,11 @@ def test_sp3_run_dirs_play_as_runs_and_their_checkpoints_as_frozen_agents(tmp_pa
     (["--run", "RUN", "--field", "rnd", "--output", "OUT"], "--output"),
     (["-a", "x=nowhere.pt"], "--run"),
     (["--run", "RUN", "--snapshots", "all", "--snapshots", "last:1"], "twice"),
+    (["-c", "CFG", "--field", "rnd"], "--output"),
 ])
 def test_usage_errors_exit_with_2(tmp_path, args, message):
     root, _cfg = fake_run(tmp_path)
-    args = [str(root) if a == "RUN" else str(tmp_path / "out") if a == "OUT" else a for a in args]
+    subst = {"RUN": str(root), "OUT": str(tmp_path / "out"), "CFG": str(root / "config.resolved.yaml")}
+    args = [subst.get(a, a) for a in args]
     result = invoke(*args)
     assert result.exit_code == 2 and message in result.output

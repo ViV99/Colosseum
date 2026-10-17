@@ -379,7 +379,8 @@ def _run_selection(item: dict):
 @click.option("--deterministic", is_flag=True, default=False, help="Greedy policies (default: stochastic)")
 @click.option("--seed", default=0, type=int, show_default=True, help="Seed of the block seeds (domains A, B)")
 @click.option("--name", default=None, help="Tournament name (default <mode>-<YYYYmmdd-HHMMSS>); the same name "
-                                           "continues an interrupted tournament")
+                                           "continues an interrupted tournament, with the same settings (every "
+                                           "size flag counts, also one the mode does not use)")
 @click.option("--output", "-o", default=None, type=click.Path(file_okay=False),
               help="Without --run: the directory for matches.db and tournaments/<name>/")
 @click.option("--pin", is_flag=True, default=False, help="select with --run: pin the confirmed winner snapshot")
@@ -393,8 +394,9 @@ def tournament_cmd(config: str | None, candidates: tuple[str, ...], runs: tuple[
     seeds with seat rotations, and select the best (--mode select: screening, then confirmation on fresh seeds).
 
     The config is checked in the "play" scope (like eval). Exit code: 0 done (also a select whose winner is not
-    confirmed), 1 config, player or env error or a dead worker, 2 bad arguments, 130 SIGINT (finished blocks are
-    kept: rerun with the same --name to continue).
+    confirmed), 1 config, player or env error, a dead worker or a --pin winner the run evicted meanwhile (the
+    reports are written first), 2 bad arguments, 130 SIGINT (finished blocks are kept: rerun with the same --name
+    to continue).
     """
     import logging
 
@@ -409,6 +411,9 @@ def tournament_cmd(config: str | None, candidates: tuple[str, ...], runs: tuple[
                                "runs/x/tournaments/<name>/)")
     if not runs and config is None:
         raise click.UsageError("give -c CONFIG or --run DIR")
+    if not runs and output is None:
+        raise click.UsageError("--output DIR is required without --run (it gets matches.db and "
+                               "tournaments/<name>/)")
     with _config_errors():
         from colosseum.arena.tournament import modes
         from colosseum.arena.tournament.engine import TournamentError
@@ -440,6 +445,10 @@ def tournament_cmd(config: str | None, candidates: tuple[str, ...], runs: tuple[
         click.echo(f"Written: {path}")
     for winner in outcome.pinned:
         click.echo(f"Pinned {winner}")
+    for error in outcome.pin_errors:
+        click.echo(f"Pin error: {error}", err=True)
+    if outcome.pin_errors:
+        sys.exit(1)
 
 
 @main.command()

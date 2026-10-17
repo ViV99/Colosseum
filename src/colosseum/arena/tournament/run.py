@@ -106,6 +106,7 @@ class TournamentOutcome:
     reused_blocks: int
     pinned: list[str]
     written: list[Path]
+    pin_errors: list[str] = dataclasses.field(default_factory=list)   # --pin failures (the CLI exits 1)
 
 
 def diff_fields(a: Any, b: Any, prefix: str = "") -> list[str]:
@@ -158,8 +159,9 @@ class TournamentDir:
         fields = diff_fields(stored.get("request", {}), dict(request))
         if fields:
             raise ConfigError(f"tournament {stored.get('name')!r} exists ({self.yaml_path}) with other settings: "
-                              f"{', '.join(fields)} differ; rerun with the same settings to continue it, or choose "
-                              f"another --name")
+                              f"{', '.join(fields)} differ (the check covers every size flag, also those the mode "
+                              f"does not use); rerun with the same settings to continue it, or choose another "
+                              f"--name")
 
     def link(self, run_index: int, selection: RunSelection, info: CheckpointInfo) -> Path:
         """The snapshot's hard-linked (else copied) ``model.pt`` + ``meta.json`` in ``snapshots/``."""
@@ -276,7 +278,7 @@ def _request(options: TournamentOptions, config: ColosseumConfig) -> dict[str, A
     }
 
 
-def _config(options: TournamentOptions) -> ColosseumConfig:
+def _config(options: TournamentOptions, run_configs: Sequence[ColosseumConfig]) -> ColosseumConfig:
     if options.config_path is not None:
         config = load_config(options.config_path, options.overrides or None)
     elif options.runs:
@@ -284,8 +286,8 @@ def _config(options: TournamentOptions) -> ColosseumConfig:
     else:
         raise ConfigError("give -c CONFIG or --run DIR (the run's config.resolved.yaml is used then)")
     own = config.env.model_dump(mode="json", by_alias=True)
-    for sel in options.runs:
-        theirs = load_run_config(Path(sel.path)).env.model_dump(mode="json", by_alias=True)
+    for sel, run_config in zip(options.runs, run_configs):
+        theirs = run_config.env.model_dump(mode="json", by_alias=True)
         if theirs != own:
             raise ConfigError(f"--run {sel.path}: its env section differs from the tournament config's "
                               f"({', '.join(diff_fields(theirs, own))}); snapshots play only in the game they were "
@@ -293,15 +295,15 @@ def _config(options: TournamentOptions) -> ColosseumConfig:
     return config
 
 
-def _layouts(options: TournamentOptions, config: ColosseumConfig, spec) -> tuple[list[str], dict[str, float]]:
+def _layouts(options: TournamentOptions, config: ColosseumConfig, spec,
+             first_config: ColosseumConfig | None) -> tuple[list[str], dict[str, float]]:
     """The tournament's layouts and weights: the first ``--run`` agent's effective ``matchmaking.layouts`` (else
     the config's); equal weights with an INFO when a chosen layout has none (ruling D13)."""
     from colosseum.league.lineups import enabled_layouts
 
     if options.runs:
         first = Path(options.runs[0].path)
-        run_config = load_run_config(first)
-        matchmaking = run_config.get_agent_config(run_agent(first, run_config, options.runs[0].agent)).matchmaking
+        matchmaking = first_config.get_agent_config(run_agent(first, first_config, options.runs[0].agent)).matchmaking
     else:
         matchmaking = config.matchmaking
     weights = enabled_layouts(spec, matchmaking)
@@ -315,7 +317,8 @@ def _layouts(options: TournamentOptions, config: ColosseumConfig, spec) -> tuple
     return chosen, dict.fromkeys(chosen, 1.0)
 
 
-def _journal_run(options: TournamentOptions, config: ColosseumConfig, db: Path, tournament_id: str):
+def _journal_run(options: TournamentOptions, config: ColosseumConfig, db: Path, tournament_id: str,
+                 first_config: ColosseumConfig | None):
     """The ``RunInfo`` the tournament writes its matches under: the first ``--run``'s (its run id, created for an
     SP3 run dir: P16), else one of the tournament itself (``--output``)."""
     from colosseum.arena.matchlog import MatchLog, RunInfo
@@ -334,9 +337,8 @@ def _journal_run(options: TournamentOptions, config: ColosseumConfig, db: Path, 
             reader.close()
         if run_id in known:
             return known[run_id]
-    run_config = load_run_config(first)
-    return RunInfo(run_id=run_id, name=first.name, parent_run_id=None, game=run_config.env.env_class,
-                   config_hash=config_hash(run_config), checkpoint_interval=run_config.checkpoint.interval)
+    return RunInfo(run_id=run_id, name=first.name, parent_run_id=None, game=first_config.env.env_class,
+                   config_hash=config_hash(first_config), checkpoint_interval=first_config.checkpoint.interval)
 
 
 def _file_logging(path: Path) -> tuple[logging.Handler, int]:
@@ -354,13 +356,34 @@ def _file_logging(path: Path) -> tuple[logging.Handler, int]:
     return handler, old_level
 
 
+def _journal_blocks(db: Path, name: str) -> int:
+    """How many blocks of tournament ``name`` the journal at ``db`` holds (0 without a journal)."""
+    from colosseum.arena.matchlog import MatchLog
+
+    if not db.is_file():
+        return 0
+    reader = MatchLog.open_readonly(db)
+    try:
+        return len(reader.blocks(name))
+    finally:
+        reader.close()
+
+
 def _new_tournament(options: TournamentOptions, config: ColosseumConfig, spec, tdir: TournamentDir,
-                    request: dict[str, Any]) -> dict[str, Any]:
-    """Validate, resolve the players (linking their snapshots into ``tdir``) and write ``tournament.yaml``."""
+                    request: dict[str, Any], *, db: Path, first_config: ColosseumConfig | None) -> dict[str, Any]:
+    """Validate, resolve the players (linking their snapshots into ``tdir``) and write ``tournament.yaml``.
+
+    A name whose blocks are already in the journal (its ``tournament.yaml`` was removed) is refused: those blocks
+    were played with settings nobody can check any more, and a new tournament would silently reuse them."""
     from colosseum.core.registry import validate_config
 
     if tdir.path.exists() and any(p.name not in ("logs", "snapshots") for p in tdir.path.iterdir()):
-        raise ConfigError(f"{tdir.path} exists without {TOURNAMENT_FILE}; remove it or choose another --name")
+        raise ConfigError(f"{tdir.path} exists without {TOURNAMENT_FILE}; choose another --name")
+    held = _journal_blocks(db, options.name)
+    if held:
+        raise ConfigError(f"the match log {db} already holds {held} blocks of a tournament named {options.name!r} "
+                          f"whose {TOURNAMENT_FILE} is gone ({tdir.yaml_path}); its settings cannot be checked, so "
+                          f"its blocks cannot be continued: choose another --name")
     bare = {name for name, path in options.candidates if path is None}
     fixed_names = [n for n in config.fixed_agent_ids()
                    if options.field is None or n in options.field or n in bare]
@@ -370,7 +393,7 @@ def _new_tournament(options: TournamentOptions, config: ColosseumConfig, spec, t
                                 rng=np.random.default_rng(options.seed),
                                 allow_empty_field=options.mode == "round-robin")
     players = {p.name: _absolute_player(p) for p in [*cand, *fld]}
-    layouts, weights = _layouts(options, config, spec)
+    layouts, weights = _layouts(options, config, spec, first_config)
     tdir.write({
         "format": TOURNAMENT_FORMAT, "name": options.name, "id": uuid.uuid4().hex,
         "created": datetime.now().isoformat(timespec="seconds"),   # informational
@@ -384,7 +407,9 @@ def _new_tournament(options: TournamentOptions, config: ColosseumConfig, spec, t
     logger.info("Tournament %s (%s): candidates %s, field %s, layouts %s", options.name, options.mode,
                 [p.name for p in cand], [p.name for p in fld], layouts)
     stored = tdir.load()
-    assert stored is not None
+    if stored is None:
+        raise ConfigError(f"{tdir.yaml_path} vanished right after it was written; is another process removing "
+                          f"{tdir.path}?")
     return stored
 
 
@@ -394,7 +419,9 @@ def run_tournament(options: TournamentOptions) -> TournamentOutcome:
     from colosseum.core.registry import env_spec
 
     options = _absolute_options(options)
-    config = _config(options)
+    run_configs = [load_run_config(Path(sel.path)) for sel in options.runs]   # each read once per start
+    first_config = run_configs[0] if run_configs else None
+    config = _config(options, run_configs)
     spec = env_spec(config)
     name = options.name or f"{options.mode}-{datetime.now():%Y%m%d-%H%M%S}"
     check_path_component(name, "tournament name")
@@ -420,11 +447,11 @@ def run_tournament(options: TournamentOptions) -> TournamentOutcome:
                                   f"{tdir.path} or the -a paths); they cannot be played again")
             logger.info("Continuing tournament %s (%s)", name, tdir.path)
         else:
-            stored = _new_tournament(options, config, spec, tdir, request)
+            stored = _new_tournament(options, config, spec, tdir, request, db=db, first_config=first_config)
         players = {d["name"]: player_from_dict(d) for d in stored["players"]}
         candidates, field_names = list(stored["candidates"]), list(stored["field"])
         layouts, weights = list(stored["layouts"]), {k: float(v) for k, v in stored["layout_weights"].items()}
-        log = MatchLog(db, _journal_run(options, config, db, stored["id"]),
+        log = MatchLog(db, _journal_run(options, config, db, stored["id"], first_config),
                        min_free_disk_mb=config.match_log.min_free_disk_mb)
         try:
             reader = MatchLog.open_readonly(db)
@@ -450,9 +477,9 @@ def run_tournament(options: TournamentOptions) -> TournamentOutcome:
         finally:
             log.close()
         written = tdir.write_reports(report)
-        pinned = _pin(report, players) if options.pin else []
+        pinned, pin_errors = _pin(report, players) if options.pin else ([], [])
         logger.info("Tournament %s: %d blocks played, %d from the journal", name, runner.played, runner.reused)
-        return TournamentOutcome(report, tdir.path, runner.played, runner.reused, pinned, written)
+        return TournamentOutcome(report, tdir.path, runner.played, runner.reused, pinned, written, pin_errors)
     finally:
         colosseum_logger = logging.getLogger("colosseum")
         colosseum_logger.removeHandler(handler)
@@ -460,9 +487,13 @@ def run_tournament(options: TournamentOptions) -> TournamentOutcome:
         handler.close()
 
 
-def _pin(report: modes.TournamentReport, players: Mapping[str, TournamentPlayer]) -> list[str]:
-    """Pin every confirmed ``select`` winner that is a run snapshot (ruling C6); the others get a WARNING."""
-    pinned = []
+def _pin(report: modes.TournamentReport,
+         players: Mapping[str, TournamentPlayer]) -> tuple[list[str], list[str]]:
+    """Pin every confirmed ``select`` winner that is a run snapshot (ruling C6); the others get a WARNING.
+    Returns ``(pinned names, errors)``: a winner the run evicted while the tournament played cannot be pinned
+    (an error after the reports are written; its copy stays in the tournament's ``snapshots/``)."""
+    pinned: list[str] = []
+    errors: list[str] = []
     for group, sel in (report.to_dict().get("selection") or {}).items():
         winner = players[sel["winner"]]
         if not sel["confirmed"]:
@@ -475,7 +506,17 @@ def _pin(report: modes.TournamentReport, players: Mapping[str, TournamentPlayer]
             logger.warning("--pin: group %s: the winner %s is not a run snapshot, so nothing was pinned (colosseum "
                            "pin pins run snapshots only)", group, winner.name)
             continue
-        pin_snapshot(winner.run, winner.run_agent, winner.version)
+        stored_dir = Path(winner.run) / "checkpoints" / winner.run_agent / f"ckpt_v{winner.version}"
+        try:
+            if not stored_dir.is_dir():
+                raise ConfigError(f"{stored_dir} is gone")
+            pin_snapshot(winner.run, winner.run_agent, winner.version)
+        except ConfigError as e:
+            errors.append(f"--pin: the winner {winner.name} was evicted by the run {winner.run} while the "
+                          f"tournament played ({e}), so nothing was pinned; the tournament's copy is "
+                          f"{winner.source.origin}")
+            logger.error(errors[-1])
+            continue
         logger.info("--pin: pinned %s in %s", winner.name, winner.run)
         pinned.append(winner.name)
-    return pinned
+    return pinned, errors
