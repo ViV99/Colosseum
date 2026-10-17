@@ -97,6 +97,12 @@ def test_several_layouts_are_combined_with_the_layout_weights():
     per = {t["layout"]: {r["name"]: r["score"] for r in t["rows"]} for t in report["tables"] if t["layout"] != "*"}
     got = {r["name"]: r["score"] for r in combined["rows"]}["main@v5"]
     assert got == pytest.approx(0.75 * per["2p"]["main@v5"] + 0.25 * per["2v"]["main@v5"])
+    from colosseum.arena.tournament.modes import report_view
+
+    view = report_view(report)                              # the combination reaches every layout's group view
+    for layout in ("2p", "2v"):
+        (group,) = view["layouts"][layout]["groups"].values()
+        assert {r["name"]: r["score"] for r in group["combined"]}["main@v5"] == got
     with pytest.raises(ConfigError, match="weight"):
         play("gauntlet", spec, LADDER, ["main@v5"], ["greedy"], layouts=["2p", "2v"], layout_weights={"2p": 1.0})
 
@@ -237,6 +243,9 @@ def test_a_candidate_in_the_field_faces_the_field_without_itself():
     (table,) = report["tables"]
     assert set(table["matrix"]["greedy"]) == {"random"} and set(table["matrix"]["main@v5"]) == {"greedy", "random"}
     assert report["flags"]["self_excluded"] == [["2p", "greedy"]]
+    from colosseum.arena.tournament.modes import report_view
+
+    assert report_view(report)["layouts"]["2p"]["self_excluded"] == ["greedy"]
     from colosseum.arena.tournament.modes import report_text
 
     assert "plays the field without itself" in report_text(report)
@@ -254,6 +263,15 @@ def test_repeated_pairs_are_flagged_in_a_deterministic_select():
     cell = stage_b["matrix"]["main@v1"]["greedy"]
     assert cell["repeated"] is True and cell["ci95"][0] < 0.25      # one block's Wilson interval, not a point
     json.dumps(report, allow_nan=False)
+    from colosseum.arena.tournament.modes import report_view
+
+    view = report_view(report)                              # the REPEATED marks reach the view (T7.1)
+    (group,) = view["layouts"]["2p"]["groups"].values()
+    rows = {r["name"]: r for r in group["candidates"]}
+    assert "greedy" in rows["main@v1"]["repeated"] and group["matrix"]["main@v1"]["greedy"]["repeated"] is True
+    assert group["select"]["repeated_columns"] == [["2p", "greedy"]]
+    assert ["2p", "greedy"] in group["select"]["diff_repeated"] and group["combined"] is None
+    assert report_view(view) == view
 
 
 def test_halving_ranks_by_name_whatever_the_input_order():

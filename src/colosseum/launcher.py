@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import os
 import queue
 import signal
 import time
@@ -1356,7 +1357,24 @@ def run_training(config_path: str, overrides: dict | None = None) -> int:
     setup_process_logging(run_dir.logs, "main", console_level=logging.INFO)
     run_dir.write_resolved_config(config)
     print(f"Run directory: {run_dir.root}", flush=True)
-    code = Launcher(config, run_dir, validated=True).launch()
+    _record_run_state(run_dir, "running")
+    try:
+        code = Launcher(config, run_dir, validated=True).launch()
+    except BaseException:
+        _record_run_state(run_dir, "failed", exit_code=1)
+        raise
+    # 130 / 143: stopped by a signal after saving the final checkpoints (not a failure); 1: a dead child.
+    _record_run_state(run_dir, "finished" if code in (0, 130, 143) else "failed", exit_code=code)
     if code == 0:
         logger.info(f"Training finished; outputs in {run_dir.root}")
     return code
+
+
+def _record_run_state(run_dir: RunDir, status: str, *, exit_code: int | None = None) -> None:
+    """run_state.json for report / dashboard (spec block 5); a failure to write it never stops a run."""
+    from colosseum.core.run_state import write_run_state
+
+    try:
+        write_run_state(run_dir.root, status, os.getpid(), exit_code=exit_code)
+    except OSError as e:
+        logger.warning(f"cannot write {run_dir.run_state_path}: {e}")

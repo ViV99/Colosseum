@@ -10,6 +10,8 @@
       league_state.json        ratings and PFSP statistics, for a run-dir resume (SP4)
       pulse_state.json         pulse bookkeeping (SP4 T6.1)
       tournaments/<name>/      colosseum tournament dirs (SP4 T5.4)
+      run_state.json           running / finished / failed + pid, written by run_training (SP4 T7.1)
+      report.html              colosseum report's default output (SP4 T7.2)
       checkpoints/<agent>/ckpt_v<N>/{model.pt, trainer_state.pt, meta.json}
 """
 
@@ -111,6 +113,16 @@ class RunDir:
     @property
     def tournaments_dir(self) -> Path:
         return self.root / "tournaments"
+
+    @property
+    def run_state_path(self) -> Path:
+        from colosseum.core.run_state import RUN_STATE_FILE
+
+        return self.root / RUN_STATE_FILE
+
+    @property
+    def report_path(self) -> Path:
+        return self.root / "report.html"
 
     @property
     def run_id(self) -> str | None:

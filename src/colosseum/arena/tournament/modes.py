@@ -524,17 +524,25 @@ def report_text(data: Mapping[str, Any]) -> str:
 
 def report_view(data: Mapping[str, Any]) -> dict[str, Any]:
     """The report by layout and role group (contract amendment A26; Part 3's page, kits and slow tests read it):
-    ``{name, mode, seed, [winner, confirmed], layouts: {layout: {outcome_kind, dropped, groups: {group:
-    {candidates, ranking, matrix, rounds, select, transitivity, repeated_pairs}}}}}``.
+    ``{name, mode, seed, [winner, confirmed], layouts: {layout: {outcome_kind, dropped, self_excluded, groups:
+    {group: {candidates, ranking, matrix, rounds, select, transitivity, repeated_pairs, candidate_weights,
+    combined}}}}}``.
 
     - ``candidates``: the rows of the group's last-stage table (B, else A), then the candidates halving eliminated
       (their last round's score, no interval); each ``{name, display, lineage, score, score_ci, worst, bt, bt_ci,
-      p_best, games, eliminated_round}`` (``bt*`` from the layout's BT section, None without one);
+      p_best, games, eliminated_round, repeated}`` (``bt*`` from the layout's BT section, None without one;
+      ``repeated``: the columns where the candidate's games repeated, ``[]`` for the eliminated);
     - ``ranking``: the last stage's order, then the eliminated by later round and higher score;
-    - ``matrix``: ``{candidate: {column: {score, ci, games}}}`` of that table; ``rounds``: ``{round, blocks,
-      survivors, eliminated}``; ``select``: the group's selection (``winner``, ``runner_up``, ``confirmed``,
-      ``diff``, ``diff_ci``, ``indistinguishable``) or None;
+    - ``matrix``: ``{candidate: {column: {score, ci, games, repeated}}}`` of that table; ``rounds``: ``{round,
+      blocks, survivors, eliminated}``; ``select``: the group's selection (``winner``, ``runner_up``,
+      ``confirmed``, ``diff``, ``diff_ci``, ``indistinguishable``, ``repeated_columns``, ``diff_repeated``,
+      ``note``) or None;
+    - ``candidate_weights``: the table's per-candidate column weights where they differ (a candidate in the field);
+      ``combined``: the group's layout combination of the last stage (``[{name, score, score_ci, repeated}]``,
+      ``repeated`` as ``[layout, column]`` pairs) or None (one layout);
     - ``dropped``: the layout's compositions the schedule could not seat (``{candidate, composition, reason}``);
+      ``self_excluded``: the layout's candidates that are also field members (they play the field without
+      themselves);
     - ``winner`` / ``confirmed`` at the top only when one group was selected.
     A partial report (e.g. ``{"name", "mode"}``) gives the view of what it has; a view (``layouts`` is already a
     mapping) is returned as it is."""
@@ -543,10 +551,14 @@ def report_view(data: Mapping[str, Any]) -> dict[str, Any]:
     players = {p["name"]: p for p in [*(data.get("candidates") or []), *(data.get("field") or [])]}
     selection = data.get("selection") or {}
     flags = (data.get("flags") or {}).get("repeated_pairs") or []
+    self_excluded = (data.get("flags") or {}).get("self_excluded") or []
     entries = {e["layout"]: e for e in data.get("layouts") or []}
     last: dict[tuple[str, str], dict] = {}
+    combined: dict[str, dict] = {}
     for t in data.get("tables") or []:
         if t["layout"] == "*":
+            if t["group"] not in combined or t["stage"] > combined[t["group"]]["stage"]:
+                combined[t["group"]] = t
             continue
         key = (t["layout"], t["group"])
         if key not in last or t["stage"] > last[key]["stage"]:
@@ -556,28 +568,32 @@ def report_view(data: Mapping[str, Any]) -> dict[str, Any]:
         section = (data.get("bt") or {}).get(layout) or {}
         rated = {e["name"]: e for e in section.get("entities") or []}
 
-        def row(name: str, score, ci, worst, games, out_round, rated=rated) -> dict:
+        def row(name: str, score, ci, worst, games, out_round, repeated=(), rated=rated) -> dict:
             e = rated.get(name)
             p = players.get(name, {})
             return {"name": name, "display": p.get("display", name), "lineage": p.get("lineage", name),
                     "score": score, "score_ci": ci, "worst": worst, "bt": None if e is None else e["rating"],
                     "bt_ci": None if e is None else e["ci95"], "p_best": None if e is None else e["p_best"],
                     "games": games if games is not None else (None if e is None else e["games"]),
-                    "eliminated_round": out_round}
+                    "eliminated_round": out_round, "repeated": list(repeated)}
 
-        candidates = [row(r["name"], r["score"], r.get("ci95"), r.get("worst"), r.get("games"), None)
-                      for r in t["rows"]]
+        candidates = [row(r["name"], r["score"], r.get("ci95"), r.get("worst"), r.get("games"), None,
+                          r.get("repeated") or ()) for r in t["rows"]]
         rounds = [r for r in data.get("rounds") or [] if r["group"] == group]
         eliminated = sorted(((r["round"], r["scores"][n], n) for r in rounds for n in r["eliminated"]),
                             key=lambda x: (-x[0], -x[1]))
         candidates += [row(n, score, None, None, None, rnd) for rnd, score, n in eliminated]
         sel = selection.get(group)
         entry = entries.get(layout, {})
+        comb = combined.get(group)
         layouts.setdefault(layout, {"outcome_kind": entry.get("outcome_kind"),
-                                    "dropped": list(entry.get("dropped") or []), "groups": {}})["groups"][group] = {
+                                    "dropped": list(entry.get("dropped") or []),
+                                    "self_excluded": [c for L, c in self_excluded if L == layout],
+                                    "groups": {}})["groups"][group] = {
             "candidates": candidates,
             "ranking": [r["name"] for r in t["rows"]] + [n for _, _, n in eliminated],
-            "matrix": {c: {col: {"score": cell["score"], "ci": cell.get("ci95"), "games": cell.get("games")}
+            "matrix": {c: {col: {"score": cell["score"], "ci": cell.get("ci95"), "games": cell.get("games"),
+                                 "repeated": bool(cell.get("repeated", False))}
                            for col, cell in cols.items()} for c, cols in (t.get("matrix") or {}).items()},
             "rounds": [{"round": r["round"], "blocks": r["blocks_per_composition"],
                         "survivors": [n for n in r["active"] if n not in r["eliminated"]],
@@ -585,9 +601,15 @@ def report_view(data: Mapping[str, Any]) -> dict[str, Any]:
             "select": None if sel is None else {
                 "winner": sel["winner"], "runner_up": sel.get("runner_up"), "confirmed": sel["confirmed"],
                 "diff": sel.get("diff"), "diff_ci": sel.get("diff_ci95"),
-                "indistinguishable": list(sel.get("indistinguishable") or [])},
+                "indistinguishable": list(sel.get("indistinguishable") or []),
+                "repeated_columns": [list(x) for x in sel.get("repeated_columns") or []],
+                "diff_repeated": [list(x) for x in sel.get("diff_repeated") or []], "note": sel.get("note")},
             "transitivity": section.get("transitivity"),
             "repeated_pairs": [[c, col] for L, c, col in flags if L == layout],
+            "candidate_weights": dict(t.get("candidate_weights") or {}),
+            "combined": None if comb is None else [
+                {"name": r["name"], "score": r["score"], "score_ci": r.get("ci95"),
+                 "repeated": [list(x) for x in r.get("repeated") or []]} for r in comb["rows"]],
         }
     out = {"name": data.get("name"), "mode": data.get("mode"), "seed": data.get("seed"), "layouts": layouts}
     if len(selection) == 1:
