@@ -502,6 +502,7 @@ def _dist_worker_main(
         vec_env_kind=config.rollout.vec_env,
         subproc_workers=config.rollout.subproc_workers,
         max_idle_steps=config.env.max_idle_steps,
+        wait_for_first_weights=True,   # never play the factory weights as version 0 (ruling A-M3)
     )
 
 

@@ -234,6 +234,7 @@ def _worker_main(
         fixed_players=fixed_players,
         teachers=teachers,
         run_id=run_id,
+        wait_for_first_weights=True,   # never play the factory weights as version 0 (ruling A-M3)
     )
 
 

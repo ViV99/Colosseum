@@ -25,6 +25,14 @@ slots of every collecting seat (slot rules of spec block 4):
   seat from collecting for its agent; a seat that starts collecting takes a parked buffer
   of that agent first (``BufferPool``).
 - A chunk's ``policy_version`` is the agent's version at its first slot.
+- **First weights** (SP4 final fix wave, ruling A-M3). With ``wait_for_first_weights`` (a stop predicate; the worker
+  processes pass one) the loop waits, before any env is reset, until every trainable agent's first payload has
+  arrived: a latest seat never plays the factory weights (random) as version 0, so with ``init.from`` or a resume no
+  random-weight match is journaled under ``v0`` or the resumed version. The wait polls in slices of
+  ``FIRST_WEIGHTS_POLL_SEC``, logs one INFO line after ``FIRST_WEIGHTS_INFO_SEC`` and ends when the predicate is
+  true (the factory weights then stay, and ``run`` with the same, sticky stop returns before its first step). Without
+  it (None, the default: in-process loops and tests that never push weights) the initial sync is one non-blocking
+  poll.
 - **Match results** (SP4 spec block 1) carry each latest seat's policy version at the episode's start and end
   (``MatchRunner(version_fn=...)`` reads ``policy_versions``, which change when weights are synced, also
   mid-episode) and the uid ``<run_id>/train/w<W>_e<E>_ep<K>`` (``match_id`` without a run id). A result
@@ -80,7 +88,11 @@ from colosseum.worker.match_runner import ActRecord, EpisodeEnd, MatchRunner, Sc
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["LATEST_NETWORK_ID", "LoopIO", "RolloutLoop"]
+__all__ = ["FIRST_WEIGHTS_INFO_SEC", "FIRST_WEIGHTS_POLL_SEC", "LATEST_NETWORK_ID", "LoopIO", "RolloutLoop"]
+
+# The wait for the first weights (module docstring): poll slice, and the wait after which one INFO line is logged.
+FIRST_WEIGHTS_POLL_SEC = 0.05
+FIRST_WEIGHTS_INFO_SEC = 5.0
 
 
 @dataclass
@@ -141,6 +153,7 @@ class RolloutLoop:
         fixed_players: FixedPlayers | None = None,
         teachers: Mapping[str, BotSpec] | None = None,
         run_id: str | None = None,
+        wait_for_first_weights: Callable[[], bool] | None = None,
     ) -> None:
         if len(lineups) != num_envs:
             raise ValueError(f"worker {worker_id}: need one lineup per env: {len(lineups)} lineups for {num_envs} envs")
@@ -209,7 +222,10 @@ class RolloutLoop:
             for aid, by_id in (checkpoint_state_dicts_by_agent or {}).items():
                 for ckpt_id, sd in by_id.items():
                     self._add_checkpoint(aid, ckpt_id, sd)
-            self.sync_weights()   # initial weights and policy versions
+            if wait_for_first_weights is None:
+                self.sync_weights()   # initial weights and policy versions
+            else:
+                self._wait_for_first_weights(wait_for_first_weights)
 
             self._tracks: list[dict[int, _SeatTrack]] = [{} for _ in range(num_envs)]
             self._env_steps = 0
@@ -258,10 +274,34 @@ class RolloutLoop:
         for aid in self._agent_ids:
             payload = self._io.poll_weights(aid)
             if payload is not None:
-                self._models[aid][LATEST_NETWORK_ID].load_state_dict(payload.to_torch_state_dict())
-                self._policy_versions[aid] = int(payload.policy_version)
-                if aid in self._teacher_active:
-                    self._teacher_active[aid] = bool(payload.teacher_active)
+                self._load_weights(aid, payload)
+        self._last_weight_sync = time.monotonic()
+
+    def _load_weights(self, aid: str, payload: WeightPayload) -> None:
+        self._models[aid][LATEST_NETWORK_ID].load_state_dict(payload.to_torch_state_dict())
+        self._policy_versions[aid] = int(payload.policy_version)
+        if aid in self._teacher_active:
+            self._teacher_active[aid] = bool(payload.teacher_active)
+
+    def _wait_for_first_weights(self, should_stop: Callable[[], bool]) -> None:
+        """The initial sync of a worker process: poll until every agent has its first payload, or until
+        ``should_stop()`` (module docstring, "First weights"). Runs before the MatchRunner resets any env."""
+        missing = list(self._agent_ids)
+        started = time.monotonic()
+        logged = False
+        while True:
+            for aid in list(missing):
+                payload = self._io.poll_weights(aid)
+                if payload is not None:
+                    self._load_weights(aid, payload)
+                    missing.remove(aid)
+            if not missing or should_stop():
+                break
+            if not logged and time.monotonic() - started >= FIRST_WEIGHTS_INFO_SEC:
+                logged = True
+                logger.info(f"Worker {self.worker_id}: waiting for the first weights of {missing} from their "
+                            f"learners; no match starts before they arrive")
+            time.sleep(FIRST_WEIGHTS_POLL_SEC)
         self._last_weight_sync = time.monotonic()
 
     def run(self, should_stop: Callable[[], bool], max_env_steps: int = 0) -> None:
