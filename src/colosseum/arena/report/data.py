@@ -19,8 +19,9 @@ Rules:
   until the journal files change; the fit, its bootstrap and the G2 test use one read of the journal
   (``bt.bootstrap_data`` / ``BootstrapData.to_table``), so a live writer cannot make them disagree;
 - bounded memory: ``ratings.json`` and the config are parsed once per file change, ``MetricsTail`` keeps
-  only the record kinds the page draws (``REPORT_KINDS``), score-layout compositions are capped like the
-  entity rows (``compositions_truncated``);
+  only the record kinds the page draws (``REPORT_KINDS``), each (kind, agent) series thinned on ingest to
+  about ``2 * series_points`` records whatever the run's length, and reads in fixed-size chunks; score-layout
+  compositions are capped like the entity rows (``compositions_truncated``);
 - no ``inf`` / ``nan`` reaches the data: missing intervals (a score with fewer than two games, an infinite
   standard error) are ``null``;
 - anchors with pulse: a stored snapshot is "unevaluated" when the journal's ``pulse`` source has no game of
@@ -38,7 +39,7 @@ import math
 import re
 import shutil
 import time
-from collections import defaultdict
+from collections import defaultdict, deque
 from collections.abc import Mapping, Sequence
 from dataclasses import asdict, dataclass, is_dataclass
 from pathlib import Path
@@ -138,37 +139,107 @@ def _file_sig(*paths: Path) -> tuple:
 
 
 REPORT_KINDS = ("train", "system", "episodes")    # the metrics.jsonl record kinds the report draws
+READ_CHUNK_BYTES = 1 << 20                         # MetricsTail reads metrics.jsonl in chunks of this size
+SERIES_RECORDS = 4000                              # MetricsTail's default per-series cap (2 x series_points)
+_COUNTER = {"train": "train_step"}                 # the counter of a record kind; every other kind: env_steps
+
+
+class _Series:
+    """One (kind, agent) series of ``MetricsTail``, thinned on ingest by its counter (stride doubling): one record
+    per counter bucket of width ``width`` (the one with the smallest counter) is kept; whenever more than ``cap``
+    buckets are kept, the width doubles and neighbouring buckets merge. The record with the largest counter (the
+    newest) is always kept as well. Records without a finite counter: the newest ``cap`` of them. At most
+    ``2 * cap + 1`` records, whatever the number ingested."""
+
+    __slots__ = ("counter", "cap", "width", "buckets", "newest", "uncounted")
+
+    def __init__(self, counter: str, cap: int) -> None:
+        self.counter, self.cap = counter, max(1, int(cap))
+        self.width = 1
+        self.buckets: dict[int, tuple[float, dict]] = {}
+        self.newest: tuple[float, dict] | None = None
+        self.uncounted: deque[dict] = deque(maxlen=self.cap)
+
+    def add(self, record: dict) -> None:
+        c = record.get(self.counter)
+        if isinstance(c, bool) or not isinstance(c, (int, float)) or not math.isfinite(c):
+            self.uncounted.append(record)
+            return
+        if self.newest is None or c >= self.newest[0]:
+            self.newest = (c, record)
+        b = math.floor(c / self.width)
+        held = self.buckets.get(b)
+        if held is None or c < held[0]:
+            self.buckets[b] = (c, record)
+        while len(self.buckets) > self.cap:
+            self.width *= 2
+            merged: dict[int, tuple[float, dict]] = {}
+            for b, item in self.buckets.items():
+                nb = b // 2                    # floor(floor(c / w) / 2) == floor(c / 2w)
+                if nb not in merged or item[0] < merged[nb][0]:
+                    merged[nb] = item
+            self.buckets = merged
+
+    def records(self) -> list[dict]:
+        out = [r for _, r in sorted(self.buckets.values(), key=lambda item: item[0])]
+        if self.newest is not None and (not out or out[-1] is not self.newest[1]):
+            out.append(self.newest[1])
+        return out + list(self.uncounted)
 
 
 class MetricsTail:
     """Incremental reader of ``metrics.jsonl``: only complete lines are parsed; a partial last line (a
     running run is writing it) waits for the next ``poll``. A malformed complete line is counted, not raised.
-    Only records of ``kinds`` are kept (default ``REPORT_KINDS``; e.g. the large ``ratings`` records are not:
-    the memory of a long run's dashboard stays proportional to what the page draws); None keeps every kind."""
+    Only records of ``kinds`` are kept (default ``REPORT_KINDS``; e.g. the large ``ratings`` records are not);
+    None keeps every kind.
 
-    def __init__(self, path: Path, kinds: Sequence[str] | None = REPORT_KINDS) -> None:
+    Bounded memory over a run of any length: each (kind, agent) series is thinned on ingest by its counter
+    (``train_step`` for ``train``, else ``env_steps``) with stride doubling (``_Series``), so it holds at most
+    ``2 * max_per_series + 1`` records (in practice ``max_per_series + 1``: records without a counter are rare);
+    the first and the newest record stay. The report passes ``2 * ReportLimits.series_points``, so its own
+    thinning (``thin``) still has its point count after a halving. A poll reads the file in chunks of
+    ``READ_CHUNK_BYTES`` (plus at most one line longer than a chunk), up to the size seen at its start."""
+
+    def __init__(self, path: Path, kinds: Sequence[str] | None = REPORT_KINDS, *,
+                 max_per_series: int = SERIES_RECORDS) -> None:
         self.path = Path(path)
         self.kinds = None if kinds is None else frozenset(kinds)
+        self.max_per_series = int(max_per_series)
         self.offset = 0
-        self.records: list[dict] = []
-        self._by_kind: dict[str, list[dict]] = defaultdict(list)
+        self._series: dict[tuple[str, str | None], _Series] = {}
         self.bad_lines = 0
 
     def poll(self) -> list[dict]:
+        """Read what was appended since the last poll; returns every kept record (series by series)."""
         try:
             size = self.path.stat().st_size
         except OSError:
-            return self.records
+            return self._all()
         if size < self.offset:                 # rewritten (another run with the same dir): start over
-            self.offset, self.records, self.bad_lines = 0, [], 0
-            self._by_kind = defaultdict(list)
+            self.offset, self.bad_lines, self._series = 0, 0, {}
+        left = size - self.offset
+        if left <= 0:
+            return self._all()
         with self.path.open("rb") as fh:
             fh.seek(self.offset)
-            chunk = fh.read()
-        end = chunk.rfind(b"\n")
-        if end < 0:
-            return self.records
-        for line in chunk[:end].split(b"\n"):
+            rest = b""
+            while left > 0:
+                chunk = fh.read(min(READ_CHUNK_BYTES, left))
+                if not chunk:
+                    break
+                left -= len(chunk)
+                data = rest + chunk if rest else chunk
+                end = data.rfind(b"\n")
+                if end < 0:                    # a line longer than a chunk, or the partial last line
+                    rest = data
+                    continue
+                self._ingest(data[:end])
+                self.offset += end + 1
+                rest = data[end + 1:]
+        return self._all()
+
+    def _ingest(self, block: bytes) -> None:
+        for line in block.split(b"\n"):
             if not line.strip():
                 continue
             try:
@@ -176,14 +247,23 @@ class MetricsTail:
             except ValueError:
                 self.bad_lines += 1
                 continue
-            if isinstance(record, dict) and (self.kinds is None or record.get("kind") in self.kinds):
-                self.records.append(record)
-                self._by_kind[str(record.get("kind"))].append(record)
-        self.offset += end + 1
-        return self.records
+            if not isinstance(record, dict):
+                continue
+            kind = str(record.get("kind"))
+            if self.kinds is not None and kind not in self.kinds:
+                continue
+            agent = record.get("agent")
+            key = (kind, None if agent is None else str(agent))
+            series = self._series.get(key)
+            if series is None:
+                series = self._series[key] = _Series(_COUNTER.get(kind, "env_steps"), self.max_per_series)
+            series.add(record)
+
+    def _all(self) -> list[dict]:
+        return [r for series in self._series.values() for r in series.records()]
 
     def of(self, kind: str) -> list[dict]:
-        return list(self._by_kind.get(kind, ()))
+        return [r for (k, _), series in self._series.items() if k == kind for r in series.records()]
 
 
 def _sorted_by(records: list[dict], key: str) -> list[dict]:
@@ -214,7 +294,8 @@ class ReportBuilder:
         self.limits = limits or ReportLimits()
         self.include_tournaments = include_tournaments
         self.seed = seed
-        self._metrics = MetricsTail(self.run_dir / "metrics.jsonl")
+        self._metrics = MetricsTail(self.run_dir / "metrics.jsonl",
+                                    max_per_series=2 * self.limits.series_points)
         self._config_cache: tuple[tuple, Any] | None = None
         self._config_error: str | None = None
         self._ratings_cache: tuple[tuple, Any] | None = None

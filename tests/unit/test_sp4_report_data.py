@@ -306,6 +306,67 @@ def test_the_metrics_tail_keeps_only_the_report_kinds(tmp_path):
     assert len(MetricsTail(path, kinds=None).poll()) == 5
 
 
+def test_the_metrics_tail_thins_each_series_by_its_counter(tmp_path):
+    """Bounded memory over a run of any length (ruling C-M2): each (kind, agent) series is thinned on ingest by its
+    counter (stride doubling) to at most ``max_per_series`` records plus the newest; the first and the newest
+    record stay, the kept counters are sorted and evenly spaced, and every series is thinned on its own."""
+    path = tmp_path / "metrics.jsonl"
+    path.write_text("")
+    cap = 50
+    tail = MetricsTail(path, max_per_series=cap)
+    for batch in range(20):                               # many polls, as a long run's dashboard makes them
+        with path.open("a") as fh:
+            for i in range(500):
+                k = batch * 500 + i
+                fh.write(json.dumps({"kind": "train", "agent": "main", "train_step": 10 * k}) + "\n")
+                if k % 5 == 0:
+                    fh.write(json.dumps({"kind": "train", "agent": "other", "train_step": k}) + "\n")
+                fh.write(json.dumps({"kind": "system", "env_steps": 100 * k}) + "\n")
+        tail.poll()
+        assert len(tail.of("train")) <= 2 * (cap + 1) and len(tail.of("system")) <= cap + 1
+    main = [r["train_step"] for r in tail.of("train") if r["agent"] == "main"]
+    other = [r["train_step"] for r in tail.of("train") if r["agent"] == "other"]
+    system = [r["env_steps"] for r in tail.of("system")]
+    for series, last in ((main, 99_990), (other, 9_995), (system, 999_900)):
+        assert cap // 2 <= len(series) <= cap + 1
+        assert series == sorted(series) and series[0] == 0 and series[-1] == last
+        gaps = [b - a for a, b in zip(series, series[1:])]
+        assert max(gaps) <= 2 * (series[-1] - series[0]) / (len(series) - 1)      # evenly spaced
+
+
+def test_the_report_builder_bounds_its_metrics_tail_by_the_page_limits(tmp_path):
+    """The builder's tail keeps 2 x ``series_points`` records per series (so the page still gets its
+    ``series_points`` after a halving), not every record of the run."""
+    run = write_run_dir(tmp_path, "wdl", train_records=600)
+    builder = ReportBuilder(run.root, limits=ReportLimits(series_points=10))
+    try:
+        steps = builder.section("training")["agents"]["main"]["train_step"]
+        assert len(builder.records("train")) <= 2 * 10 + 1
+        assert len(steps) == 10 and steps[0] == 0 and steps[-1] == 5990
+    finally:
+        builder.close()
+
+
+def test_the_metrics_tail_reads_in_fixed_size_chunks(tmp_path, monkeypatch):
+    """Chunked reads give the same records as one read: lines across chunk borders, a line longer than a chunk, a
+    malformed line and a partial last line that completes later."""
+    import colosseum.arena.report.data as data_mod
+
+    path = tmp_path / "metrics.jsonl"
+    lines = [json.dumps({"kind": "train", "agent": "main", "train_step": i, "pad": "x" * (i % 7) * 10})
+             for i in range(40)]
+    path.write_text("\n".join(lines) + "\nnot json\n" + '{"kind": "train", "agent": "main", "train_st')
+    whole = MetricsTail(path)
+    assert [r["train_step"] for r in whole.poll()] == list(range(40)) and whole.bad_lines == 1
+    monkeypatch.setattr(data_mod, "READ_CHUNK_BYTES", 7)
+    tail = MetricsTail(path)
+    assert [r["train_step"] for r in tail.poll()] == list(range(40)) and tail.bad_lines == 1
+    assert tail.offset == whole.offset == path.stat().st_size - len('{"kind": "train", "agent": "main", "train_st')
+    with path.open("a") as fh:
+        fh.write('ep": 40}\n')
+    assert [r["train_step"] for r in tail.poll()] == list(range(41)) and tail.offset == path.stat().st_size
+
+
 def test_ratings_json_is_parsed_once_per_change(tmp_path, monkeypatch):
     import colosseum.arena.report.data as data_mod
 
