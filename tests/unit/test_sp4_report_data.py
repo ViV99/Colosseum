@@ -415,6 +415,13 @@ def test_the_matrix_lists_the_trainable_agents_and_draws_the_chosen_ones_snapsho
     second = section(run.root, "matrix", agent="second")
     assert second["agents"] == ["main", "second"] and second["layouts"]["2p"]["snapshots"]["agent"] == "second"
     assert any(e.startswith("second@v") for e in second["layouts"]["2p"]["snapshots"]["axis"])
+    # FW-2 C-N1: ``second`` plays no 3p game, an unknown agent none at all: no map (not the lineage map), a note
+    assert second["layouts"]["3p"]["snapshots"] is None and second["layouts"]["3p"]["lineages"]["axis"]
+    assert second["notes"] == ["3p: second has no snapshots in this layout."]
+    unknown = section(run.root, "matrix", agent="nobody")
+    assert [unknown["layouts"][L]["snapshots"] for L in ("2p", "3p")] == [None, None]
+    assert unknown["notes"] == [f"{L}: nobody has no snapshots in this layout." for L in ("2p", "3p")]
+    assert plain["layouts"]["3p"]["snapshots"]["agent"] == "main" and not plain["notes"]
 
 
 def test_pulse_anchors_of_a_score_game_and_agents_without_pulse_results(tmp_path):

@@ -210,6 +210,7 @@ def test_the_live_page_keeps_its_layout_and_agent_choices_across_refreshes(tmp_p
     assert _options(matrix, "layout") == (["2p", "3p"], ["2p"])
     assert _options(matrix, "agent") == (["", "main", "second"], ["second"])
     assert "Snapshots of second" in matrix
+    assert "3p: second has no snapshots in this layout." in matrix       # FW-2 C-N1: no lineage-map copy
     assert not [c for c in calls if c[0] in ("ratings", "matrix") and "layout" in c[1]]
     assert ("matrix", {"agent": "second"}) in calls
     assert [c for c in calls if c[0] == "ratings"][-1] == ("ratings", {})

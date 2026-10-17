@@ -36,9 +36,18 @@ def _data_of(page: str) -> dict:
     return json.loads(m.group(1))
 
 
-def _dom(tmp_path, data: dict) -> str:
+def _dom(tmp_path, data: dict, *, live: bool = False, before: str = "", act: str = "") -> str:
+    """The page's DOM in headless Chrome; ``before``: a script run before page.js, ``act``: one run after it has
+    drawn every section."""
+    html = render_html(data, live=live)
+    if before:
+        head = '<script type="application/json" id="colosseum-config">'
+        html = html.replace(head, f"<script>{before}</script>{head}", 1)
+    if act:
+        end = html.rindex("</body>")
+        html = html[:end] + f"<script>{act}</script>" + html[end:]
     page = tmp_path / "report.html"
-    page.write_text(render_html(data))
+    page.write_text(html)
     proc = subprocess.run([CHROME, "--headless=new", "--no-sandbox", "--disable-gpu", "--dump-dom",
                            "--virtual-time-budget=3000", page.as_uri()], capture_output=True, text=True, timeout=60)
     if proc.returncode != 0 or not proc.stdout.strip():
@@ -183,6 +192,69 @@ def _score_first(data: dict) -> dict:
     layouts = data["sections"]["ratings"]["layouts"]
     data["sections"]["ratings"]["layouts"] = {"solo": layouts.pop("solo"), **layouts}
     return data
+
+
+# a select's choice made as a user makes it: its value, then its own change event
+_PICK = """function pick(sec, label, value) {
+  const s = document.querySelector("#sec-" + sec + ' select[aria-label="' + label + '"]');
+  s.value = value;
+  s.dispatchEvent(new Event("change"));
+}
+"""
+
+
+def _section_of(dom: str, name: str) -> str:
+    m = re.search(rf'<section id="sec-{name}".*?</section>', dom, re.S)
+    assert m, name
+    return m.group(0)
+
+
+@pytest.mark.skipif(CHROME is None, reason="no headless Chrome")
+def test_the_ratings_agent_filter_also_filters_the_score_compositions(tmp_path):
+    """FW-2 C-N2: the Ratings agent select filters a score layout's cross-play compositions by their members'
+    lineage (as the server's ``agent=`` filter does), not only its entity rows."""
+    data = _score_first(sample_report_data())
+    solo = data["sections"]["ratings"]["layouts"]["solo"]
+    solo["entities"].append({"entity": "greedy", "lineage": "greedy", "version": None, "kind": "scripted", "n": 40,
+                             "mean": 1.0, "ci": [0.8, 1.2]})
+    solo["compositions"].append({"composition": "greedy+greedy", "n": 20, "mean": 1.0, "ci": [0.8, 1.2],
+                                 "homogeneous": True})
+    every = _section_of(_dom(tmp_path, data), "ratings")
+    assert "main@v100+random" in every and "greedy+greedy" in every
+    main = _section_of(_dom(tmp_path, data, act=_PICK + 'pick("ratings", "agent", "main");'), "ratings")
+    assert "main@v100+random" in main and "greedy+greedy" not in main
+    greedy = _section_of(_dom(tmp_path, data, act=_PICK + 'pick("ratings", "agent", "greedy");'), "ratings")
+    assert "greedy+greedy" in greedy and "main@v100+random" not in greedy
+
+
+# live mode without a server: ``api/matrix?agent=second`` answers the dashboard's 202 "building" placeholder (no
+# ``agents``), every other request the embedded section (so it is not redrawn)
+_BUILDING_FETCH = """(function () {
+  let sections = null;
+  window.fetch = function (url) {
+    sections = sections || JSON.parse(document.getElementById("colosseum-data").textContent).sections;
+    const m = /^api\\/([a-z]+)(\\?.*)?$/.exec(url);
+    const building = m[1] === "matrix" && m[2] === "?agent=second";
+    const body = building ? { building: true, section: "matrix", notes: ["Building this section."] } : sections[m[1]];
+    return Promise.resolve({ ok: true, status: building ? 202 : 200, json: () => Promise.resolve(body) });
+  };
+})();
+"""
+
+
+@pytest.mark.skipif(CHROME is None, reason="no headless Chrome")
+def test_the_matrix_agent_select_stays_while_the_agents_map_is_building(tmp_path):
+    """FW-2 C-N3: while a new ``api/matrix?agent=`` key builds, the dashboard answers a placeholder without
+    ``agents``; the page draws the agent select from the last list it had, with the choice kept."""
+    data = sample_report_data()
+    data["sections"]["matrix"]["agents"] = ["main", "second"]
+    matrix = _section_of(_dom(tmp_path, data, live=True, before=_BUILDING_FETCH,
+                              act=_PICK + 'pick("matrix", "agent", "second");'), "matrix")
+    assert "Building this section." in matrix and "Snapshots of" not in matrix
+    m = re.search(r'<select aria-label="agent"[^>]*>(.*?)</select>', matrix, re.S)
+    assert m, "the agent select is gone"
+    assert re.findall(r'<option value="([^"]*)"', m.group(1)) == ["", "main", "second"]
+    assert re.findall(r'<option value="([^"]*)" selected=""', m.group(1)) == ["second"]
 
 
 @pytest.mark.skipif(CHROME is None, reason="no headless Chrome")

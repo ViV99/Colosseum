@@ -308,6 +308,9 @@
   };
 
   function layoutsOf(s) { return Object.keys(s.layouts || {}); }
+  function lineageOf(entity) { return String(entity).replace(/@v\d+$/, ""); }
+  /* a cross-play composition ("a+a+b": sorted member entities) with a member of lineage `agent` */
+  function hasMember(c, agent) { return String(c.composition).split("+").some((m) => lineageOf(m) === agent); }
 
   R.ratings = function (s) {
     const layouts = layoutsOf(s), out = [];
@@ -331,7 +334,7 @@
         { key: "composition", label: "composition" }, { key: "mean", label: "mean score", num: true, fmt: (v) => num(v, 3) },
         { key: "ci", label: "95% CI", text: (r) => ci(r.ci, 3), sortv: (r) => (r.ci ? r.ci[0] : null) }, { key: "n", label: "matches", num: true },
         { key: "homogeneous", label: "homogeneous", text: (r) => (r.homogeneous ? "yes" : "no") },
-      ], lay.compositions || [], { key: "comp", sort: { key: "mean", dir: "desc" } }));
+      ], (lay.compositions || []).filter((c) => !agent || hasMember(c, agent)), { key: "comp", sort: { key: "mean", dir: "desc" } }));
       if (lay.compositions_truncated) out.push(h("p", { class: "note" }, lay.compositions_truncated + " more compositions not shown."));
       return out.concat(notes(s.notes));
     }
@@ -360,11 +363,14 @@
   };
 
   /* Live mode: the agent select asks the dashboard for that agent's snapshot map (and, for score layouts, the
-     cross-play compositions with that agent: api/matrix?agent=); the layout is chosen here, from the full answer. */
+     cross-play compositions with that agent: api/matrix?agent=); the layout is chosen here, from the full answer.
+     A "building" placeholder has no agents: the select keeps the last list. */
   R.matrix = function (s) {
     const layouts = layoutsOf(s), out = [];
-    const agentPick = CFG.live && (s.agents || []).length
-      ? select("matrix", "agent", "agent", [""].concat(s.agents), () => refresh("matrix")) : null;
+    const known = st("matrix", "known_agents", []);
+    const agents = STATE.matrix.known_agents = Array.isArray(s.agents) ? s.agents : known;
+    const agentPick = CFG.live && agents.length
+      ? select("matrix", "agent", "agent", [""].concat(agents), () => refresh("matrix")) : null;
     if (!layouts.length) return [agentPick ? h("div", { class: "controls" }, agentPick) : null, h("p", { class: "note" }, "No matches yet.")].concat(notes(s.notes));
     const L = st("matrix", "layout", layouts[0]);
     const lay = s.layouts[L] || s.layouts[layouts[0]];

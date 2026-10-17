@@ -730,9 +730,11 @@ class ReportBuilder:
     # ----- matrix -----
     def _matrix(self, agent: str | None = None, layout: str | None = None) -> dict:
         """Per layout: the lineage heat map, the snapshot map of ``agent`` (default: the trainable agent rated
-        highest on the layout) and, for ``score`` layouts, the cross-play compositions (those with a member of
-        ``agent`` when given). ``agents``: the config's trainable agents, whatever the filter (the dashboard's
-        agent control)."""
+        highest on the layout; null with a note when it has no snapshot in the layout's matrix) and, for ``score``
+        layouts, the cross-play compositions (those with a member of ``agent`` when given). ``agents``: the
+        config's trainable agents, whatever the filter (the dashboard's agent control)."""
+        from colosseum.arena.entities import lineage
+
         notes: list[str] = []
         agents = [aid for aid, kind in self.agent_kinds().items() if kind == "trainable"]
         table = self.table()
@@ -768,6 +770,9 @@ class ReportBuilder:
             entry = {"kind": "bt", "lineages": {"axis": axis, "cells": _cells(axis, acc)}}
             trainable = [x for x in axis if self.agent_kinds().get(x) == "trainable"]
             target = agent if agent else (trainable[0] if trainable else None)
+            if target and not any(lineage(e) == target for pair in entity_acc for e in pair):
+                notes.append(f"{name}: {target} has no snapshots in this layout.")    # not a copy of the lineage map
+                target = None
             entry["snapshots"] = self._snapshot_matrix(target, entity_acc, axis, order) if target else None
             if skipped:
                 notes.append(f"{name}: {skipped} team pairs with members of several agents are not in the matrix.")
