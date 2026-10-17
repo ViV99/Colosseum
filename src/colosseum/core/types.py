@@ -28,6 +28,8 @@ FIXED_NETWORK_ID = "fixed"
 SOURCE_OWNER = "owner"
 # Opponent categories of the built-in matchmaker (SP3 spec block 5); "fallback" marks the runtime fallback.
 OPPONENT_CATEGORIES = ("latest", "snapshots", "rivals", "anchors", "fallback")
+# Where a match record comes from (SP4 spec block 1): training workers, a tournament, the pulse process.
+MATCH_SOURCES = ("train", "tournament", "pulse")
 
 # Values of TrajectoryChunk.kind (int8).
 SLOT_ACT, SLOT_BOOT, SLOT_PAD = 0, 1, 2
@@ -272,16 +274,29 @@ class SeatAssignment:
 
 @dataclass
 class Lineup:
-    """One match composition: a layout of the game and one assignment per seat of it."""
+    """One match composition: a layout of the game and one assignment per seat of it.
+
+    Optional (SP4): ``seed`` is the explicit episode seed (tournament, pulse; None = ``MatchRunner``'s derived
+    seed), ``block`` the design block copied into ``MatchResult.block``, ``uid`` a deterministic match uid
+    (None = the runner makes one). A lineup with a ``uid`` is meant to be played once.
+    """
 
     layout: str
     seats: list[SeatAssignment]
+    seed: int | None = None
+    block: str | None = None
+    uid: str | None = None
 
 
 @dataclass
 class SeatResult:
     """One seat of a finished match. ``reward`` is the undiscounted episode return; ``source`` is the
-    seat's ``SeatAssignment.source``."""
+    seat's ``SeatAssignment.source``. ``version_start`` / ``version_end`` (SP4): the seat's weights version at the
+    episode's start and end (``latest``: the worker's version of the agent, which can change mid-episode;
+    ``ckpt_v<N>``: N; ``fixed``: None; None also when the runner has no version source). ``version_start`` is the
+    version at the env's reset (read right after it); the worker may sync weights between the reset and the
+    episode's first decision, so that decision can already use weights one sync newer. ``version_end`` is read when
+    the result is made."""
 
     seat: int
     role: str
@@ -291,6 +306,8 @@ class SeatResult:
     reward: float
     eliminated_step: int | None = None
     source: str = ""
+    version_start: int | None = None
+    version_end: int | None = None
 
 
 @dataclass
@@ -304,7 +321,14 @@ class TeamResult:
 
 @dataclass
 class MatchResult:
-    """A finished match: one SeatResult per occupied seat, one TeamResult per team."""
+    """A finished match: one SeatResult per occupied seat, one TeamResult per team.
+
+    SP4 (spec block 1): ``uid`` is globally unique (``<run id>/train/w<W>_e<E>_ep<K>`` in training, the lineup's
+    uid in a tournament; ``match_id`` is unique only within one runner); ``source`` is one of ``MATCH_SOURCES``;
+    ``seed`` the episode seed when known; ``env_steps`` the global env-step counter when the result was received
+    (stamped by the training main process; a pulse match carries its snapshot's); ``block`` the tournament / pulse
+    design block (None in training).
+    """
 
     match_id: str
     layout: str
@@ -312,6 +336,11 @@ class MatchResult:
     seats: list[SeatResult]
     teams: list[TeamResult]
     episode_length: int
+    uid: str = ""
+    source: str = "train"
+    seed: int | None = None
+    env_steps: int | None = None
+    block: str | None = None
 
 
 @dataclass

@@ -16,6 +16,7 @@ SP3: ``agents.<id>.kind`` (trainable / scripted / frozen) and the implicit train
 SP3: ``checkpoint.keep_last`` / ``keep_every`` (``pool_size`` is read as ``keep_last``).
 SP3: ``init`` and ``kickstart`` sections (global + per agent); ``training.kickstart_*`` are translated
 into ``kickstart``.
+SP4: the global ``match_log`` and ``ratings`` sections.
 """
 
 from __future__ import annotations
@@ -560,6 +561,10 @@ class CheckpointConfig(StrictModel):
     Kept: the newest ``keep_last`` (with ``trainer_state.pt``), every snapshot whose version is a multiple of
     ``interval * keep_every`` (``model.pt`` + ``meta.json``), and every final snapshot. ``pool_size`` (SP2) is
     read as ``keep_last`` with a warning.
+
+    SP4: only the final snapshot of the current run is protected (``meta.json`` ``run_id``), pinned snapshots
+    (``colosseum pin``) are; ``keep_top_k`` keeps the top-k by the live rating's lower bound with protection of new
+    snapshots; ``max_snapshots`` caps the pool (spec block 4; the rule: ``arena.retention``).
     """
 
     interval: int = Field(
@@ -575,6 +580,26 @@ class CheckpointConfig(StrictModel):
         default=10, ge=0,
         description="Also keep every snapshot whose version is a multiple of interval * keep_every (model.pt and "
                     "meta.json only); 0 = off.",
+    )
+    keep_top_k: int = Field(
+        default=0, ge=0,
+        description="Also keep the k snapshots with the highest lower bound of their live BT rating (needs "
+                    "match_log.enabled); 0 = off.",
+    )
+    top_k_quantile: float = Field(
+        default=0.1, gt=0.0, lt=0.5,
+        description="Quantile of the rating distribution used as the lower bound for keep_top_k.",
+    )
+    top_k_min_games: int = Field(
+        default=200, ge=0,
+        description="With keep_top_k > 0, a snapshot outside keep_last with fewer rated games is never evicted "
+                    "(rated comparisons, self-play excluded: one per match in a two-team layout, T - 1 per match "
+                    "in a T-team free-for-all).",
+    )
+    max_snapshots: int | None = Field(
+        default=100, ge=1,
+        description="At most this many snapshots per agent (keep_last, this run's final and pinned ones are never "
+                    "evicted); null = no cap. Not set and keep_last > 100: keep_last (INFO).",
     )
     save_optimizer: bool = Field(
         default=True,
@@ -597,6 +622,22 @@ class CheckpointConfig(StrictModel):
         logger.warning(f"checkpoint.pool_size is the SP2 name of checkpoint.keep_last; read as keep_last: "
                        f"{data['keep_last']} (rename it in the config)")
         return data
+
+    @model_validator(mode="after")
+    def _check_cap(self) -> CheckpointConfig:
+        """An unset ``max_snapshots`` below ``keep_last`` (an SP3 ``keep_last`` or SP2 ``pool_size`` over the default
+        100) becomes ``keep_last``, with one INFO line (ruling A-M7: SP3 configs keep working); an explicit one is a
+        ConfigError. The raised value is then set, so a re-validated dump (``get_agent_config``) logs nothing."""
+        if ("max_snapshots" not in self.model_fields_set and self.max_snapshots is not None
+                and self.max_snapshots < self.keep_last):
+            logger.info(f"checkpoint.max_snapshots is not set and its default ({self.max_snapshots}) is below "
+                        f"checkpoint.keep_last ({self.keep_last}): the cap is keep_last ({self.keep_last}) per agent")
+            self.max_snapshots = self.keep_last
+        if self.max_snapshots is not None and self.max_snapshots < self.keep_last:
+            raise ValueError(f"checkpoint.max_snapshots ({self.max_snapshots}) is smaller than checkpoint.keep_last "
+                             f"({self.keep_last}): the newest keep_last snapshots are never evicted; raise "
+                             f"max_snapshots or lower keep_last")
+        return self
 
 
 class InitConfig(StrictModel):
@@ -655,6 +696,58 @@ class MetricsConfig(StrictModel):
         default=10.0, ge=0.0,
         description="Seconds between console progress lines and episodes/system/ratings records.",
     )
+
+
+class EvaluationConfig(StrictModel):
+    """Pulse: every new snapshot against a fixed field during training (SP4 spec block 6). Global only."""
+
+    enabled: bool = Field(default=False, description="Start the pulse process (needs match_log.enabled).")
+    agents: list[str] | None = Field(default=None, description="Trainable agents to evaluate; null = all.")
+    field: list[str] | None = Field(
+        default=None, description="Scripted / frozen agents of the config to play against; null = all of them.")
+    layouts: list[str] | None = Field(
+        default=None, description="Layouts; null = every enabled layout with a seat of the agent's roles.")
+    every: int = Field(default=1, ge=1, description="Evaluate every k-th saved snapshot (the final one is offered "
+                       "too, but a local run stops before it is played: evaluate it with colosseum tournament).")
+    blocks: int = Field(default=25, ge=1, description="Blocks per field member (or composition); 1v1: 2 matches each.")
+    num_envs: int = Field(default=8, ge=1, description="Envs of the pulse process.")
+    deterministic: bool = Field(default=False, description="Greedy snapshot policies.")
+    max_backlog: int = Field(default=4, ge=1, description="Snapshots waiting for evaluation; the oldest are skipped.")
+
+
+class MatchLogConfig(StrictModel):
+    """The match log ``runs/<name>/matches.db`` (SP4 spec block 1). Global only (no per-agent override)."""
+
+    enabled: bool = Field(
+        default=True,
+        description="Journal every training match (false: only the online ELO of SP2; snapshot ratings, top-k "
+                    "snapshots and evaluation need the journal).",
+    )
+    detail_window_mb: float = Field(
+        default=512.0, gt=0,
+        description="Detailed training matches are kept within this size (an estimate, about 1M matches at "
+                    "512); older ones are compacted into counts, which keep the ratings exact.",
+    )
+    min_free_disk_mb: float = Field(
+        default=2048.0, ge=0,
+        description="When the journal's disk has less free space, new training matches go to the counts only "
+                    "(the detail resumes when space is back).",
+    )
+    compact_interval_sec: float = Field(default=60.0, gt=0, description="Seconds between compaction passes.")
+
+
+class RatingsConfig(StrictModel):
+    """Snapshot ratings (SP4 spec block 2): Bradley-Terry over the match log. Global only."""
+
+    anchor: str | None = Field(
+        default=None,
+        description="Agent of the config whose rating is 0 in every role group and component it plays in (a "
+                    "trainable agent: its first version bucket). null: the first RandomBot agent, else the mean of the "
+                    "scripted / frozen agents, else v0 of the first trainable agent.",
+    )
+    refit_interval_sec: float = Field(default=60.0, gt=0, description="Seconds between live refits during training.")
+    bootstrap_samples: int = Field(
+        default=200, ge=20, description="Bootstrap replicates for reports, tournaments and --snapshots top:N.")
 
 
 class RunConfig(StrictModel):
@@ -883,9 +976,12 @@ class ColosseumConfig(StrictModel):
     training: TrainingConfig = Field(default_factory=TrainingConfig)
     matchmaking: MatchmakingConfig = Field(default_factory=MatchmakingConfig)
     checkpoint: CheckpointConfig = Field(default_factory=CheckpointConfig)
+    evaluation: EvaluationConfig = Field(default_factory=EvaluationConfig)
     init: InitConfig = Field(default_factory=InitConfig)
     kickstart: KickstartConfig = Field(default_factory=KickstartConfig)
     metrics: MetricsConfig = Field(default_factory=MetricsConfig)
+    match_log: MatchLogConfig = Field(default_factory=MatchLogConfig)
+    ratings: RatingsConfig = Field(default_factory=RatingsConfig)
     bc: BCConfig = Field(default_factory=BCConfig)
     transport: TransportConfig = Field(default_factory=TransportConfig)
     run: RunConfig = Field(default_factory=RunConfig)
@@ -968,6 +1064,20 @@ class ColosseumConfig(StrictModel):
                 self.get_agent_config(agent_id)
             except ValidationError as e:
                 raise ValueError(f"agents.{agent_id}: invalid override:\n{e}") from None
+        return self
+
+    @model_validator(mode="after")
+    def _check_sp4_dependencies(self) -> ColosseumConfig:
+        """SP4 features that read the match log (spec blocks 1, 4, 6)."""
+        if self.checkpoint.keep_top_k > 0 and not self.match_log.enabled:
+            raise ValueError(f"checkpoint.keep_top_k={self.checkpoint.keep_top_k} keeps snapshots by their rating, "
+                             f"which comes from the match log; set match_log.enabled: true or keep_top_k: 0")
+        ev = self.evaluation
+        if ev.enabled and not self.match_log.enabled:
+            raise ValueError("evaluation.enabled: pulse matches go to the match log; set match_log.enabled: true or "
+                             "evaluation.enabled: false")
+        if ev.enabled and ev.field is not None and not ev.field:
+            raise ValueError("evaluation.field is empty: name scripted / frozen agents of the config, or null for all")
         return self
 
     def _has_implicit_agent(self) -> bool:

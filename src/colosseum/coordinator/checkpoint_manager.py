@@ -1,5 +1,5 @@
-"""Checkpoint storage: atomic per-agent snapshots, retention (``keep_last`` / ``keep_every`` / final),
-the run-dir pool import, resume resolution.
+"""Checkpoint storage: atomic per-agent snapshots, retention (``keep_last`` / ``keep_every`` / final / pinned /
+top-k / ``max_snapshots``), the run-dir pool import, resume resolution.
 
 Layout (``base_dir`` is ``<run_dir>/checkpoints``)::
 
@@ -7,19 +7,23 @@ Layout (``base_dir`` is ``<run_dir>/checkpoints``)::
         model.pt            torch.save of the model state_dict (CPU tensors)
         trainer_state.pt    torch.save of BaseAlgorithm.state_dict() (optional)
         meta.json           agent_id, checkpoint_id, policy_version, timestamp, + extras
-                            (SP2: roles and role_signature of the agent; required by resume and eval)
+                            (SP2: roles and role_signature of the agent; required by resume and eval;
+                            SP4: pinned, and run_id when the manager has one)
 
 A checkpoint's path is always ``base_dir/agent_id/checkpoint_id``; both ids must be
 safe path components (``core.config.check_path_component``), and agent ids may not
 contain ``.`` (``core.config.check_agent_id``). A ``path`` stored in
 ``meta.json`` (older layouts, copied runs) is never used (R6-06).
 
-Retention (SP3 spec block 4), after every save and import: the newest ``keep_last`` snapshots, every
-snapshot whose version is a multiple of ``interval * keep_every`` (``keep_every > 0``), every final
-snapshot (``meta.json`` ``final: true``) and the snapshot just saved are kept; every other one is evicted
-(``on_evict(agent_id, checkpoint_id)`` is called for each, after the index no longer lists it, so a
-raising callback never leaves deleted dirs in the index). Only the newest ``keep_last`` keep
-``trainer_state.pt``: resume only ever needs the latest snapshots.
+Retention (SP4 spec block 4; the decision is ``colosseum.arena.retention.retain``), after every save, import
+and ``reapply_retention``: the newest ``keep_last``, the final snapshot of the current run (``run_id``; with no
+run id every final, as in SP3), pinned snapshots (``meta.json`` ``pinned``, re-read from disk before every
+decision, so ``colosseum pin`` works while a run trains), the snapshot just saved, every ``keep_every``-th
+version, and with ``keep_top_k > 0`` the top-k by the scores provider's lower bound plus new snapshots with
+fewer than ``top_k_min_games`` rated games; then the ``max_snapshots`` cap. Evicted ids leave the index first,
+then ``on_evict(agent_id, checkpoint_id)`` is called for each (a raising callback never leaves deleted dirs in
+the index). Only the newest ``keep_last`` keep ``trainer_state.pt``. Every new ``meta.json`` gets ``pinned``
+(false) and, with a run id, ``run_id``.
 
 Writes go to ``.tmp-<id>-<rand>/`` and are moved into place with ``os.replace``.
 Replacing an existing id first moves it aside to ``.tmp-old-<id>-<rand>/``. Eviction
@@ -41,7 +45,7 @@ import re
 import shutil
 import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -49,9 +53,11 @@ from typing import Any
 import numpy as np
 import torch
 
+from colosseum.arena.retention import RetentionPolicy, SnapshotInfo, SnapshotScore, retain
 from colosseum.core.config import check_agent_id, check_path_component
 from colosseum.core.errors import ConfigError
 from colosseum.core.types import state_dict_from_numpy, state_dict_to_numpy
+from colosseum.utils.fs import write_text_atomic
 
 logger = logging.getLogger(__name__)
 
@@ -186,7 +192,7 @@ def _clean_tmp_dirs(agent_dir: Path) -> None:
             logger.info(f"Removed stale checkpoint write dir {d}")
 
 
-def _link_or_copy(src: Path, dst: Path) -> None:
+def link_or_copy(src: Path, dst: Path) -> None:
     """Hard-link ``src`` to ``dst``; copy when links are impossible (another file system, no support)."""
     try:
         os.link(src, dst)
@@ -194,19 +200,131 @@ def _link_or_copy(src: Path, dst: Path) -> None:
         shutil.copy2(src, dst)
 
 
+_link_or_copy = link_or_copy   # the SP3 name
+
+
+def read_snapshots(agent_dir: str | Path) -> list[CheckpointInfo]:
+    """Valid snapshots of one agent dir, by version, read without touching it (no tmp cleanup, malformed ones
+    skipped with a warning). For read-only callers on a live run (``colosseum pin``, the tournament)."""
+    return _read_agent_dir(Path(agent_dir))
+
+
+def set_pinned(ckpt_dir: str | Path, pinned: bool) -> dict:
+    """Set ``pinned`` in ``ckpt_dir/meta.json`` by an atomic rewrite (temp file + ``os.replace``: a hard-linked
+    copy of the file in another run dir keeps its old content); returns the new meta. ConfigError for a
+    missing dir or an invalid ``meta.json``."""
+    path = Path(ckpt_dir)
+    meta = read_checkpoint_meta(path)
+    meta["pinned"] = bool(pinned)
+    write_text_atomic(path / META_FILE, json.dumps(meta, indent=2, sort_keys=True))
+    return meta
+
+
+SNAPSHOT_REF_RE = re.compile(r"([A-Za-z0-9_][A-Za-z0-9_-]*)@v(\d+)")
+
+
+def parse_snapshot_ref(text: str) -> tuple[str, int]:
+    """``"main@v1200"`` -> ``("main", 1200)``: a snapshot reference of the CLI (spec §8: ``agent@v<N>`` in the CLI
+    only; configs name agents). ConfigError for anything else."""
+    match = SNAPSHOT_REF_RE.fullmatch(text)
+    if match is None:
+        raise ConfigError(f"{text!r} is not a snapshot reference; write agent@v<version>, e.g. main@v1200")
+    return match.group(1), int(match.group(2))
+
+
+def _run_checkpoints(run_dir: str | Path) -> Path:
+    root = Path(run_dir)
+    ckpts = root / "checkpoints"
+    if not ckpts.is_dir():
+        raise ConfigError(f"{root} is not a run dir (no checkpoints/ inside); pass runs/<name>")
+    return ckpts
+
+
+def list_snapshots(run_dir: str | Path) -> dict[str, list[CheckpointInfo]]:
+    """Stored snapshots of every agent of a run dir, agents in name order, snapshots by version. Read-only: no
+    ``CheckpointManager`` scan (it would clean the tmp dirs of a live writer); malformed snapshots are skipped
+    with a warning (``read_snapshots``); agents without valid snapshots are left out."""
+    ckpts = _run_checkpoints(run_dir)
+    out: dict[str, list[CheckpointInfo]] = {}
+    for agent_dir in sorted(p for p in ckpts.iterdir() if p.is_dir() and not p.name.startswith(".")):
+        infos = read_snapshots(agent_dir)
+        if infos:
+            out[agent_dir.name] = infos
+    return out
+
+
+def pin_snapshot(run_dir: str | Path, agent_id: str, version: int, *, pinned: bool = True) -> Path:
+    """Pin (unpin) snapshot ``ckpt_v<version>`` of ``agent_id`` in ``run_dir`` by ``set_pinned``; idempotent and
+    safe while the run trains (its retention re-reads pins before every decision). Returns the snapshot dir.
+    ConfigError (not a run dir, an unknown agent or snapshot) naming the stored agents or snapshots.
+
+    The race with a training run's eviction (which renames the dir away): a snapshot that disappears before or
+    while ``meta.json`` is rewritten, or (pinning) right after it, is a ConfigError that says so and points to the
+    tournaments' linked copies; an unpinned snapshot evicted right after the write is the expected outcome. The
+    check after the write narrows the window in which "pinned" is reported for a snapshot that is gone a moment
+    later (the trainer's retention may have read the pins just before the write); it cannot close it."""
+    snapshots = list_snapshots(run_dir)
+    if agent_id not in snapshots:
+        raise ConfigError(f"{run_dir}: no snapshots of agent {agent_id!r}; agents with snapshots: {sorted(snapshots)}")
+    by_id = {c.checkpoint_id: c for c in snapshots[agent_id]}
+    checkpoint_id = f"ckpt_v{int(version)}"
+    if checkpoint_id not in by_id:
+        raise ConfigError(f"{run_dir}: agent {agent_id!r} has no stored snapshot {checkpoint_id} (newest stored: "
+                          f"{list(by_id)[-10:]}); see colosseum pin {run_dir} --list")
+    path = by_id[checkpoint_id].path
+    try:
+        set_pinned(path, pinned)
+    except (OSError, ConfigError) as e:
+        if path.is_dir():
+            if isinstance(e, ConfigError):
+                raise
+            raise ConfigError(f"{path}: writing {META_FILE} failed ({type(e).__name__}: {e})") from e
+        raise _evicted_meanwhile(run_dir, agent_id, version, pinned) from e
+    if pinned and not path.is_dir():
+        raise _evicted_meanwhile(run_dir, agent_id, version, pinned)
+    return path
+
+
+def _evicted_meanwhile(run_dir: str | Path, agent_id: str, version: int, pinned: bool) -> ConfigError:
+    return ConfigError(f"{run_dir}: snapshot {agent_id}@v{version} was evicted by the training run while it was being "
+                       f"{'pinned' if pinned else 'unpinned'}; a copy may still be in "
+                       f"{Path(run_dir) / 'tournaments'}/*/snapshots/ (a tournament links its players' snapshots "
+                       f"there); see colosseum pin {run_dir} --list")
+
+
 class CheckpointManager:
     """Saves snapshots atomically and applies the retention rules per agent (module docstring)."""
 
     def __init__(self, base_dir: str | Path, keep_last: int = 20, keep_every: int = 0, interval: int = 1,
-                 on_evict: Callable[[str, str], None] | None = None) -> None:
-        if keep_last < 1 or keep_every < 0 or interval < 1:
-            raise ValueError(f"CheckpointManager: need keep_last >= 1, keep_every >= 0, interval >= 1; got "
-                             f"{keep_last}, {keep_every}, {interval}")
+                 on_evict: Callable[[str, str], None] | None = None, *, run_id: str | None = None,
+                 keep_top_k: int = 0, top_k_min_games: int = 200, max_snapshots: int | None = None,
+                 scores_fn: Callable[[str], Mapping[str, SnapshotScore] | None] | None = None) -> None:
+        """``run_id``: the current run (only its final snapshot is protected; None keeps the SP3 rule: every
+        final); ``scores_fn(agent_id)``: ``{checkpoint_id: SnapshotScore}`` of the agent's rated snapshots, or
+        None while there are no ratings yet (``arena.retention``: unrated snapshots are new, the cap waits), read
+        only with ``keep_top_k > 0``."""
+        if keep_last < 1 or keep_every < 0 or interval < 1 or keep_top_k < 0 or top_k_min_games < 0 \
+                or (max_snapshots is not None and max_snapshots < keep_last):
+            raise ValueError(f"CheckpointManager: need keep_last >= 1, keep_every >= 0, interval >= 1, "
+                             f"keep_top_k >= 0, top_k_min_games >= 0 and max_snapshots >= keep_last; got "
+                             f"{keep_last}, {keep_every}, {interval}, {keep_top_k}, {top_k_min_games}, "
+                             f"{max_snapshots}")
         self._base_dir = Path(base_dir)
         self._keep_last = int(keep_last)
         self._keep_every = int(keep_every)
         self._interval = int(interval)
         self._on_evict = on_evict
+        self._run_id = run_id
+        self._keep_top_k = int(keep_top_k)
+        self._top_k_min_games = int(top_k_min_games)
+        self._max_snapshots = max_snapshots
+        self._scores_fn = scores_fn
+        # (agent, decided without ratings) whose cap overflow was logged: once per agent and kind, so a WARNING
+        # against the raised pre-refit cap never hides a later one against max_snapshots itself
+        self._warned: set[tuple[str, bool]] = set()
+        self._noted: set[str] = set()        # agents whose raised pre-refit cap was announced (INFO once)
+        self._scores_failed = False          # the first failing scores_fn call is logged with its traceback
+        self._reasons: dict[str, dict[str, str]] = {}   # per agent: the last decision's reasons (retain)
         self._base_dir.mkdir(parents=True, exist_ok=True)
         self._index: dict[str, list[CheckpointInfo]] = {}
         self._scan()
@@ -214,6 +332,11 @@ class CheckpointManager:
     @property
     def base_dir(self) -> Path:
         return self._base_dir
+
+    @property
+    def run_id(self) -> str | None:
+        """The current run's id (``meta.json`` ``run_id`` of new snapshots), or None (the SP3 final rule)."""
+        return self._run_id
 
     @property
     def agents(self) -> list[str]:
@@ -261,6 +384,12 @@ class CheckpointManager:
             "timestamp": timestamp,
             **(meta_extra or {}),
         }
+        previous = next((c for c in self._index.get(agent_id, []) if c.checkpoint_id == checkpoint_id), None)
+        if previous is not None:
+            self._refresh_pins([previous])     # a replaced snapshot keeps its pin
+        meta.setdefault("pinned", bool(previous is not None and previous.meta.get("pinned") is True))
+        if self._run_id is not None:
+            meta.setdefault("run_id", self._run_id)
         try:
             torch.save(numpy_state_to_torch(model_state), tmp_dir / MODEL_FILE)
             if isinstance(trainer_state, (bytes, bytearray)):
@@ -282,34 +411,110 @@ class CheckpointManager:
         entries = [c for c in self._index.get(agent_id, []) if c.checkpoint_id != checkpoint_id]
         entries.append(CheckpointInfo(checkpoint_id, agent_id, int(policy_version), final_dir, timestamp, meta))
         entries.sort(key=lambda c: c.policy_version)
+        self._index[agent_id] = entries          # indexed before retention: the dir is in place whatever happens
         self._index[agent_id], evicted = self._retain(agent_id, entries, protect=checkpoint_id)
-        logger.info(f"Saved checkpoint {checkpoint_id} of {agent_id} (pool {len(self._index[agent_id])}; "
-                    f"keep_last {self._keep_last}, keep_every {self._keep_every})")
+        logger.info(f"Saved checkpoint {checkpoint_id} of {agent_id} (pool {len(self._index[agent_id])})")
         self._notify_evicted(agent_id, evicted)
         return checkpoint_id
 
+    def _policy(self) -> RetentionPolicy:
+        return RetentionPolicy(keep_last=self._keep_last, keep_every_period=self._interval * self._keep_every,
+                               keep_top_k=self._keep_top_k, top_k_min_games=self._top_k_min_games,
+                               max_snapshots=self._max_snapshots, current_run_id=self._run_id)
+
+    @staticmethod
+    def _refresh_pins(entries: list[CheckpointInfo]) -> None:
+        """Re-read ``pinned`` from every entry's ``meta.json`` (another process may have pinned it); an unreadable
+        file keeps the indexed value."""
+        for c in entries:
+            try:
+                disk = json.loads((c.path / META_FILE).read_text())
+            except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+                continue
+            if isinstance(disk, dict):
+                c.meta["pinned"] = disk.get("pinned") is True
+
+    def _scores(self, agent_id: str) -> Mapping[str, SnapshotScore] | None:
+        """The provider's scores (only with ``keep_top_k > 0``; ``{}`` without a provider); None = no ratings yet
+        (``arena.retention``). A raising provider is logged (ERROR, once per manager) and read as "no ratings yet":
+        retention never fails a save over the ratings."""
+        if self._scores_fn is None or self._keep_top_k == 0:
+            return {}
+        try:
+            return self._scores_fn(agent_id)
+        except Exception:  # noqa: BLE001 - the snapshot is already stored; keep it and wait for good ratings
+            logger.error(f"Snapshot scores of {agent_id} failed; retention treats them as not rated yet",
+                         exc_info=not self._scores_failed)
+            self._scores_failed = True
+            return None
+
     def _retain(self, agent_id: str, entries: list[CheckpointInfo],
                 protect: str | None = None) -> tuple[list[CheckpointInfo], list[str]]:
-        """Apply the retention rules to ``entries`` (sorted by version); returns the kept ones and the ids
+        """Apply ``arena.retention.retain`` to ``entries`` (sorted by version); returns the kept ones and the ids
         evicted (the caller updates the index first, then calls ``_notify_evicted``)."""
+        if not entries:
+            return [], []
+        self._refresh_pins(entries)
+        scores = self._scores(agent_id)
+        infos = [SnapshotInfo(c.checkpoint_id, c.policy_version, c.meta.get("final") is True, c.meta.get("run_id"),
+                              c.meta.get("pinned") is True) for c in entries]
+        decision = retain(infos, scores, self._policy(), protect=protect)
+        self._reasons[agent_id] = dict(decision.reasons)
+        if decision.warnings and (agent_id, decision.waiting) not in self._warned:   # once (ruling D4)
+            self._warned.add((agent_id, decision.waiting))
+            for warning in decision.warnings:
+                logger.warning(f"Snapshots of {agent_id}: {warning}")
+        if decision.notes and agent_id not in self._noted:
+            self._noted.add(agent_id)
+            for note in decision.notes:
+                logger.info(f"Snapshots of {agent_id}: {note}")
+        keep = set(decision.keep)
         newest = {c.checkpoint_id for c in entries[-self._keep_last:]}
-        period = self._interval * self._keep_every
-        keep = set(newest) | ({protect} if protect is not None else set())
-        for c in entries:
-            if (period > 0 and c.policy_version % period == 0) or c.meta.get("final") is True:
-                keep.add(c.checkpoint_id)
         kept: list[CheckpointInfo] = []
         evicted: list[str] = []
         for c in entries:
             if c.checkpoint_id not in keep:
                 self._evict(agent_id, c.checkpoint_id)
-                logger.debug(f"Evicted checkpoint {c.checkpoint_id} of {agent_id}")
+                logger.debug(f"Evicted checkpoint {c.checkpoint_id} of {agent_id}: "
+                             f"{decision.reasons[c.checkpoint_id]}")
                 evicted.append(c.checkpoint_id)
                 continue
             kept.append(c)
             if c.checkpoint_id not in newest:
                 (c.path / TRAINER_FILE).unlink(missing_ok=True)
         return kept, evicted
+
+    def reapply_retention(self, agent_id: str) -> list[str]:
+        """Rerun retention for ``agent_id`` without a save (new ratings, new pins); returns the evicted ids, after
+        ``on_evict`` ran for each. Main loop only (spec block 4)."""
+        entries = list(self._index.get(agent_id, []))
+        if not entries:
+            return []
+        self._index[agent_id], evicted = self._retain(agent_id, entries)
+        if evicted:
+            logger.info(f"Retention of {agent_id}: evicted {evicted} (pool {len(self._index[agent_id])})")
+        self._notify_evicted(agent_id, evicted)
+        return evicted
+
+    def pin(self, agent_id: str, checkpoint_id: str, pinned: bool = True) -> None:
+        """Pin (or unpin) a stored snapshot: ``meta.json`` is rewritten atomically. A pinned snapshot is never
+        evicted; an unpinned one becomes evictable at the next retention pass. ConfigError for an unknown id."""
+        entry = next((c for c in self._index.get(agent_id, []) if c.checkpoint_id == checkpoint_id), None)
+        if entry is None:
+            stored = [c.checkpoint_id for c in self._index.get(agent_id, [])]
+            raise ConfigError(f"agent {agent_id!r} has no stored snapshot {checkpoint_id!r} (stored: {stored[-10:]})")
+        entry.meta.update(set_pinned(entry.path, pinned))
+
+    def retention_reasons(self, agent_id: str) -> dict[str, str]:
+        """``{checkpoint_id: "kept: ..." | "evicted: ..."}`` of the agent's last retention decision (``{}`` before
+        one); diagnostics and tests."""
+        return dict(self._reasons.get(agent_id, {}))
+
+    def pinned(self, agent_id: str) -> list[str]:
+        """Ids of the pinned snapshots of ``agent_id`` (as on disk now), by version."""
+        entries = self._index.get(agent_id, [])
+        self._refresh_pins(entries)
+        return [c.checkpoint_id for c in entries if c.meta.get("pinned") is True]
 
     def _notify_evicted(self, agent_id: str, evicted: list[str]) -> None:
         """Call ``on_evict`` for every evicted id (the index is already updated); every callback runs, the
@@ -362,7 +567,7 @@ class CheckpointManager:
             tmp_dir.mkdir()
             try:
                 for name in (MODEL_FILE, META_FILE):
-                    _link_or_copy(info.path / name, tmp_dir / name)
+                    link_or_copy(info.path / name, tmp_dir / name)
                 os.replace(tmp_dir, agent_dir / info.checkpoint_id)
             except BaseException:
                 shutil.rmtree(tmp_dir, ignore_errors=True)
@@ -371,6 +576,7 @@ class CheckpointManager:
                                           agent_dir / info.checkpoint_id, info.timestamp, dict(info.meta)))
             imported += 1
         entries.sort(key=lambda c: c.policy_version)
+        self._index[agent_id] = entries          # indexed before retention: the dirs are in place
         self._index[agent_id], evicted = self._retain(agent_id, entries)
         kept = [c.checkpoint_id for c in self._index[agent_id]]
         if infos:

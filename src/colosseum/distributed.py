@@ -24,6 +24,9 @@ agents, ``init``, a custom matchmaker, per-agent matchmaking or kickstart, a tea
 global ``.pt``) with a ConfigError pointing to SP5; any opponent mix other than "latest only" is
 reduced to it with one warning, which also names a ``teammates: mixed`` that is ignored (default and
 resolved configs write every share explicitly).
+SP4: no match results reach a journal (no ``matches.db``, no ratings; one INFO per role when
+``match_log.enabled``); ``evaluation.enabled`` and ``checkpoint.keep_top_k > 0`` are refused (SP5);
+``checkpoint.max_snapshots`` caps the learner's snapshots oldest-first among the ``keep_every``-only ones.
 Layouts are drawn once per worker env (ruling PR-3) from an RNG seeded by ``training.seed +
 worker_id``, and the agent rotation starts at env 0 of worker 0, so every worker machine of a run
 starts with the same layout mix and rotation.
@@ -185,9 +188,10 @@ def _teacher_problem(config: ColosseumConfig, teacher: str) -> str | None:
 
 
 def check_distributed_scope(config: ColosseumConfig) -> None:
-    """Spec block 8: refuse SP3 settings distributed mode cannot honour (ConfigError naming SP5) and
+    """Spec block 8: refuse SP3 / SP4 settings distributed mode cannot honour (ConfigError naming SP5),
     warn once when some trainable agent's opponent mix is reduced to "latest only" or ``teammates: mixed`` is
-    ignored. Decides by the values of the final config, not by which keys the YAML wrote."""
+    ignored, and note once (INFO) that no match log is written. Decides by the values of the final config, not
+    by which keys the YAML wrote."""
     problems: list[str] = []
     fixed = config.fixed_agent_ids()
     if fixed:
@@ -210,8 +214,17 @@ def check_distributed_scope(config: ColosseumConfig) -> None:
         problem = _teacher_problem(config, teacher)
         if problem is not None:
             problems.append(problem)
+    if config.evaluation.enabled:
+        problems.append("evaluation.enabled (pulse evaluation runs in the training main process next to the match "
+                        "log; across machines with SP5)")
+    if config.checkpoint.keep_top_k > 0:
+        problems.append(f"checkpoint.keep_top_k={config.checkpoint.keep_top_k} (snapshot ratings need the match "
+                        f"log, which the distributed roles do not write; checkpoint.max_snapshots works)")
     if problems:
         raise ConfigError(f"{_SP5}: " + "; ".join(problems))
+    if config.match_log.enabled:
+        logger.info("distributed roles write no match log and no Bradley-Terry ratings (SP5: the hub); "
+                    "match_log / ratings settings have no effect here, max_snapshots caps snapshots FIFO")
     reduced = {aid: acfg.matchmaking.opponents.model_dump(mode="json")
                for aid, acfg in agent_configs.items() if not _latest_only(acfg.matchmaking.opponents)}
     mixed = any(acfg.matchmaking.teammates == "mixed" for acfg in agent_configs.values())
@@ -223,15 +236,18 @@ def check_distributed_scope(config: ColosseumConfig) -> None:
                        f"across machines come with SP5): {'; '.join(ignored)}")
 
 
-def distributed_checkpoint_manager(config: ColosseumConfig, base_dir: str | Path) -> CheckpointManager:
+def distributed_checkpoint_manager(config: ColosseumConfig, base_dir: str | Path,
+                                   run_id: str | None = None) -> CheckpointManager:
     """The distributed learner's snapshot storage: the local retention (``keep_last``, every
-    ``keep_every``-th, the final snapshot; ``trainer_state.pt`` only in the ``keep_last`` window).
-    Nothing listens for evictions: distributed workers play latest weights only."""
+    ``keep_every``-th, the final snapshot of this learner's run (``run_id``), pinned ones;
+    ``trainer_state.pt`` only in the ``keep_last`` window); ``max_snapshots`` with FIFO order (no ratings:
+    ``keep_top_k > 0`` is refused by ``check_distributed_scope``). Nothing listens for evictions: distributed
+    workers play latest weights only."""
     from colosseum.coordinator.checkpoint_manager import CheckpointManager
 
     ckpt = config.checkpoint
     return CheckpointManager(base_dir=base_dir, keep_last=ckpt.keep_last, keep_every=ckpt.keep_every,
-                             interval=ckpt.interval)
+                             interval=ckpt.interval, run_id=run_id, max_snapshots=ckpt.max_snapshots)
 
 
 def distributed_setup(config: ColosseumConfig, agent_ids: list[str]) -> DistributedSetup:
@@ -338,7 +354,8 @@ def run_distributed_learner(
     # Checkpoint persistence (drained off-thread so training never blocks). Always on:
     # the learner's final snapshot is saved even without periodic checkpoints.
     checkpoint_queue: queue.Queue = queue.Queue(maxsize=16)
-    coordinator_ckpt = distributed_checkpoint_manager(config, run_dir.checkpoints)
+    # The distributed learner never runs Launcher.launch: it creates its run's run.json itself (A2).
+    coordinator_ckpt = distributed_checkpoint_manager(config, run_dir.checkpoints, run_id=run_dir.ensure_run_id())
 
     # The kickstart teacher (if any) is read here, before training starts, into a numpy spec.
     teacher = resolve_teacher(config, agent_id, setup.spec)
@@ -485,6 +502,7 @@ def _dist_worker_main(
         vec_env_kind=config.rollout.vec_env,
         subproc_workers=config.rollout.subproc_workers,
         max_idle_steps=config.env.max_idle_steps,
+        wait_for_first_weights=True,   # never play the factory weights as version 0 (ruling A-M3)
     )
 
 

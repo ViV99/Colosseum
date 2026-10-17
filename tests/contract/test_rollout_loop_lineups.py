@@ -125,7 +125,7 @@ def test_results_are_reported_per_episode_and_stats_have_the_contract_keys():
     assert [s.agent_id for s in col.results[1].seats] == ["b", "a"]
     assert col.results[0].outcome_kind == "wdl" and col.results[0].teams[0].rank == 1.0
     assert set(loop.stats) == {
-        "chunks_sent", "env_steps", "episodes", "parked_buffers", "dropped_reward_episodes",
+        "chunks_sent", "env_steps", "episodes", "parked_buffers", "dropped_reward_episodes", "dropped_results",
         "recorded_transitions", "recorded_transitions/a", "recorded_transitions/b",
         "buffered_transitions/a", "buffered_transitions/b",
     }

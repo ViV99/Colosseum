@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import logging
 import multiprocessing as mp
+import os
 import queue
+import reprlib
 import signal
 import time
 from collections.abc import Callable, Mapping
@@ -28,11 +30,11 @@ from typing import TYPE_CHECKING, Any
 
 import numpy as np
 
-from colosseum.coordinator.coordinator import Coordinator
+from colosseum.coordinator.coordinator import LEAGUE_STATE_FILE, Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.ipc import QueueReader, SharedCounter, queue_depths, release_command_queues
 from colosseum.core.run_dir import RunDir
-from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, Lineup, SeatAssignment
+from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, Lineup, MatchResult, SeatAssignment
 from colosseum.envs.game import GameSpec, RoleSpec
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.players.registry import BotSpec, FixedPlayers
@@ -49,13 +51,39 @@ logger = logging.getLogger(__name__)
 _WEIGHT_QUEUE_SIZE = 1  # newest-wins mailbox per (agent, worker); see core.ipc.put_latest
 _CHECKPOINT_QUEUE_SIZE = 16
 _METRICS_QUEUE_SIZE = 100
-_RESULTS_QUEUE_SIZE = 1000
+# Match results from all workers (SP4 spec block 1), in batches: each item is a list of up to RESULTS_BATCH_MAX
+# results that one worker gathered over at most RESULTS_BATCH_SEC (worker.rollout_worker.ResultBatcher; one item per
+# match let the results pile up in the workers' feeder buffers between monitor passes until the queue was full, SP4
+# FX1). 1000 batches hold more results than the spec's 10 000 single ones (at most 256 000), and the memory stays
+# bounded. A full queue drops a whole batch; the worker counts every result in it.
+_RESULTS_QUEUE_SIZE = 1_000
 # One slot: a command that was put has been taken by the worker before the next one
 # can be put, so no command (and none of its new_checkpoints) is replaced unseen (D9).
 _COMMAND_QUEUE_SIZE = 1
 # Bound on each step of releasing the queues after the teardown (reading back unread
 # commands, joining feeder threads, ending abandoned reads); see Launcher._release_queues.
 _QUEUE_RELEASE_SEC = 1.0
+# Pulse results (SP4 T6.1): one message per evaluated snapshot; the pulse process puts with a blocking put.
+_PULSE_RESULTS_QUEUE_SIZE = 64
+
+
+def _flatten_result_batches(items: list) -> list[MatchResult]:
+    """The results of the batches drained from the results queue, in arrival order. Every item must be a list of
+    ``MatchResult`` (a worker's ``ResultBatcher`` batch); anything else is a programming error and raises
+    ``TypeError`` naming the item, before any result is fed."""
+    results: list[MatchResult] = []
+    for k, batch in enumerate(items):
+        if not isinstance(batch, list):
+            raise TypeError(f"Malformed item on the results queue: drained item {k} is a {type(batch).__name__} "
+                            f"({reprlib.repr(batch)}); workers put batches, each a list of MatchResult "
+                            f"(rollout_worker.ResultBatcher)")
+        for i, result in enumerate(batch):
+            if not isinstance(result, MatchResult):
+                raise TypeError(f"Malformed item on the results queue: item {i} of the batch is a "
+                                f"{type(result).__name__} ({reprlib.repr(result)}; drained item {k}, {len(batch)} "
+                                f"items); a batch is a list of MatchResult (rollout_worker.ResultBatcher)")
+        results.extend(batch)
+    return results
 
 
 # =====================================================================
@@ -161,6 +189,7 @@ def _worker_main(
     metrics_queue: mp.Queue | None = None,
     fixed_players: FixedPlayers | None = None,
     teachers: Mapping[str, BotSpec] | None = None,
+    run_id: str | None = None,
 ) -> None:
     """Worker process body (see ``_worker_target``).
 
@@ -168,7 +197,7 @@ def _worker_main(
     functions is picklable under spawn, which the subprocess vector env needs to ship ``env_fn``
     to its children). Models are built for each agent's role spec. ``fixed_players`` (numpy and
     ``BotSpec`` data from the main process) become this worker's bots and frozen models; ``teachers``
-    (``BotSpec`` by student agent) its scripted kickstart teachers (DAgger).
+    (``BotSpec`` by student agent) its scripted kickstart teachers (DAgger); ``run_id`` prefixes the match uids.
     """
     from functools import partial
 
@@ -204,6 +233,8 @@ def _worker_main(
         max_idle_steps=config.env.max_idle_steps,
         fixed_players=fixed_players,
         teachers=teachers,
+        run_id=run_id,
+        wait_for_first_weights=True,   # never play the factory weights as version 0 (ruling A-M3)
     )
 
 
@@ -321,7 +352,7 @@ def _resolve_lineups(
                 seats.append(replace(seat))
             else:
                 seats.append(replace(seat, network_id=LATEST_NETWORK_ID, collect=True))
-        resolved.append(Lineup(layout=lineup.layout, seats=seats))
+        resolved.append(replace(lineup, seats=seats))   # seed, block and uid stay
     return new_ckpts, resolved
 
 
@@ -372,6 +403,27 @@ class Launcher:
         self._command_queues: list[mp.Queue] = []
         self._results_queue: mp.Queue | None = None
         self._metrics_queue: mp.Queue | None = None
+        # Set by launch(): this run's id (run.json; match uids and the journal's runs table).
+        self._run_id: str | None = None
+        # Set by launch() when match_log.enabled: the journal writer thread and the in-memory comparison table it
+        # feeds (the live ratings' input, T2.2); results received from the workers so far.
+        self._match_log_writer = None
+        self._comparison_table = None
+        self._match_log_stopped = False
+        self._results_received = 0
+        self._pulse_results_received = 0         # pulse matches given to the journal writer (SP4 T6.1)
+        # Set by launch() with the journal: the live Bradley-Terry refit thread (T2.2).
+        self._live_ratings = None
+        self._league_state_error_logged = False   # the first failing league_state.json write logs its traceback
+        # The live ratings version the last retention pass used (T4.1: retention reruns after every refit).
+        self._retention_version: int | None = None
+        # Set by launch() with evaluation.enabled (SP4 T6.1): the pulse plan, the feeder of snapshot requests, the
+        # one-slot request queue (this process produces it) and the pulse results queue (journal only, A20).
+        self._pulse_plan = None
+        self._pulse_feeder = None
+        self._pulse_requests: mp.Queue | None = None
+        self._pulse_results: mp.Queue | None = None
+        self._pulse_state_error_logged = False    # the first failing pulse_state.json write logs its traceback
 
     @property
     def env_steps_done(self) -> int:
@@ -381,7 +433,7 @@ class Launcher:
     def _build_coordinator(self, setup: RunSetup) -> Coordinator:
         """The run's coordinator; its matchmaker reads the global env-step counter (share schedules)."""
         return Coordinator(self._config, setup.spec, setup.player_roles, checkpoint_dir=self._run_dir.checkpoints,
-                           env_steps=lambda: int(self._env_step_counter.value))
+                           env_steps=lambda: int(self._env_step_counter.value), run_id=self._run_id)
 
     def launch(self) -> int:
         """Run the full training pipeline; returns the process exit code.
@@ -392,7 +444,8 @@ class Launcher:
         cfg = self._config
         trainable_agents = cfg.get_trainable_agent_ids()
 
-        logger.info("Colosseum: Starting training pipeline")
+        self._run_id = self._run_dir.ensure_run_id()
+        logger.info(f"Colosseum: Starting training pipeline (run id {self._run_id})")
         logger.info(f"  Agents: {trainable_agents}")
         logger.info(f"  Algorithm: {cfg.algorithm.name}")
         logger.info(f"  Workers: {cfg.rollout.num_workers}")
@@ -411,6 +464,7 @@ class Launcher:
 
         # Resume (before any process starts: a bad resume source fails fast).
         resume_states = self._resolve_resume(setup.agent_configs, setup.role_specs)
+        self._load_league_state(coordinator)          # before the import: evictions there forget PFSP entries
         self._import_snapshot_pool(coordinator)
         from colosseum.learner.factory import resolve_teacher
         # Kickstart teachers are resolved here (ConfigError before any process starts) into numpy specs.
@@ -424,6 +478,14 @@ class Launcher:
                   "config_hash": cfg_hash}
             for aid in trainable_agents
         }
+        if cfg.evaluation.enabled:
+            from colosseum.arena.pulse import PulseFeeder, pulse_plan
+
+            self._pulse_plan = pulse_plan(cfg, setup.spec, setup.player_roles)
+            self._pulse_feeder = PulseFeeder(self._pulse_plan.agents, cfg.evaluation.every,
+                                             cfg.evaluation.max_backlog)
+            self._pulse_requests = mp.Queue(maxsize=1)
+            self._pulse_results = mp.Queue(maxsize=_PULSE_RESULTS_QUEUE_SIZE)
 
         trajectory_queues: dict[str, mp.Queue] = {}
         checkpoint_queues: dict[str, mp.Queue] = {}
@@ -453,6 +515,7 @@ class Launcher:
             self._all_queues.append(trajectory_queues[aid])
             self._all_queues.append(checkpoint_queues[aid])
             self._all_queues.extend(weight_queues_per_agent[aid])
+        self._all_queues += [q for q in (self._pulse_requests, self._pulse_results) if q is not None]
 
         self._coordinator = coordinator
         self._agent_ids = list(trainable_agents)
@@ -470,6 +533,11 @@ class Launcher:
             # The metrics hub (and its file) exists before any child starts: an open failure here
             # cannot orphan children. _finish_metrics closes whatever was opened.
             self._open_metrics(resume_states)
+            # The journal is opened (and a resumed run's journal imported) before any child starts: a schema or
+            # file problem is a ConfigError that leaves no child behind; _finish_metrics stops the writer.
+            self._open_match_log(coordinator)
+            self._open_live_ratings()
+            self._wire_retention()
             started = False
             try:
                 self._start_children(
@@ -527,6 +595,7 @@ class Launcher:
             initial_env_steps=int(self._env_step_counter.value),
             initial_train_steps={aid: int(s["policy_version"]) if s else 0 for aid, s in resume_states.items()},
             wandb_logger=self._wandb,
+            stored_snapshots=self._stored_snapshot_versions,
         )
 
     def _start_children(
@@ -621,11 +690,27 @@ class Launcher:
                     fixed_players=setup.fixed,
                     teachers=scripted_teachers,
                     metrics_queue=metrics_queue,
+                    run_id=self._run_id,
                 ),
                 daemon=worker_daemon,
             )
             start_process(worker_proc)
             self._supervisor.add(f"worker-{worker_id}", worker_proc)
+
+        if self._pulse_feeder is not None:
+            from colosseum.arena.pulse import pulse_target
+
+            fixed, names = setup.fixed, self._pulse_plan.field
+            field_specs = FixedPlayers(bots={n: fixed.bots[n] for n in names if n in fixed.bots},
+                                       frozen={n: fixed.frozen[n] for n in names if n in fixed.frozen},
+                                       roles={n: fixed.roles[n] for n in names})
+            pulse_proc = mp.Process(target=pulse_target, name="pulse", daemon=True, kwargs=dict(
+                log_dir=str(self._run_dir.logs), config=cfg, requests=self._pulse_requests,
+                results=self._pulse_results, stop_event=self._stop_event, field_specs=field_specs, field=list(names),
+                agents=self._pulse_plan.agents, run_id=self._run_id))
+            start_process(pulse_proc)
+            self._supervisor.add("pulse", pulse_proc)
+            logger.info(f"Pulse started for {list(self._pulse_plan.agents)} against {names}")
 
     def _monitor_loop(
         self,
@@ -652,11 +737,16 @@ class Launcher:
         last_refresh = time.monotonic()
         while True:
             self._drain_all_checkpoints()
+            self._reapply_retention()   # after a new live refit (T4.1); the refit thread never touches storage
             self._drain_results()
+            self._pump_pulse()
             self._drain_metrics()
             env_steps = int(self._env_step_counter.value)
-            self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot(),
-                                 queue_depths=queue_depths(self._trajectory_queues))
+            # The method itself: the hub builds the ratings snapshot only when a tick is due (spec block 7.3).
+            if self._hub.maybe_tick(env_steps=env_steps, ratings=coordinator.ratings_snapshot,
+                                    queue_depths=queue_depths(self._trajectory_queues),
+                                    match_log=self._match_log_stats(), bt=self._live_snapshot()):
+                self._save_league_state()
             if self._supervisor.received_signal is not None:
                 return self._signal_exit_code()
             if self._stop_event.is_set():
@@ -728,13 +818,189 @@ class Launcher:
         return reader.drain()
 
     def _drain_results(self) -> None:
-        """Feed queued match results to the coordinator (ratings, PFSP) and the hub."""
+        """Feed queued match results to the coordinator (ratings, PFSP), the hub and the journal writer (never
+        blocking: a full writer queue drops and counts); a result without ``env_steps`` is stamped with the
+        global env-step counter at its arrival (spec block 1; a pulse result arrives with its snapshot's, T6.1).
+        Workers put batches (``_flatten_result_batches``); they are flattened in arrival order."""
         if self._results_queue is None:
             return
         workers = lambda: [n for n in self._supervisor.names if n.startswith("worker-")]  # noqa: E731
-        for result in self._drain(self._results_queue, "results", workers):
+        results = _flatten_result_batches(self._drain(self._results_queue, "results", workers))
+        if not results:
+            return
+        env_steps = int(self._env_step_counter.value)
+        for result in results:
+            if result.env_steps is None:
+                result.env_steps = env_steps
             self._coordinator.report_match_result(result)
             self._hub.on_match_result(result)
+        self._results_received += len(results)
+        if self._match_log_writer is not None:
+            self._match_log_writer.submit(results)
+
+    def _open_match_log(self, coordinator: Coordinator) -> None:
+        """The match log (spec block 1). The journal is opened here first, so a schema or file problem is a
+        ConfigError before any child starts (a file that is not an SQLite database is moved aside by
+        ``MatchLog``); a run-dir resume imports the resumed run's journal (an SP3 run dir has none: INFO, the
+        journal starts empty); the in-memory comparison table of the live ratings is read from it once; then the
+        writer thread starts with its own connection (opened in the thread). Evicted snapshots reach the writer
+        through the coordinator's evict listener."""
+        import sqlite3
+        from functools import partial
+        from pathlib import Path
+
+        from colosseum.arena.matchlog import (
+            MATCH_LOG_FILE,
+            RUN_SOURCES,
+            MatchLog,
+            MatchLogError,
+            MatchLogWriter,
+            RunInfo,
+        )
+        from colosseum.coordinator.checkpoint_manager import RESUME_RUN_DIR, classify_resume_source
+        from colosseum.core.config import config_hash
+        from colosseum.core.errors import ConfigError
+        from colosseum.core.run_dir import read_run_id
+
+        cfg = self._config
+        if not cfg.match_log.enabled:
+            logger.info("Match log: off (match_log.enabled is false)")
+            return
+        resume_from = cfg.training.resume_from
+        parent = (Path(resume_from) if resume_from and classify_resume_source(resume_from) == RESUME_RUN_DIR
+                  else None)
+        run = RunInfo(run_id=self._run_id, name=self._run_dir.run_name or self._run_dir.root.name,
+                      parent_run_id=read_run_id(parent) if parent is not None else None, game=cfg.env.env_class,
+                      config_hash=config_hash(cfg), checkpoint_interval=cfg.checkpoint.interval)
+        path = self._run_dir.matches_path
+        factory = partial(MatchLog, path, run, min_free_disk_mb=cfg.match_log.min_free_disk_mb)
+        hint = "move it away or set match_log.enabled: false"
+        try:
+            log = factory()
+        except MatchLogError as e:
+            raise ConfigError(f"Match log: {e}; {hint}") from e
+        except (sqlite3.Error, OSError) as e:
+            raise ConfigError(f"Match log {path} cannot be opened ({type(e).__name__}: {e}; locked by another "
+                              f"process or unreadable); {hint}") from e
+        try:
+            if parent is not None:
+                parent_log = parent / MATCH_LOG_FILE
+                if not parent_log.exists():
+                    logger.info(f"Match log: the resumed run dir {parent} has no {MATCH_LOG_FILE} (an SP3 run "
+                                f"dir); the journal starts empty")
+                else:
+                    try:
+                        stats = log.import_parent(parent_log)
+                    except (MatchLogError, sqlite3.Error, OSError) as e:
+                        raise ConfigError(f"Match log: importing the resumed run's journal {parent_log} failed "
+                                          f"({type(e).__name__}: {e}); this run's journal is unchanged; move "
+                                          f"{parent_log} away to resume without it, or set match_log.enabled: "
+                                          f"false") from e
+                    if not stats.skipped:
+                        logger.info(f"Match log: imported {parent_log}: {stats.counts_rows} counts rows, "
+                                    f"{stats.folded} detailed training matches folded into counts, "
+                                    f"{stats.copied} tournament / pulse matches copied")
+            try:
+                table = log.comparison_table(RUN_SOURCES)
+            except (MatchLogError, sqlite3.Error) as e:
+                raise ConfigError(f"Match log {path} cannot be read ({type(e).__name__}: {e}); {hint}") from e
+        finally:
+            log.close()
+        self._comparison_table = table
+        mlc = cfg.match_log
+        self._match_log_writer = MatchLogWriter(
+            factory, compact_interval_sec=mlc.compact_interval_sec,
+            window_bytes=int(mlc.detail_window_mb * 1024 * 1024), table=table)
+        self._match_log_writer.start()
+        coordinator.add_evict_listener(self._on_snapshot_evicted)
+        logger.info(f"Match log: {path} (detail window {mlc.detail_window_mb:g} MB, min free disk "
+                    f"{mlc.min_free_disk_mb:g} MB, compaction every {mlc.compact_interval_sec:g} s)")
+
+    def _open_live_ratings(self) -> None:
+        """The live Bradley-Terry refit thread over the writer's in-memory table (spec block 2); none without the
+        journal. Lower bounds at ``checkpoint.top_k_quantile``, ``P(top-k)`` with ``checkpoint.keep_top_k``."""
+        if self._comparison_table is None:
+            return
+        from colosseum.arena.live import LiveRatings, rating_inputs
+
+        cfg = self._config
+        options, fixed_agents, random_bot = rating_inputs(cfg)
+        self._live_ratings = LiveRatings(
+            self._comparison_table, interval_sec=cfg.ratings.refit_interval_sec,
+            options=options, fixed_agents=fixed_agents,
+            random_bot=random_bot, agent_order=cfg.agent_ids(), top_k=cfg.checkpoint.keep_top_k,
+            quantile=cfg.checkpoint.top_k_quantile,
+            env_steps_fn=lambda: int(self._env_step_counter.value), seed=cfg.training.seed or 0)
+        self._live_ratings.start()
+        logger.info(f"Live ratings: Bradley-Terry refit every {cfg.ratings.refit_interval_sec:g} s")
+
+    def _wire_retention(self) -> None:
+        """T4.1: top-k retention reads the live ratings (spec block 4). Evictions already reach the journal through
+        T1.3's evict listener (``_on_snapshot_evicted``), whose next compaction pass folds the evicted entity's
+        detailed matches into counts."""
+        if self._live_ratings is not None:
+            self._coordinator.set_ratings_source(self._live_ratings.latest)
+
+    def _reapply_retention(self) -> None:
+        """After every live refit (a new ``RatingsSnapshot.version``), rerun retention for every trainable agent;
+        only with ``keep_top_k > 0``, where scores decide (spec block 4). Main loop only."""
+        if self._live_ratings is None or self._config.checkpoint.keep_top_k == 0 or self._coordinator is None:
+            return
+        snapshot = self._live_ratings.latest()
+        if snapshot is None or snapshot.version == self._retention_version:
+            return
+        self._retention_version = snapshot.version
+        for aid in self._agent_ids:
+            self._coordinator.checkpoint_manager.reapply_retention(aid)
+
+    def _live_snapshot(self):
+        """The newest live ratings snapshot (None without live ratings or before the first refit)."""
+        return None if self._live_ratings is None else self._live_ratings.latest()
+
+    def _stored_snapshot_versions(self) -> dict[str, set[int]] | None:
+        """Per trainable agent the versions of its stored snapshots, from the checkpoint manager's index (the
+        compact ratings record's ``best``, ruling A-M4); None before the coordinator exists."""
+        from colosseum.arena.entities import snapshot_version
+
+        if self._coordinator is None:
+            return None
+        manager = self._coordinator.checkpoint_manager
+        return {aid: {v for c in manager.list_checkpoints(aid) if (v := snapshot_version(c.checkpoint_id)) is not None}
+                for aid in self._coordinator.trainable_agents}
+
+    def _finish_live_ratings(self):
+        """Stop the refit thread and refit once more on the final data (the journal writer has flushed), unless
+        that would be slow (``LiveRatings.finish``). Returns the newest snapshot (None without live ratings)."""
+        if self._live_ratings is None:
+            return None
+        return self._live_ratings.finish(SHUTDOWN_GRACE_SEC)
+
+    def _on_snapshot_evicted(self, agent_id: str, checkpoint_id: str) -> None:
+        """Coordinator evict listener (main loop): the journal folds the evicted snapshot's training matches."""
+        from colosseum.arena.entities import entity_key, snapshot_version
+
+        version = snapshot_version(checkpoint_id)
+        if self._match_log_writer is not None and version is not None:
+            self._match_log_writer.note_evicted([entity_key(agent_id, version)])
+
+    def _match_log_stats(self) -> dict | None:
+        """The journal writer's stats for the ``system`` record (None without a journal)."""
+        return None if self._match_log_writer is None else self._match_log_writer.stats.as_dict()
+
+    def _stop_match_log(self) -> None:
+        """Flush and stop the journal writer (within SHUTDOWN_GRACE_SEC, after the children are gone and the final
+        drains are done); log the run's result accounting. Runs once."""
+        if self._match_log_writer is None or self._match_log_stopped:
+            return
+        self._match_log_stopped = True
+        stats = self._match_log_writer.stop(SHUTDOWN_GRACE_SEC)
+        worker_drops = self._hub.system_cumulative("dropped_results") if self._hub is not None else 0
+        workers, pulse = self._results_received, self._pulse_results_received
+        received = (f"{workers + pulse} received ({workers} from workers, {pulse} from the pulse)"
+                    if self._pulse_feeder is not None else f"{workers} received")
+        logger.info(f"Match results: {received}, {stats.written} journaled, "
+                    f"{stats.duplicates} duplicates, {stats.dropped} dropped by the journal writer, {worker_drops} "
+                    f"dropped by workers")
 
     def _drain_metrics(self) -> None:
         """Learner train metrics and worker stats share the metrics queue."""
@@ -747,17 +1013,33 @@ class Launcher:
                 self._hub.on_train_metrics(item)
 
     def _finish_metrics(self) -> None:
-        """Record what arrived during shutdown (final train metrics, last results), write the
-        final records and ratings.json; the metrics file is closed and the WandB run finished
-        even if any of that fails (or if the hub was never built)."""
+        """Record what arrived during shutdown (final train metrics, last results), flush and stop
+        the journal writer, write the final records and ratings.json; the writer is stopped, the
+        metrics file closed and the WandB run finished even if any of that fails (or if the hub
+        was never built)."""
         try:
             if self._hub is not None:
                 self._drain_results()
+                self._pump_pulse()                # before the writer stops: the last pulse results (A17, A20)
                 self._drain_metrics()
+                self._stop_match_log()
+                final_bt = self._finish_live_ratings()
+                self._finish_pulse()
                 self._hub.close(env_steps=int(self._env_step_counter.value),
-                                ratings=self._coordinator.ratings_snapshot(),
-                                queue_depths=queue_depths(self._trajectory_queues))
+                                ratings=self._coordinator.ratings_snapshot,
+                                queue_depths=queue_depths(self._trajectory_queues),
+                                match_log=self._match_log_stats(), bt=final_bt)
+                self._save_league_state()
         finally:
+            try:
+                self._stop_match_log()            # also when the final drains failed
+            except Exception:  # noqa: BLE001 - must not replace the original error
+                logger.exception("Stopping the match log writer failed")
+            try:
+                if self._live_ratings is not None:
+                    self._live_ratings.stop(SHUTDOWN_GRACE_SEC)
+            except Exception:  # noqa: BLE001 - must not replace the original error
+                logger.exception("Stopping the live ratings failed")
             try:
                 if self._metrics_writer is not None:
                     self._metrics_writer.close()
@@ -827,6 +1109,38 @@ class Launcher:
             states[aid] = state
         return states
 
+    def _load_league_state(self, coordinator: Coordinator) -> None:
+        """A run-dir resume restores the resumed run's ratings and PFSP statistics (spec block 7.4); a run dir
+        without league_state.json (an SP3 run dir, or an SP4 run that never saved one, e.g. killed before its first
+        metrics tick) gives an INFO line and empty tables. A resume from a checkpoint dir or a .pt starts empty, as
+        in SP3."""
+        from pathlib import Path
+
+        from colosseum.coordinator.checkpoint_manager import RESUME_RUN_DIR, classify_resume_source
+
+        resume_from = self._config.training.resume_from
+        if not resume_from or classify_resume_source(resume_from) != RESUME_RUN_DIR:
+            return
+        path = Path(resume_from) / LEAGUE_STATE_FILE
+        if coordinator.load_league_state(path):
+            logger.info(f"Resume: league state (ratings, PFSP statistics) restored from {path}")
+        else:
+            logger.info(f"Resume: {resume_from} has no {LEAGUE_STATE_FILE} (an SP3 run dir, or a run that never "
+                        f"saved it, e.g. killed before its first metrics tick); ratings and PFSP statistics start "
+                        f"empty")
+
+    def _save_league_state(self) -> None:
+        """Write league_state.json (each metrics tick and at the end); a failure is an ERROR, never a crash."""
+        if self._coordinator is None:
+            return
+        try:
+            self._coordinator.save_league_state(self._run_dir.league_state_path,
+                                                env_steps=int(self._env_step_counter.value))
+        except Exception as e:  # noqa: BLE001 - the league state must never stop training
+            logger.error(f"Writing {self._run_dir.league_state_path} failed ({type(e).__name__}: {e})",
+                         exc_info=not self._league_state_error_logged)
+            self._league_state_error_logged = True
+
     def _import_snapshot_pool(self, coordinator: Coordinator) -> None:
         """A resume from a run dir carries its snapshot pool into this run (spec block 4), before the first
         lineups are drawn; a resume from a checkpoint dir or a .pt starts with an empty pool."""
@@ -838,8 +1152,64 @@ class Launcher:
 
     def _save_checkpoint(self, payload: dict) -> None:
         aid = payload["agent_id"]
-        meta = {**self._checkpoint_meta.get(aid, {}), "env_steps": int(self._env_step_counter.value)}
-        self._coordinator.save_checkpoint_payload(payload, meta_extra=meta)
+        env_steps = int(self._env_step_counter.value)
+        meta = {**self._checkpoint_meta.get(aid, {}), "env_steps": env_steps}
+        checkpoint_id = self._coordinator.save_checkpoint_payload(payload, meta_extra=meta)
+        if self._pulse_feeder is not None:          # the pulse evaluates it even if retention evicts it (spec block 6)
+            self._pulse_feeder.offer(aid, checkpoint_id, int(payload["policy_version"]), env_steps,
+                                     payload["model_state"], final=bool(payload.get("final", False)))
+
+    def _main_produced_queues(self) -> list:
+        """Queues this process writes to and must release itself (``release_command_queues``)."""
+        return [*self._command_queues, *([self._pulse_requests] if self._pulse_requests is not None else [])]
+
+    def _pump_pulse(self) -> None:
+        """Hand waiting snapshots to the pulse process; give its results to the journal writer only (contract
+        amendment A20: not to the coordinator, the online ELO, PFSP or the episodes aggregator); keep the
+        ``system`` counters and ``pulse_state.json`` current. Main loop only."""
+        feeder = self._pulse_feeder
+        if feeder is None or self._pulse_requests is None:
+            return
+        handing_out = not self._stop_event.is_set()     # after the stop the pulse takes no new request
+        if handing_out:
+            feeder.pump(self._pulse_requests)
+        if self._pulse_results is not None:
+            for message in self._drain(self._pulse_results, "pulse-results", lambda: ["pulse"]):
+                self._pulse_results_received += len(message.results)
+                if self._match_log_writer is not None:
+                    self._match_log_writer.submit(message.results)   # a drop is counted by the writer (T1.3)
+                feeder.done(message)
+            if handing_out:
+                feeder.pump(self._pulse_requests)   # the next one, if the pulse took the previous request
+        if self._hub is not None:
+            self._hub.set_system_value("pulse_skipped_snapshots", feeder.skipped)
+            self._hub.set_system_value("pulse_evaluated_snapshots", feeder.evaluated)
+            self._hub.set_system_value("pulse_pending_snapshots", feeder.pending)
+        if feeder.changed:
+            self._write_pulse_state()
+
+    def _write_pulse_state(self) -> None:
+        """``pulse_state.json`` (bookkeeping; a failing write is logged and retried at the next change, never fatal)."""
+        from colosseum.metrics.jsonl import write_json_atomic
+
+        self._pulse_feeder.changed = False
+        try:
+            write_json_atomic(self._run_dir.pulse_state_path, self._pulse_feeder.state())
+        except Exception as e:  # noqa: BLE001 - the pulse bookkeeping must never stop training
+            logger.error(f"Writing {self._run_dir.pulse_state_path} failed ({type(e).__name__}: {e})",
+                         exc_info=not self._pulse_state_error_logged)
+            self._pulse_state_error_logged = True
+
+    def _finish_pulse(self) -> None:
+        """At the end: the final pulse state, and an INFO per final snapshot the run gave no time to evaluate."""
+        if self._pulse_feeder is None:
+            return
+        for agent_id, checkpoint_id in self._pulse_feeder.unevaluated_final():
+            why = ("the backlog skipped it" if self._pulse_feeder.skipped_by_backlog(agent_id, checkpoint_id)
+                   else "the run stopped first")
+            logger.info(f"pulse: the final snapshot {checkpoint_id} of {agent_id} was not evaluated ({why}); "
+                        f"evaluate it with colosseum tournament")
+        self._write_pulse_state()
 
     def _drain_all_checkpoints(self) -> None:
         """Save every queued checkpoint payload.
@@ -921,7 +1291,7 @@ class Launcher:
 
         def poll() -> None:
             nonlocal first_error
-            for drain in (self._drain_all_checkpoints, self._drain_results, self._drain_metrics):
+            for drain in (self._drain_all_checkpoints, self._drain_results, self._pump_pulse, self._drain_metrics):
                 try:
                     drain()
                 except Exception as e:  # noqa: BLE001 - re-raised after the teardown
@@ -943,9 +1313,9 @@ class Launcher:
             self._finish_reads(max(deadline, time.monotonic() + 1.0), poll)
             # Detach queue feeder threads so a queue still holding undrained data (e.g.
             # trajectory chunks a now-dead learner never consumed) cannot block this process
-            # from exiting. The command queues (fed by this process) are drained, closed and
-            # joined with a bound by _release_queues instead.
-            produced_here = {id(q) for q in self._command_queues}
+            # from exiting. The command queues and the pulse request queue (fed by this process)
+            # are drained, closed and joined with a bound by _release_queues instead.
+            produced_here = {id(q) for q in self._main_produced_queues()}
             for q in self._all_queues:
                 if id(q) in produced_here:
                     continue
@@ -965,7 +1335,7 @@ class Launcher:
         GC frees them, e.g. along with a traceback; a GC that runs inside the
         multiprocessing resource tracker then warns that they "might leak" (gh-109629).
         Every step is bounded by ``_QUEUE_RELEASE_SEC``, so a release never blocks the exit.
-        - Command queues (this process is their producer): unread commands are read back,
+        - Command queues and the pulse request queue (this process is their producer): unread items are read back,
           then the queue is closed and its feeder thread joined, so no feeder outlives
           ``launch`` to unlink the semaphores during interpreter shutdown
           (``release_command_queues``).
@@ -976,8 +1346,8 @@ class Launcher:
         for reader in self._readers.values():
             reader.release(_QUEUE_RELEASE_SEC)
         busy = {key: reader for key, reader in self._readers.items() if reader.busy}
-        produced_here = {id(q) for q in self._command_queues}
-        release_command_queues(self._command_queues, _QUEUE_RELEASE_SEC)
+        produced_here = {id(q) for q in self._main_produced_queues()}
+        release_command_queues(self._main_produced_queues(), _QUEUE_RELEASE_SEC)
         for q in self._all_queues:
             if id(q) in produced_here:
                 continue
@@ -993,6 +1363,7 @@ class Launcher:
         self._trajectory_queues = {}
         self._checkpoint_queues = {}
         self._results_queue = self._metrics_queue = None
+        self._pulse_requests = self._pulse_results = None
 
     def _finish_reads(self, deadline: float, poll: Callable[[], None]) -> None:
         """All children are gone: let in-progress reads complete until ``deadline``, then
@@ -1028,7 +1399,28 @@ def run_training(config_path: str, overrides: dict | None = None) -> int:
     setup_process_logging(run_dir.logs, "main", console_level=logging.INFO)
     run_dir.write_resolved_config(config)
     print(f"Run directory: {run_dir.root}", flush=True)
-    code = Launcher(config, run_dir, validated=True).launch()
+    _record_run_state(run_dir, "running")
+    try:
+        code = Launcher(config, run_dir, validated=True).launch()
+    except KeyboardInterrupt:
+        # Ctrl-C before launch installed its signal handlers (the CLI exits 130): nothing was saved
+        _record_run_state(run_dir, "stopped", exit_code=130)
+        raise
+    except BaseException:
+        _record_run_state(run_dir, "failed", exit_code=1)
+        raise
+    # 130 / 143: stopped by a signal after saving the final checkpoints (not a failure); 1: a dead child.
+    _record_run_state(run_dir, "finished" if code in (0, 130, 143) else "failed", exit_code=code)
     if code == 0:
         logger.info(f"Training finished; outputs in {run_dir.root}")
     return code
+
+
+def _record_run_state(run_dir: RunDir, status: str, *, exit_code: int | None = None) -> None:
+    """run_state.json for report / dashboard (spec block 5); a failure to write it never stops a run."""
+    from colosseum.core.run_state import write_run_state
+
+    try:
+        write_run_state(run_dir.root, status, os.getpid(), exit_code=exit_code)
+    except OSError as e:
+        logger.warning(f"cannot write {run_dir.run_state_path}: {e}")

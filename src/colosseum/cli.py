@@ -108,14 +108,6 @@ def _parse_overrides(overrides: tuple[str, ...]) -> dict:
     return result
 
 
-def _parse_agent_spec(spec: str) -> tuple[str, str | None]:
-    """``name=path`` -> (name, path); ``name`` -> (name, None): a scripted or frozen agent of the config."""
-    name, sep, path = spec.partition("=")
-    if not name or (sep and not path):
-        raise click.BadParameter(f"expected name or name=path, got {spec!r}", param_hint="'--agent'")
-    return name, (path if sep else None)
-
-
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
 @click.option("--set", "overrides", multiple=True,
@@ -125,6 +117,9 @@ def train(config: str, overrides: tuple[str, ...]) -> None:
 
     Exit code: 0 budget reached, 1 config error or a child process died, 130 SIGINT, 143 SIGTERM.
     """
+    from colosseum.utils.process import limit_main_blas_threads
+
+    limit_main_blas_threads()   # first: numpy is imported below; this process's BLAS gets one thread (SP4)
     with _config_errors():
         from colosseum.launcher import run_training  # imports torch: about a second
 
@@ -154,11 +149,13 @@ def validate_cmd(config: str, overrides: tuple[str, ...]) -> None:
 
 @main.command("eval")
 @click.option("--config", "-c", required=True, type=click.Path(exists=True),
-              help="Config YAML: its env is used for every match; agents.<name> / networks build .pt agents")
+              help="Config YAML: its env is used for every match; a trainable agents.<name> or the global "
+                   "networks build .pt agents")
 @click.option("--agent", "-a", "agents", required=True, multiple=True,
               help="name=path or name. path is a checkpoint dir (architecture and roles from its meta.json) or "
-                   "a .pt state_dict (architecture and roles of agents.<name>, else the global networks playing "
-                   "every role). A bare name is a scripted or frozen agent of the config. Repeatable.")
+                   "a .pt state_dict (architecture and roles of the trainable agents.<name>, else the global "
+                   "networks playing every role; a frozen entry of that name is not used for a path given here). "
+                   "A bare name is a scripted or frozen agent of the config. Repeatable.")
 @click.option("--layout", "layouts", multiple=True,
               help="Layout to evaluate (repeatable). Default: every layout the agents can fill.")
 @click.option("--num-matches", "-n", default=100, type=click.IntRange(min=1), show_default=True,
@@ -200,12 +197,16 @@ def eval_cmd(
         raise click.BadParameter(f"directory {str(Path(output).parent)!r} does not exist", param_hint="'--output'")
     with _config_errors():
         from colosseum.core.config import load_config
+        from colosseum.core.errors import ConfigError
         from colosseum.core.registry import env_spec, validate_config
-        from colosseum.eval import evaluate
+        from colosseum.eval import balanced_match_count, evaluate, parse_agent_spec
 
         cfg = load_config(config, _parse_overrides(overrides) or None)
-        specs = [_parse_agent_spec(spec) for spec in agents]
-        validate_config(cfg, scope="play", players=[name for name, path in specs if path is None])
+        try:
+            specs = [parse_agent_spec(spec, option=None) for spec in agents]   # click names --agent
+        except ConfigError as e:
+            raise click.BadParameter(str(e), param_hint="'--agent'") from e
+        report_v = validate_config(cfg, scope="play", players=[name for name, path in specs if path is None])
         names = [name for name, _ in specs]
         duplicates = sorted({name for name in names if names.count(name) > 1})
         if duplicates:
@@ -221,14 +222,14 @@ def eval_cmd(
                 raise click.BadParameter(f"{p}: expected a checkpoint directory or a .pt file",
                                          param_hint="'--agent'")
         spec = env_spec(cfg)
-        chosen = list(layouts) or list(spec.layouts)
-        competitive = any(spec.num_teams(name) >= 2 for name in chosen if name in spec.layouts)
-        if len(specs) > 1 and competitive and num_matches % 2:
-            click.echo(f"Note: --num-matches {num_matches} is odd; using {num_matches + 1} per pair so every "
-                       f"agent plays every side equally often.", err=True)
-            num_matches += 1
+        if len(specs) > 1:
+            rounded = balanced_match_count(spec, list(layouts) or None, num_matches)
+            if rounded != num_matches:
+                click.echo(f"Note: --num-matches {num_matches} is odd; using {rounded} per pair so every "
+                           f"agent plays every side equally often.", err=True)
+                num_matches = rounded
         report = evaluate(cfg, dict(specs), layouts=list(layouts) or None, num_matches=num_matches, seed=seed,
-                          deterministic=deterministic, num_envs=num_envs)
+                          deterministic=deterministic, num_envs=num_envs, fixed=report_v.fixed)
     click.echo("\n" + report.text())
     if output:
         report.write_json(output)
@@ -275,14 +276,16 @@ def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tupl
     with _config_errors():  # also a scripted player's error (PlayerError)
         from colosseum.core.config import load_config
         from colosseum.core.registry import validate_config
-        from colosseum.eval import EvalReport
-        from colosseum.record import RECORD_FILE, parse_player, record
+        from colosseum.eval import EvalReport, parse_agent_spec
+        from colosseum.record import RECORD_FILE, record
 
         cfg = load_config(config, _parse_overrides(overrides) or None)
-        named = [parse_player(text) for text in (player, *against)]
-        validate_config(cfg, scope="play", players=[name for name, path in named if path is None])
+        named = [parse_agent_spec(text, option=opt) for opt, text in (("--player", player),
+                                                                       *(("--against", a) for a in against))]
+        report_v = validate_config(cfg, scope="play", players=[name for name, path in named if path is None])
         content = record(cfg, player, list(against), layouts=list(layouts) or None, num_matches=num_matches,
-                         output=output, num_envs=num_envs, seed=seed, deterministic=deterministic)
+                         output=output, num_envs=num_envs, seed=seed, deterministic=deterministic,
+                         fixed=report_v.fixed)
     summary = content["summary"]
     report = EvalReport(agents=summary["agents"], num_matches=summary["num_matches"],
                         deterministic=summary["deterministic"], layouts=summary["layouts"])
@@ -293,6 +296,163 @@ def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tupl
         click.echo(f"  {role}: {cell['seat_episodes']} seat-episodes, {cell['decisions']} decisions, "
                    f"{len(cell['files'])} file(s)")
     click.echo(f"Description: {output}/{RECORD_FILE}")
+
+
+class _TournamentCommand(click.Command):
+    """Keeps the raw arguments: every ``--agent`` / ``--snapshots`` belongs to the ``--run`` before it."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        ctx.meta["tournament_args"] = list(args)
+        return super().parse_args(ctx, args)
+
+
+def _group_runs(args: list[str]) -> list[dict]:
+    """``[{"run", "agent", "snapshots"}]`` in command-line order (``--opt value`` and ``--opt=value``)."""
+    runs: list[dict] = []
+    i = 0
+    while i < len(args):
+        token, key, value = args[i], None, None
+        for opt in ("--run", "--agent", "--snapshots"):
+            if token == opt:
+                key, value = opt, args[i + 1] if i + 1 < len(args) else None
+                i += 1
+                break
+            if token.startswith(opt + "="):
+                key, value = opt, token[len(opt) + 1:]
+                break
+        i += 1
+        if key is None:
+            continue
+        if key == "--run":
+            runs.append({"run": value, "agent": None, "snapshots": None})
+            continue
+        if not runs:
+            raise click.UsageError(f"{key} belongs to a --run: write it after the --run it describes")
+        slot = key.removeprefix("--")
+        if runs[-1][slot] is not None:
+            raise click.UsageError(f"--run {runs[-1]['run']}: {key} given twice")
+        runs[-1][slot] = value
+    return runs
+
+
+def _run_selection(item: dict):
+    from pathlib import Path
+
+    from colosseum.arena.tournament.players import RunSelection
+
+    text = item["run"]
+    alias, sep, path = text.partition("=")
+    if not sep or not alias or "/" in alias or not path:
+        alias, path = None, text
+    p = Path(path)
+    if not p.is_dir():
+        raise click.BadParameter(f"{path}: not a directory", param_hint="'--run'")
+    return RunSelection(path=p, alias=alias, agent=item["agent"], snapshots=item["snapshots"] or "all")
+
+
+@main.command("tournament", cls=_TournamentCommand)
+@click.option("--config", "-c", default=None, type=click.Path(exists=True, dir_okay=False),
+              help="Config YAML (its env and agents); default: the first --run's config.resolved.yaml")
+@click.option("-a", "--candidate", "candidates", multiple=True,
+              help="Candidate: name=path (a checkpoint dir of any architecture, or a .pt built like eval's: the "
+                   "trainable agents.<name>, else the global networks) or a scripted / frozen agent of the config. "
+                   "Repeatable.")
+@click.option("--run", "runs", multiple=True,
+              help="[alias=]runs/x: candidates are its stored snapshots (repeatable; --agent / --snapshots after a "
+                   "--run apply to it). Matches go to the first run's matches.db, reports to its tournaments/<name>/.")
+@click.option("--agent", "run_agents", multiple=True, help="The --run's agent (default: its only trainable agent)")
+@click.option("--snapshots", "run_snapshots", multiple=True,
+              help="The --run's snapshots: all (default), last:N, top:N (by the run journal's rating lower bound), "
+                   "every:K")
+@click.option("--field", default=None,
+              help="Comma-separated opponents: agents of the config, -a names or snapshots [alias/]agent@vN. "
+                   "Default: every scripted / frozen agent of the config.")
+@click.option("--mode", default="gauntlet", show_default=True,
+              type=click.Choice(["gauntlet", "round-robin", "halving", "select"]))
+@click.option("--layout", "layouts", multiple=True, help="Layout (repeatable); default: the enabled layouts")
+@click.option("--blocks", default=None, type=click.IntRange(min=1),
+              help="gauntlet / round-robin: blocks per composition (default 50; T8.2 ruling)")
+@click.option("--halving-blocks", default=None, type=click.IntRange(min=1),
+              help="halving / select: blocks per composition of round 0 (default 8; T8.2 ruling)")
+@click.option("--confirm-blocks", default=None, type=click.IntRange(min=1),
+              help="select: blocks per composition of the confirmation stage (default 100; T8.2 ruling)")
+@click.option("--finalists", default=None, type=click.IntRange(min=1), help="halving / select (default 3)")
+@click.option("--num-workers", default=1, type=click.IntRange(min=1), show_default=True, help="Worker processes")
+@click.option("--num-envs", default=8, type=click.IntRange(min=1), show_default=True, help="Envs per worker")
+@click.option("--deterministic", is_flag=True, default=False, help="Greedy policies (default: stochastic)")
+@click.option("--seed", default=0, type=int, show_default=True, help="Seed of the block seeds (domains A, B)")
+@click.option("--name", default=None, help="Tournament name (default <mode>-<YYYYmmdd-HHMMSS>); the same name "
+                                           "continues an interrupted tournament, with the same settings (every "
+                                           "size flag counts, also one the mode does not use)")
+@click.option("--output", "-o", default=None, type=click.Path(file_okay=False),
+              help="Without --run: the directory for matches.db and tournaments/<name>/")
+@click.option("--pin", is_flag=True, default=False, help="select with --run: pin the confirmed winner snapshot")
+@click.option("--set", "overrides", multiple=True, help="Override config values." + _SET_HELP_YAML)
+def tournament_cmd(config: str | None, candidates: tuple[str, ...], runs: tuple[str, ...], run_agents: tuple[str, ...],
+                   run_snapshots: tuple[str, ...], field: str | None, mode: str, layouts: tuple[str, ...],
+                   blocks: int | None, halving_blocks: int | None, confirm_blocks: int | None, finalists: int | None,
+                   num_workers: int, num_envs: int, deterministic: bool, seed: int, name: str | None,
+                   output: str | None, pin: bool, overrides: tuple[str, ...]) -> None:
+    """Compare candidates (run snapshots, checkpoint dirs of any architecture, .pt weights, scripted / frozen
+    agents) on common seeds with seat rotations, and select the best (--mode select: screening, then confirmation
+    on fresh seeds).
+
+    The config is checked in the "play" scope (like eval). Exit code: 0 done (also a select whose winner is not
+    confirmed), 1 config, player or env error, a dead worker or a --pin winner the run evicted meanwhile (the
+    reports are written first), 2 bad arguments, 130 SIGINT (finished blocks are kept: rerun with the same --name
+    to continue).
+    """
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    grouped = _group_runs(click.get_current_context().meta.get("tournament_args", []))
+    if len(grouped) != len(runs):
+        raise click.UsageError("could not match --agent / --snapshots to their --run")
+    if pin and (not runs or mode != "select"):
+        raise click.UsageError("--pin needs --mode select and --run (it pins the winner in the run's storage)")
+    if output is not None and runs:
+        raise click.UsageError("--output is for tournaments without --run (with --run the reports go to "
+                               "runs/x/tournaments/<name>/)")
+    if not runs and config is None:
+        raise click.UsageError("give -c CONFIG or --run DIR")
+    if not runs and output is None:
+        raise click.UsageError("--output DIR is required without --run (it gets matches.db and "
+                               "tournaments/<name>/)")
+    with _config_errors():
+        from colosseum.arena.tournament import modes
+        from colosseum.arena.tournament.engine import TournamentError
+        from colosseum.arena.tournament.run import TournamentOptions, run_tournament
+        from colosseum.core.errors import ConfigError
+        from colosseum.eval import parse_agent_spec
+
+        try:
+            parsed = tuple(parse_agent_spec(text, option=None) for text in candidates)   # click names -a
+        except ConfigError as e:
+            raise click.BadParameter(str(e), param_hint="'-a'") from e
+        options = TournamentOptions(
+            mode=mode, candidates=parsed, runs=tuple(_run_selection(item) for item in grouped),
+            field=None if field is None else tuple(n.strip() for n in field.split(",") if n.strip()),
+            layouts=tuple(layouts),
+            blocks=blocks or modes.DEFAULT_BLOCKS, halving_blocks=halving_blocks or modes.DEFAULT_HALVING_BLOCKS,
+            confirm_blocks=confirm_blocks or modes.DEFAULT_CONFIRM_BLOCKS,
+            finalists=finalists or modes.DEFAULT_FINALISTS, seed=seed, deterministic=deterministic,
+            num_workers=num_workers, num_envs=num_envs, name=name, output=output, pin=pin, config_path=config,
+            overrides=_parse_overrides(overrides))
+        try:
+            outcome = run_tournament(options)
+        except TournamentError as e:
+            click.echo(f"Tournament error: {e}", err=True)
+            sys.exit(1)
+    click.echo("\n" + outcome.report.text())
+    click.echo(f"Blocks: {outcome.played_blocks} played, {outcome.reused_blocks} from the journal")
+    for path in outcome.written:
+        click.echo(f"Written: {path}")
+    for winner in outcome.pinned:
+        click.echo(f"Pinned {winner}")
+    for error in outcome.pin_errors:
+        click.echo(f"Pin error: {error}", err=True)
+    if outcome.pin_errors:
+        sys.exit(1)
 
 
 @main.command()
@@ -389,6 +549,101 @@ def bc(
         message += f", accuracy={metrics['accuracy']:.3f}"
     click.echo(message)
     click.echo(f"Weights saved to {output}")
+
+
+@main.command("report")
+@click.argument("run", type=click.Path(exists=True, file_okay=False))
+@click.option("--output", "-o", default=None, type=click.Path(dir_okay=False),
+              help="HTML file to write (default: RUN/report.html)")
+def report_cmd(run: str, output: str | None) -> None:
+    """Build a self-contained HTML report of a run directory (or of a tournament directory): ratings, results
+    matrix, anchors, opponents, training, system, matches and tournaments. The page needs no network.
+
+    Exit code: 0 done, 1 not a run or tournament directory (or an unreadable run), or a section failed (the
+    page is still written, with a note in place of each failed section), 2 bad command-line arguments,
+    130 SIGINT.
+    """
+    import logging
+    from pathlib import Path
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    if output is not None and not Path(output).absolute().parent.is_dir():
+        raise click.BadParameter(f"directory {str(Path(output).absolute().parent)!r} does not exist",
+                                 param_hint="'--output'")
+    with _config_errors():
+        from colosseum.arena.report.render import ReportSectionsFailed, write_report
+
+        try:
+            path = write_report(run, output)
+        except ReportSectionsFailed as e:
+            failed = "; ".join(f"{name} ({error})" for name, error in e.failed.items())
+            click.echo(f"Report written to {e.path}, but {len(e.failed)} section(s) failed and show a note "
+                       f"instead: {failed} (tracebacks in the log above)", err=True)
+            sys.exit(1)
+    click.echo(f"Report written to {path}")
+
+
+@main.command("dashboard")
+@click.argument("run", type=click.Path(exists=True, file_okay=False))
+@click.option("--host", default="127.0.0.1", show_default=True,
+              help="Address to listen on. No authentication: keep 127.0.0.1 and use an SSH tunnel from other machines")
+@click.option("--port", default=8765, type=click.IntRange(0, 65535), show_default=True,
+              help="Port (0: any free port, printed at start)")
+@click.option("--refresh", default=10, type=click.IntRange(min=2), show_default=True,
+              help="Seconds between page refreshes (at least 2)")
+def dashboard_cmd(run: str, host: str, port: int, refresh: int) -> None:
+    """Serve the run's report live: the same page as 'colosseum report', refreshed from /api/<section> JSON.
+    The match log is opened read-only; ratings come from ratings.json while the run trains.
+
+    Exit code: 1 not a run directory or the port is taken, 2 bad command-line arguments, 130 Ctrl+C.
+    """
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    with _config_errors():
+        from colosseum.arena.report.server import make_server
+
+        server = make_server(run, host=host, port=port, refresh_sec=refresh)
+    click.echo(f"Dashboard of {run} at http://{host}:{server.port}/ (Ctrl+C to stop)")
+    try:
+        server.serve_forever()
+    finally:
+        server.server_close()        # a KeyboardInterrupt propagates: "Interrupted", exit code 130
+
+
+@main.command("pin")
+@click.argument("run_dir", type=click.Path(exists=True, file_okay=False))
+@click.argument("snapshot", required=False)
+@click.option("--remove", is_flag=True, default=False, help="Unpin instead of pin")
+@click.option("--list", "list_", is_flag=True, default=False, help="List every agent's stored snapshots")
+def pin_cmd(run_dir: str, snapshot: str | None, remove: bool, list_: bool) -> None:
+    """Pin a stored snapshot (AGENT@vN) of a run dir so retention never evicts it, unpin it (--remove) or list
+    the snapshots (--list). Safe while the run trains: its next retention pass sees the pin.
+
+    Exit code: 0 done, 1 config error (not a run dir, unknown agent or snapshot, a snapshot the run evicted while
+    it was being pinned), 2 bad arguments.
+    """
+    from colosseum.coordinator.checkpoint_manager import list_snapshots, parse_snapshot_ref, pin_snapshot
+    from colosseum.core.errors import ConfigError
+
+    if list_ == (snapshot is not None):
+        raise click.UsageError("give either a snapshot (AGENT@vN) or --list")
+    if list_ and remove:
+        raise click.UsageError("--remove needs a snapshot, not --list")
+    if snapshot is not None:
+        try:
+            agent_id, version = parse_snapshot_ref(snapshot)
+        except ConfigError as e:  # a malformed reference is a usage error
+            raise click.BadParameter(str(e), param_hint="'SNAPSHOT'") from e
+    with _config_errors():
+        if list_:
+            for agent_id, infos in list_snapshots(run_dir).items():
+                names = [f"{c.checkpoint_id} (pinned)" if c.meta.get("pinned") is True else c.checkpoint_id
+                         for c in infos]
+                click.echo(f"{agent_id}: {', '.join(names)}")
+            return
+        path = pin_snapshot(run_dir, agent_id, version, pinned=not remove)
+    click.echo(f"{'Unpinned' if remove else 'Pinned'} {agent_id}@v{version} ({path})")
 
 
 @main.command("run-learner")

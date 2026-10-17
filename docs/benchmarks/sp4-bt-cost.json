@@ -1,0 +1,12 @@
+{
+  "blas_threads": "1",
+  "entities": 2003,
+  "fit_cold_s": 2.1490352260007057,
+  "iterations_cold": 7,
+  "fit_warm_s": 2.1842208220041357,
+  "iterations_warm": 4,
+  "laplace_s": 0.12160165898967534,
+  "bootstrap_s": 0.8744162670045625,
+  "bootstrap_samples": 20,
+  "pass": true
+}

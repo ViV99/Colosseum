@@ -6,7 +6,8 @@ Engine
 training: seat lifecycle, masks, per-seat model states, results by team. ``models`` maps every
 ``agent_id`` of the lineups to a ``PolicyModel``, a ``ScriptedPlayer`` or a ``ScriptedBot`` instance (a
 prototype: every (agent, env, seat) plays a deep copy with ``game_spec`` set); ``network_id`` is ignored
-(every seat uses ``models[agent_id]``). Every lineup is played once, to completion. Envs left without
+(every seat uses ``models[agent_id]``); a ``pool`` instead serves players by ``(agent_id, network_id)``
+(snapshots of one agent side by side). Every lineup is played once, to completion. Envs left without
 a scheduled lineup keep playing their last one until the rest finish; those extra episodes are
 discarded, so short episodes are not favoured. The in-process API is what the learning tests and the
 future ``colosseum tournament`` (SP4) use.
@@ -71,12 +72,32 @@ from colosseum.envs.game import GameSpec, MultiAgentEnv
 from colosseum.envs.vector import VectorEnv
 from colosseum.networks.model import PolicyModel
 from colosseum.players.scripted import ScriptedBot
-from colosseum.worker.match_runner import EpisodeEnd, MatchObserver, MatchRunner, ScriptedPlayer
+from colosseum.worker.match_runner import EpisodeEnd, MatchObserver, MatchRunner, PlayerPool, ScriptedPlayer
 
 logger = logging.getLogger(__name__)
 
 Z_95 = 1.959963984540054
 SCORE_CI_METHOD = "wilson-on-score (draw = half win; conservative approximation)"
+
+
+def parse_agent_spec(text: str, *, option: str | None = "-a") -> tuple[str, str | None]:
+    """``name`` (a scripted or frozen agent of the config) or ``name=path``: the player syntax of ``eval -a``,
+    ``record --player`` / ``--against`` and ``tournament -a``. ConfigError otherwise, its message prefixed by
+    ``option`` (None: no prefix, for a caller whose error names the option already)."""
+    name, sep, path = text.partition("=")
+    if not name or (sep and not path):
+        where = f"{option} {text!r}" if option else repr(text)
+        raise ConfigError(f"{where}: expected an agent name of the config or name=path")
+    return name, (path if sep else None)
+
+
+def balanced_match_count(spec: GameSpec, layouts: Sequence[str] | None, num_matches: int) -> int:
+    """``num_matches`` rounded up to even when one of ``layouts`` (default: every layout of the game) has two or
+    more teams, so both players of a pair play every side equally often (SP3 ruling #32). Callers that play
+    pairs use it and tell the user when it changed the count."""
+    chosen = list(layouts) if layouts else list(spec.layouts)
+    competitive = any(spec.num_teams(name) >= 2 for name in chosen if name in spec.layouts)
+    return num_matches + 1 if competitive and num_matches % 2 else num_matches
 
 
 # ---------------------------------------------------------------------------
@@ -241,13 +262,18 @@ class _Collector:
 def play_lineups(
     *,
     env_fn: Callable[[], MultiAgentEnv],
-    models: Mapping[str, PolicyModel | ScriptedBot | ScriptedPlayer],
+    models: Mapping[str, PolicyModel | ScriptedBot | ScriptedPlayer] | None = None,
     lineups: Sequence[Lineup],
     num_envs: int = 8,
     seed: int | None = None,
     deterministic: bool = False,
     max_idle_steps: int = 1000,
     observer: MatchObserver | None = None,
+    pool: PlayerPool | None = None,
+    source: str = "train",
+    context: str = "eval, ",
+    match_id_prefix: str = "eval",
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[MatchResult]:
     """Play every lineup once, to completion; one ``MatchResult`` per lineup, in completion order.
 
@@ -257,17 +283,29 @@ def play_lineups(
     untouched. Models run in eval mode; their train/eval flags are restored on return. Scripted players
     need no eval mode; a ``ScriptedBot`` instance is never played itself (deep copies are).
     ``observer`` (optional) sees every decision and episode of the scheduled lineups; see ``_Collector``.
+
+    Exactly one of ``models`` (``agent_id`` -> player for any network id) and ``pool`` (a ``PlayerPool`` keyed by
+    ``(agent_id, network_id)``: the tournament's; its models must already be in eval mode, ``play_lineups`` does
+    not touch them). A lineup's ``seed`` / ``block`` / ``uid`` are kept (``MatchRunner`` resets with the lineup's
+    seed and copies block and uid into the result); ``source`` is the results' ``source``. Snapshot seats are
+    served by the pool itself (``snapshot_fallback=False``). ``context`` (ending with ``", "``) prefixes every
+    error message and ``match_id_prefix`` the match ids (``MatchRunner``); a tournament worker passes its own.
+    ``should_stop`` (optional) is called before every env step: when it returns True, play ends there and only the
+    matches finished so far are returned (fewer results than lineups; the pulse uses it to exit at the stop).
     """
-    lineups = [Lineup(lineup.layout, [dataclasses.replace(seat, collect=False) for seat in lineup.seats])
+    if (models is None) == (pool is None):
+        raise ValueError("play_lineups: pass exactly one of models and pool")
+    lineups = [dataclasses.replace(lineup, seats=[dataclasses.replace(seat, collect=False) for seat in lineup.seats])
                for lineup in lineups]
     if not lineups:
         return []
-    unknown = sorted({seat.agent_id for lineup in lineups for seat in lineup.seats} - set(models))
-    if unknown:
-        raise ValueError(f"play_lineups: lineups use unknown agents {unknown}")
+    if models is not None:
+        unknown = sorted({seat.agent_id for lineup in lineups for seat in lineup.seats} - set(models))
+        if unknown:
+            raise ValueError(f"play_lineups: lineups use unknown agents {unknown}")
     if num_envs < 1:
         raise ValueError(f"play_lineups: num_envs must be >= 1, got {num_envs}")
-    neural = [m for m in models.values() if isinstance(m, PolicyModel)]
+    neural = [m for m in models.values() if isinstance(m, PolicyModel)] if models is not None else []
     rng = torch.random.fork_rng(devices=[]) if seed is not None else contextlib.nullcontext()
     was_training = [(m, m.training) for model in neural for m in model.modules()]
     try:
@@ -281,17 +319,24 @@ def play_lineups(
             collector = _Collector(pending, [True] * n, inner=observer)
             vec_env = VectorEnv(env_fn, n)
             try:
-                pool = {name: ScriptedPlayer(functools.partial(_copy_bot, player, vec_env.spec))
-                        if isinstance(player, ScriptedBot) else player for name, player in models.items()}
-                runner = MatchRunner(vec_env=vec_env, lineups=lineups[:n], models=_FixedModels(pool),
-                                     observer=collector, seed=seed, max_idle_steps=max_idle_steps,
-                                     deterministic=deterministic, context="eval, ", match_id_prefix="eval")
+                if models is not None:
+                    players = {name: ScriptedPlayer(functools.partial(_copy_bot, player, vec_env.spec))
+                               if isinstance(player, ScriptedBot) else player for name, player in models.items()}
+                    served: PlayerPool = _FixedModels(players)
+                else:
+                    served = pool
+                runner = MatchRunner(vec_env=vec_env, lineups=lineups[:n], models=served, observer=collector,
+                                     seed=seed, max_idle_steps=max_idle_steps, deterministic=deterministic,
+                                     context=context, match_id_prefix=match_id_prefix, source=source,
+                                     snapshot_fallback=False)
             except BaseException:
                 vec_env.close()
                 raise
             collector.runner = runner
             try:
                 while len(collector.results) < len(lineups):
+                    if should_stop is not None and should_stop():
+                        break
                     runner.step()
             finally:
                 runner.close()
@@ -604,31 +649,14 @@ def summarize(spec: GameSpec, results: Sequence[MatchResult], *, agents: Sequenc
 # ---------------------------------------------------------------------------
 
 
-def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
-                    spec: GameSpec | None = None, validated: set[str] | None = None) -> tuple[PolicyModel, list[str]]:
-    """Build and load one evaluation agent; returns ``(model in eval mode, roles)``.
-
-    - A checkpoint dir (read with ``load_checkpoint_dir``: strict, never modified): roles and
-      ``role_signature`` from its ``meta.json`` (required; the signature must match the game's
-      spaces for those roles), architecture from its ``networks`` (else the agent's config).
-    - A ``.pt`` state_dict: architecture and roles of ``agents.<name>`` when configured (a trainable
-      agent's effective networks and roles; a frozen agent's ``networks`` / ``roles`` overrides), else the
-      global ``networks`` with every role of the game (which must share one signature).
-
-    Loading is ``players.registry.load_frozen`` + ``build_frozen_model`` (the loader frozen agents share).
-
-    The built architecture is checked like ``validate_config`` checks an agent's model (``step``
-    and ``unroll`` on the role's spaces), once per distinct (networks, roles): keys already in
-    ``validated`` are skipped and new ones are added (``None``: always check).
-
-    Problems raise ConfigError naming the path; a path that is neither a dir nor a ``.pt`` file
-    raises FileNotFoundError.
-    """
-    from colosseum.core.registry import env_spec
+def load_frozen_player(config: ColosseumConfig, name: str, path: str | Path, *, spec: GameSpec,
+                       validated: set[str] | None = None, use_entry: bool = True) -> tuple[PolicyModel, Any]:
+    """``(model in eval mode, FrozenSpec)`` of a checkpoint dir or ``.pt`` (``players.registry.load_frozen`` +
+    ``build_frozen_model``), its architecture checked once per distinct (networks, roles) as in
+    ``validate_config`` (keys in ``validated`` are skipped, new ones added; None: always check)."""
     from colosseum.players.registry import build_frozen_model, load_frozen
 
-    spec = spec if spec is not None else env_spec(config)
-    frozen = load_frozen(config, name, path, spec)
+    frozen = load_frozen(config, name, path, spec, use_entry=use_entry)
     model = build_frozen_model(config, frozen, spec)
     role = agent_role_spec(spec, list(frozen.roles))
     key = json.dumps([frozen.networks, list(frozen.roles)], sort_keys=True)
@@ -639,38 +667,75 @@ def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *,
             raise ConfigError(f"{frozen.networks_source}: {e}") from e
         if validated is not None:
             validated.add(key)
+    return model, frozen
+
+
+def load_eval_model(config: ColosseumConfig, name: str, path: str | Path, *, spec: GameSpec | None = None,
+                    validated: set[str] | None = None,
+                    use_entry: bool = False) -> tuple[PolicyModel, list[str]]:
+    """Build and load one evaluation agent; returns ``(model in eval mode, roles)``.
+
+    - A checkpoint dir (read with ``load_checkpoint_dir``: strict, never modified): roles and
+      ``role_signature`` from its ``meta.json`` (required; the signature must match the game's
+      spaces for those roles), architecture from its ``networks`` (else the agent's config).
+    - A ``.pt`` state_dict: architecture and roles of ``agents.<name>`` when configured (a trainable
+      agent's effective networks and roles; a frozen agent's ``networks`` / ``roles`` overrides only with
+      ``use_entry``), else the global ``networks`` with every role of the game (which must share one signature).
+
+    Loading is ``players.registry.load_frozen`` + ``build_frozen_model`` (the loader frozen agents share);
+    ``use_entry`` as in ``load_frozen``: False for paths given on the command line.
+
+    The built architecture is checked like ``validate_config`` checks an agent's model (``step``
+    and ``unroll`` on the role's spaces), once per distinct (networks, roles): keys already in
+    ``validated`` are skipped and new ones are added (``None``: always check).
+
+    Problems raise ConfigError naming the path; a path that is neither a dir nor a ``.pt`` file
+    raises FileNotFoundError.
+    """
+    from colosseum.core.registry import env_spec
+
+    spec = spec if spec is not None else env_spec(config)
+    model, frozen = load_frozen_player(config, name, path, spec=spec, validated=validated, use_entry=use_entry)
     return model, list(frozen.roles)
 
 
 def load_player(config: ColosseumConfig, name: str, path: str | None, *, spec: GameSpec,
-                validated: set[str] | None = None,
-                option: str = "-a") -> tuple[PolicyModel | ScriptedPlayer, list[str]]:
+                validated: set[str] | None = None, option: str = "-a",
+                fixed: Any = None) -> tuple[PolicyModel | ScriptedPlayer, list[str]]:
     """One player of ``eval -a`` / ``record --player`` / ``record --against``: ``path=None`` is the scripted
     or frozen agent ``name`` of the config (a trainable agent needs a path: ConfigError naming ``option``),
-    otherwise a checkpoint dir or a ``.pt`` (``load_eval_model``). Returns ``(player, roles)``.
+    otherwise a checkpoint dir or a ``.pt`` (``load_eval_model``; a frozen entry of the same name does not apply
+    to it, SP4 §8). Returns ``(player, roles)``.
+
+    ``fixed`` (optional): the ``FixedPlayers`` ``validate_config`` loaded (``ValidationReport.fixed``); a scripted
+    or frozen agent found there is not loaded (or checked) again.
 
     A path that is neither a directory nor a ``.pt`` file is a ConfigError."""
-    from colosseum.players.registry import BotSpec, make_bot, resolve_player_roles
+    from colosseum.players.registry import BotSpec, build_frozen_model, make_bot, resolve_player_roles
 
     if path is None:
         entry = config.agent_entry(name)          # ConfigError for an unknown name
         if entry.kind == "trainable":
             raise ConfigError(f"{option} {name}: '{name}' is a trainable agent, whose weights are not in the config; "
                               f"use {option} {name}=<checkpoint dir or .pt>")
+        if fixed is not None and name in fixed.bots:      # validate_config built and played it already
+            return ScriptedPlayer(functools.partial(make_bot, fixed.bots[name], spec)), list(fixed.roles[name])
+        if fixed is not None and name in fixed.frozen:    # loaded and checked by validate_config: not again
+            frozen = fixed.frozen[name]
+            return build_frozen_model(config, frozen, spec), list(frozen.roles)
         if entry.kind == "scripted":
             bot = BotSpec(entry.class_path, dict(entry.kwargs))
             make_bot(bot, spec)                    # a bad class or kwargs fail here, as a ConfigError
             roles = list(resolve_player_roles(config, spec, [name])[name])   # other fixed agents are not read
             return ScriptedPlayer(functools.partial(make_bot, bot, spec)), roles
-        path = entry.path
-        p = Path(path)
+        p = Path(entry.path)
         if not (p.is_dir() or (p.is_file() and p.suffix == ".pt")):
-            raise ConfigError(f"agents.{name}.path={path!r}: expected a checkpoint dir or a .pt file")
-    else:
-        p = Path(path)
-        if not (p.is_dir() or (p.is_file() and p.suffix == ".pt")):
-            raise ConfigError(f"{option} {name}={path}: expected a checkpoint dir or a .pt file")
-    return load_eval_model(config, name, path, spec=spec, validated=validated)
+            raise ConfigError(f"agents.{name}.path={entry.path!r}: expected a checkpoint dir or a .pt file")
+        return load_eval_model(config, name, entry.path, spec=spec, validated=validated, use_entry=True)
+    p = Path(path)
+    if not (p.is_dir() or (p.is_file() and p.suffix == ".pt")):
+        raise ConfigError(f"{option} {name}={path}: expected a checkpoint dir or a .pt file")
+    return load_eval_model(config, name, path, spec=spec, validated=validated, use_entry=False)
 
 
 def default_layouts(spec: GameSpec, players: Mapping[str, Sequence[str]]) -> list[str]:
@@ -680,9 +745,9 @@ def default_layouts(spec: GameSpec, players: Mapping[str, Sequence[str]]) -> lis
 
 def evaluate(config: ColosseumConfig, agents: Mapping[str, str | None], *, layouts: Sequence[str] | None,
              num_matches: int, seed: int | None = None, deterministic: bool = False,
-             num_envs: int = 8) -> EvalReport:
+             num_envs: int = 8, fixed: Any = None) -> EvalReport:
     """Load ``agents`` (name -> checkpoint dir or ``.pt``; ``None`` = the scripted or frozen agent of that name
-    in the config), schedule, play and summarize."""
+    in the config), schedule, play and summarize. ``fixed``: ``ValidationReport.fixed`` (``load_player``)."""
     from colosseum.core.registry import env_spec, make_env
 
     spec = env_spec(config)
@@ -690,7 +755,7 @@ def evaluate(config: ColosseumConfig, agents: Mapping[str, str | None], *, layou
     players: dict[str, list[str]] = {}
     validated: set[str] = set()  # each distinct architecture is checked once
     for name, path in agents.items():
-        models[name], players[name] = load_player(config, name, path, spec=spec, validated=validated)
+        models[name], players[name] = load_player(config, name, path, spec=spec, validated=validated, fixed=fixed)
     chosen = list(dict.fromkeys(layouts)) if layouts else default_layouts(spec, players)
     unknown = sorted(set(chosen) - set(spec.layouts))
     if unknown:

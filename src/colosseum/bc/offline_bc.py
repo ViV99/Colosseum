@@ -231,6 +231,7 @@ class OfflineBCTrainer:
         if seq_len < 1:
             raise ValueError(f"seq_len must be >= 1, got {seq_len}")
         self._device = torch.device(device)
+        logger.info("BC trainer: device %s", self._device)
         self._model = model.to(self._device)
         self._action_spec = action_spec
         self._obs_spec = obs_spec

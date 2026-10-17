@@ -38,15 +38,21 @@ from colosseum.core.specs import ActionSpec, ObsSpec
 from colosseum.core.tree import Tree, tree_map
 from colosseum.core.types import Lineup
 from colosseum.envs.game import GameSpec, RoleSpec
-from colosseum.eval import load_player, play_lineups, schedule_lineups, summarize
+from colosseum.eval import (
+    balanced_match_count,
+    load_player,
+    parse_agent_spec,
+    play_lineups,
+    schedule_lineups,
+    summarize,
+)
 from colosseum.utils.fs import write_text_atomic
 from colosseum.worker.buffers import put_row
 from colosseum.worker.match_runner import ActRecord, EpisodeEnd
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DECISIONS_PER_FILE", "RECORD_FILE", "RECORD_FORMAT", "RecordObserver", "RoleWriter", "parse_player",
-           "record"]
+__all__ = ["DECISIONS_PER_FILE", "RECORD_FILE", "RECORD_FORMAT", "RecordObserver", "RoleWriter", "record"]
 
 RECORD_FILE = "record.json"
 RECORD_FORMAT = 1
@@ -147,14 +153,6 @@ class RecordObserver:
             del self._buffers[key]
 
 
-def parse_player(text: str) -> tuple[str, str | None]:
-    """``name`` (a scripted or frozen agent of the config) or ``name=path``."""
-    name, sep, path = text.partition("=")
-    if not name or (sep and not path):
-        raise ConfigError(f"player {text!r}: expected an agent name of the config or name=path")
-    return name, (path if sep else None)
-
-
 def _schedule(spec: GameSpec, player: str, roles: Mapping[str, Sequence[str]], opponents: Sequence[str],
               layouts: Sequence[str] | None, num_matches: int) -> list[Lineup]:
     explicit = bool(layouts)
@@ -195,11 +193,12 @@ def _schedule(spec: GameSpec, player: str, roles: Mapping[str, Sequence[str]], o
 
 def record(config: ColosseumConfig, player: str, against: Sequence[str], *, layouts: Sequence[str] | None,
            num_matches: int, output: str | Path, num_envs: int = 8, seed: int | None = None,
-           deterministic: bool = False, decisions_per_file: int = DECISIONS_PER_FILE) -> dict:
+           deterministic: bool = False, decisions_per_file: int = DECISIONS_PER_FILE, fixed: Any = None) -> dict:
     """Record ``player``'s decisions into ``output`` (module docstring); returns the ``record.json`` content.
 
     With opponents and a layout of two or more teams among the chosen ones, an odd ``num_matches``
     is rounded up (like ``colosseum eval``), so the player plays every side equally often.
+    ``fixed``: ``ValidationReport.fixed`` (scripted / frozen agents already loaded; ``eval.load_player``).
     """
     if num_matches < 1:
         raise ConfigError(f"num_matches must be >= 1, got {num_matches}")
@@ -207,8 +206,8 @@ def record(config: ColosseumConfig, player: str, against: Sequence[str], *, layo
     out = Path(output)
     if out.exists() and (not out.is_dir() or any(out.iterdir())):
         raise ConfigError(f"--output {out}: exists and is not empty; choose a new directory")
-    p_name, p_path = parse_player(player)
-    opponents = [parse_player(text) for text in against]
+    p_name, p_path = parse_agent_spec(player, option="--player")
+    opponents = [parse_agent_spec(text, option="--against") for text in against]
     names = [p_name] + [name for name, _ in opponents]
     reused = sorted({name for name in names if names.count(name) > 1})
     if reused:
@@ -218,12 +217,14 @@ def record(config: ColosseumConfig, player: str, against: Sequence[str], *, layo
     roles: dict[str, list[str]] = {}
     validated: set[str] = set()
     for option, (name, path) in [("--player", (p_name, p_path)), *(("--against", o) for o in opponents)]:
-        models[name], roles[name] = load_player(config, name, path, spec=spec, validated=validated, option=option)
-    chosen = list(layouts) if layouts else list(spec.layouts)
-    if opponents and num_matches % 2 and any(spec.num_teams(name) >= 2 for name in chosen if name in spec.layouts):
-        logger.info("num_matches %d is odd; rounded up, using %d per opponent and layout so the player plays "
-                    "every side equally often", num_matches, num_matches + 1)
-        num_matches += 1
+        models[name], roles[name] = load_player(config, name, path, spec=spec, validated=validated, option=option,
+                                                fixed=fixed)
+    if opponents:
+        rounded = balanced_match_count(spec, layouts, num_matches)
+        if rounded != num_matches:
+            logger.info("num_matches %d is odd; rounded up, using %d per opponent and layout so the player plays "
+                        "every side equally often", num_matches, rounded)
+            num_matches = rounded
     lineups = _schedule(spec, p_name, roles, [name for name, _ in opponents], layouts, num_matches)
     out.mkdir(parents=True, exist_ok=True)
     writers = {role: RoleWriter(out / role, spec.roles[role], decisions_per_file) for role in roles[p_name]}

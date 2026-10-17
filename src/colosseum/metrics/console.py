@@ -21,7 +21,10 @@ class ConsoleReporter:
 
     def format_line(self, agent_id: str, *, train_step: int, env_steps: int, fps: float,
                     loss: float | None, entropy: float | None, return_mean: float | None,
-                    wr_vs_past: float | None, wr_arena: float | None) -> str:
+                    wr_vs_past: float | None, wr_arena: float | None,
+                    bt: tuple[float, float] | None = None) -> str:
+        """One progress line. ``bt``: the agent's live Bradley-Terry rating of its latest version bucket and the
+        half width of its 95 % interval (Elo units, SP4)."""
         parts = [
             f"[{agent_id}] step {train_step}",
             f"{100.0 * min(1.0, env_steps / self._total):5.1f}% budget",
@@ -34,6 +37,8 @@ class ConsoleReporter:
             parts.append(f"wr_vs_past {wr_vs_past:.2f}")
         if wr_arena is not None:
             parts.append(f"wr_arena {wr_arena:.2f}")
+        if bt is not None:
+            parts.append(f"bt {round(bt[0])} ± {round(bt[1])}")      # round(): never "-0"
         return " | ".join(parts)
 
     def emit(self, lines: list[str]) -> None:

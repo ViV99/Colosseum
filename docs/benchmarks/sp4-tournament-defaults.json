@@ -1,0 +1,1376 @@
+{
+  "grid": [
+    [
+      8,
+      32
+    ],
+    [
+      16,
+      64
+    ],
+    [
+      32,
+      128
+    ]
+  ],
+  "floors": {
+    "halving_blocks": 8,
+    "confirm_blocks": 100,
+    "blocks": 50
+  },
+  "rows": [
+    {
+      "game": "tic_tac_toe",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 0,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.8,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 1,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.8,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 2,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.7,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 3,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.7,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 4,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.7,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 5,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.9,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 6,
+      "checks": {
+        "winner": true,
+        "order": false,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [
+        "ranking ['e000', 'e025', 'e100', 'e050'] != true order ['e000', 'e025', 'e050', 'e100']"
+      ],
+      "seconds": 3.8,
+      "ranking": [
+        "e000",
+        "e025",
+        "e100",
+        "e050"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 7,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.8,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 8,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.8,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 9,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.7,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 0,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.3,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 1,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 2,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 3,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.5,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 4,
+      "checks": {
+        "winner": true,
+        "order": false,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [
+        "ranking ['e000', 'e025', 'e100', 'e050'] != true order ['e000', 'e025', 'e050', 'e100']"
+      ],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e100",
+        "e050"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 5,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.3,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 6,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 7,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 8,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.3,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 8,
+      "confirm": 32,
+      "seed": 9,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 0,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.1,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 1,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.1,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 2,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.9,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 3,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.9,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 4,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.0,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 5,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.9,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 6,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 3.9,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 7,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.0,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 8,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.0,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 9,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.1,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 0,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 5.1,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 1,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 5.2,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 2,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 5.0,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 3,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 5.1,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 4,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 5.2,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 5,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 5.2,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 6,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 5.1,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 7,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 5.1,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 8,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 5.1,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 16,
+      "confirm": 64,
+      "seed": 9,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 5.1,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 0,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 1,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 2,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 3,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 4,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 5,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 6,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.4,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 7,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.3,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 8,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.2,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tic_tac_toe",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 9,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 4.5,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 0,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 6.7,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 1,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 6.7,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 2,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 6.6,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 3,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 6.7,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 4,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 6.9,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 5,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 6.5,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 6,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 6.6,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 7,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 6.7,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 8,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 6.6,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    },
+    {
+      "game": "tron",
+      "blocks": 32,
+      "confirm": 128,
+      "seed": 9,
+      "checks": {
+        "winner": true,
+        "order": true,
+        "confirmed": true,
+        "bt": true
+      },
+      "problems": [],
+      "seconds": 6.8,
+      "ranking": [
+        "e000",
+        "e025",
+        "e050",
+        "e100"
+      ],
+      "winner": "e000",
+      "confirmed": true
+    }
+  ],
+  "decision": {
+    "chosen": [
+      8,
+      32
+    ],
+    "summary": {
+      "tic_tac_toe": {
+        "runs": 10,
+        "winner": 10,
+        "order": 9,
+        "confirmed": 10,
+        "bt": 10,
+        "mean_seconds": 3.7700000000000005
+      },
+      "tron": {
+        "runs": 10,
+        "winner": 10,
+        "order": 9,
+        "confirmed": 10,
+        "bt": 10,
+        "mean_seconds": 4.380000000000001
+      }
+    },
+    "defaults": {
+      "halving_blocks": 8,
+      "confirm_blocks": 100,
+      "blocks": 50
+    }
+  }
+}

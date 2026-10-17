@@ -32,3 +32,10 @@ wandb/
 # SP2 compatibility fixtures (SP3 T0.1): a committed SP2 checkpoint inside an SP2-shaped run dir
 !/tests/fixtures/sp2/run/checkpoints/
 !/tests/fixtures/sp2/run/checkpoints/**
+
+# SP3 run-dir fixture (SP4 T0.1): committed SP3 snapshots inside an SP3-shaped run dir
+!/tests/fixtures/sp3/run/checkpoints/
+!/tests/fixtures/sp3/run/checkpoints/**
+
+# SDD workspace (scratch, deleted after each merge)
+.superpowers/

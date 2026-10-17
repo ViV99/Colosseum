@@ -2,15 +2,24 @@
 
     runs/<name>/
       config.resolved.yaml     after --set overrides and agent merging
+      run.json                 the run's id ({"run_id": <uuid4 hex>}), written once by the launcher (SP4)
       logs/<process>.log       main, learner-<agent>, worker-<i>, worker-<i>-env<k>
       metrics.jsonl            one JSON record per line (T6.3)
       ratings.json             latest ratings snapshot (T6.3)
+      matches.db               the match log (SP4: colosseum.arena.matchlog)
+      league_state.json        ratings and PFSP statistics, for a run-dir resume (SP4)
+      pulse_state.json         pulse bookkeeping (SP4 T6.1)
+      tournaments/<name>/      colosseum tournament dirs (SP4 T5.4)
+      run_state.json           running / finished / failed + pid, written by run_training (SP4 T7.1)
+      report.html              colosseum report's default output (SP4 T7.2)
       checkpoints/<agent>/ckpt_v<N>/{model.pt, trainer_state.pt, meta.json}
 """
 
 from __future__ import annotations
 
+import json
 import re
+import uuid
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -22,6 +31,22 @@ from colosseum.core.errors import ConfigError
 from colosseum.utils.fs import write_text_atomic
 
 RESOLVED_CONFIG_FILE = "config.resolved.yaml"
+RUN_INFO_FILE = "run.json"
+
+
+def read_run_id(root: str | Path) -> str | None:
+    """The run id stored in ``<root>/run.json``; None when the file is absent (an SP3 run dir, or a run that never
+    started). Never writes. An unreadable or malformed file is a ConfigError naming it."""
+    path = Path(root) / RUN_INFO_FILE
+    if not path.is_file():
+        return None
+    try:
+        run_id = json.loads(path.read_text())["run_id"]
+    except (OSError, ValueError, KeyError, TypeError) as e:
+        raise ConfigError(f"Malformed {path}: {e!r}; it must be {{\"run_id\": \"<id>\"}}") from e
+    if not isinstance(run_id, str) or not run_id:
+        raise ConfigError(f"Malformed {path}: run_id must be a non-empty string, got {run_id!r}")
+    return run_id
 
 
 def safe_path_component(value: str, fallback: str) -> str:
@@ -61,6 +86,57 @@ class RunDir:
     @property
     def resolved_config_path(self) -> Path:
         return self.root / RESOLVED_CONFIG_FILE
+
+    @property
+    def run_info_path(self) -> Path:
+        return self.root / RUN_INFO_FILE
+
+    @property
+    def league_state_path(self) -> Path:
+        from colosseum.coordinator.coordinator import LEAGUE_STATE_FILE
+
+        return self.root / LEAGUE_STATE_FILE
+
+    @property
+    def pulse_state_path(self) -> Path:
+        from colosseum.arena.pulse import PULSE_STATE_FILE
+
+        return self.root / PULSE_STATE_FILE
+
+    @property
+    def matches_path(self) -> Path:
+        # A local import: colosseum.arena.matchlog pulls in colosseum.core.types.
+        from colosseum.arena.matchlog import MATCH_LOG_FILE
+
+        return self.root / MATCH_LOG_FILE
+
+    @property
+    def tournaments_dir(self) -> Path:
+        return self.root / "tournaments"
+
+    @property
+    def run_state_path(self) -> Path:
+        from colosseum.core.run_state import RUN_STATE_FILE
+
+        return self.root / RUN_STATE_FILE
+
+    @property
+    def report_path(self) -> Path:
+        return self.root / "report.html"
+
+    @property
+    def run_id(self) -> str | None:
+        """The stored run id (``read_run_id``); None before ``ensure_run_id``."""
+        return read_run_id(self.root)
+
+    def ensure_run_id(self) -> str:
+        """The run's id, created on the first call (uuid4 hex, written atomically to ``run.json``)."""
+        existing = read_run_id(self.root)
+        if existing is not None:
+            return existing
+        run_id = uuid.uuid4().hex
+        write_text_atomic(self.run_info_path, json.dumps({"run_id": run_id}) + "\n")
+        return run_id
 
     @classmethod
     def open(cls, root: str | Path) -> RunDir:

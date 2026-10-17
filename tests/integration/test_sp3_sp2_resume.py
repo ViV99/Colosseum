@@ -21,8 +21,12 @@ def test_training_resumes_from_the_sp2_run_dir(tmp_path):
     assert f"env-step counter continues from {SP2_CHECKPOINT_ENV_STEPS}" in log
     agent_dir = run.root / "checkpoints" / "agent_0"
     versions = _versions(agent_dir)
-    assert versions[0] == SP2_CHECKPOINT_VERSION and len(versions) >= 2   # the SP2 snapshot joined the new pool
+    assert versions and max(versions) > SP2_CHECKPOINT_VERSION
+    # the SP2 snapshot joined the new pool (the log), as an ordinary snapshot: it has no run_id, so SP4 T4.1
+    # treats it as imported and retention may evict it like any other
+    assert "Imported 1 snapshots of agent_0" in log
     imported = agent_dir / f"ckpt_v{SP2_CHECKPOINT_VERSION}"
-    assert sorted(p.name for p in imported.iterdir()) == ["meta.json", "model.pt"]   # final: kept; no trainer state
+    if imported.exists():
+        assert sorted(p.name for p in imported.iterdir()) == ["meta.json", "model.pt"]   # no trainer state
     assert "snapshot pool carried over" in log
     assert _versions(source / "checkpoints" / "agent_0") == [SP2_CHECKPOINT_VERSION]  # the source is untouched

@@ -117,6 +117,36 @@ def take_lost_interrupt() -> bool:
     return lost
 
 
+# Thread-count variables of the BLAS libraries numpy may load (OpenBLAS, MKL, BLIS, Accelerate, OpenMP).
+BLAS_THREAD_VARS = ("OPENBLAS_NUM_THREADS", "OMP_NUM_THREADS", "MKL_NUM_THREADS", "BLIS_NUM_THREADS",
+                    "VECLIB_MAXIMUM_THREADS", "NUMEXPR_NUM_THREADS")
+
+
+def limit_main_blas_threads() -> bool:
+    """Load numpy's BLAS with one thread in this process only (SP4 spec block 2: the live-rating refit of the
+    training main process must not compete with the workers for cores).
+
+    BLAS libraries read their thread count when they are loaded, i.e. on ``import numpy``: the variables are set,
+    numpy is imported, and the environment is restored at once, so spawned children (workers, learners) start with
+    the original environment. Returns False (and changes nothing) when numpy is already imported. OpenBLAS (the
+    numpy wheels) and OpenMP read the count at load time; a BLAS that reads it later is not limited. A DEBUG line
+    notes the no-op case."""
+    if "numpy" in sys.modules:
+        logger.debug("limit_main_blas_threads: numpy is already imported; its BLAS keeps its thread count")
+        return False
+    saved = {name: os.environ.get(name) for name in BLAS_THREAD_VARS}
+    os.environ.update({name: "1" for name in BLAS_THREAD_VARS})
+    try:
+        import numpy  # noqa: F401 - loads the BLAS with the variables above
+    finally:
+        for name, value in saved.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
+    return True
+
+
 def parent_alive() -> bool:
     """False once the process that started this one has exited (True in the main process)."""
     parent = mp.parent_process()

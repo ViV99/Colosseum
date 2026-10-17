@@ -17,19 +17,26 @@ means of the same member-pair scores (fractional: a draw counts 0.5).
 
 One-team layouts (solo, cooperative, ``score``): ``ScoreTracker`` keeps every agent's team score
 (mean, EMA, 95% CI) and ``CrossPlayTable`` the mean score per team composition.
+
+SP4 (spec block 7.4): ``RatingBook.state_dict()`` / ``load_state_dict(state, agents=...)`` save and restore every
+table (``league_state.json``), so a run-dir resume continues them; entries of agents that are not in the new config
+are dropped (one INFO line), new agents start empty.
 """
 
 from __future__ import annotations
 
+import logging
 import math
 from collections import deque
-from collections.abc import Iterable, Sequence
+from collections.abc import Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, Literal
 
 from colosseum.core.outcomes import pairwise_rank_score
 from colosseum.core.types import LATEST_NETWORK_ID, MatchResult, SeatResult
 from colosseum.envs.game import GameSpec
+
+logger = logging.getLogger(__name__)
 
 Z_95 = 1.959963984540054
 SCORE_EMA_ALPHA = 0.05
@@ -258,6 +265,42 @@ class _LayoutRatings:
         return {role: {a: {b: s / w for b, (s, w) in row.items()} for a, row in table.items()}
                 for role, table in sorted(self.role_scores.items())}
 
+    def state_dict(self) -> dict[str, Any]:
+        wr = self.win_rates
+        return {
+            "outcome_kind": self.outcome_kind,
+            "elo": dict(self.elo._ratings),
+            "win_rates": {"scores": wr._scores, "weights": wr._weights, "games": wr._games},
+            "past": {a: [list(entry) for entry in entries] for a, entries in self.past._scores.items()},
+            "scores": {a: list(stats) for a, stats in self.scores._stats.items()},
+            "cross_play": {key: list(cell) for key, cell in self.cross_play._cells.items()},
+            "role_scores": self.role_scores,
+        }
+
+    def load_state_dict(self, state: Mapping[str, Any], known: Collection[str], dropped: set[str]) -> None:
+        """Restore ``state_dict`` entries whose agents are all ``known``; the others' agents go into ``dropped``."""
+        def ok(*agents: str) -> bool:
+            unknown = [a for a in agents if a not in known]
+            dropped.update(unknown)
+            return not unknown
+
+        self.elo._ratings = {a: float(r) for a, r in state["elo"].items() if ok(a)}
+        tracker = WinRateTracker()
+        for part, target in (("scores", tracker._scores), ("weights", tracker._weights), ("games", tracker._games)):
+            for a, row in state["win_rates"][part].items():
+                if ok(a):
+                    target[a] = {b: (int(v) if part == "games" else float(v)) for b, v in row.items() if ok(b)}
+        self.win_rates = tracker
+        self.past._scores = {a: deque(((float(s), float(w)) for s, w in entries), maxlen=self.past._window)
+                             for a, entries in state["past"].items() if ok(a)}
+        self.scores._stats = {a: (int(v[0]), float(v[1]), float(v[2]), float(v[3]))
+                              for a, v in state["scores"].items() if ok(a)}
+        self.cross_play._cells = {key: [int(c[0]), float(c[1])] for key, c in state["cross_play"].items()
+                                  if ok(*key.split("+"))}
+        self.role_scores = {role: {a: {b: [float(c[0]), float(c[1])] for b, c in row.items() if ok(b)}
+                                   for a, row in table.items() if ok(a)}
+                            for role, table in state["role_scores"].items()}
+
 
 class RatingBook:
     """Rating tables of every layout of a game (module docstring)."""
@@ -309,6 +352,35 @@ class RatingBook:
     def elo(self, layout: str, agent_id: str) -> float:
         """ELO of ``agent_id`` in ``layout``; ValueError for a layout the game does not have."""
         return self._layout(layout, "elo: ").elo.get(agent_id)
+
+    def state_dict(self) -> dict[str, Any]:
+        """Every table of every layout, JSON-ready (``league_state.json``)."""
+        return {"layouts": {layout: book.state_dict() for layout, book in self._books.items()}}
+
+    def load_state_dict(self, state: Mapping[str, Any], *, agents: Collection[str]) -> list[str]:
+        """Restore ``state_dict`` output. Entries of agents not in ``agents`` are dropped, and a layout the game no
+        longer has or whose outcome kind changed is skipped, with one INFO line per reason; returns the dropped
+        agents."""
+        dropped: set[str] = set()
+        missing: list[str] = []
+        changed: list[str] = []
+        for layout, saved in state.get("layouts", {}).items():
+            book = self._books.get(layout)
+            if book is None:
+                missing.append(layout)
+                continue
+            if saved.get("outcome_kind") != book.outcome_kind:
+                changed.append(f"{layout} (saved {saved.get('outcome_kind')}, now {book.outcome_kind})")
+                continue
+            book.load_state_dict(saved, set(agents), dropped)
+        if dropped:
+            logger.info(f"League state: ratings of agents not in this config are dropped: {sorted(dropped)}")
+        if missing:
+            logger.info(f"League state: ratings of layouts this game does not have are dropped: {sorted(missing)}")
+        if changed:
+            logger.info(f"League state: ratings of layouts whose outcome kind changed are dropped: "
+                        f"{', '.join(sorted(changed))}")
+        return sorted(dropped)
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
         ids = self._agent_ids

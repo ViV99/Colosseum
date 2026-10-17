@@ -1,0 +1,35 @@
+# Origin: .superpowers/sdd/2026-10-16-sp4-selection/drops-diag/proto-idle.diff in the git-ignored SDD workspace (deleted after the SP4 merge); copied verbatim on 2026-10-17.
+# Frozen record, not applicable as-is: the FX1 diagnostic prototype "idle drain" (paths of the diagnostic's scratch trees, against the pre-FX1 launcher); see fx1-drops-diagnostic.md.
+
+--- /home/viv/dev/repos/Colosseum/src/colosseum/launcher.py	2026-10-17 07:07:17.173004204 +0500
++++ proto-idle/src/colosseum/launcher.py	2026-10-17 09:19:40.620119491 +0500
+@@ -52,6 +52,10 @@
+ _METRICS_QUEUE_SIZE = 100
+ # Match results from all workers (SP4 spec block 1): a full queue drops results, and workers count the drops.
+ _RESULTS_QUEUE_SIZE = 10_000
++# The monitor pass sleeps in slices of this length and drains the results queue after each one: the queue's pipe
++# holds only ~64 KiB and a drain ends at the first momentarily empty pipe, so one drain per 0.2 s pass caps the
++# rate at about one pipe of results per pass (drops-diag).
++_RESULTS_DRAIN_SLICE_SEC = 0.01
+ # One slot: a command that was put has been taken by the worker before the next one
+ # can be put, so no command (and none of its new_checkpoints) is replaced unseen (D9).
+ _COMMAND_QUEUE_SIZE = 1
+@@ -741,7 +745,17 @@
+                 self._refresh_worker_matches(coordinator, agent_ids, command_queues, worker_sent_ckpts,
+                                              self._worker_evictions)
+                 last_refresh = time.monotonic()
+-            time.sleep(0.2)
++            self._idle(0.2)
++
++    def _idle(self, seconds: float) -> None:
++        """Sleep ``seconds``, draining the results queue every ``_RESULTS_DRAIN_SLICE_SEC``."""
++        end = time.monotonic() + seconds
++        while True:
++            left = end - time.monotonic()
++            if left <= 0:
++                return
++            time.sleep(min(_RESULTS_DRAIN_SLICE_SEC, left))
++            self._drain_results()
+ 
+     def _shutdown_after_error(self, error: BaseException) -> None:
+         """Tear down after ``error``. A teardown failure is logged and noted on ``error``,

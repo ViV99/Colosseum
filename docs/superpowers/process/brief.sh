@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # Origin: the SP2 controller's job scratch dir (brief.sh), copied 2026-10-09 into docs/superpowers/process/.
-# SP2 template: extracts one task's brief from the plan parts. Adapt WS and PLAN (env vars or the
-# defaults below) to the next sub-project's workspace and plan dir; the logic is unchanged from SP2.
+# SP2 template: extracts one task's brief from the plan parts. Set WS and PLAN (env vars, required)
+# to the sub-project's workspace and plan dir; the logic is unchanged from SP2.
 #
 # Usage: brief.sh TASK_ID   (e.g. T1.1) -> writes $WS/task-<ID>-brief.md
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-WS=${WS:-.superpowers/sdd/2026-10-10-sp3-league}
-P=${PLAN:-docs/superpowers/plans/2026-10-10-sp3-league}
+WS=${WS:?set WS to the workspace, e.g. .superpowers/sdd/<plan-name>}
+P=${PLAN:?set PLAN to the plan dir, e.g. docs/superpowers/plans/<plan-name>}
 id=$1
 part=$(grep -l -E "^### Task ${id//./\\.}:" $P/0[1-4]-*.md | head -1)
 [ -n "$part" ] || { echo "task $id not found" >&2; exit 3; }

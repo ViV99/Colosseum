@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{TITLE}}</title>
+<style>
+{{CSS}}
+</style>
+</head>
+<body>
+<header class="top">
+  <div class="top-row"><h1 id="page-title">{{TITLE}}</h1><span id="live-status" class="muted"></span></div>
+  <nav id="nav"></nav>
+</header>
+<main id="main">
+  <section id="sec-summary" class="sec"><h2>Summary</h2><div class="body"></div></section>
+  <section id="sec-ratings" class="sec"><h2>Ratings</h2><div class="body"></div></section>
+  <section id="sec-matrix" class="sec"><h2>Results matrix</h2><div class="body"></div></section>
+  <section id="sec-anchors" class="sec"><h2>Anchors</h2><div class="body"></div></section>
+  <section id="sec-opponents" class="sec"><h2>Opponents</h2><div class="body"></div></section>
+  <section id="sec-training" class="sec"><h2>Training</h2><div class="body"></div></section>
+  <section id="sec-system" class="sec"><h2>System</h2><div class="body"></div></section>
+  <section id="sec-matches" class="sec"><h2>Matches</h2><div class="body"></div></section>
+  <section id="sec-tournaments" class="sec"><h2>Tournaments</h2><div class="body"></div></section>
+</main>
+<div id="tip" class="tip" hidden></div>
+<noscript><p class="note">This page draws its tables and charts with JavaScript; the data is embedded below as JSON.</p></noscript>
+<script type="application/json" id="colosseum-config">{{CONFIG}}</script>
+<script type="application/json" id="colosseum-data">{{DATA}}</script>
+<script>
+{{JS}}
+</script>
+</body>
+</html>

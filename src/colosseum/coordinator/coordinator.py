@@ -19,6 +19,7 @@ from collections import deque
 from collections.abc import Callable, Mapping, Sequence
 from pathlib import Path
 
+from colosseum.arena.retention import SnapshotScore, snapshot_scores
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.coordinator.ratings import RatingBook
 from colosseum.core.config import ColosseumConfig
@@ -27,20 +28,26 @@ from colosseum.core.roles import agent_role_spec, role_signature
 from colosseum.core.types import Lineup, MatchResult
 from colosseum.envs.game import GameSpec
 from colosseum.league.base import BaseMatchmaker, MatchmakerContext, build_matchmaker, load_matchmaker_class
-from colosseum.league.lineups import check_lineup
+from colosseum.league.lineups import check_lineup, enabled_layouts
 from colosseum.league.mixture import MixtureMatchmaker, validate_matchmaking
-from colosseum.league.pfsp import PfspStats
+from colosseum.league.pfsp import PfspStats, compact_ratings
 
 logger = logging.getLogger(__name__)
+
+# The league state of a run (SP4 spec block 7.4): ratings and PFSP statistics, restored by a run-dir resume.
+LEAGUE_STATE_FILE = "league_state.json"
+LEAGUE_STATE_VERSION = 1
 
 
 class Coordinator:
     """Central coordinator of a single-machine training run."""
 
     def __init__(self, config: ColosseumConfig, spec: GameSpec, player_roles: Mapping[str, Sequence[str]],
-                 checkpoint_dir: str | Path, env_steps: Callable[[], int] = lambda: 0) -> None:
+                 checkpoint_dir: str | Path, env_steps: Callable[[], int] = lambda: 0,
+                 run_id: str | None = None) -> None:
         """``player_roles``: roles of EVERY agent (``players.registry.resolve_player_roles``); ``env_steps``:
-        the run's global env-step counter (share schedules, SP3 block 5)."""
+        the run's global env-step counter (share schedules, SP3 block 5); ``run_id``: the current run (SP4: only
+        its final snapshot is protected; None keeps the SP3 rule)."""
         self._config = config
         self._spec = spec
         trainable = config.get_trainable_agent_ids()
@@ -56,13 +63,17 @@ class Coordinator:
         self._rng = random.Random(config.training.seed)
         ckpt = config.checkpoint
         self._evicted: dict[str, list[str]] = {}   # evicted since the last take_evictions(), per agent
+        self._evict_listeners: list[Callable[[str, str], None]] = []   # e.g. the journal writer (SP4)
+        self._evict_listener_failed = False   # the first failing listener call is logged with its traceback
         # Only the launcher's match refresh drains evictions (take_evictions); without it nothing is buffered.
         self._buffer_evictions = config.rollout.match_refresh_interval_sec > 0
         self._pfsp = PfspStats({aid: config.get_agent_config(aid).matchmaking.pfsp.halflife_games
                                 for aid in trainable})
+        self._ratings_source: Callable[[], object | None] | None = None   # top-k retention (SP4 T4.1)
         self._checkpoint_manager = CheckpointManager(
             base_dir=checkpoint_dir, keep_last=ckpt.keep_last, keep_every=ckpt.keep_every, interval=ckpt.interval,
-            on_evict=self._on_evict,
+            on_evict=self._on_evict, run_id=run_id, keep_top_k=ckpt.keep_top_k,
+            top_k_min_games=ckpt.top_k_min_games, max_snapshots=ckpt.max_snapshots, scores_fn=self.snapshot_scores,
         )
         self._ratings = RatingBook(spec, players)   # every player is a rating entity
         self._role_signatures = {a: role_signature(agent_role_spec(spec, roles))
@@ -125,13 +136,44 @@ class Coordinator:
     def role_signature(self, agent_id: str) -> str:
         return self._role_signatures[agent_id]
 
+    def add_evict_listener(self, listener: Callable[[str, str], None]) -> None:
+        """Also call ``listener(agent_id, checkpoint_id)`` for every evicted snapshot (main loop; SP4: the journal
+        writer folds the snapshot's matches). A raising listener is logged (ERROR) and never stops the eviction or
+        the run."""
+        self._evict_listeners.append(listener)
+
+    def set_ratings_source(self, fn: Callable[[], object | None]) -> None:
+        """Where top-k retention reads ratings from: a callable returning the latest immutable
+        ``RatingsSnapshot`` (``LiveRatings.latest``) or None. Main loop only."""
+        self._ratings_source = fn
+
+    def snapshot_scores(self, agent_id: str) -> dict[str, SnapshotScore] | None:
+        """Live-rating scores of ``agent_id``'s snapshots (``arena.retention.snapshot_scores``): layout weights from
+        the agent's ``matchmaking.layouts``, quantile ``checkpoint.top_k_quantile``. None while there are no
+        ratings yet (no source, as during the run-dir import, or no refit yet): retention then keeps every unrated
+        snapshot as new and reruns after the first refit (``Launcher._reapply_retention``)."""
+        snapshot = self._ratings_source() if self._ratings_source is not None else None
+        if snapshot is None:
+            return None
+        weights = enabled_layouts(self._spec, self._config.get_agent_config(agent_id).matchmaking)
+        return snapshot_scores(snapshot, agent_id, layout_weights=weights,
+                               quantile=self._config.checkpoint.top_k_quantile)
+
     def _on_evict(self, agent_id: str, checkpoint_id: str) -> None:
         """Storage evicted a snapshot (spec block 4): new lineups no longer draw it (the matchmaker's
-        candidates come from the store), its PFSP statistics are dropped, and workers are told to unload it
+        candidates come from the store), its PFSP statistics are dropped, the evict listeners are told, and
+        workers are told to unload it
         (``take_evictions``; only with ``rollout.match_refresh_interval_sec > 0``: without a match refresh the
         workers' lineups never change and nothing drains the buffer)."""
         logger.debug(f"Snapshot {checkpoint_id} of {agent_id} evicted")
         self._pfsp.forget((agent_id, checkpoint_id))
+        for listener in self._evict_listeners:
+            try:
+                listener(agent_id, checkpoint_id)
+            except Exception:  # noqa: BLE001 - a listener (the journal) must never stop training
+                logger.error(f"Evict listener {listener!r} failed for snapshot {checkpoint_id} of {agent_id}; "
+                             f"training goes on", exc_info=not self._evict_listener_failed)
+                self._evict_listener_failed = True
         if not self._buffer_evictions:
             return
         bucket = self._evicted.setdefault(agent_id, [])
@@ -189,13 +231,42 @@ class Coordinator:
     def match_results(self) -> list[MatchResult]:
         return list(self._match_results)
 
-    def ratings_snapshot(self) -> dict:
-        """``RatingBook.snapshot()`` with each layout's PFSP table under ``"pfsp"`` (JSON-serializable)."""
+    def ratings_snapshot(self, *, compact: bool = False) -> dict:
+        """``RatingBook.snapshot()`` with each layout's PFSP table under ``"pfsp"`` (JSON-serializable); with
+        ``compact`` the table is replaced by its ``pfsp_summary`` (the form of the metrics.jsonl records)."""
         snap = self._ratings.snapshot()
         pfsp = self._pfsp.snapshot()
         for layout, table in snap.items():
             table["pfsp"] = pfsp.get(layout, {})
-        return snap
+        return compact_ratings(snap) if compact else snap
+
+    def save_league_state(self, path: str | Path, *, env_steps: int) -> None:
+        """Write the ratings (``RatingBook``) and the PFSP statistics (with the forgotten snapshots) atomically to
+        ``path`` (spec block 7.4). A custom matchmaker's own state (``on_result``) is not saved."""
+        from colosseum.metrics.jsonl import write_json_atomic
+
+        write_json_atomic(path, {"version": LEAGUE_STATE_VERSION, "env_steps": int(env_steps),
+                                 "ratings": self._ratings.state_dict(), "pfsp": self._pfsp.state_dict()})
+
+    def load_league_state(self, path: str | Path) -> bool:
+        """Restore a saved league state; False when ``path`` does not exist (an SP3 run dir, or a run that never saved
+        it). Entries of agents that are not in this config are dropped (INFO). An unreadable file is a ConfigError."""
+        import json
+
+        path = Path(path)
+        if not path.is_file():
+            return False
+        try:
+            state = json.loads(path.read_text())
+            if state.get("version") != LEAGUE_STATE_VERSION:
+                raise ValueError(f"version {state.get('version')!r}, expected {LEAGUE_STATE_VERSION}")
+            players = list(self._player_roles)
+            self._ratings.load_state_dict(state["ratings"], agents=players)
+            self._pfsp.load_state_dict(state["pfsp"], agents=players)
+        except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as e:
+            raise ConfigError(f"Cannot read the league state {path} ({type(e).__name__}: {e}); move it away to "
+                              f"resume with empty ratings and PFSP statistics") from e
+        return True
 
     def save_checkpoint_payload(self, payload: dict, meta_extra: dict | None = None) -> str:
         """Persist a learner checkpoint payload (see ``learner.make_checkpoint_payload``).

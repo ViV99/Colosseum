@@ -6,7 +6,7 @@ import multiprocessing as mp
 import torch
 
 from colosseum.core.registry import build_model
-from colosseum.core.types import FIXED_NETWORK_ID, Lineup, SeatAssignment, TrajectoryChunk
+from colosseum.core.types import FIXED_NETWORK_ID, Lineup, SeatAssignment, TrajectoryChunk, WeightPayload
 from colosseum.launcher import _worker_target, setup_run
 from game_helpers import agent_role_of, frozen_agent, make_test_config, scripted_agent
 
@@ -26,6 +26,9 @@ def test_a_spawned_worker_seats_scripted_and_frozen_players_that_never_collect(t
     ctx = mp.get_context("spawn")
     trajectories, weights, results, stop = ctx.Queue(maxsize=64), ctx.Queue(maxsize=1), ctx.Queue(maxsize=100), \
         ctx.Event()
+    # the learner's initial weights: a worker plays no match before them (ruling A-M3)
+    weights.put(WeightPayload.from_model(
+        "agent_0", 0, build_model(setup.agent_configs["agent_0"], setup.role_specs["agent_0"])))
     proc = ctx.Process(target=_worker_target, daemon=True, kwargs=dict(
         worker_id=0, config=config, agent_ids=["agent_0"], agent_roles=setup.agent_roles,
         agent_configs=setup.agent_configs, role_specs=setup.role_specs,
@@ -34,7 +37,9 @@ def test_a_spawned_worker_seats_scripted_and_frozen_players_that_never_collect(t
     ))
     proc.start()
     try:
-        got = [results.get(timeout=60) for _ in range(4)]
+        got = []
+        while len(got) < 4:                       # the worker puts its results in batches (lists)
+            got.extend(results.get(timeout=60))
         chunks = [TrajectoryChunk.from_payload(trajectories.get(timeout=60)) for _ in range(2)]
     finally:
         stop.set()

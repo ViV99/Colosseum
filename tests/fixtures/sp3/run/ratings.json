@@ -1,0 +1,56 @@
+{
+  "env_steps": 6256,
+  "layouts": {
+    "2p": {
+      "cross_play": {},
+      "elo": {
+        "main": 1230.1748145920728,
+        "random": 1169.8251854079272
+      },
+      "games": {
+        "main": {
+          "random": 284
+        },
+        "random": {
+          "main": 284
+        }
+      },
+      "outcome_kind": "wdl",
+      "past_games": {
+        "main": 246,
+        "random": 0
+      },
+      "pfsp": {
+        "main": {
+          "random@fixed": {
+            "games": 284.0,
+            "score": 0.5515787629771339
+          }
+        }
+      },
+      "role_win_rates": {
+        "player": {
+          "main": {
+            "random": 0.5633802816901409
+          },
+          "random": {
+            "main": 0.43661971830985913
+          }
+        }
+      },
+      "scores": {},
+      "win_rates": {
+        "main": {
+          "random": 0.5633802816901409
+        },
+        "random": {
+          "main": 0.43661971830985913
+        }
+      },
+      "wr_vs_past": {
+        "main": 0.4796747967479675,
+        "random": null
+      }
+    }
+  }
+}

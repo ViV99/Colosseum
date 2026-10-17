@@ -7,6 +7,7 @@ can monkeypatch it there).
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Collection, Sequence
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -31,6 +32,8 @@ from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
 from colosseum.envs.game import GameSpec, RoleSpec, StepResult
 from colosseum.networks.dist import Distribution
 
+logger = logging.getLogger(__name__)
+
 VALIDATE_STEPS = 8  # random legal steps per enabled layout
 VALIDATE_LINEUPS = 16  # lineups drawn per trainable agent from a custom matchmaker
 VALIDATION_SCOPES = ("train", "play")
@@ -49,6 +52,7 @@ class ValidationReport:
     visible in the config (fixed players; later the opponent mix and init reports)."""
 
     lines: list[str] = field(default_factory=list)
+    fixed: Any = None  # the FixedPlayers validate loaded (reused by eval / record / tournament)
 
 
 def _seeded(space: Any, rng: np.random.Generator) -> Any:
@@ -225,7 +229,7 @@ def _repeat(tree: Any, n: int) -> Any:
     return None if tree is None else tree_to_torch(tree_stack([tree] * n))
 
 
-def _check_model(model: Any, role: RoleSpec, sample: tuple | None, where: str) -> None:
+def check_model(model: Any, role: RoleSpec, sample: tuple | None, where: str) -> None:
     """``step`` on observations of the role and ``unroll`` on a synthetic chunk with BOOT/PAD
     slots, resets and ``global_state`` (spec block 9), plus SP1's state checks."""
     obs_spec = ObsSpec.from_space(role.observation_space)
@@ -312,6 +316,9 @@ def _check_model(model: Any, role: RoleSpec, sample: tuple | None, where: str) -
         if policy_only.value is not None:
             raise ConfigError(f"{where}: unroll(with_value=False) must return value=None (BC and the kickstart "
                               f"teacher run the policy path only)")
+
+
+_check_model = check_model    # the SP2/SP3 name (validate_config, eval, tests that patch eval._check_model)
 
 
 def _check_kickstart_teachers(config: ColosseumConfig, spec: GameSpec, agent_configs: dict[str, ColosseumConfig],
@@ -544,6 +551,78 @@ def _check_warm_start(config: ColosseumConfig, spec: GameSpec, agent_configs: di
         report.lines.append("training.resume_from is set: agents restored from it ignore init")
 
 
+def _check_evaluation(config: ColosseumConfig, spec: GameSpec, player_roles: dict[str, list[str]],
+                      report: ValidationReport) -> None:
+    """Pulse (spec block 6): the field, the agents and the role coverage (``arena.pulse.pulse_plan``), and the
+    effective settings in one line."""
+    if not config.evaluation.enabled:
+        return
+    from colosseum.arena.pulse import describe_pulse, pulse_plan
+
+    plan = pulse_plan(config, spec, player_roles)
+    report.lines.append(describe_pulse(plan, config, spec, player_roles))
+
+
+def _describe_retention(config: ColosseumConfig, report: ValidationReport) -> None:
+    """The effective retention rule per trainable agent (spec block 4), and a WARNING when the pinned snapshots a
+    run-dir resume carries over plus ``keep_last`` exceed ``max_snapshots``."""
+    from pathlib import Path
+
+    from colosseum.arena.retention import describe_retention
+    from colosseum.coordinator.checkpoint_manager import RESUME_RUN_DIR, classify_resume_source, read_snapshots
+
+    rule = describe_retention(config.checkpoint)
+    source = config.training.resume_from
+    try:
+        run_dir = Path(source) if source and classify_resume_source(source) == RESUME_RUN_DIR else None
+    except ConfigError:
+        run_dir = None          # a bad resume source is reported by the launcher, as before (SP3)
+    cap = config.checkpoint.max_snapshots
+    for aid in config.get_trainable_agent_ids():
+        report.lines.append(f"agent '{aid}': {rule}")
+        if run_dir is None or cap is None:
+            continue
+        # Not len(newest keep_last | pinned) of the parent: once this run has saved keep_last snapshots of its own
+        # (new snapshots are not pinned), every carried pin lies outside the window, so keep_last + pinned is the
+        # number of protected snapshots for the rest of the run.
+        pinned = sum(1 for c in read_snapshots(run_dir / "checkpoints" / aid) if c.meta.get("pinned") is True)
+        if config.checkpoint.keep_last + pinned > cap:
+            message = (f"agent '{aid}': {pinned} pinned snapshots carried over from {run_dir} plus the newest "
+                       f"keep_last {config.checkpoint.keep_last} of this run exceed checkpoint.max_snapshots {cap}: "
+                       f"the protected snapshots are all kept and nothing else fits; unpin some (colosseum pin "
+                       f"--remove) or raise max_snapshots")
+            logger.warning(message)
+            report.lines.append(f"WARNING: {message}")
+
+
+def _check_ratings(config: ColosseumConfig, report: ValidationReport) -> None:
+    """``ratings.anchor`` names an agent of the config (SP4 spec block 2); report the journal and rating
+    settings."""
+    from colosseum.arena.live import random_bot_agent
+
+    anchor = config.ratings.anchor
+    if anchor is not None and anchor not in config.agent_ids():
+        raise ConfigError(f"ratings.anchor {anchor!r} is not an agent of the config (agents: {config.agent_ids()}); "
+                          f"name one of them or remove ratings.anchor")
+    log = config.match_log
+    if not log.enabled:
+        report.lines.append("match log: off (no snapshot ratings)")
+        return
+    report.lines.append(f"match log: on (detail window {log.detail_window_mb:g} MB, min free disk "
+                        f"{log.min_free_disk_mb:g} MB, compaction every {log.compact_interval_sec:g} s)")
+    if anchor is not None:
+        rule = f"anchor {anchor!r}"
+    elif (random_bot := random_bot_agent(config)) is not None:
+        rule = f"anchor {random_bot!r} (the first RandomBot agent)"
+    elif config.fixed_agent_ids():
+        rule = f"anchor: the mean of the fixed agents that played ({', '.join(config.fixed_agent_ids())})"
+    else:
+        rule = "anchor: v0 of the first trainable agent"
+    ratings = config.ratings
+    report.lines.append(f"ratings: Bradley-Terry over train and pulse matches, refit every "
+                        f"{ratings.refit_interval_sec:g} s, {rule}; bootstrap {ratings.bootstrap_samples}")
+
+
 def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] = "train",
                     players: Collection[str] | None = None) -> ValidationReport:
     """Check a whole config before any process starts (spec block 9; SP3 spec block 1).
@@ -559,6 +638,8 @@ def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] 
       agents' roles (``resolve_agent_roles``), the matchmaking checks per agent
       (``colosseum.league.mixture.validate_matchmaking``), a custom matchmaker's lineups, and the
       effective opponent mix of every agent (``ValidationReport.lines``);
+    - with ``evaluation.enabled``, the pulse (SP4 spec block 6): its field, agents, layouts and role coverage,
+      and one ``pulse:`` line with the effective settings;
     - ``networks.critic_encoder_class`` only for agents whose roles declare a ``global_state_space``;
     - ``reset`` of every enabled layout and up to ``VALIDATE_STEPS`` random legal steps under the
       contract checks, with full ``space.contains`` checks of observations, global states and
@@ -599,7 +680,11 @@ def validate_config(config: ColosseumConfig, *, scope: Literal["train", "play"] 
             report.lines.append(f"matchmaker: {config.matchmaking.matchmaker_class} (custom; the mix below is the "
                                 f"configured matchmaking section, which it may ignore)")
         report.lines.extend(describe_mix(config, spec))
+        _check_ratings(config, report)
+        _describe_retention(config, report)
+        _check_evaluation(config, spec, player_roles, report)
     fixed = load_fixed_players(config, spec, selected)   # roles, classes, paths and role signatures of fixed agents
+    report.fixed = fixed
     agent_configs = {aid: config.get_agent_config(aid) for aid in agent_roles}
     role_specs = {aid: agent_role_spec(spec, roles) for aid, roles in agent_roles.items()}
     for aid, acfg in agent_configs.items():

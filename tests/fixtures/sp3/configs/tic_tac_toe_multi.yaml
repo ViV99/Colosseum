@@ -1,0 +1,61 @@
+# Two trainable agents in a league: every opposing team is the other agent's latest weights (opponents.rivals 1.0).
+run:
+  name: null
+  dir: "runs"
+
+env:
+  env_class: "examples.tic_tac_toe.game.TicTacToeGame"
+  kwargs: {}
+
+networks:
+  encoder_class: "examples.tic_tac_toe.models.TicTacToeEncoder"
+  core: null
+  policy_class: "examples.tic_tac_toe.models.TicTacToePolicy"
+  value_class: "examples.tic_tac_toe.models.TicTacToeValue"
+  kwargs: {}
+
+algorithm:
+  gamma: 0.99
+  vtrace_lambda: 1.0
+  entropy_coeff: 0.01
+  learning_rate: 3.0e-4
+  lr_schedule: "constant"
+
+rollout:
+  chunk_length: 32
+  num_workers: 2
+  envs_per_worker: 8
+  weight_sync_interval_sec: 2.0
+  torch_threads: 1
+  match_refresh_interval_sec: 10.0
+
+learner:
+  device: "auto"
+  queue_size: 32
+  batch_chunks: 8
+
+training:
+  total_timesteps: 300000
+
+matchmaking:
+  # SP2 form: mode league, self_play_ratio 0.0, latest_prob 0.8, pfsp_exponent 1.0 (translated exactly; see docs/LEAGUE_GUIDE.md)
+  opponents: {latest: 0.0, snapshots: 0.0, rivals: 1.0, anchors: 0.0}
+  pfsp: {weighting: hard, exponent: 1.0}
+  shuffle_seats: true
+
+checkpoint:
+  interval: 100
+  keep_last: 5
+  save_optimizer: false
+
+metrics:
+  use_wandb: false
+  log_interval: 10
+  console_interval_sec: 10.0
+
+# Agent overrides are partial and deep-merged onto the sections above.
+agents:
+  agent_alpha: {}
+  agent_beta:
+    algorithm:
+      learning_rate: 1.0e-4

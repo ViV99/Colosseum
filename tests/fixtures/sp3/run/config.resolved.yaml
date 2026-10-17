@@ -1,0 +1,117 @@
+algorithm:
+  name: appo
+  algorithm_class: colosseum.algorithms.appo.APPO
+  gamma: 0.99
+  vtrace_lambda: 1.0
+  eps_clip: 0.2
+  value_loss_coeff: 0.5
+  entropy_coeff: 0.01
+  max_grad_norm: 0.5
+  num_epochs: 1
+  minibatch_chunks: 0
+  vtrace_rho_bar: 1.0
+  vtrace_c_bar: 1.0
+  learning_rate: 0.001
+  lr_schedule: constant
+  use_torch_compile: false
+  normalize_advantages: true
+  use_amp: false
+  amp_dtype: float16
+  ratio_mode: auto
+  unit_trace: auto
+  entropy_reduction: auto
+env:
+  env_class: examples.tic_tac_toe.game.TicTacToeGame
+  kwargs: {}
+  max_idle_steps: 1000
+networks:
+  model_class: null
+  encoder_class: examples.tic_tac_toe.models.TicTacToeEncoder
+  core: null
+  policy_class: examples.tic_tac_toe.models.TicTacToePolicy
+  value_class: examples.tic_tac_toe.models.TicTacToeValue
+  critic_encoder_class: null
+  kwargs:
+    hidden: 16
+    latent: 8
+rollout:
+  chunk_length: 16
+  num_workers: 1
+  envs_per_worker: 4
+  weight_sync_interval_sec: 0.5
+  vec_env: sync
+  subproc_workers: null
+  torch_threads: 1
+  match_refresh_interval_sec: 1.0
+learner:
+  device: cpu
+  queue_size: 16
+  batch_chunks: 2
+  weight_push_interval: 5
+  pin_memory: false
+  torch_threads: null
+training:
+  total_timesteps: 6000
+  seed: 0
+  resume_from: null
+matchmaking:
+  opponents:
+    latest: 0.5
+    snapshots: 0.3
+    rivals: 0.0
+    anchors: 0.2
+  anchors:
+  - random
+  pfsp:
+    weighting: hard
+    exponent: 2.0
+    halflife_games: 200.0
+  layouts: {}
+  teammates: self
+  teammate_self_prob: 0.5
+  shuffle_seats: true
+  matchmaker_class: null
+checkpoint:
+  interval: 20
+  keep_last: 3
+  keep_every: 2
+  save_optimizer: true
+init:
+  from: null
+  strict: true
+  critic_warmup_steps: 0
+kickstart:
+  teacher: null
+  lambda: 1.0
+  decay_steps: 50000
+  kl: forward
+metrics:
+  use_wandb: false
+  wandb_project: colosseum
+  wandb_entity: null
+  log_interval: 5
+  console_interval_sec: 1.0
+bc:
+  seq_len: 64
+transport:
+  mode: local
+  grpc_port: 50051
+  grpc_max_message_mb: 64
+run:
+  name: sp3_run
+  dir: runs
+agents:
+  main:
+    kind: trainable
+    roles: null
+    networks: null
+    algorithm: null
+    learner: null
+    matchmaking: null
+    init: null
+    kickstart: null
+  random:
+    kind: scripted
+    class: colosseum.players.RandomBot
+    kwargs: {}
+    roles: null

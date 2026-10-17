@@ -8,7 +8,10 @@ top-level classes, so ``functools.partial(Game, ...)`` or the class itself is a 
 from __future__ import annotations
 
 import functools
+import hashlib
+import json
 import math
+import os
 import queue
 import shutil
 from collections.abc import Callable, Collection, Mapping, Sequence
@@ -27,7 +30,7 @@ from colosseum.core.config import AlgorithmConfig
 from colosseum.core.ipc import assert_no_tensors
 from colosseum.core.specs import ActionSpec, ObsSpec
 from colosseum.core.tree import Tree, tree_get, tree_leaves, tree_map, tree_to_torch
-from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
+from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD, MatchResult, SeatResult, TeamResult
 from colosseum.core.validation import random_legal_action
 from colosseum.envs.contract import EpisodeTracker
 from colosseum.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
@@ -39,6 +42,7 @@ from colosseum.networks.dist import Distribution, make_distribution
 from colosseum.networks.heads import UnitsHead
 from colosseum.networks.model import PolicyModel, PolicyStep, UnrollOutput
 from colosseum.players import ScriptedBot
+from colosseum.utils.logging import ENV_PROCESS_NAME
 from colosseum.worker.buffers import BufferSpec, RolloutBuffer
 from colosseum.worker.match_runner import ScriptedPlayer
 
@@ -1180,6 +1184,43 @@ def copy_sp2_run(tmp_path) -> Path:
 
 
 # ---------------------------------------------------------------------------
+# SP4 (T0.1): SP3 compatibility fixtures (read-only inputs; copy before writing)
+# ---------------------------------------------------------------------------
+
+
+SP3_FIXTURES = Path(__file__).resolve().parent / "fixtures" / "sp3"
+SP3_CONFIGS = SP3_FIXTURES / "configs"
+SP3_CONFIG_NAMES = ("chase", "coin_grid", "coop_buttons", "predator_prey", "space_miners", "team_tag",
+                    "tic_tac_toe", "tic_tac_toe_attention", "tic_tac_toe_multi", "tron", "unit_harvest",
+                    "unit_harvest_league")
+SP3_TTT_TINY = SP3_FIXTURES / "sp3_ttt_tiny.yaml"
+SP3_RUN = SP3_FIXTURES / "run"
+
+
+def sp3_manifest() -> dict:
+    """What the SP3 run fixture holds (``tests/fixtures/sp3/manifest.json``, written by its generator):
+    ``agent``, ``anchor``, ``layout``, ``versions``, ``final_version``, ``with_trainer_state``, ``env_steps``."""
+    return json.loads((SP3_FIXTURES / "manifest.json").read_text())
+
+
+def copy_sp3_run(tmp_path) -> Path:
+    """A writable copy of the SP3 run fixture under ``tmp_path`` (tests never write into tests/fixtures)."""
+    dst = Path(tmp_path) / "sp3_run"
+    shutil.copytree(SP3_RUN, dst)
+    return dst
+
+
+def tree_digest(root) -> dict[str, str]:
+    """``{relative path: sha256 hex}`` of every file under ``root`` (directories map to ``"<dir>"``).
+
+    Compares contents, not only names: a file rewritten in place (e.g. through a hard link of a run-dir
+    resume's snapshot import) changes its digest."""
+    root = Path(root)
+    return {str(p.relative_to(root)): hashlib.sha256(p.read_bytes()).hexdigest() if p.is_file() else "<dir>"
+            for p in sorted(root.rglob("*"))}
+
+
+# ---------------------------------------------------------------------------
 # SP3 (T1.2): scripted bots and config entries for fixed players
 # ---------------------------------------------------------------------------
 
@@ -1352,3 +1393,290 @@ class LabelBot(ScriptedBot):
         if self.fail == "raise":
             raise RuntimeError("teacher bot failure")
         return np.int64(self.action)
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T1.2): match records for journal and rating tests
+# ---------------------------------------------------------------------------
+
+
+def make_match_result(seats: Sequence[tuple], ranks: Sequence[float] | None = None, *, layout: str = "2p",
+                      uid: str = "u0", source: str = "train", scores: Sequence[float] | None = None,
+                      match_id: str | None = None, env_steps: int | None = None, seed: int | None = None,
+                      block: str | None = None, length: int = 5, outcome_kind: str | None = None):
+    """A ``MatchResult`` from compact seat tuples ``(team, agent_id, network_id[, role[, version_start[,
+    version_end]]])`` in seat order. ``ranks`` / ``scores``: one per team (default: team 0 best, then 1, ...; scores
+    0); the outcome kind follows the number of teams unless given."""
+    from colosseum.core.types import MatchResult, SeatResult, TeamResult
+
+    seat_results = []
+    for i, spec in enumerate(seats):
+        team, agent, network, *rest = spec
+        role = rest[0] if len(rest) > 0 else "player"
+        start = rest[1] if len(rest) > 1 else None
+        end = rest[2] if len(rest) > 2 else start
+        seat_results.append(SeatResult(seat=i, role=role, team=int(team), agent_id=agent, network_id=network,
+                                       reward=0.0, version_start=start, version_end=end))
+    num_teams = 1 + max(s.team for s in seat_results)
+    ranks = list(ranks) if ranks is not None else [float(t + 1) for t in range(num_teams)]
+    scores = list(scores) if scores is not None else [0.0] * num_teams
+    kind = outcome_kind or ("score" if num_teams == 1 else "wdl" if num_teams == 2 else "rank")
+    return MatchResult(match_id=match_id or uid, layout=layout, outcome_kind=kind, seats=seat_results,
+                       teams=[TeamResult(t, float(ranks[t]), float(scores[t])) for t in range(num_teams)],
+                       episode_length=length, uid=uid, source=source, seed=seed, env_steps=env_steps, block=block)
+
+
+def synthetic_journal_results(n: int, *, seed: int = 0, prefix: str = "R/train/", source: str = "train",
+                              layout: str = "2p", interval: int = 10, first: int = 0) -> list:
+    """``n`` tic-tac-toe-like 1v1 results for journal tests: agent ``main``'s latest weights (``version_start`` in
+    ``[0, 3 * interval)``, i.e. buckets v0 / v10 / v20 at the default interval) against ``main@ckpt_v10``,
+    ``main@ckpt_v20``, the fixed agents ``random`` / ``greedy`` or latest itself, on random sides, with draws.
+    uids ``<prefix>w0_e<k % 4>_ep<k>`` for ``k = first .. first + n - 1``; ``env_steps = 10 * k``."""
+    rng = np.random.default_rng(seed)
+    opponents = [("main", "ckpt_v10"), ("main", "ckpt_v20"), ("random", "fixed"), ("greedy", "fixed"),
+                 ("main", "latest")]
+    out = []
+    for k in range(first, first + n):
+        version = int(rng.integers(0, 3 * interval))
+        agent, network = opponents[int(rng.integers(len(opponents)))]
+        own = (0, "main", "latest", "player", version, version + int(rng.integers(0, 2)))
+        other = (1, agent, network, "player", version if network == "latest" else None,
+                 version if network == "latest" else None)
+        seats = [own, other] if rng.random() < 0.5 else [(0, *other[1:]), (1, *own[1:])]
+        u = rng.random()
+        ranks = [1.0, 1.0] if u < 0.1 else ([1.0, 2.0] if u < 0.55 else [2.0, 1.0])
+        out.append(make_match_result(seats, ranks, layout=layout, uid=f"{prefix}w0_e{k % 4}_ep{k}",
+                                     match_id=f"w0_e{k % 4}_ep{k}", source=source, env_steps=10 * k,
+                                     seed=int(rng.integers(2**31)), length=int(rng.integers(5, 10))))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T2.1): synthetic matches of known strengths for the Bradley-Terry tests
+# ---------------------------------------------------------------------------
+
+
+def _entity_seat(entity: str) -> tuple[str, str]:
+    """``"main@v40"`` -> ``("main", "ckpt_v40")`` (a snapshot seat); any other name -> a fixed seat."""
+    if "@v" in entity:
+        agent, version = entity.rsplit("@v", 1)
+        return agent, f"ckpt_v{version}"
+    return entity, "fixed"
+
+
+def synthetic_bt_matches(strengths: Mapping[str, float], *, n_matches: int, rng: np.random.Generator,
+                         team_size: int = 1, num_teams: int = 2, bias: Sequence[float] | None = None,
+                         draw: float = 0.0, roles: Sequence[str] | None = None, layout: str = "2p",
+                         choose: Callable[[np.random.Generator], list[list[str]]] | None = None,
+                         source: str = "train", uid_prefix: str = "u") -> list:
+    """Match results drawn from a known Bradley-Terry model (logits). Entities ``agent@v<N>`` sit on snapshot seats
+    (rating version N), other names on fixed seats. Teams: ``choose(rng)`` or ``num_teams * team_size`` distinct
+    entities drawn uniformly. Team strength = mean member strength + ``bias[team index]``. Two teams: team 0 wins with
+    ``sigmoid(S_0 - S_1)``, with draws of probability ``draw * 2 * min(p, 1 - p)`` arranged so the expected outcome
+    stays ``p``; more teams: ranks from ``S + Gumbel noise`` (every pairwise probability is the logistic one).
+    ``roles[t]`` is the role of team t's seats (default ``"player"``)."""
+    from colosseum.core.types import MatchResult, SeatResult, TeamResult
+
+    names = sorted(strengths)
+    bias = list(bias) if bias is not None else [0.0] * num_teams
+    roles = list(roles) if roles is not None else ["player"] * num_teams
+    out = []
+    for m in range(n_matches):
+        if choose is not None:
+            teams = choose(rng)
+        else:
+            picked = rng.choice(len(names), size=team_size * num_teams, replace=False)
+            teams = [[names[i] for i in picked[t * team_size:(t + 1) * team_size]] for t in range(num_teams)]
+        strength = [float(np.mean([strengths[e] for e in team])) + bias[t] for t, team in enumerate(teams)]
+        if len(teams) == 2:
+            p = 1.0 / (1.0 + math.exp(-(strength[0] - strength[1])))
+            d = draw * 2.0 * min(p, 1.0 - p)
+            if rng.random() < d:
+                ranks = [1.0, 1.0]
+            else:
+                ranks = [1.0, 2.0] if rng.random() < (p - d / 2.0) / (1.0 - d) else [2.0, 1.0]
+        else:
+            order = np.argsort(-(np.asarray(strength) + rng.gumbel(size=len(teams))))
+            ranks = [0.0] * len(teams)
+            for place, team in enumerate(order):
+                ranks[int(team)] = float(place + 1)
+        seats = []
+        for t, team in enumerate(teams):
+            for entity in team:
+                agent, network = _entity_seat(entity)
+                seats.append(SeatResult(seat=len(seats), role=roles[t], team=t, agent_id=agent, network_id=network,
+                                        reward=0.0))
+        out.append(MatchResult(match_id=f"m{m}", layout=layout, outcome_kind="wdl" if len(teams) == 2 else "rank",
+                               seats=seats, teams=[TeamResult(t, ranks[t], 0.0) for t in range(len(teams))],
+                               episode_length=1, uid=f"{uid_prefix}{m}", source=source))
+    return out
+
+
+def bt_table(results: Sequence, interval: int = 1):
+    """A ``ComparisonTable`` of ``results`` (rating versions with checkpoint interval ``interval``)."""
+    from colosseum.arena.comparisons import ComparisonTable
+    from colosseum.arena.entities import rating_version
+
+    table = ComparisonTable()
+    for result in results:
+        table.add_result(result, [rating_version(s.network_id, s.version_start, interval) for s in result.seats])
+    return table
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T5.1): tournament support
+# ---------------------------------------------------------------------------
+
+
+class CrashBot(ScriptedBot):
+    """Kills its own process (``os._exit(3)``) at the first ``act``: a tournament worker dying mid-task."""
+
+    def act(self, obs, mask, info):
+        os._exit(3)
+
+
+class PlayerErrorBot(ScriptedBot):
+    """Raises at the first ``act``: the match core turns that into a PlayerError with its context."""
+
+    def act(self, obs, mask, info):
+        raise RuntimeError("bot failure on purpose")
+
+
+def biased_model(config, agent_id: str, logits, seed: int = 0):
+    """A ``GameTestModel`` of trainable ``agent_id`` whose policy head has zero weights and bias ``logits``: it
+    plays one fixed distribution whatever it sees (``[20, 0, 0]``: always action 0)."""
+    from colosseum.core.registry import build_model
+
+    _roles, role = agent_role_of(config, agent_id)
+    torch.manual_seed(seed)
+    model = build_model(config.get_agent_config(agent_id), role)
+    head = model.inner.policy.heads["0"]
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.copy_(torch.as_tensor(list(logits), dtype=head.bias.dtype))
+    return model
+
+
+def write_fake_run(root, game: str = "turns", *, agent: str = "main", versions=(10, 20, 30),
+                   agents: dict | None = None, biases: Mapping[int, Sequence[float]] | None = None, **sections):
+    """A run dir as ``colosseum train`` leaves it, without training: ``config.resolved.yaml`` of
+    ``make_test_config(game, agents=agents or {agent: {}}, **sections)`` and ``checkpoints/<agent>/ckpt_v<N>`` for
+    every version (``write_ckpt_dir``; seed = position, so the weights differ). A version in ``biases`` gets a
+    ``biased_model`` with those logits (a policy that ignores the observation). Returns ``(root, config)``."""
+    import yaml
+
+    root = Path(root)
+    config = make_test_config(game, agents=agents if agents is not None else {agent: {}}, **sections)
+    (root / "checkpoints" / agent).mkdir(parents=True)
+    (root / "config.resolved.yaml").write_text(
+        yaml.safe_dump(config.model_dump(mode="json", by_alias=True), sort_keys=False))
+    for i, version in enumerate(versions):
+        model = biased_model(config, agent, biases[version], seed=i) if biases and version in biases else None
+        write_ckpt_dir(root / "checkpoints" / agent, config, agent, model=model, policy_version=version, seed=i)
+    return root, config
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T6.1): pulse
+# ---------------------------------------------------------------------------
+
+
+class PulseFailBot(ScriptedBot):
+    """Random legal play, except in the process named ``pulse`` (``COLOSSEUM_PROCESS_NAME``), where ``act`` raises:
+    ``validate`` and the rollout workers play it normally, the pulse process crashes on it."""
+
+    def reset(self, *, role, seat, layout, rng) -> None:
+        self._role, self._rng = self.game_spec.roles[role], rng
+
+    def act(self, obs, mask, info):
+        if os.environ.get(ENV_PROCESS_NAME) == "pulse":
+            raise RuntimeError("pulse failure on purpose")
+        return random_legal_action(self._role, mask, self._rng)
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T5.2): tournament stand-ins
+# ---------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class SyntheticSource:
+    origin: str = "synthetic"
+
+
+@dataclass(frozen=True)
+class SyntheticPlayer:
+    """A tournament player stand-in with the fields ``schedule``, ``stats`` and ``modes`` read."""
+
+    agent_id: str
+    network_id: str = "fixed"
+    roles: tuple[str, ...] = ("player",)
+    display: str = ""
+    kind: str = "scripted"
+    lineage: str = ""
+    source: SyntheticSource = field(default_factory=SyntheticSource)
+
+
+def synthetic_players(names, roles=None) -> dict:
+    """``"main@v3"`` -> a snapshot of ``main`` (``ckpt_v3``, lineage ``main``); any other name -> a scripted player
+    (lineage = name). ``roles``: name -> roles (default ``("player",)``)."""
+    out = {}
+    for name in names:
+        agent, _, version = name.partition("@v")
+        out[name] = SyntheticPlayer(agent, f"ckpt_v{version}" if version else "fixed",
+                                    tuple((roles or {}).get(name, ("player",))), display=name,
+                                    kind="snapshot" if version else "scripted", lineage=agent)
+    return out
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T5.3): a results source for tournament modes
+# ---------------------------------------------------------------------------
+
+
+class FakeArena:
+    """A ``play`` function for the tournament modes and statistics without envs: every match is a Bradley-Terry
+    draw on ``strengths`` (a team's strength is its player's; ranks by ``strength + Gumbel``, so
+    ``P(a beats b) = sigmoid(s_a - s_b)``); a one-team layout scores ``mean strength + N(0, noise)``. Results are
+    real ``MatchResult``s (uid, block, seed, source "tournament"); ``length`` is the episode length (int or
+    callable of the rng). ``calls`` lists the block ids of every call. ``crn=True``: common random numbers, every
+    team's draw is seeded by ``(lineup seed, rotation, team)``, so equally strong players get identical outcomes on
+    the same seeds and rotations (and every call repeats them)."""
+
+    def __init__(self, spec, players, strengths, *, seed=0, noise=0.1, length=6, crn=False):
+        self.spec, self.strengths, self.noise, self.length, self.crn = spec, strengths, noise, length, crn
+        self.rng = np.random.default_rng(seed)
+        self.names = {(p.agent_id, p.network_id): n for n, p in players.items()}
+        self.calls: list[list[str]] = []
+
+    def _length(self) -> int:
+        return int(self.length(self.rng)) if callable(self.length) else int(self.length)
+
+    def __call__(self, blocks):
+        self.calls.append([b.id for b in blocks])
+        out = {}
+        for b in blocks:
+            seat_specs = self.spec.layouts[b.layout]
+            rows = []
+            for lu in b.lineups:
+                names = {seat_specs[s].team: self.names[(x.agent_id, x.network_id)] for s, x in enumerate(lu.seats)}
+                rotation = int(lu.uid.rsplit("/r", 1)[1])
+
+                def rng(team, lu=lu, rotation=rotation):
+                    return np.random.default_rng([lu.seed, rotation, team]) if self.crn else self.rng
+
+                if len(names) == 1:
+                    value = float(np.mean([self.strengths[self.names[(x.agent_id, x.network_id)]]
+                                           for x in lu.seats])) + float(rng(0).normal(0.0, self.noise))
+                    teams = [TeamResult(0, 1.0, value)]
+                else:
+                    perf = {t: self.strengths[n] + float(rng(t).gumbel()) for t, n in names.items()}
+                    order = sorted(perf, key=lambda t: -perf[t])
+                    teams = [TeamResult(t, float(order.index(t) + 1), 0.0) for t in sorted(names)]
+                seats = [SeatResult(s, seat_specs[s].role, seat_specs[s].team, x.agent_id, x.network_id, 0.0)
+                         for s, x in enumerate(lu.seats)]
+                rows.append(MatchResult(match_id=lu.uid, layout=b.layout, outcome_kind=self.spec.outcome_kind(b.layout),
+                                        seats=seats, teams=teams, episode_length=self._length(), uid=lu.uid,
+                                        source="tournament", seed=lu.seed, block=b.id))
+            out[b.id] = rows
+        return out

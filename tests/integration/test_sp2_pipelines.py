@@ -12,7 +12,8 @@ import pytest
 from cli_runner import REPO_ROOT
 from colosseum.coordinator.checkpoint_manager import CheckpointManager
 from colosseum.core.config import ColosseumConfig, load_config
-from colosseum.core.types import Lineup, SeatAssignment, TrajectoryChunk
+from colosseum.core.registry import build_model
+from colosseum.core.types import Lineup, SeatAssignment, TrajectoryChunk, WeightPayload
 from colosseum.launcher import setup_run
 from game_helpers import make_test_run_dir
 
@@ -28,6 +29,13 @@ def _config(name: str, tmp_path, **sections: dict) -> ColosseumConfig:
     for section, values in sections.items():
         data[section].update(values)
     return ColosseumConfig(**data)
+
+
+def _push_initial_weights(weight_queues, setup) -> None:
+    """What each learner does first: its initial weights (a worker plays no match before them, ruling A-M3)."""
+    for aid, wq in weight_queues.items():
+        model = build_model(setup.agent_configs[aid], setup.role_specs[aid])
+        wq.put(WeightPayload.from_model(aid, 0, model))
 
 
 def _stop(proc: mp.Process, stop_event) -> None:
@@ -52,6 +60,7 @@ def test_worker_produces_chunks(tmp_path):
     stop_event = mp.Event()
     setup = setup_run(config, validate=False)
     lineups = [Lineup("2p", [SeatAssignment(agent_id), SeatAssignment(agent_id)]) for _ in range(2)]
+    _push_initial_weights(weight_queues, setup)
     proc = mp.Process(
         target=_worker_target,
         kwargs=dict(
@@ -86,6 +95,7 @@ def test_worker_multi_agent_routing(tmp_path):
     weight_queues = {aid: mp.Queue(maxsize=2) for aid in agent_ids}
     stop_event = mp.Event()
     lineups = [Lineup("2p", [SeatAssignment(agent_ids[0]), SeatAssignment(agent_ids[1])]) for _ in range(2)]
+    _push_initial_weights(weight_queues, setup)
     proc = mp.Process(
         target=_worker_target,
         kwargs=dict(

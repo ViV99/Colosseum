@@ -48,7 +48,9 @@ def test_worker_runs_to_its_step_limit_and_sends_numpy_payloads(restore_torch_th
     assert payloads and all(isinstance(p, dict) for p in payloads)
     chunk = TrajectoryChunk.from_payload(payloads[0])
     assert chunk.agent_id == "a" and chunk.num_slots == 3
-    match_ids = [results.get_nowait().match_id for _ in range(results.qsize())]
+    batches = [results.get_nowait() for _ in range(results.qsize())]
+    assert batches and all(isinstance(batch, list) for batch in batches)    # results travel in batches
+    match_ids = [r.match_id for batch in batches for r in batch]
     assert match_ids[:2] == ["w3_e0_ep0", "w3_e1_ep0"]
     worker_stats = stats.get_nowait()
     assert worker_stats["kind"] == "worker_stats" and worker_stats["worker_id"] == 3

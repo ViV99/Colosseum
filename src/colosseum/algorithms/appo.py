@@ -458,7 +458,7 @@ class APPO(BaseAlgorithm):
             "value_loss": value_loss,
             "entropy": entropy,
             **self._diagnostics(batch, ev, is_act, n_act, valid, n_valid, unit_log_ratio, joint_log_ratio,
-                                trace_log_rho, vt.vs),
+                                trace_log_rho, vt.vs, rho_bar, c_bar),
         }
         if kick is not None:
             result["kickstart_loss"] = kickstart_loss.detach()
@@ -469,7 +469,12 @@ class APPO(BaseAlgorithm):
 
     @torch.no_grad()
     def _diagnostics(self, batch, ev, is_act, n_act, valid, n_valid, unit_log_ratio, joint_log_ratio,
-                     trace_log_rho, vs) -> dict[str, Tensor]:
+                     trace_log_rho, vs, rho_bar: float, c_bar: float) -> dict[str, Tensor]:
+        """Training diagnostics over ACT slots. ``rho_bar`` / ``c_bar`` are the bars V-trace applied (1 and 1 with
+        ``unit_trace: none``, where every rho is 1): ``rho_trunc_mass = sum(max(rho - rho_bar, 0)) / sum(rho)`` and
+        ``c_trunc_mass`` (with ``c_bar``) are the share of the importance-weight mass V-trace cut off, 0 on-policy up
+        to float rounding (SP4 spec block 7.1; they replace the fractions ``rho_clip_frac`` / ``c_clip_frac``,
+        which counted float noise above a bar of 1)."""
         cfg = self._config
         eps = cfg.eps_clip
         n_dec = valid.sum().clamp(min=1).float()
@@ -481,6 +486,8 @@ class APPO(BaseAlgorithm):
         nan = torch.full_like(abs_unit, float("nan"))
         sum_rho = rho.sum()
         sum_rho2 = (rho * rho).sum()
+        zeros_rho = torch.zeros_like(rho)
+        mass = sum_rho.clamp(min=1e-12)
 
         def frac_dec(x: Tensor) -> Tensor:
             return torch.where(valid, x.float(), torch.zeros_like(abs_unit)).sum() / n_dec
@@ -490,8 +497,8 @@ class APPO(BaseAlgorithm):
             "clip_fraction": frac_dec((unit_ratio - 1.0).abs() > eps),
             "clip_fraction_joint": _act_mean(((joint_ratio - 1.0).abs() > eps).float(), is_act, n_act),
             "rho_mean": _act_mean(rho, is_act, n_act),
-            "rho_clip_frac": _act_mean((rho > cfg.vtrace_rho_bar).float(), is_act, n_act),
-            "c_clip_frac": _act_mean((rho > cfg.vtrace_c_bar).float(), is_act, n_act),
+            "rho_trunc_mass": torch.where(is_act, (rho - rho_bar).clamp(min=0.0), zeros_rho).sum() / mass,
+            "c_trunc_mass": torch.where(is_act, (rho - c_bar).clamp(min=0.0), zeros_rho).sum() / mass,
             "log_rho_abs_mean": frac_dec(abs_unit),
             "log_rho_abs_p95": torch.nanquantile(torch.where(valid, abs_unit, nan).flatten(), 0.95),
             "log_rho_joint_abs_mean": _act_mean(joint_log_ratio.abs(), is_act, n_act),

@@ -113,8 +113,14 @@ def test_resume_continues_versions_env_steps_and_lr(tmp_path):
     ``env_steps / total_timesteps``: only then is "the LR at the end of the first run" a
     point on the schedule the resumed run continues.
     """
-    budget = 10000
-    interrupt_at = 4000  # leaves room for the steps made while the interrupt lands
+    # The interrupt must land well before the budget. Between crossing interrupt_at and the stop, the first run
+    # keeps stepping: the system record that the poll reads is written once per console_interval_sec (1 s), the
+    # poll waits 0.2 s, then SIGINT reaches the children; at ~4900 env steps/s (1 worker) that is up to ~6000 steps,
+    # and a busy machine adds more. 10000 vs 4000 failed about 1 run in 5 under load (the run hit the budget first);
+    # 30000 vs 6000 leaves 24000 steps (~4.9 s at full speed, 4x the worst lag seen), and the resumed run still
+    # starts at a linear-LR progress >= 0.2 (the LR checks below).
+    budget = 30000
+    interrupt_at = 6000
     common = {"algorithm.lr_schedule": "linear", "checkpoint.interval": "10",
               "training.total_timesteps": str(budget)}
 
@@ -147,7 +153,12 @@ def test_resume_continues_versions_env_steps_and_lr(tmp_path):
     assert [v for v in versions if v > first_final], (first_final, versions)
     # SP3 T2.1: a run-dir resume carries the first run's stored snapshots (model.pt + meta.json) into the pool
     carried = [v for v in versions if v <= first_final]
-    assert first_final in carried and set(carried) <= set(checkpoint_versions(first, "agent_0")), (carried, versions)
+    assert set(carried) <= set(checkpoint_versions(first, "agent_0")), (carried, versions)
+    # SP4 T4.1: the first run's final is an ordinary snapshot here; only this run's final is protected
+    second_final = json.loads((second.root / "checkpoints" / "agent_0" / f"ckpt_v{versions[-1]}" / "meta.json")
+                              .read_text())
+    assert second_final["final"] is True and second_final["run_id"] != json.loads(
+        (first.root / "checkpoints" / "agent_0" / f"ckpt_v{first_final}" / "meta.json").read_text())["run_id"]
     assert not any((second.root / "checkpoints" / "agent_0" / f"ckpt_v{v}" / "trainer_state.pt").is_file()
                    for v in carried)
     assert versions[-1] == max(r["train_step"] for r in second_train), (versions, second_train[-1])
@@ -174,5 +185,7 @@ def test_resume_continues_versions_env_steps_and_lr(tmp_path):
     assert second_lr == pytest.approx(base_lr * (1.0 - second_train[0]["progress"]))
     assert second_lr <= base_lr * (1.0 - resumed_progress) + 1e-12, (base_lr, resumed_progress, second_lr)
     assert second_lr <= last_lr, (last_lr, second_lr)
-    # progress starts at resumed_env_steps / budget >= 0.4, so the linear LR has already decayed
-    assert second_lr < 0.75 * first_lr, (first_lr, second_lr)
+    # progress starts at resumed_env_steps / budget >= interrupt_at / budget = 0.2, so the linear LR has already
+    # decayed to <= 0.8 of the base LR, while the first run's first train record comes after a few hundred env
+    # steps (LR ~0.99 of the base; the check needs it above 0.89)
+    assert second_lr < 0.9 * first_lr, (first_lr, second_lr)

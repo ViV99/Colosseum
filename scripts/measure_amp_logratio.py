@@ -16,7 +16,7 @@ see below). The script measures what AMP does to the importance ratio at zero po
   (``_evaluate(_prepare_batch(chunks))`` under ``torch.no_grad()``). Printed: mean / p95 / max of the
   per-decider |log-ratio| over valid ``act`` deciders, of the joint |log-ratio| over ``act`` slots, the
   per-decider difference to the fp32 learner, and ``compute_loss``'s ``log_rho_abs_p95``,
-  ``clip_fraction``, ``rho_clip_frac``.
+  ``clip_fraction``, ``rho_trunc_mass`` (``rho_clip_frac`` before SP4).
 
 At zero lag every log-ratio would be 0 in exact arithmetic; the spread is pure numerics. The fp32 column
 of the LSTM core includes cuDNN TF32 (torch's default for cuDNN RNN on Ampere+, ruling G-R1); the fp32
@@ -63,7 +63,7 @@ CORES = (("none", 64), ("lstm", 256))
 LOG_STDS = (0.0, -2.0, -4.0)
 NUM_CHUNKS = 8
 PATTERN = "A" * 63 + "B"
-DIAGNOSTICS = ("log_rho_abs_p95", "clip_fraction", "rho_clip_frac")
+DIAGNOSTICS = ("log_rho_abs_p95", "clip_fraction", "rho_trunc_mass")
 
 
 def _roles() -> dict:

@@ -10,6 +10,7 @@
 #   colosseum train -c configs/examples/unit_harvest_league.yaml --set run.name=harvest-league \
 #     --set agents.main.init.from=bc.pt --set agents.main.init.critic_warmup_steps=30 \
 #     --set agents.main.kickstart.teacher=greedy
+#   colosseum report runs/harvest-league            # HTML report (docs/ARENA_GUIDE.md)
 run:
   name: null
   dir: "runs"
@@ -55,7 +56,15 @@ matchmaking:
 checkpoint:
   interval: 100           # train steps between snapshots
   keep_last: 10
+  keep_top_k: 0           # e.g. 5: also keep the 5 best snapshots by the rating's lower bound (needs match_log)
+  max_snapshots: 100      # cap per agent; null = no cap (SP3)
   save_optimizer: true
+
+evaluation:               # pulse (docs/ARENA_GUIDE.md): every k-th new snapshot against a fixed field on fixed seeds
+  enabled: false          # true: one more process (num_envs envs); unbiased "score vs field by version" in the report
+  field: null             # null: every scripted / frozen agent (here greedy and random)
+  every: 1
+  blocks: 25              # blocks per field member (1v1: 2 games per block)
 
 metrics:
   use_wandb: false
