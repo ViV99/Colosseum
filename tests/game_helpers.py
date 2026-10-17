@@ -30,7 +30,7 @@ from colosseum.core.config import AlgorithmConfig
 from colosseum.core.ipc import assert_no_tensors
 from colosseum.core.specs import ActionSpec, ObsSpec
 from colosseum.core.tree import Tree, tree_get, tree_leaves, tree_map, tree_to_torch
-from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD
+from colosseum.core.types import SLOT_ACT, SLOT_BOOT, SLOT_PAD, MatchResult, SeatResult, TeamResult
 from colosseum.core.validation import random_legal_action
 from colosseum.envs.contract import EpisodeTracker
 from colosseum.envs.game import GameSpec, MultiAgentEnv, Outcome, RoleSpec, SeatSpec, StepResult
@@ -1610,3 +1610,49 @@ def synthetic_players(names, roles=None) -> dict:
                                     tuple((roles or {}).get(name, ("player",))), display=name,
                                     kind="snapshot" if version else "scripted", lineage=agent)
     return out
+
+
+# ---------------------------------------------------------------------------
+# SP4 (T5.3): a results source for tournament modes
+# ---------------------------------------------------------------------------
+
+
+class FakeArena:
+    """A ``play`` function for the tournament modes and statistics without envs: every match is a Bradley-Terry
+    draw on ``strengths`` (a team's strength is its player's; ranks by ``strength + Gumbel``, so
+    ``P(a beats b) = sigmoid(s_a - s_b)``); a one-team layout scores ``mean strength + N(0, noise)``. Results are
+    real ``MatchResult``s (uid, block, seed, source "tournament"); ``length`` is the episode length (int or
+    callable of the rng). ``calls`` lists the block ids of every call."""
+
+    def __init__(self, spec, players, strengths, *, seed=0, noise=0.1, length=6):
+        self.spec, self.strengths, self.noise, self.length = spec, strengths, noise, length
+        self.rng = np.random.default_rng(seed)
+        self.names = {(p.agent_id, p.network_id): n for n, p in players.items()}
+        self.calls: list[list[str]] = []
+
+    def _length(self) -> int:
+        return int(self.length(self.rng)) if callable(self.length) else int(self.length)
+
+    def __call__(self, blocks):
+        self.calls.append([b.id for b in blocks])
+        out = {}
+        for b in blocks:
+            seat_specs = self.spec.layouts[b.layout]
+            rows = []
+            for lu in b.lineups:
+                names = {seat_specs[s].team: self.names[(x.agent_id, x.network_id)] for s, x in enumerate(lu.seats)}
+                if len(names) == 1:
+                    value = float(np.mean([self.strengths[self.names[(x.agent_id, x.network_id)]]
+                                           for x in lu.seats])) + float(self.rng.normal(0.0, self.noise))
+                    teams = [TeamResult(0, 1.0, value)]
+                else:
+                    perf = {t: self.strengths[n] + float(self.rng.gumbel()) for t, n in names.items()}
+                    order = sorted(perf, key=lambda t: -perf[t])
+                    teams = [TeamResult(t, float(order.index(t) + 1), 0.0) for t in sorted(names)]
+                seats = [SeatResult(s, seat_specs[s].role, seat_specs[s].team, x.agent_id, x.network_id, 0.0)
+                         for s, x in enumerate(lu.seats)]
+                rows.append(MatchResult(match_id=lu.uid, layout=b.layout, outcome_kind=self.spec.outcome_kind(b.layout),
+                                        seats=seats, teams=teams, episode_length=self._length(), uid=lu.uid,
+                                        source="tournament", seed=lu.seed, block=b.id))
+            out[b.id] = rows
+        return out
