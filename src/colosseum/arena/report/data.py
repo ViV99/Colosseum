@@ -5,7 +5,10 @@ tournaments. The same builders serve ``colosseum report`` (``build_report_data``
 (``ReportBuilder.section`` behind ``/api/<section>``).
 
 Rules:
-- read-only: the match log is opened with ``MatchLog.open_readonly``; nothing in the run dir is written;
+- read-only for the run's data: the match log is opened with ``MatchLog.open_readonly`` and no run file is
+  changed. SQLite itself creates the journal's ``matches.db-shm`` / ``matches.db-wal`` side files for a
+  ``mode=ro`` reader of a WAL database, and they stay in the run dir; for the same reason a run dir the reader
+  cannot write (a read-only mount, another user's dir) gives the note "the match log cannot be opened";
 - order by counters (``train_step``, ``env_steps``, versions, journal row order), never by ``ts``
   (WSL2 wall clocks jump; ``ts`` is informational);
 - bounded (``ReportLimits``): series thinned to 2 000 points (first and last kept), 2 000 entity rows
