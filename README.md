@@ -4,16 +4,16 @@ A reusable training framework for competitive bot-programming competitions (Lux 
 behavioural cloning → RL → self-play → league, built on an IMPALA-style asynchronous actor–learner (APPO with V-trace)
 in PyTorch, without Ray.
 
-> **Status (SP4 of 6, implemented on `sp4-selection`; acceptance pending).** Single-machine training is the supported
-> mode for every game structure: solo, 1v1 with turn-based or simultaneous moves, one bot controlling many units, team
-> vs team, free-for-all with elimination and 2–4 players in one run, asymmetric roles, and cooperative games. Each
-> structure has a demo game that is trained end-to-end in the test suite. SP3 added scripted and frozen players, a
-> configurable league (latest weights, PFSP over stored snapshots, other agents, scripted/frozen anchors; shares,
-> schedules, per-agent overrides, a custom matchmaker), snapshot retention, per-agent warm start (`init`, critic
-> warm-up, kickstart from a neural or scripted teacher) and `colosseum record`. SP4 adds a match log, Bradley–Terry
-> snapshot ratings with intervals, `colosseum tournament` with two-stage selection, top-k / pinned / capped snapshot
-> storage, evaluation of new snapshots during training (pulse), and `colosseum report` / `colosseum dashboard`. Read
-> [Status and limitations](#status-and-limitations) before relying on anything else.
+> **Status (SP4 of 6, implemented on `sp4-selection`; acceptance report written, awaiting the owner's acceptance).**
+> Single-machine training is the supported mode for every game structure: solo, 1v1 with turn-based or simultaneous
+> moves, one bot controlling many units, team vs team, free-for-all with elimination and 2–4 players in one run,
+> asymmetric roles, and cooperative games. Each structure has a demo game that is trained end-to-end in the test suite.
+> SP3 added scripted and frozen players, a configurable league (latest weights, PFSP over stored snapshots, other
+> agents, scripted/frozen anchors; shares, schedules, per-agent overrides, a custom matchmaker), snapshot retention,
+> per-agent warm start (`init`, critic warm-up, kickstart from a neural or scripted teacher) and `colosseum record`. SP4
+> adds a match log, Bradley–Terry snapshot ratings with intervals, `colosseum tournament` with two-stage selection,
+> top-k / pinned / capped snapshot storage, evaluation of new snapshots during training (pulse), and `colosseum report`
+> / `colosseum dashboard`. Read [Status and limitations](#status-and-limitations) before relying on anything else.
 
 ## Quick start
 
@@ -505,7 +505,7 @@ and `checkpoint.keep_top_k > 0` are refused (SP5), while `checkpoint.max_snapsho
 | ✔ | SP1 Foundation and stabilization | correct single-machine training, stateful model protocol, run dir, metrics, lifecycle |
 | ✔ | SP2 Game model | `GameSpec` / `MultiAgentEnv`, elimination, teams, roles, layouts, `Units`, Dict observations, bootstrap on the learner, centralized critic (accepted and merged 2026-10-09) |
 | ✔ | SP3 Players, league, warm start | scripted and frozen players, opponent mixes with PFSP over snapshots and anchors, snapshot retention, per-agent init / critic warm-up / kickstart (neural or DAgger), `colosseum record` (accepted and merged 2026-10-15; acceptance report `docs/superpowers/reports/2026-10-10-sp3-acceptance.md`) |
-| | SP4 Selection and observability | match log, Bradley–Terry snapshot ratings with intervals, `colosseum tournament` with two-stage selection, top-k / pinned / capped snapshot storage, pulse (evaluation during training), `colosseum report` / `colosseum dashboard` (implemented on `sp4-selection`; acceptance pending) |
+| | SP4 Selection and observability | match log, Bradley–Terry snapshot ratings with intervals, `colosseum tournament` with two-stage selection, top-k / pinned / capped snapshot storage, pulse (evaluation during training), `colosseum report` / `colosseum dashboard` (implemented on `sp4-selection`; acceptance report `docs/superpowers/reports/2026-10-17-sp4-acceptance.md`, awaiting the owner's acceptance) |
 | | SP5 Distributed | hub and nodes, adding / removing agents and machines during a run, shared-memory weight store and trajectory ring buffer, wire format, per-machine weight cache, fault tolerance, `max_policy_lag`, K8s images, distributed league, scripted/frozen players and SP3 warm start across machines |
 | | SP6 Speed and extensions | vectorized fast path for array envs and hundreds of seats (Neural MMO), cuDNN RNN path, fast transformer unroll, GPU inference on workers, inference server, new algorithms |
 
