@@ -236,7 +236,7 @@ checkpoint:
   keep_top_k: 0         # SP4: > 0 — ещё k лучших по нижней границе рейтинга (нужен match_log)
   top_k_quantile: 0.1
   top_k_min_games: 200
-  max_snapshots: 100    # SP4: потолок на агента; null — без потолка
+  max_snapshots: 100    # SP4: потолок на агента; null — без потолка; не задан и keep_last > 100 — keep_last
   save_optimizer: true
 ```
 

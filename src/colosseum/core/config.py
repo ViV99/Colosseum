@@ -599,7 +599,7 @@ class CheckpointConfig(StrictModel):
     max_snapshots: int | None = Field(
         default=100, ge=1,
         description="At most this many snapshots per agent (keep_last, this run's final and pinned ones are never "
-                    "evicted); null = no cap.",
+                    "evicted); null = no cap. Not set and keep_last > 100: keep_last (INFO).",
     )
     save_optimizer: bool = Field(
         default=True,
@@ -625,6 +625,14 @@ class CheckpointConfig(StrictModel):
 
     @model_validator(mode="after")
     def _check_cap(self) -> CheckpointConfig:
+        """An unset ``max_snapshots`` below ``keep_last`` (an SP3 ``keep_last`` or SP2 ``pool_size`` over the default
+        100) becomes ``keep_last``, with one INFO line (ruling A-M7: SP3 configs keep working); an explicit one is a
+        ConfigError. The raised value is then set, so a re-validated dump (``get_agent_config``) logs nothing."""
+        if ("max_snapshots" not in self.model_fields_set and self.max_snapshots is not None
+                and self.max_snapshots < self.keep_last):
+            logger.info(f"checkpoint.max_snapshots is not set and its default ({self.max_snapshots}) is below "
+                        f"checkpoint.keep_last ({self.keep_last}): the cap is keep_last ({self.keep_last}) per agent")
+            self.max_snapshots = self.keep_last
         if self.max_snapshots is not None and self.max_snapshots < self.keep_last:
             raise ValueError(f"checkpoint.max_snapshots ({self.max_snapshots}) is smaller than checkpoint.keep_last "
                              f"({self.keep_last}): the newest keep_last snapshots are never evicted; raise "

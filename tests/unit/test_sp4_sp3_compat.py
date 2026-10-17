@@ -119,3 +119,61 @@ def test_match_records_are_constructible_without_the_sp4_fields():
     assert [f.name for f in dataclasses.fields(SeatResult)][:8] == [
         "seat", "role", "team", "agent_id", "network_id", "reward", "eliminated_step", "source"]
     assert [f.name for f in dataclasses.fields(Lineup)][:2] == ["layout", "seats"]
+
+
+# ---------------------------------------------------------------------------
+# SP4 final fix wave, ruling A-M7: an SP3 config with keep_last > 100 (or SP2 pool_size > 100) still validates
+# ---------------------------------------------------------------------------
+
+
+def _sp3_ttt_with_checkpoint(tmp_path, **checkpoint) -> str:
+    raw = yaml.safe_load((SP3_CONFIGS / "tic_tac_toe.yaml").read_text())
+    raw["checkpoint"] = {"interval": raw["checkpoint"]["interval"], **checkpoint}
+    path = tmp_path / "sp3_ttt.yaml"
+    path.write_text(yaml.safe_dump(raw))
+    return str(path)
+
+
+def _cap_lines(caplog) -> list[str]:
+    return [r.getMessage() for r in caplog.records if r.name == "colosseum.core.config" and "max_snapshots" in
+            r.getMessage()]
+
+
+def test_an_sp3_config_with_keep_last_150_validates_and_caps_at_keep_last(tmp_path, monkeypatch, caplog):
+    path = _sp3_ttt_with_checkpoint(tmp_path, keep_last=150)
+    with caplog.at_level(logging.INFO, logger="colosseum.core.config"):
+        config = load_config(path)
+    assert config.checkpoint.keep_last == 150 and config.checkpoint.max_snapshots == 150
+    (line,) = _cap_lines(caplog)
+    assert "keep_last (150)" in line and "max_snapshots" in line
+    assert config.get_agent_config("agent_0").checkpoint.max_snapshots == 150      # re-validated: no second line
+    assert len(_cap_lines(caplog)) == 1
+    monkeypatch.chdir(REPO_ROOT)
+    result = CliRunner().invoke(main, ["validate", "-c", path])
+    assert result.exit_code == 0, result.output
+    assert "at most 150 per agent" in result.output and result.output.rstrip().endswith("Config is valid.")
+
+
+def test_an_sp2_pool_size_over_100_is_capped_at_keep_last_too(tmp_path, caplog):
+    with caplog.at_level(logging.INFO, logger="colosseum.core.config"):
+        config = load_config(_sp3_ttt_with_checkpoint(tmp_path, pool_size=150))
+    assert config.checkpoint.keep_last == 150 and config.checkpoint.max_snapshots == 150
+    assert len(_cap_lines(caplog)) == 1
+
+
+@pytest.mark.parametrize("checkpoint, cap", [
+    ({"keep_last": 50}, 100),                               # the default cap stays when it holds keep_last
+    ({"keep_last": 150, "max_snapshots": None}, None),      # an explicit "no cap"
+    ({"keep_last": 150, "max_snapshots": 200}, 200),
+])
+def test_the_cap_follows_keep_last_only_when_max_snapshots_is_not_set(tmp_path, caplog, checkpoint, cap):
+    with caplog.at_level(logging.INFO, logger="colosseum.core.config"):
+        config = load_config(_sp3_ttt_with_checkpoint(tmp_path, **checkpoint))
+    assert config.checkpoint.max_snapshots == cap and _cap_lines(caplog) == []
+
+
+def test_an_explicit_max_snapshots_below_keep_last_is_still_a_config_error(tmp_path):
+    from colosseum.core.errors import ConfigError
+
+    with pytest.raises(ConfigError, match=r"max_snapshots \(120\) is smaller than checkpoint.keep_last \(150\)"):
+        load_config(_sp3_ttt_with_checkpoint(tmp_path, keep_last=150, max_snapshots=120))
