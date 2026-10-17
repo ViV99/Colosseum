@@ -16,13 +16,22 @@ request whose build is not done in time is answered from the key's last successf
 ``X-Colosseum-Stale: 1``), or, if there is none yet, with HTTP 202 and a placeholder section
 ``{"building": true, "section", "notes"}`` that the page draws as a note until the next refresh; the page
 itself (``GET /``) is rendered after the same wait with placeholders for the sections still building. A
-failed build answers 500 with ``{"error"}``; no request error stops the server.
+failed build answers 500 with ``{"error"}``; no request error stops the server. If the builder thread itself
+dies (a ``BaseException`` outside a section build, logged once), every later request answers 500 "builder
+stopped" instead of waiting for builds that never come.
+
+Security. No authentication; listening on a non-loopback ``host`` logs a WARNING. Against DNS rebinding, a
+request whose ``Host`` header names neither a loopback address nor the bound host answers 403 (a wildcard
+bind, ``0.0.0.0``, accepts any ``Host``). The server is IPv4 only.
 """
 
 from __future__ import annotations
 
+import errno
+import ipaddress
 import json
 import logging
+import socket
 import threading
 import time
 from collections import OrderedDict
@@ -47,11 +56,34 @@ MAX_PENDING = 32
 # Last results kept (one per (section, filters) key, least recently built dropped first).
 MAX_RESULTS = 64
 # server_close waits this long for a build in progress; the builder thread closes the journal when it ends.
-CLOSE_WAIT_SEC = 2.0
+CLOSE_WAIT_SEC = 0.5
 BUILDING_NOTE = ("Building this section: the first build of a large match log (BT fit and bootstrap) can take "
                  "a while. It is drawn at the next refresh.")
 
+JSON = "application/json; charset=utf-8"
+_LOOPBACK_NAMES = ("localhost",)
+_WILDCARD = ("", "0.0.0.0")
+
 _Key = tuple[str, tuple[tuple[str, str], ...]]
+
+
+def is_loopback(host: str) -> bool:
+    """``localhost`` or a loopback IP literal (``127.0.0.0/8``, ``::1``)."""
+    host = host.strip().strip("[]").lower()
+    if host in _LOOPBACK_NAMES or host.endswith(".localhost"):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _host_of(header: str) -> str:
+    """The host part of a ``Host`` header (``name:port``, ``[v6]:port``)."""
+    header = header.strip().lower()
+    if header.startswith("["):
+        return header[1:header.find("]")] if "]" in header else header
+    return header.rsplit(":", 1)[0] if header.count(":") == 1 else header
 
 
 def _key(name: str, filters: dict[str, str] | None = None) -> _Key:
@@ -81,6 +113,7 @@ class _Builds:
         self._results: OrderedDict[_Key, _Result] = OrderedDict()
         self._seq = 0
         self._closed = False
+        self.failed: str | None = None          # why the builder thread stopped (None while it runs)
         self._thread = threading.Thread(target=self._loop, name="dashboard-builder", daemon=True)
         self._thread.start()
 
@@ -88,10 +121,12 @@ class _Builds:
         """``key -> (state, payload)`` for every key, waiting at most ``timeout`` seconds in all. States:
         ``fresh`` (JSON bytes of a build that ended after this call began), ``error`` (its message), ``stale``
         (JSON bytes of the last successful build), ``building`` (none yet), ``busy`` (queue full, none yet),
-        ``closed``."""
+        ``closed``, ``failed`` (the builder thread died; payload: why)."""
         deadline = time.monotonic() + timeout
         out: dict[_Key, tuple[str, bytes | str | None]] = {}
         with self._cond:
+            if self.failed is not None:
+                return {key: ("failed", self.failed) for key in keys}
             since = self._seq
             full: set[_Key] = set()
             for key in keys:
@@ -108,9 +143,11 @@ class _Builds:
                     if key not in out and r is not None and r.seq > since:
                         out[key] = ("error", r.error) if r.error is not None else ("fresh", r.body)
                 remaining = deadline - time.monotonic()
-                if len(out.keys() | full) == len(keys) or remaining <= 0 or self._closed:
+                if len(out.keys() | full) == len(keys) or remaining <= 0 or self._closed or self.failed:
                     break
                 self._cond.wait(remaining)
+            if self.failed is not None:
+                return {key: out.get(key) or ("failed", self.failed) for key in keys}
             for key in keys:
                 if key in out:
                     continue
@@ -160,6 +197,11 @@ class _Builds:
                         self._results.popitem(last=False)
                     self._running = None
                     self._cond.notify_all()
+        except BaseException as e:  # noqa: BLE001 - logged and answered as 500 instead of 202 forever
+            logger.exception("dashboard: the builder thread stopped; every request now answers 500")
+            with self._cond:
+                self.failed = f"builder stopped ({type(e).__name__}: {e})"
+                self._cond.notify_all()
         finally:
             with self._lock:
                 self._builder.close()
@@ -179,8 +221,10 @@ class DashboardServer(ThreadingHTTPServer):
             self.request_wait_sec = REQUEST_WAIT_SEC
             self.builder = ReportBuilder(self.run_dir, table_min_age_sec=TABLE_MIN_AGE_SEC)
             self.lock = threading.Lock()          # ReportBuilder is not thread-safe
-            cfg = self.builder.config()            # before the builder thread starts
-            self.title = str(cfg.run.name if cfg is not None and cfg.run.name else self.run_dir.name)
+            self.title = self.builder.title()       # read before the builder thread owns the builder
+            self.page_sections = tuple(n for n in SECTIONS if n != "tournaments" or self.builder.include_tournaments)
+            host = str(address[0])
+            self.allowed_hosts = None if host in _WILDCARD else {host.lower()}
             self._builds = _Builds(self.builder, self.lock)
         except BaseException:
             self.server_close()
@@ -205,10 +249,21 @@ class DashboardServer(ThreadingHTTPServer):
 class _Handler(BaseHTTPRequestHandler):
     server: DashboardServer
 
+    def _host_allowed(self) -> bool:
+        header = self.headers.get("Host")
+        allowed = self.server.allowed_hosts
+        if header is None or allowed is None:
+            return True
+        host = _host_of(header)
+        return is_loopback(host) or host in allowed
+
     def do_GET(self) -> None:  # noqa: N802 - http.server API
         url = urlsplit(self.path)
         try:
-            if url.path in ("/", "/index.html"):
+            if not self._host_allowed():
+                self._json(403, {"error": f"Host {self.headers.get('Host')!r} is not this dashboard's address "
+                                          f"(DNS rebinding guard); open it by its loopback or bound address"})
+            elif url.path in ("/", "/index.html"):
                 self._page()
             elif url.path.startswith("/api/") and url.path[5:] in SECTIONS:
                 name = url.path[5:]
@@ -227,14 +282,14 @@ class _Handler(BaseHTTPRequestHandler):
                 pass
 
     def _page(self) -> None:
-        names = [n for n in SECTIONS if n != "tournaments" or self.server.builder.include_tournaments]
+        names = self.server.page_sections
         answers = self.server.sections([_key(n) for n in names])
         sections = {}
         for name in names:
             state, payload = answers[_key(name)]
             if state in ("fresh", "stale"):
                 sections[name] = json.loads(payload)
-            elif state == "error":
+            elif state in ("error", "failed"):
                 sections[name] = {"notes": [f"This section failed: {payload}"]}
             else:
                 sections[name] = placeholder(name)
@@ -247,10 +302,10 @@ class _Handler(BaseHTTPRequestHandler):
         state, payload = self.server.sections([key])[key]
         retry = {"Retry-After": str(max(1, round(self.server.request_wait_sec)))}
         if state == "fresh":
-            self._send(200, "application/json", payload)
+            self._send(200, JSON, payload)
         elif state == "stale":
-            self._send(200, "application/json", payload, {"X-Colosseum-Stale": "1"})
-        elif state == "error":
+            self._send(200, JSON, payload, {"X-Colosseum-Stale": "1"})
+        elif state in ("error", "failed"):
             self._json(500, {"error": payload})
         elif state == "building":
             self._json(202, placeholder(name), retry)
@@ -261,7 +316,7 @@ class _Handler(BaseHTTPRequestHandler):
             self._json(503, {"error": "the dashboard is shutting down"})
 
     def _json(self, code: int, obj: dict, headers: dict[str, str] | None = None) -> None:
-        self._send(code, "application/json", embed_json(obj).encode("utf-8"), headers)
+        self._send(code, JSON, embed_json(obj).encode("utf-8"), headers)
 
     def _send(self, code: int, ctype: str, body: bytes, headers: dict[str, str] | None = None) -> None:
         self.send_response(code)
@@ -285,10 +340,27 @@ def make_server(run_dir: str | Path, *, host: str = "127.0.0.1", port: int = 876
     if not is_run_dir(run_dir):
         raise ConfigError(f"{run_dir} is not a run directory (no metrics.jsonl, config.resolved.yaml, matches.db "
                           f"or tournaments/)")
+    if not is_loopback(host):
+        logger.warning(f"dashboard: listening on {host} without authentication; prefer 127.0.0.1 and an SSH "
+                       f"tunnel (docs/ARENA_GUIDE.md)")
     try:
         return DashboardServer(run_dir, (host, int(port)), refresh_sec)
     except OSError as e:
-        raise ConfigError(f"cannot listen on {host}:{port}: {e}; choose another --port") from None
+        raise ConfigError(_bind_error(host, int(port), e)) from None
+
+
+def _bind_error(host: str, port: int, e: OSError) -> str:
+    if isinstance(e, socket.gaierror):
+        return (f"cannot listen on {host!r}: {e}; the dashboard listens on IPv4 only: give --host an IPv4 address "
+                f"(127.0.0.1 by default) or a name that resolves to one")
+    if e.errno == errno.EADDRINUSE:
+        return f"cannot listen on {host}:{port}: the port is in use; choose another --port (0: any free port)"
+    if e.errno == errno.EADDRNOTAVAIL:
+        return f"cannot listen on {host}:{port}: {host} is not an address of this machine; check --host"
+    if e.errno == errno.EACCES:
+        return (f"cannot listen on {host}:{port}: permission denied (ports below 1024 need privileges); choose "
+                f"another --port")
+    return f"cannot listen on {host}:{port}: {e}; check --host and --port"
 
 
 def serve(run_dir: str | Path, *, host: str = "127.0.0.1", port: int = 8765, refresh_sec: int = 10) -> None:

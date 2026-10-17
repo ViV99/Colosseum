@@ -352,9 +352,12 @@ class ReportBuilder:
     def build(self) -> dict:
         sections = {name: self.section(name) for name in SECTIONS
                     if name != "tournaments" or self.include_tournaments}
+        return {"format": REPORT_FORMAT, "title": self.title(), "sections": sections}
+
+    def title(self) -> str:
+        """The page title: the config's ``run.name``, else the run dir's name."""
         cfg = self.config()
-        title = cfg.run.name if cfg is not None and cfg.run.name else self.run_dir.name
-        return {"format": REPORT_FORMAT, "title": str(title), "sections": sections}
+        return str(cfg.run.name if cfg is not None and cfg.run.name else self.run_dir.name)
 
     def section(self, name: str, **filters: Any) -> dict:
         if name not in SECTIONS:

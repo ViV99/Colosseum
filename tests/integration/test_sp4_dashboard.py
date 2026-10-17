@@ -1,9 +1,11 @@
 """``colosseum dashboard`` (SP4 spec block 5, T7.3): the live page and ``/api/<section>`` JSON on an
 ephemeral port, filters, errors that do not stop the server, live BT while running, slow builds that never
-block other requests, the CLI's port handling and Ctrl+C (exit 130)."""
+block other requests, a dead builder thread, the Host guard, bind errors and the non-loopback warning, the
+CLI's port handling and Ctrl+C (exit 130)."""
 from __future__ import annotations
 
 import json
+import logging
 import os
 import re
 import select
@@ -39,9 +41,12 @@ def serving(root, **kwargs):
         thread.join(timeout=10)
 
 
-def _get_full(url: str) -> tuple[int, dict, str]:
+JSON = "application/json; charset=utf-8"
+
+
+def _get_full(url: str, headers: dict[str, str] | None = None) -> tuple[int, dict, str]:
     try:
-        with urllib.request.urlopen(url, timeout=30) as r:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers or {}), timeout=30) as r:
             return r.status, dict(r.headers), r.read().decode("utf-8")
     except urllib.error.HTTPError as e:
         return e.code, dict(e.headers), e.read().decode("utf-8")
@@ -64,7 +69,7 @@ def test_page_and_every_section_over_http(tmp_path):
         assert not any(s.get("building") for s in data["sections"].values())
         for name in SECTIONS:
             code, ctype, body = _get(f"{base}/api/{name}")
-            assert code == 200 and ctype == "application/json", name
+            assert code == 200 and ctype == JSON, name
             assert isinstance(json.loads(body), dict)
         code, _, body = _get(base + "/api/matches?source=pulse&agent=main&bogus=1")
         rows = json.loads(body)["rows"]
@@ -137,8 +142,47 @@ def test_make_server_refuses_a_non_run_dir_and_a_busy_port(tmp_path):
         make_server(tmp_path)
     run = write_run_dir(tmp_path, "wdl")
     with serving(run.root) as (_, server):
-        with pytest.raises(ConfigError, match="--port"):
+        with pytest.raises(ConfigError, match="in use; choose another --port"):
             make_server(run.root, port=server.port)
+    with pytest.raises(ConfigError, match="IPv4 only"):
+        make_server(run.root, host="::1", port=0)
+
+
+def test_a_non_loopback_host_warns_and_foreign_host_headers_are_refused(tmp_path, caplog):
+    run = write_run_dir(tmp_path, "wdl")
+    with caplog.at_level(logging.WARNING, logger="colosseum.arena.report.server"):
+        make_server(run.root, host="0.0.0.0", port=0).server_close()
+    assert "listening on 0.0.0.0 without authentication" in caplog.text
+    caplog.clear()
+    with caplog.at_level(logging.WARNING, logger="colosseum.arena.report.server"):
+        with serving(run.root) as (base, server):
+            assert not caplog.records                          # 127.0.0.1: no warning
+            code, _, body = _get_full(base + "/api/summary", {"Host": "evil.example:80"})
+            assert code == 403 and "DNS rebinding" in json.loads(body)["error"]
+            assert _get_full(base + "/", {"Host": "evil.example"})[0] == 403
+            for host in (f"localhost:{server.port}", f"127.0.0.1:{server.port}", "[::1]"):
+                assert _get_full(base + "/api/summary", {"Host": host})[0] == 200, host
+
+
+class _Fatal(BaseException):
+    pass
+
+
+def test_a_dead_builder_thread_is_logged_and_answers_500(tmp_path, monkeypatch, caplog):
+    run = write_run_dir(tmp_path, "wdl")
+    with serving(run.root) as (base, server):
+        def fatal(**kw):
+            raise _Fatal("boom")
+
+        monkeypatch.setattr(server.builder, "_matrix", fatal)
+        with caplog.at_level(logging.ERROR, logger="colosseum.arena.report.server"):
+            code, _, body = _get(base + "/api/matrix")
+        assert code == 500 and "builder stopped" in json.loads(body)["error"]
+        assert "builder thread stopped" in caplog.text and "_Fatal" in caplog.text
+        code, _, body = _get(base + "/api/summary")
+        assert code == 500 and "builder stopped" in json.loads(body)["error"]
+        code, _, page = _get(base + "/")
+        assert code == 200 and "builder stopped" in page
 
 
 def test_cli_prints_the_address_serves_and_exits_130_on_ctrl_c(tmp_path):
@@ -164,6 +208,8 @@ def test_cli_prints_the_address_serves_and_exits_130_on_ctrl_c(tmp_path):
         except ProcessLookupError:
             pass
         proc.wait()
+        proc.stdout.close()
+        proc.stderr.close()
 
 
 def test_cli_exit_codes_for_a_non_run_dir_and_bad_arguments(tmp_path):
