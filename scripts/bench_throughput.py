@@ -6,7 +6,7 @@ that affects the workload is set here, not inherited from the example yaml, so
 "before" and "after" runs measure the same work). After the run the script reads
 the run's ``metrics.jsonl`` (T6.3): ``train`` records of ``agent_0`` (one per
 learner train step, ``metrics.log_interval=1``) and ``system`` records (one per
-``metrics.console_interval_sec``). Rates use the records' own ``ts``. After a
+``metrics.console_interval_sec``). Rates use the clock of ``--clock`` (below). After a
 warm-up period the script measures, over ``--duration`` seconds:
 
 - ``updates/s``          learner train steps per second (``train`` records);
@@ -23,6 +23,12 @@ warm-up period the script measures, over ``--duration`` seconds:
 
 Checkpoints are disabled, so every slot plays the latest policy and collects data.
 
+Clocks (``--clock``): ``counters`` (default since SP4) samples the launcher's global env-step counter and
+the newest ``train`` / ``system`` records on ``time.monotonic()`` in this process (``CounterSampler``);
+``ts`` uses the records' wall-clock ``ts`` as before SP4. On machines whose wall clock jumps (WSL2: GPU
+checks report §8) only ``counters`` works. ``--tree PATH`` measures another checkout (for example a ``main``
+worktree) with its own ``_make_config``; run it with ``PYTHONPATH=PATH/src``.
+
 A run whose measurement window is incomplete (too few learner or system samples,
 or samples starting late / stopping early, e.g. because a learner died) is
 reported as an error, gets no row, and makes the script exit non-zero.
@@ -31,6 +37,7 @@ Usage::
 
     .venv/bin/python scripts/bench_throughput.py                 # 1, 2, 4 workers, 60 s each
     .venv/bin/python scripts/bench_throughput.py --workers 1 2 --duration 30 --json out.json
+    PYTHONPATH=../main/src .venv/bin/python scripts/bench_throughput.py --tree ../main   # another checkout
 """
 
 from __future__ import annotations
@@ -66,6 +73,95 @@ MIN_WINDOW_SAMPLES = 5
 WINDOW_EDGE_TOLERANCE_S = 5.0
 # Mean learner queue depth at or above this fraction of QUEUE_SIZE counts as learner-bound.
 LEARNER_BOUND_QUEUE_FRACTION = 0.5
+CLOCKS = ("counters", "ts")
+# Counter clock: how often the sampler reads the env-step counter and metrics.jsonl (seconds of time.monotonic()).
+SAMPLE_INTERVAL_S = 0.25
+
+
+class CounterSampler:
+    """Measurement by counters on ``time.monotonic()`` (GPU checks report §8: WSL2 wall clocks jump by ~9 s,
+    so windows over the records' ``ts`` fail). Every ``interval`` seconds it records:
+
+    - ``system``: ``(t, env_steps, queue_depth)``: the launcher's global env-step counter and the learner
+      queue depth of the newest ``system`` record (-1 = unknown);
+    - ``train``: ``(t, train_step, chunks_received)`` of the newest ``train`` record of ``agent_id``, once
+      per new train step.
+
+    The lists have the shapes ``load_samples`` returns, so ``validate_window`` / ``compute_rates`` apply.
+    """
+
+    def __init__(self, env_steps_fn, metrics_path: str | Path, agent_id: str = AGENT_ID,
+                 interval: float = SAMPLE_INTERVAL_S, clock=time.monotonic) -> None:
+        self.train: list[tuple[float, int, int]] = []
+        self.system: list[tuple[float, int, int]] = []
+        self._env_steps_fn = env_steps_fn
+        self._path = Path(metrics_path)
+        self._agent_id = agent_id
+        self._interval = float(interval)
+        self._clock = clock
+        self._offset = 0
+        self._last_train: tuple[int, int] | None = None
+        self._depth = -1
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=self._run, name="bench-sampler", daemon=True)
+
+    def start(self) -> None:
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        self._thread.join(timeout=5)
+
+    def sample(self) -> None:
+        now = self._clock()
+        self._read_metrics()
+        self.system.append((now, int(self._env_steps_fn()), self._depth))
+        if self._last_train is not None and (not self.train or self.train[-1][1] != self._last_train[0]):
+            self.train.append((now, *self._last_train))
+
+    def _read_metrics(self) -> None:
+        """New complete lines of metrics.jsonl (a partial last line waits for the next sample)."""
+        try:
+            with self._path.open("rb") as fh:
+                fh.seek(self._offset)
+                chunk = fh.read()
+        except OSError:
+            return
+        end = chunk.rfind(b"\n")
+        if end < 0:
+            return
+        self._offset += end + 1
+        for line in chunk[:end].split(b"\n"):
+            if not line.strip():
+                continue
+            r = json.loads(line)
+            if r["kind"] == "train" and r["agent"] == self._agent_id:
+                self._last_train = (int(r["train_step"]), int(r.get("chunks_received") or 0))
+            elif r["kind"] == "system":
+                self._depth = int(r["queue_depths"].get(self._agent_id, -1))
+
+    def _run(self) -> None:
+        while not self._stop.wait(self._interval):
+            self.sample()
+
+
+def load_tree_config(tree: str | Path):
+    """``_make_config`` of the benchmark script of another checkout (``--tree``, e.g. a ``main`` worktree),
+    whose ``src`` must be the ``colosseum`` this process imported (``PYTHONPATH=<tree>/src``)."""
+    import importlib.util
+
+    import colosseum
+
+    tree = Path(tree).resolve()
+    if not Path(colosseum.__file__).resolve().is_relative_to(tree / "src"):
+        raise SystemExit(f"--tree {tree}: colosseum is imported from {Path(colosseum.__file__).parent}; run with "
+                         f"PYTHONPATH={tree / 'src'} so the measured code is the tree's")
+    spec = importlib.util.spec_from_file_location("bench_throughput_tree", tree / "scripts" / "bench_throughput.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    if str(tree) not in sys.path:
+        sys.path.insert(0, str(tree))         # the tree's examples.* for this process and spawned children
+    return module._make_config
 
 
 def load_samples(metrics_path: str | Path, agent_id: str = AGENT_ID) -> tuple[list, list]:
@@ -228,23 +324,32 @@ def compute_rates(train: list[tuple[float, int, int]], system: list[tuple[float,
     }
 
 
-def run_one(num_workers: int, duration: float, warmup: float) -> dict:
+def run_one(num_workers: int, duration: float, warmup: float, *, clock: str = "counters",
+            make_config=None) -> dict:
     """Run one configuration; raises RuntimeError if the window is incomplete."""
     from colosseum.core.run_dir import RunDir
     from colosseum.launcher import Launcher
 
+    if clock not in CLOCKS:
+        raise ValueError(f"clock {clock!r} is not one of {CLOCKS}")
+    make_config = make_config or _make_config
     with tempfile.TemporaryDirectory(prefix="bench-") as tmp:
-        config = _make_config(num_workers, tmp)
+        config = make_config(num_workers, tmp)
         run_dir = RunDir.create(config)
         launcher = Launcher(config, run_dir)
-        started = time.time()  # metrics.jsonl ``ts`` is Unix time
+        sampler = CounterSampler(lambda: launcher.env_steps_done, run_dir.metrics_path) if clock == "counters" else None
+        started = time.monotonic() if sampler is not None else time.time()  # ts mode: metrics.jsonl ``ts`` is Unix time
         timer = threading.Timer(warmup + duration, launcher._stop_event.set)
         timer.start()
+        if sampler is not None:
+            sampler.start()
         try:
             launcher.launch()
         finally:
             timer.cancel()
-        train, system = load_samples(run_dir.metrics_path)
+            if sampler is not None:
+                sampler.stop()
+        train, system = (sampler.train, sampler.system) if sampler is not None else load_samples(run_dir.metrics_path)
     start, end = started + warmup, started + warmup + duration
     error = validate_window(train, start, end, "learner") or validate_window(system, start, end, "system")
     if error is not None:
@@ -279,7 +384,13 @@ def main() -> int:
     parser.add_argument("--duration", type=float, default=60.0, help="measured seconds per run")
     parser.add_argument("--warmup", type=float, default=15.0, help="ignored seconds after start")
     parser.add_argument("--json", type=str, default=None, help="also write results to this JSON file")
+    parser.add_argument("--clock", choices=CLOCKS, default="counters",
+                        help="counters: time.monotonic() samples of the counters (default); ts: records' ts")
+    parser.add_argument("--tree", type=str, default=None,
+                        help="measure another checkout with its own _make_config (run with PYTHONPATH=<tree>/src)")
     args = parser.parse_args()
+    make_config = load_tree_config(args.tree) if args.tree else _make_config
+    tree = str(Path(args.tree).resolve()) if args.tree else str(REPO_ROOT)
 
     mp.set_start_method("spawn", force=True)
     logging.basicConfig(level=logging.WARNING)
@@ -296,12 +407,13 @@ def main() -> int:
     workload = workload_summary(args.warmup, args.duration)
     print(f"machine: {machine}", flush=True)
     print(f"workload: {workload}", flush=True)
+    print(f"clock: {args.clock}; tree: {tree}", flush=True)
 
     results = []
     failed = []
     for n in args.workers:
         try:
-            r = run_one(n, args.duration, args.warmup)
+            r = run_one(n, args.duration, args.warmup, clock=args.clock, make_config=make_config)
         except RuntimeError as exc:
             failed.append(n)
             print(f"ERROR workers={n}: invalid measurement: {exc}; no row reported", file=sys.stderr, flush=True)
@@ -333,7 +445,8 @@ def main() -> int:
 
     if args.json:
         Path(args.json).write_text(
-            json.dumps({"machine": machine, "workload": workload, "results": results}, indent=2) + "\n"
+            json.dumps({"machine": machine, "workload": workload, "clock": args.clock, "tree": tree,
+                        "results": results}, indent=2) + "\n"
         )
     return 0
 

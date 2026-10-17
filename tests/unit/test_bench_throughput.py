@@ -128,3 +128,53 @@ def test_benchmark_workload_is_latest_only_self_play_without_fixed_players(tmp_p
     assert (opponents.latest, opponents.snapshots, opponents.rivals, opponents.anchors) == (1.0, 0.0, 0.0, 0.0)
     assert cfg.init.from_ is None and cfg.kickstart.teacher is None
     assert cfg.checkpoint.interval >= 10**9                       # no snapshot is ever written
+
+
+REPO_ROOT = Path(__file__).resolve().parents[2]
+
+
+def test_benchmark_config_sets_every_section_and_every_sp4_key_explicitly(tmp_path):
+    """Guard: a new config key never changes the pinned workload silently (SP1 T0.4 rule)."""
+    from colosseum.core.config import ColosseumConfig
+
+    cfg = bench._make_config(1, str(tmp_path))
+    assert set(ColosseumConfig.model_fields) - cfg.model_fields_set <= {"agents", "bc"}
+    for name in ("match_log", "ratings", "evaluation", "checkpoint"):
+        section = getattr(cfg, name)
+        assert section.model_fields_set == set(type(section).model_fields), name
+
+
+def test_benchmark_workload_has_the_journal_on_and_pulse_and_top_k_off(tmp_path):
+    """Criterion 3.6: throughput with the journal on and pulse off (and no top-k: no snapshot exists)."""
+    cfg = bench._make_config(1, str(tmp_path))
+    assert cfg.match_log.enabled and not cfg.evaluation.enabled and cfg.checkpoint.keep_top_k == 0
+
+
+def test_counter_sampler_reads_the_counters_on_its_own_clock(tmp_path):
+    from colosseum.metrics.jsonl import MetricsWriter
+
+    path = tmp_path / "metrics.jsonl"
+    writer = MetricsWriter(path)
+    clock, env_steps = iter([1.0, 2.0, 3.0]), iter([100, 200, 300])
+    sampler = bench.CounterSampler(lambda: next(env_steps), path, clock=lambda: next(clock))
+    writer.write("train", agent="agent_0", train_step=1, chunks_received=8.0)
+    writer.write("train", agent="other", train_step=9, chunks_received=8.0)
+    writer.write("system", env_steps=0, env_steps_per_sec=0.0, train_steps_per_sec={}, queue_depths={"agent_0": 7},
+                 parked_buffers=0, dropped_reward_episodes=0, workers_reporting=1)
+    sampler.sample()
+    sampler.sample()                                     # no new train step: no new train sample
+    writer.write("train", agent="agent_0", train_step=2, chunks_received=16.0)
+    writer._fh.write('{"ts": 1, "kind": "tra')          # a partial line waits
+    writer._fh.flush()
+    sampler.sample()
+    writer.close()
+    assert sampler.train == [(1.0, 1, 8), (3.0, 2, 16)]
+    assert sampler.system == [(1.0, 100, 7), (2.0, 200, 7), (3.0, 300, 7)]
+    rates = bench.compute_rates(sampler.train, sampler.system, 0.0, 10.0)
+    assert rates["env_steps_per_s"] == pytest.approx(100.0)
+
+
+def test_tree_config_needs_the_tree_on_the_python_path(tmp_path):
+    assert callable(bench.load_tree_config(REPO_ROOT))   # this checkout's colosseum is the imported one
+    with pytest.raises(SystemExit, match="PYTHONPATH"):
+        bench.load_tree_config(tmp_path)
