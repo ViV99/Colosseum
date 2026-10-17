@@ -536,7 +536,7 @@ Known limitations today:
 ## Tests
 
 ```bash
-.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 2121 tests
+.venv/bin/python -m pytest -m "not gpu and not slow" -q     # full fast suite (CI), 2168 tests
 .venv/bin/python -m pytest -m slow -v                       # 14 tests, about 10 min (see below)
 .venv/bin/python -m pytest -m gpu -v                        # 25 tests, CUDA machine only, see docs/GPU_CHECKS.md
 ```
