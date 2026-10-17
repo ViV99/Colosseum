@@ -67,7 +67,7 @@ def test_select_on_a_run_writes_the_journal_and_reports_and_pins_the_confirmed_w
     assert json.loads((root / "checkpoints" / "main" / "ckpt_v30" / "meta.json").read_text())["pinned"] is True
     assert "Pinned main@v30" in result.output
     tdir = root / "tournaments" / "sel"
-    for name in ("tournament.yaml", "report.json", "report.txt"):
+    for name in ("tournament.yaml", "report.json", "report.txt", "report.html"):
         assert (tdir / name).is_file()
     assert (tdir / "logs" / "tournament.log").is_file()
     blocks, results = journal(root / MATCH_LOG_FILE, "sel")

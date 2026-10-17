@@ -547,6 +547,31 @@ def bc(
     click.echo(f"Weights saved to {output}")
 
 
+@main.command("report")
+@click.argument("run", type=click.Path(exists=True, file_okay=False))
+@click.option("--output", "-o", default=None, type=click.Path(dir_okay=False),
+              help="HTML file to write (default: RUN/report.html)")
+def report_cmd(run: str, output: str | None) -> None:
+    """Build a self-contained HTML report of a run directory (or of a tournament directory): ratings, results
+    matrix, anchors, opponents, training, system, matches and tournaments. The page needs no network.
+
+    Exit code: 0 done, 1 not a run or tournament directory (or an unreadable run), 2 bad command-line
+    arguments, 130 SIGINT.
+    """
+    import logging
+    from pathlib import Path
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    if output is not None and not Path(output).absolute().parent.is_dir():
+        raise click.BadParameter(f"directory {str(Path(output).absolute().parent)!r} does not exist",
+                                 param_hint="'--output'")
+    with _config_errors():
+        from colosseum.arena.report.render import write_report
+
+        path = write_report(run, output)
+    click.echo(f"Report written to {path}")
+
+
 @main.command("pin")
 @click.argument("run_dir", type=click.Path(exists=True, file_okay=False))
 @click.argument("snapshot", required=False)

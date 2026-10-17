@@ -139,7 +139,7 @@ class TournamentDir:
 
     @property
     def report_paths(self) -> tuple[Path, Path, Path]:
-        """``report.json``, ``report.txt``, ``report.html`` (the last once Part 3's renderer exists)."""
+        """``report.json``, ``report.txt``, ``report.html``."""
         return self.path / REPORT_JSON, self.path / REPORT_TXT, self.path / REPORT_HTML
 
     def load(self) -> dict | None:
@@ -183,17 +183,14 @@ class TournamentDir:
         return dst
 
     def write_reports(self, report: modes.TournamentReport) -> list[Path]:
-        """``report.json``, ``report.txt`` and, once Part 3's renderer exists, ``report.html``: the single writer
-        of the reports (contract amendment A27)."""
+        """``report.json``, ``report.txt`` and ``report.html`` (the run report's page with the tournaments
+        section only): the single writer of the reports (contract amendment A27)."""
+        from colosseum.arena.report.render import write_tournament_html
+
         json_path, txt_path, _html_path = self.report_paths
         written = [write_text_atomic(json_path, json.dumps(report.to_dict(), indent=2, sort_keys=False) + "\n"),
                    write_text_atomic(txt_path, report.text() + "\n")]
-        try:   # T7.2 provides the renderer and removes this guard (contract amendment A27)
-            from colosseum.arena.report.render import write_tournament_html
-        except ImportError:
-            logger.info("report.html is not written yet: colosseum.arena.report.render arrives with SP4 T7.2")
-            return written
-        written.append(write_tournament_html(self.path))       # report.html next to report.json
+        written.append(write_tournament_html(self.path))   # report.html: the same page, tournaments section only
         return written
 
 
