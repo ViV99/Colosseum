@@ -1,12 +1,16 @@
 """Slow disk-bound test (SP4 criterion 3.5): a tic_tac_toe run far longer than a 1 MB detail window keeps
 ``matches.db`` within the window + what compaction never touches + a slack (T8.3 ruling), its counts are
 complete (the BT fit from the compacted journal equals the run's final live fit over the in-memory
-comparison table, which saw every written result) and every agent keeps at most ``max_snapshots``
-snapshots. 2 rollout workers."""
+comparison table, which saw every written result: the same per-entity games exactly, ratings within 0.5 Elo),
+a compaction of a copy of the final journal down to the window keeps the detail within 1.1 x the window and
+the fit unchanged, and every agent keeps at most ``max_snapshots`` snapshots during the whole run (sampled
+every 0.5 s; a save places the new snapshot before retention renames the evicted one away, a few ms, so a
+listing over the cap counts only when two more listings 0.1 s apart are over it too). 2 rollout workers."""
 from __future__ import annotations
 
 import json
 import re
+import sqlite3
 import threading
 import time
 
@@ -28,6 +32,7 @@ MAX_SNAPSHOTS = 5
 # compaction pass) plus the matches of one compaction interval (~1 MB/s here).
 SLACK_MB = 13.0
 RATING_TOL_ELO = 0.5
+COMPACT_TOL_ELO = 1e-3          # the same sufficient statistics, folded into counts: only rounding may differ
 OVERRIDES = {
     "training.total_timesteps": 400_000, "rollout.num_workers": 2, "rollout.envs_per_worker": 16,
     # the run lasts ~20 s: with the config's 30 s lineup refresh every match would be latest-vs-latest self-play
@@ -39,15 +44,56 @@ OVERRIDES = {
 }
 
 
+def _snapshot_counts(checkpoints) -> dict[str, int]:
+    """``ckpt_v*`` dirs per agent dir under ``checkpoints`` (a listing that races a rename gives what it got)."""
+    counts: dict[str, int] = {}
+    try:
+        for agent_dir in checkpoints.iterdir():
+            counts[agent_dir.name] = sum(1 for d in agent_dir.iterdir() if re.fullmatch(r"ckpt_v\d+", d.name))
+    except OSError:
+        pass
+    return counts
+
+
+def _compacted_copy(db, target):
+    """A copy of the journal ``db`` (SQLite backup API) compacted down to the window: (sizes, comparison table)."""
+    target.parent.mkdir(parents=True)
+    src = sqlite3.connect(f"{db.resolve().as_uri()}?mode=ro", uri=True)
+    dst = sqlite3.connect(target)
+    try:
+        src.backup(dst)
+    finally:
+        dst.close()
+        src.close()
+    log = MatchLog(target, None)
+    try:
+        log.compact(window_bytes=int(WINDOW_MB * MB))
+        return log.sizes(), log.comparison_table(sources=("train", "pulse"))
+    finally:
+        log.close()
+
+
 def test_journal_and_snapshots_stay_bounded_and_counts_stay_complete(tmp_path):
     db = tmp_path / "runs" / "disk" / MATCH_LOG_FILE
-    peak = {"bytes": 0}
+    checkpoints = db.parent / "checkpoints"
+    peak = {"bytes": 0, "over_cap_listings": 0}
+    peak_snapshots: dict[str, int] = {}
     stop = threading.Event()
 
     def poll():
         while not stop.wait(0.5):
             total = sum(p.stat().st_size for p in (db, db.with_name(db.name + "-wal")) if p.exists())
             peak["bytes"] = max(peak["bytes"], total)
+            counts = _snapshot_counts(checkpoints)
+            for _ in range(2):                     # over the cap: a save in progress, unless it persists
+                if max(counts.values(), default=0) <= MAX_SNAPSHOTS:
+                    break
+                peak["over_cap_listings"] += 1
+                stop.wait(0.1)
+                again = _snapshot_counts(checkpoints)
+                counts = {agent: min(n, again.get(agent, n)) for agent, n in counts.items()}
+            for agent, n in counts.items():
+                peak_snapshots[agent] = max(peak_snapshots.get(agent, 0), n)
 
     sampler = threading.Thread(target=poll, daemon=True)
     sampler.start()
@@ -84,17 +130,36 @@ def test_journal_and_snapshots_stay_bounded_and_counts_stay_complete(tmp_path):
     from_journal = bt.fit(table, "2p", sources=("train", "pulse"), options=options, fixed_agents=fixed,
                           random_bot=random_bot)
     final_bt = json.loads((run.root / "ratings.json").read_text())["bt"]["2p"]
-    live = {e["entity"]: e["rating"] for label, group in final_bt.items() if not label.startswith("@")
-            for e in group}                                  # A14: rows per group label, '@' keys are extras (P5)
+    rows = [e for label, group in final_bt.items() if not label.startswith("@")
+            for e in group]                                  # A14: rows per group label, '@' keys are extras (P5)
+    live = {e["entity"]: e["rating"] for e in rows}
+    live_games = {e["entity"]: e["games"] for e in rows}
     rated_games = sum(from_journal.games.values())
     print(f"[disk] rated: {len(live)} entities live, {len(from_journal.rating)} from the journal, "
           f"{rated_games} entity-games (self-play excluded)")
     assert len(live) >= 2, "no rated entities: the comparison of the two fits would be empty"
     assert set(live) == set(from_journal.rating)
+    # counts complete, exactly: every entity rated on the same number of games in the live table and the journal
+    assert live_games == {e: int(from_journal.games.get(e, 0)) for e in from_journal.rating}
     worst = max(abs(live[e] - from_journal.rating[e]) for e in live)
     print(f"[disk] {len(live)} entities; max |live - journal| = {worst:.4f} Elo")
     assert worst <= RATING_TOL_ELO
 
+    # the window itself (the brief's 1.1 x check, where it is valid: no writer, compaction run to the end)
+    sizes_c, table_c = _compacted_copy(db, tmp_path / "compacted" / MATCH_LOG_FILE)
+    compacted = bt.fit(table_c, "2p", sources=("train", "pulse"), options=options, fixed_agents=fixed,
+                       random_bot=random_bot)
+    moved = max(abs(compacted.rating[e] - from_journal.rating[e]) for e in from_journal.rating)
+    print(f"[disk] compacted copy: detail {sizes_c.detail_bytes / MB:.2f} MB (window {WINDOW_MB} MB), counts rows "
+          f"{sizes_c.counts_rows}; max |compacted - journal| = {moved:.6f} Elo")
+    assert sizes_c.detail_bytes <= 1.1 * WINDOW_MB * MB
+    assert set(compacted.rating) == set(from_journal.rating) and compacted.games == from_journal.games
+    assert moved <= COMPACT_TOL_ELO
+
+    print(f"[disk] most snapshots per agent during the run: {peak_snapshots}; listings over the cap "
+          f"{peak['over_cap_listings']} (a save in progress)")
+    assert peak_snapshots, "the poll never saw a snapshot"
+    assert max(peak_snapshots.values()) <= MAX_SNAPSHOTS, peak_snapshots
     for agent_dir in (run.root / "checkpoints").iterdir():
         kept = [d for d in agent_dir.iterdir() if re.fullmatch(r"ckpt_v\d+", d.name)]
         assert len(kept) <= MAX_SNAPSHOTS, (agent_dir.name, sorted(d.name for d in kept))
