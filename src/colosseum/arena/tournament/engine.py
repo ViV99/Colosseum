@@ -282,13 +282,18 @@ def _error_after_failure(results: Any, failure: Any, supervisor: ProcessSupervis
                          handle: Callable[[tuple], None]) -> Exception:
     """The error a dead worker sent before dying (a typed one), else a TournamentError naming its log. The blocks
     other workers finish meanwhile still go to ``handle`` (the journal); the search ends after ``STOP_GRACE_SEC``,
-    or earlier once no worker is alive and the queue is empty."""
+    or earlier once no worker is alive and the queue is empty (drained once more after the alive check: a worker
+    may put its last message and exit between the empty read and the check)."""
     deadline = time.monotonic() + STOP_GRACE_SEC
     while (left := deadline - time.monotonic()) > 0:
         try:
             msg = results.get(timeout=min(0.2, left))
         except queue.Empty:
             if not supervisor.alive():
+                for late in _drain(results):
+                    if late[0] == "error":
+                        return _typed_error(late, supervisor)
+                    handle(late)
                 break
             continue
         if msg[0] == "error":

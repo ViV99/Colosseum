@@ -380,12 +380,13 @@ def _play_mode(ctx: _Context, mode: str) -> tuple[list[dict], list[dict], dict[s
     selection: dict[str, dict] = {}
     if mode == "round-robin":
         participants = list(dict.fromkeys([*ctx.candidates, *ctx.field]))
-        for layout in settings.layouts:
+        for layout in settings.layouts:       # every layout first: nothing is played (journaled) before the error
             groups = check_role_groups(ctx.spec, layout, participants, ctx.players)
             if len(groups) > 1:
                 raise ConfigError(f"--mode round-robin ranks every participant in one table, but in layout {layout!r} "
                                   f"they play different role groups: {groups}; compare the groups with gauntlet or "
                                   f"select (they rank per role group), or give round-robin participants of one group")
+        for layout in settings.layouts:
             ctx.run(ctx.round_robin(layout, participants))
         tables.extend(_round_robin_tables(ctx, participants))
         return tables, rounds, selection

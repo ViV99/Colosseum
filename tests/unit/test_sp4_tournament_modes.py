@@ -414,3 +414,19 @@ def test_round_robin_refuses_mixed_role_groups_and_a_pairless_participant_has_no
     report = {"name": "t", "mode": "round-robin", "seed": 0, "deterministic": False, "tables": [table], "rounds": [],
               "selection": None, "bt": {}, "flags": {"repeated_pairs": []}, "games": {"matches": 0, "blocks": 0}}
     assert "y@v1" in modes.report_text(report)
+
+
+def test_round_robin_checks_the_role_groups_of_every_layout_before_playing_any():
+    """FW-2 B-a: in layout ``aa`` both participants play role ``a`` (one group), in ``bc`` one plays ``b`` and the
+    other ``c`` (two groups). The ConfigError comes before any block of ``aa`` is played: the results source,
+    which in the CLI is the runner that journals every played block (``run.BlockRunner``), is never called."""
+    role = TurnTakingGame().spec.roles["player"]
+    spec = GameSpec(roles={"a": role, "b": role, "c": role},
+                    layouts={"aa": (SeatSpec("a", 0), SeatSpec("a", 1)), "bc": (SeatSpec("b", 0), SeatSpec("c", 1))})
+    strengths = {"p@v1": 0.0, "q@v1": 0.0}
+    players = synthetic_players(strengths, {"p@v1": ("a", "b"), "q@v1": ("a", "c")})
+    arena = FakeArena(spec, players, strengths)
+    with pytest.raises(ConfigError, match=r"in layout 'bc' they play different role groups"):
+        play("round-robin", spec, strengths, ["p@v1"], ["q@v1"], arena=arena, players=players, layouts=["aa", "bc"],
+             layout_weights={"aa": 1.0, "bc": 1.0}, blocks=2)
+    assert arena.calls == []

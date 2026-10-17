@@ -82,3 +82,28 @@ def test_a_typed_error_found_after_the_failure_keeps_its_class():
     with pytest.raises(PlayerError, match="bot failure") as caught:
         engine._collect(results, _Supervisor(), stop, {0, 1}, lambda msg: handled.append(msg[1]), None)
     assert handled == [1] and "logs/tournament-worker-0.log" in str(caught.value)
+
+
+class _AllExited(_Supervisor):
+    """Worker 0 is dead (killed); worker 1 has exited too, after sending its last messages."""
+
+    def alive(self):
+        return []
+
+
+def test_a_peer_that_exits_right_after_an_empty_read_still_has_its_last_block_journaled():
+    """FW-2 B-b: the search reads the queue empty, then finds no worker alive; a peer that put its last ``done``
+    and exited in between still has it handled (one more drain, as ``_collect`` does), and an error sent in that
+    gap keeps its class."""
+    from colosseum.core.errors import PlayerError
+
+    stop = threading.Event()
+    handled: list[int] = []
+    results = _Results([GAP, ("done", 1, {})])
+    with pytest.raises(TournamentError, match="tournament-worker-0 died"):
+        engine._collect(results, _AllExited(), stop, {0, 1}, lambda msg: handled.append(msg[1]), None)
+    assert handled == [1] and stop.is_set()
+    error = ("error", 0, 0, "PlayerError", "tournament, worker 0, env 0, seat 1: bot failure", "match m of block b")
+    with pytest.raises(PlayerError, match="bot failure"):
+        engine._collect(_Results([GAP, ("done", 1, {}), error]), _AllExited(), threading.Event(), {0, 1},
+                        lambda msg: None, None)
