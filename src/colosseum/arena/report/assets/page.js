@@ -51,7 +51,6 @@
     const e = document.createElement(tag);
     for (const [k, v] of Object.entries(attrs || {})) {
       if (k === "on") for (const [ev, fn] of Object.entries(v)) e.addEventListener(ev, fn);
-      else if (k === "html") e.innerHTML = v;
       else if (v !== null && v !== undefined && v !== false) e.setAttribute(k, v === true ? "" : v);
     }
     for (const kid of kids.flat()) if (kid !== null && kid !== undefined) e.append(kid instanceof Node ? kid : String(kid));
@@ -499,12 +498,21 @@
       { key: "composition", label: "teams (versions)", text: composition },
       { key: "seed", label: "seed", num: true, fmt: (v) => (v === null || v === undefined ? "-" : String(v)) },
       { key: "episode_length", label: "length", num: true },
-      { key: "replay", label: "replay", cell: (r) => (r.replay && !/^\s*javascript:/i.test(r.replay) ? h("a", { href: r.replay }, "replay") : "-") },
+      { key: "replay", label: "replay", cell: replayCell },
       { key: "uid", label: "uid" },
     ], shown, { key: "m" }));
     out.push(h("p", { class: "note" }, "The latest " + rows.length + " matches" + (CFG.live ? " matching the filters." : " (filters apply to these).")));
     return out.concat(notes(s.notes));
   };
+  /* A replay link from the env: a link only for http(s) and file URLs (an allow-list: "java\tscript:" and
+     friends are normalized by the URL parser, so a deny-list can be bypassed); anything else is plain text. */
+  const REPLAY_PROTOCOLS = ["http:", "https:", "file:"];
+  function replayCell(r) {
+    if (r.replay === null || r.replay === undefined || r.replay === "") return "-";
+    let ok = false;
+    try { ok = REPLAY_PROTOCOLS.includes(new URL(String(r.replay), location.href).protocol); } catch (e) { ok = false; }
+    return ok ? h("a", { href: String(r.replay) }, "replay") : String(r.replay);
+  }
   function refilter() { if (CFG.live) refresh("matches"); else rerender("matches")(); }
 
   /* One role group of a tournament (modes.report_view): candidates, the score matrix, the layout combination,

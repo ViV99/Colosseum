@@ -38,9 +38,11 @@ def _data_of(page: str) -> dict:
 def _dom(tmp_path, data: dict) -> str:
     page = tmp_path / "report.html"
     page.write_text(render_html(data))
-    return subprocess.run([CHROME, "--headless=new", "--no-sandbox", "--disable-gpu", "--dump-dom",
-                           "--virtual-time-budget=3000", page.as_uri()], capture_output=True, text=True,
-                          timeout=60).stdout
+    proc = subprocess.run([CHROME, "--headless=new", "--no-sandbox", "--disable-gpu", "--dump-dom",
+                           "--virtual-time-budget=3000", page.as_uri()], capture_output=True, text=True, timeout=60)
+    if proc.returncode != 0 or not proc.stdout.strip():
+        pytest.fail(f"headless Chrome failed (exit code {proc.returncode}): {proc.stderr[-2000:]}")
+    return proc.stdout
 
 
 def _visible(dom: str) -> str:
@@ -179,6 +181,24 @@ def _score_first(data: dict) -> dict:
     return data
 
 
+@pytest.mark.skipif(CHROME is None, reason="no headless Chrome")
+def test_replay_links_only_for_allowed_protocols(tmp_path):
+    """A replay link is a link only for http(s) / file URLs; every other string is plain text. The bypasses of a
+    ``javascript:`` deny-list (a tab inside the scheme, a leading control character) stay text."""
+    data = sample_report_data()
+    rows = data["sections"]["matches"]["rows"]
+    replays = ["https://replays.test/r/1", "file:///data/replays/r2.html", "java\tscript:alert(1)",
+               "\x01javascript:alert(2)", " javascript:alert(3)", "JaVaScRiPt:alert(4)", "data:text/html,<b>x</b>",
+               "vbscript:msgbox(5)"]
+    for row, replay in zip(rows, replays):
+        row["replay"] = replay
+    dom = _dom(tmp_path, data)
+    hrefs = [x for x in re.findall(r'<a href="([^"]*)"', dom) if not x.startswith("#")]     # not the section menu
+    assert sorted(hrefs) == ["file:///data/replays/r2.html", "https://replays.test/r/1"]
+    text = _visible(dom)
+    assert "alert(1)" in text and "alert(2)" in text and "alert(4)" in text and "vbscript:msgbox(5)" in text
+
+
 def test_write_report_default_path_and_output(tmp_path):
     run = write_run_dir(tmp_path, "rank")
     path = write_report(run.root)
@@ -186,18 +206,45 @@ def test_write_report_default_path_and_output(tmp_path):
     other = write_report(run.root, tmp_path / "x.html")
     assert other == tmp_path / "x.html" and other.exists()
     (tmp_path / "empty").mkdir()
-    with pytest.raises(ConfigError, match="neither a run directory"):
+    with pytest.raises(ConfigError, match=r"neither a run directory \(metrics.jsonl, config.resolved.yaml, "
+                                          r"matches.db or tournaments/\)"):
         write_report(tmp_path / "empty")
+
+
+def test_an_unfinished_tournament_dir_is_refused_with_its_own_message(tmp_path):
+    tdir = tmp_path / "t1"
+    tdir.mkdir()
+    (tdir / "tournament.yaml").write_text("mode: select\n")
+    with pytest.raises(ConfigError, match="the tournament has no report.json yet"):
+        write_report(tdir)
 
 
 def test_a_tournament_output_dir_counts_as_a_run_dir(tmp_path):
     """``colosseum tournament --output DIR`` lays DIR out like a run dir (ruling C5): ``matches.db`` and
-    ``tournaments/`` without ``metrics.jsonl`` or a resolved config."""
+    ``tournaments/`` without ``metrics.jsonl`` or a resolved config; its report is a page."""
     (tmp_path / "out" / "tournaments").mkdir(parents=True)
     assert is_run_dir(tmp_path / "out") and not is_run_dir(tmp_path)
     (tmp_path / "db").mkdir()
     (tmp_path / "db" / "matches.db").write_bytes(b"")
     assert is_run_dir(tmp_path / "db")
+
+
+def test_a_tournament_output_dir_builds_a_page(tmp_path):
+    from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLog, RunInfo
+
+    out = tmp_path / "out"
+    tdir = out / "tournaments" / "sel"
+    tdir.mkdir(parents=True)
+    MatchLog(out / MATCH_LOG_FILE, RunInfo(run_id="r1", name="out", parent_run_id=None, game="g",
+                                          config_hash="h", checkpoint_interval=10)).close()
+    (tdir / "tournament.yaml").write_text("mode: select\n")
+    (tdir / "report.json").write_text(json.dumps(sample_report_data()["sections"]["tournaments"]["items"][0]["report"]))
+    path = write_report(out)
+    assert path == out / REPORT_FILE
+    data = _data_of(path.read_text())
+    assert set(data["sections"]) == set(SECTIONS)
+    assert [item["name"] for item in data["sections"]["tournaments"]["items"]] == ["sel"]
+    assert data["sections"]["tournaments"]["items"][0]["report"]["winner"] == "main@v2000"
 
 
 def test_a_tournament_dir_gets_a_tournament_only_page(tmp_path):
@@ -212,3 +259,18 @@ def test_a_tournament_dir_gets_a_tournament_only_page(tmp_path):
     assert set(data["sections"]) == {"tournaments"}
     assert data["sections"]["tournaments"]["items"][0]["report"]["winner"] == "main@v2000"
     assert _data_of(write_report(tdir).read_text()) == data
+
+
+def test_write_report_of_a_tournament_dir_uses_the_tournament_writer(tmp_path, monkeypatch):
+    """One writer of a tournament dir's ``report.html`` (``write_tournament_html``); ``-o`` writes elsewhere."""
+    from colosseum.arena.report import render
+
+    tdir = tmp_path / "t1"
+    tdir.mkdir()
+    (tdir / "tournament.yaml").write_text("mode: select\n")
+    (tdir / "report.json").write_text(json.dumps(sample_report_data()["sections"]["tournaments"]["items"][0]["report"]))
+    calls = []
+    monkeypatch.setattr(render, "write_tournament_html", lambda d: calls.append(d) or d / REPORT_FILE)
+    assert write_report(tdir) == tdir / REPORT_FILE and calls == [tdir]
+    other = write_report(tdir, tmp_path / "t.html")
+    assert other.exists() and calls == [tdir] and set(_data_of(other.read_text())["sections"]) == {"tournaments"}

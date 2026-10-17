@@ -104,12 +104,17 @@ def write_report(run_dir: str | Path, out: str | Path | None = None) -> Path:
 
     root = Path(run_dir)
     if is_tournament_dir(root):
+        if out is None:                        # one writer of a tournament dir's report.html
+            return write_tournament_html(root)
         data = tournament_page_data(root)
+    elif (root / "tournament.yaml").exists():
+        raise ConfigError(f"{root} is a tournament directory, but the tournament has no report.json yet (it is "
+                          f"running or was interrupted: rerun it with the same --name to finish it)")
     elif is_run_dir(root):
         data = build_report_data(root)
         data["generated"] = "colosseum report"
     else:
-        raise ConfigError(f"{root} is neither a run directory (metrics.jsonl, config.resolved.yaml) nor a "
-                          f"tournament directory (tournament.yaml, report.json)")
+        raise ConfigError(f"{root} is neither a run directory (metrics.jsonl, config.resolved.yaml, matches.db or "
+                          f"tournaments/) nor a tournament directory (tournament.yaml and report.json)")
     target = Path(out) if out is not None else root / REPORT_FILE
     return write_text_atomic(target, render_html(data))
