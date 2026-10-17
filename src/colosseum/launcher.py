@@ -385,6 +385,7 @@ class Launcher:
         self._comparison_table = None
         self._match_log_stopped = False
         self._results_received = 0
+        self._pulse_results_received = 0         # pulse matches given to the journal writer (SP4 T6.1)
         # Set by launch() with the journal: the live Bradley-Terry refit thread (T2.2).
         self._live_ratings = None
         self._league_state_error_logged = False   # the first failing league_state.json write logs its traceback
@@ -955,7 +956,10 @@ class Launcher:
         self._match_log_stopped = True
         stats = self._match_log_writer.stop(SHUTDOWN_GRACE_SEC)
         worker_drops = self._hub.system_cumulative("dropped_results") if self._hub is not None else 0
-        logger.info(f"Match results: {self._results_received} received, {stats.written} journaled, "
+        workers, pulse = self._results_received, self._pulse_results_received
+        received = (f"{workers + pulse} received ({workers} from workers, {pulse} from the pulse)"
+                    if self._pulse_feeder is not None else f"{workers} received")
+        logger.info(f"Match results: {received}, {stats.written} journaled, "
                     f"{stats.duplicates} duplicates, {stats.dropped} dropped by the journal writer, {worker_drops} "
                     f"dropped by workers")
 
@@ -1130,6 +1134,7 @@ class Launcher:
             feeder.pump(self._pulse_requests)
         if self._pulse_results is not None:
             for message in self._drain(self._pulse_results, "pulse-results", lambda: ["pulse"]):
+                self._pulse_results_received += len(message.results)
                 if self._match_log_writer is not None:
                     self._match_log_writer.submit(message.results)   # a drop is counted by the writer (T1.3)
                 feeder.done(message)

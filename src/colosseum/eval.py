@@ -271,6 +271,7 @@ def play_lineups(
     source: str = "train",
     context: str = "eval, ",
     match_id_prefix: str = "eval",
+    should_stop: Callable[[], bool] | None = None,
 ) -> list[MatchResult]:
     """Play every lineup once, to completion; one ``MatchResult`` per lineup, in completion order.
 
@@ -287,6 +288,8 @@ def play_lineups(
     seed and copies block and uid into the result); ``source`` is the results' ``source``. Snapshot seats are
     served by the pool itself (``snapshot_fallback=False``). ``context`` (ending with ``", "``) prefixes every
     error message and ``match_id_prefix`` the match ids (``MatchRunner``); a tournament worker passes its own.
+    ``should_stop`` (optional) is called before every env step: when it returns True, play ends there and only the
+    matches finished so far are returned (fewer results than lineups; the pulse uses it to exit at the stop).
     """
     if (models is None) == (pool is None):
         raise ValueError("play_lineups: pass exactly one of models and pool")
@@ -330,6 +333,8 @@ def play_lineups(
             collector.runner = runner
             try:
                 while len(collector.results) < len(lineups):
+                    if should_stop is not None and should_stop():
+                        break
                     runner.step()
             finally:
                 runner.close()

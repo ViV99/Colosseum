@@ -78,13 +78,30 @@ def test_the_feeder_offers_every_kth_snapshot_and_the_final_one_and_drops_the_ol
         feeder.offer("main", "ckpt_v8", 8, 80, {}, final=True)                # 8th: even, and final
         feeder.offer("main", "ckpt_v9", 9, 90, {}, final=True)                # odd, but final
     q = queue.Queue(maxsize=1)
-    assert feeder.pump(q) == 1 and q.get_nowait().version in (6, 8)
+    assert feeder.pump(q) == 1 and q.get_nowait().version == 8           # backlog [8, 9]: the oldest goes first
     state = feeder.state()
     assert state["offered"]["main"] == [2, 4, 6, 8, 9]
-    assert state["skipped"]["main"] == [2, 4, 6] or state["skipped"]["main"] == [2, 4]
-    assert feeder.skipped == len(state["skipped"]["main"])
-    assert any("skipped" in r.getMessage() for r in caplog.records)
+    assert state["skipped"]["main"] == [2, 4, 6] and feeder.skipped == 3
+    assert any("ckpt_v6 of main skipped" in r.getMessage() for r in caplog.records)
     assert "other" not in state["offered"]
+
+
+def test_a_final_snapshot_dropped_by_the_backlog_is_logged_and_unevaluated(caplog):
+    feeder = PulseFeeder(["main", "b"], every=1, max_backlog=1)
+    feeder.offer("main", "ckpt_v5", 5, 50, {}, final=True)
+    with caplog.at_level(logging.INFO, logger="colosseum.arena.pulse"):
+        feeder.offer("b", "ckpt_v7", 7, 70, {}, final=True)                 # pushes main's final out
+    assert any("the final snapshot ckpt_v5 of main skipped" in r.getMessage() for r in caplog.records)
+    assert feeder.state()["skipped"] == {"main": [5], "b": []}
+    assert sorted(feeder.unevaluated_final()) == [("b", "ckpt_v7"), ("main", "ckpt_v5")]
+
+
+def test_the_feeder_keeps_no_weights_of_a_request_in_flight():
+    feeder = PulseFeeder(["main"], every=1, max_backlog=2)
+    feeder.offer("main", "ckpt_v1", 1, 10, {"w": np.zeros(3)}, final=False)
+    q = queue.Queue(maxsize=1)
+    feeder.pump(q)
+    assert feeder.pending == 1 and not any(hasattr(t, "state_dict") for t in feeder._in_flight.values())
 
 
 def test_the_feeder_bookkeeping_adds_up():
@@ -213,3 +230,137 @@ def test_the_launcher_offers_saved_snapshots_and_journals_pulse_results_only(tmp
     assert values == {"pulse_skipped_snapshots": 0, "pulse_evaluated_snapshots": 1, "pulse_pending_snapshots": 0}
     state_file = json.loads(run.pulse_state_path.read_text())
     assert state_file["evaluated"] == {"main": [7]} and state_file["offered"] == {"main": [7]}
+
+
+def _numpy_state(cfg, agent_id):
+    _roles, role = agent_role_of(cfg, agent_id)
+    model = build_model(cfg.get_agent_config(agent_id), role)
+    return {k: v.detach().numpy().copy() for k, v in model.state_dict().items()}
+
+
+def _run_pulse_in_process(cfg, requests, monkeypatch, *, stop=None):
+    """``pulse_main`` in this process on plain queues (cheap: no spawn); returns the messages it sent."""
+    import threading
+
+    from colosseum.arena import pulse as pulse_module
+    from colosseum.core import threads
+
+    monkeypatch.setattr(threads, "configure_torch_threads", lambda *a, **k: None)
+    spec = env_spec(cfg)
+    plan = pulse_plan(cfg, spec, resolve_player_roles(cfg, spec))
+    q_in, q_out = queue.Queue(), queue.Queue()
+    for request in [*requests, None]:
+        q_in.put(request)
+    pulse_module.pulse_main(cfg, requests=q_in, results=q_out, stop_event=stop or threading.Event(),
+                            field_specs=load_fixed_players(cfg, spec, plan.field), field=plan.field,
+                            agents=plan.agents, run_id="0123456789abcdef")
+    out = []
+    while not q_out.empty():
+        out.append(q_out.get_nowait())
+    return out
+
+
+def test_the_pulse_plays_score_layouts_for_two_agents(monkeypatch):
+    """A one-team layout (score_blocks: the homogeneous team and cross-play with the field) and two evaluated
+    agents, each on its own seats and uids."""
+    cfg = make_test_config("coop", agents={"a": {}, "b": {}, "rnd": scripted_agent()},
+                           evaluation={"enabled": True, "blocks": 2, "num_envs": 2})
+    got = _run_pulse_in_process(cfg, [PulseRequest("a", "ckpt_v3", 3, 30, _numpy_state(cfg, "a")),
+                                      PulseRequest("b", "ckpt_v4", 4, 40, _numpy_state(cfg, "b"))], monkeypatch)
+    assert [(m.agent_id, m.version) for m in got] == [("a", 3), ("b", 4)]
+    for m in got:
+        prefix = f"pulse-0123456789ab/P/coop2/{m.agent_id}@v{m.version}/"
+        uids = {r.uid for r in m.results}
+        # 2 blocks x (the homogeneous team, rotation 0 + cross-play with rnd on either seat, rotations 0 and 1)
+        assert uids == ({f"{prefix}-/{k}/r0" for k in (0, 1)}
+                        | {f"{prefix}rnd/{k}/r{seat}" for k in (0, 1) for seat in (0, 1)})
+        assert {r.source for r in m.results} == {"pulse"}
+        assert {s.agent_id for r in m.results for s in r.seats} == {m.agent_id, "rnd"}
+    assert {r.seed for r in got[0].results} == {r.seed for r in got[1].results}
+
+
+def test_unscheduled_compositions_are_logged_once_per_agent(monkeypatch, caplog):
+    cfg = make_test_config("asymmetric", agents={"hunter": {"roles": ["hunter"]}, "prey": {"roles": ["prey"]},
+                                                 "preybot": {**scripted_agent(), "roles": ["prey"]},
+                                                 "hunterbot": {**scripted_agent(), "roles": ["hunter"]}},
+                           evaluation={"enabled": True, "agents": ["hunter"], "blocks": 1, "num_envs": 2})
+    state = _numpy_state(cfg, "hunter")
+    with caplog.at_level(logging.INFO):
+        got = _run_pulse_in_process(cfg, [PulseRequest("hunter", f"ckpt_v{v}", v, v, state) for v in (1, 2)],
+                                    monkeypatch)
+    assert [m.version for m in got] == [1, 2]
+    messages = [(r.name, r.getMessage()) for r in caplog.records]
+    # the schedule's own line comes from pulse_plan (the main process) only, never per snapshot
+    assert not [m for n, m in messages if n.endswith("schedule") and ("hunter@v1" in m or "hunter@v2" in m)]
+    drops = [m for n, m in messages if n == "colosseum.arena.pulse" and "hunterbot is not played" in m]
+    assert len(drops) == 1
+
+
+def test_put_until_stop_still_sends_after_the_stop_when_there_is_room():
+    import threading
+
+    from colosseum.arena.tournament.engine import put_until_stop
+
+    stop = threading.Event()
+    stop.set()
+    q = queue.Queue(maxsize=1)
+    assert put_until_stop(q, "finished", stop) and q.get_nowait() == "finished"
+    q.put("occupied")
+    assert not put_until_stop(q, "late", stop)
+
+
+def test_play_lineups_ends_early_when_asked_to_stop():
+    from colosseum.core.registry import make_env
+    from colosseum.core.types import Lineup, SeatAssignment
+    from colosseum.eval import play_lineups
+    from colosseum.players import RandomBot
+
+    cfg = make_test_config("turns", agents=AGENTS)
+    lineups = [Lineup("2p", [SeatAssignment("x"), SeatAssignment("y")], uid=f"u{i}") for i in range(4)]
+    kwargs = dict(env_fn=lambda: make_env(cfg), models={"x": RandomBot(), "y": RandomBot()}, lineups=lineups,
+                  num_envs=2, seed=0)
+    assert play_lineups(**kwargs, should_stop=lambda: True) == []
+    assert len(play_lineups(**kwargs, should_stop=lambda: False)) == 4
+
+
+def test_a_failing_pulse_state_write_is_logged_and_training_goes_on(tmp_path, monkeypatch, caplog):
+    from colosseum.launcher import Launcher
+    from colosseum.metrics import jsonl
+    from game_helpers import make_test_run_dir
+
+    cfg = _cfg()
+    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
+    launcher._pulse_feeder = PulseFeeder(["main"], every=1, max_backlog=4)
+    launcher._pulse_requests = queue.Queue(maxsize=1)
+
+    def broken(path, data):
+        raise OSError("disk full on purpose")
+
+    monkeypatch.setattr(jsonl, "write_json_atomic", broken)
+    launcher._pulse_feeder.offer("main", "ckpt_v1", 1, 10, {}, final=False)
+    with caplog.at_level(logging.ERROR, logger="colosseum.launcher"):
+        launcher._pump_pulse()                                             # no exception
+        launcher._pulse_feeder.offer("main", "ckpt_v2", 2, 20, {}, final=False)
+        launcher._pump_pulse()
+    errors = [r for r in caplog.records if r.levelno == logging.ERROR and "disk full on purpose" in r.getMessage()]
+    assert len(errors) == 2 and errors[0].exc_info and not errors[1].exc_info   # traceback only the first time
+    assert not launcher._pulse_feeder.changed and launcher._pulse_requests.get_nowait().version == 1
+
+
+class _StopAfter:
+    """A stop event that reads as set from its ``n``-th check on (the pulse is then mid-play)."""
+
+    def __init__(self, n: int) -> None:
+        self.n, self.calls = n, 0
+
+    def is_set(self) -> bool:
+        self.calls += 1
+        return self.calls >= self.n
+
+
+def test_a_stop_during_play_ends_the_pulse_without_sending_the_snapshot(monkeypatch):
+    cfg = _cfg(blocks=50, num_envs=2)
+    stop = _StopAfter(20)                    # past the request loop's checks, inside play_lineups' step loop
+    got = _run_pulse_in_process(cfg, [PulseRequest("main", "ckpt_v1", 1, 10, _numpy_state(cfg, "main"))],
+                                monkeypatch, stop=stop)
+    assert got == [] and 20 <= stop.calls < 200

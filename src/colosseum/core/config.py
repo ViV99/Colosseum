@@ -690,7 +690,6 @@ class MetricsConfig(StrictModel):
     )
 
 
-
 class EvaluationConfig(StrictModel):
     """Pulse: every new snapshot against a fixed field during training (SP4 spec block 6). Global only."""
 
@@ -705,6 +704,7 @@ class EvaluationConfig(StrictModel):
     num_envs: int = Field(default=8, ge=1, description="Envs of the pulse process.")
     deterministic: bool = Field(default=False, description="Greedy snapshot policies.")
     max_backlog: int = Field(default=4, ge=1, description="Snapshots waiting for evaluation; the oldest are skipped.")
+
 
 class MatchLogConfig(StrictModel):
     """The match log ``runs/<name>/matches.db`` (SP4 spec block 1). Global only (no per-agent override)."""

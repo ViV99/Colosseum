@@ -170,8 +170,14 @@ def make_tasks(blocks: Sequence[Block], num_envs: int) -> list[list[Block]]:
     return tasks
 
 
-def _put(q: Any, item: Any, stop_event: Any) -> bool:
-    """Blocking put that gives up when ``stop_event`` is set."""
+def put_until_stop(q: Any, item: Any, stop_event: Any) -> bool:
+    """Blocking put that gives up only when ``stop_event`` is set: one ``put_nowait`` first (an item finished after
+    the stop still goes out when the queue has room; the shutdown drains it), then timed puts until the stop."""
+    try:
+        q.put_nowait(item)
+        return True
+    except queue.Full:
+        pass
     while not stop_event.is_set():
         try:
             q.put(item, timeout=0.5)
@@ -249,14 +255,14 @@ def _worker_main(*, worker_id: int, config: ColosseumConfig, players: list[Tourn
                                   max_idle_steps=config.env.max_idle_steps, observer=placement, source=source,
                                   context=context, match_id_prefix=source)
         except (ConfigError, EnvContractError, PlayerError) as e:
-            _put(results, ("error", index, worker_id, _error_kind(e), str(e),
+            put_until_stop(results, ("error", index, worker_id, _error_kind(e), str(e),
                            placement.where(str(e), context, blocks)), stop_event)
             raise
         by_block: dict[str, list[MatchResult]] = {}
         for result in played:
             by_block.setdefault(result.block, []).append(result)
         logger.info(f"tournament worker {worker_id}: task {index} done ({len(played)} matches)")
-        if not _put(results, ("done", index, by_block), stop_event):
+        if not put_until_stop(results, ("done", index, by_block), stop_event):
             return
 
 

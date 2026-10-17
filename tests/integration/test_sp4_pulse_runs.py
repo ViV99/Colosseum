@@ -41,6 +41,12 @@ def test_pulse_evaluates_snapshots_into_the_journal_on_the_same_seeds(tmp_path):
     assert (run.root / "logs" / "pulse.log").is_file()
     system = read_records(run.root, "system")
     assert system and "pulse_skipped_snapshots" in system[-1]
+    main_log = run.log("main")
+    assert "Terminated processes" not in main_log                          # the pulse exits by itself at the stop
+    m = re.search(r"Match results: (\d+) received \((\d+) from workers, (\d+) from the pulse\), (\d+) journaled, "
+                  r"(\d+) duplicates, (\d+) dropped by the journal writer", main_log)
+    total, workers, pulse, written, duplicates, dropped = map(int, m.groups())
+    assert total == workers + pulse == written + duplicates + dropped and pulse == len(results)
 
 
 def test_a_pulse_crash_stops_the_run_with_a_pointer_to_its_log(tmp_path):
