@@ -30,6 +30,7 @@ the user to pin by hand with ``colosseum pin`` (ruling C6). ``confirmed: false``
 
 from __future__ import annotations
 
+import contextlib
 import dataclasses
 import filecmp
 import functools
@@ -37,8 +38,9 @@ import json
 import logging
 import os
 import shutil
+import sqlite3
 import uuid
-from collections.abc import Mapping, Sequence
+from collections.abc import Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
@@ -170,21 +172,25 @@ class TournamentDir:
         dir is reused only when it holds the snapshot's own files (the same file, or equal bytes for a copy), never
         by its path alone; anything else there is replaced."""
         dst = self.snapshots / f"{run_index}-{Path(selection.path).name}" / info.agent_id / info.checkpoint_id
-        if all((dst / name).is_file() for name in _SNAPSHOT_FILES) and \
-                all(_same_file(dst / name, info.path / name) for name in _SNAPSHOT_FILES):
-            return dst
-        if dst.exists():          # another snapshot's files, or an incomplete link dir
-            shutil.rmtree(dst)
-        dst.parent.mkdir(parents=True, exist_ok=True)
-        tmp = dst.parent / f".tmp-{info.checkpoint_id}-{uuid.uuid4().hex[:8]}"
-        tmp.mkdir()
         try:
-            for name in _SNAPSHOT_FILES:
-                link_or_copy(info.path / name, tmp / name)
-            os.replace(tmp, dst)
-        finally:
-            if tmp.exists():
-                shutil.rmtree(tmp, ignore_errors=True)
+            if all((dst / name).is_file() for name in _SNAPSHOT_FILES) and \
+                    all(_same_file(dst / name, info.path / name) for name in _SNAPSHOT_FILES):
+                return dst
+            if dst.exists():          # another snapshot's files, or an incomplete link dir
+                shutil.rmtree(dst)
+            dst.parent.mkdir(parents=True, exist_ok=True)
+            tmp = dst.parent / f".tmp-{info.checkpoint_id}-{uuid.uuid4().hex[:8]}"
+            tmp.mkdir()
+            try:
+                for name in _SNAPSHOT_FILES:
+                    link_or_copy(info.path / name, tmp / name)
+                os.replace(tmp, dst)
+            finally:
+                if tmp.exists():
+                    shutil.rmtree(tmp, ignore_errors=True)
+        except FileNotFoundError as e:    # retention removed it between the listing and the link (B-M3)
+            raise ConfigError(f"--run {selection.path}: snapshot {info.checkpoint_id} of {info.agent_id} ({info.path}) "
+                              f"was evicted by the run while the tournament started; rerun") from e
         return dst
 
     def write_reports(self, report: modes.TournamentReport) -> list[Path]:
@@ -239,6 +245,21 @@ class BlockRunner:
                         log_dir=self._log_dir, source="tournament")
             out.update({b.id: self._done[b.id] for b in todo})
         return out
+
+
+@contextlib.contextmanager
+def _journal_errors(db: Path, name: str) -> Iterator[None]:
+    """A journal that cannot be read or written (another schema version, a damaged file, a long lock by another
+    process) as a ConfigError naming it (B-M3); blocks already written whole stay for a rerun."""
+    from colosseum.arena.matchlog import MatchLogError
+
+    try:
+        yield
+    except (MatchLogError, sqlite3.Error) as e:
+        raise ConfigError(f"tournament {name!r}: the match log {db} cannot be used ({type(e).__name__}: {e}); blocks "
+                          f"already in it are kept: rerun with the same --name when the journal is usable again "
+                          f"(another process may hold a long write lock), or move a journal of another version "
+                          f"away") from e
 
 
 def _same_file(a: Path, b: Path) -> bool:
@@ -424,8 +445,9 @@ def _new_tournament(options: TournamentOptions, config: ColosseumConfig, spec, t
 
 
 def run_tournament(options: TournamentOptions) -> TournamentOutcome:
-    """Run (or continue) one tournament (module docstring)."""
-    from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLog
+    """Run (or continue) one tournament (module docstring). A journal that cannot be read or written and a
+    snapshot the run evicts while the tournament starts are ConfigErrors (B-M3)."""
+    from colosseum.arena.matchlog import MATCH_LOG_FILE
     from colosseum.core.registry import env_spec
 
     options = _absolute_options(options)
@@ -446,55 +468,64 @@ def run_tournament(options: TournamentOptions) -> TournamentOutcome:
     db = root / MATCH_LOG_FILE
     handler, old_level = _file_logging(tdir.logs / "tournament.log")
     try:
-        request = _request(options, config)
-        stored = tdir.load()
-        if stored is not None:
-            tdir.check(stored, request)
-            missing = [d["name"] for d in stored["players"]
-                       if d["source"]["kind"] == "model" and not Path(d["source"]["weights"]).is_file()]
-            if missing:
-                raise ConfigError(f"tournament {name!r}: the weights of {missing} are gone (snapshots/ of "
-                                  f"{tdir.path} or the -a paths); they cannot be played again")
-            logger.info("Continuing tournament %s (%s)", name, tdir.path)
-        else:
-            stored = _new_tournament(options, config, spec, tdir, request, db=db, first_config=first_config)
-        players = {d["name"]: player_from_dict(d) for d in stored["players"]}
-        candidates, field_names = list(stored["candidates"]), list(stored["field"])
-        layouts, weights = list(stored["layouts"]), {k: float(v) for k, v in stored["layout_weights"].items()}
-        log = MatchLog(db, _journal_run(options, config, db, stored["id"], first_config),
-                       min_free_disk_mb=config.match_log.min_free_disk_mb)
-        try:
-            reader = MatchLog.open_readonly(db)
-            try:
-                whole = reader.blocks(name)
-                done: dict[str, list[MatchResult]] = {}
-                for result in reader.match_results(source="tournament", tournament=name):
-                    if result.block in whole:
-                        done.setdefault(result.block, []).append(result)
-            finally:
-                reader.close()
-            runner = BlockRunner(config=config, spec=spec, players=players, log=log, done=done,
-                                 num_workers=options.num_workers, num_envs=options.num_envs,
-                                 deterministic=options.deterministic, log_dir=tdir.logs)
-            settings = modes.TournamentSettings(
-                name=name, layouts=layouts, layout_weights=weights, blocks=options.blocks,
-                halving_blocks=options.halving_blocks, confirm_blocks=options.confirm_blocks,
-                finalists=options.finalists, seed=options.seed, deterministic=options.deterministic)
-            bt_fn = functools.partial(modes.bt_section, players=players, anchor=config.ratings.anchor,
-                                      samples=config.ratings.bootstrap_samples, seed=options.seed)
-            report = modes.run(options.mode, spec=spec, players=players, candidates=candidates, field=field_names,
-                               settings=settings, play=runner, bt_fn=bt_fn)
-        finally:
-            log.close()
-        written = tdir.write_reports(report)
-        pinned, pin_errors = _pin(report, players) if options.pin else ([], [])
-        logger.info("Tournament %s: %d blocks played, %d from the journal", name, runner.played, runner.reused)
-        return TournamentOutcome(report, tdir.path, runner.played, runner.reused, pinned, written, pin_errors)
+        with _journal_errors(db, name):
+            return _run(options, config, spec, name, tdir, db, first_config)
     finally:
         colosseum_logger = logging.getLogger("colosseum")
         colosseum_logger.removeHandler(handler)
         colosseum_logger.setLevel(old_level)
         handler.close()
+
+
+def _run(options: TournamentOptions, config: ColosseumConfig, spec, name: str, tdir: TournamentDir, db: Path,
+         first_config: ColosseumConfig | None) -> TournamentOutcome:
+    """The body of ``run_tournament`` once the tournament dir and its log are set up."""
+    from colosseum.arena.matchlog import MatchLog
+
+    request = _request(options, config)
+    stored = tdir.load()
+    if stored is not None:
+        tdir.check(stored, request)
+        missing = [d["name"] for d in stored["players"]
+                   if d["source"]["kind"] == "model" and not Path(d["source"]["weights"]).is_file()]
+        if missing:
+            raise ConfigError(f"tournament {name!r}: the weights of {missing} are gone (snapshots/ of "
+                              f"{tdir.path} or the -a paths); they cannot be played again")
+        logger.info("Continuing tournament %s (%s)", name, tdir.path)
+    else:
+        stored = _new_tournament(options, config, spec, tdir, request, db=db, first_config=first_config)
+    players = {d["name"]: player_from_dict(d) for d in stored["players"]}
+    candidates, field_names = list(stored["candidates"]), list(stored["field"])
+    layouts, weights = list(stored["layouts"]), {k: float(v) for k, v in stored["layout_weights"].items()}
+    log = MatchLog(db, _journal_run(options, config, db, stored["id"], first_config),
+                   min_free_disk_mb=config.match_log.min_free_disk_mb)
+    try:
+        reader = MatchLog.open_readonly(db)
+        try:
+            whole = reader.blocks(name)
+            done: dict[str, list[MatchResult]] = {}
+            for result in reader.match_results(source="tournament", tournament=name):
+                if result.block in whole:
+                    done.setdefault(result.block, []).append(result)
+        finally:
+            reader.close()
+        runner = BlockRunner(config=config, spec=spec, players=players, log=log, done=done,
+                             num_workers=options.num_workers, num_envs=options.num_envs,
+                             deterministic=options.deterministic, log_dir=tdir.logs)
+        settings = modes.TournamentSettings(
+            name=name, layouts=layouts, layout_weights=weights, blocks=options.blocks,
+            halving_blocks=options.halving_blocks, confirm_blocks=options.confirm_blocks,
+            finalists=options.finalists, seed=options.seed, deterministic=options.deterministic)
+        bt_fn = functools.partial(modes.bt_section, players=players, anchor=config.ratings.anchor,
+                                  samples=config.ratings.bootstrap_samples, seed=options.seed)
+        report = modes.run(options.mode, spec=spec, players=players, candidates=candidates, field=field_names,
+                           settings=settings, play=runner, bt_fn=bt_fn)
+    finally:
+        log.close()
+    written = tdir.write_reports(report)
+    pinned, pin_errors = _pin(report, players) if options.pin else ([], [])
+    logger.info("Tournament %s: %d blocks played, %d from the journal", name, runner.played, runner.reused)
+    return TournamentOutcome(report, tdir.path, runner.played, runner.reused, pinned, written, pin_errors)
 
 
 def _pin(report: modes.TournamentReport,

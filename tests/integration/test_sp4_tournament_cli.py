@@ -328,3 +328,47 @@ def test_a_retried_start_never_plays_the_snapshot_links_of_a_failed_one(tmp_path
     other = read_snapshots(second / "checkpoints" / "main")[-1]
     assert tdir.link(1, RunSelection(second), other) == dst
     assert os.path.samefile(dst / "model.pt", other.path / "model.pt")
+
+
+def test_journal_and_eviction_errors_are_config_errors_with_their_context(tmp_path, monkeypatch):
+    """B-M3: a journal of another schema version, a journal write that fails (a long lock by another process) and a
+    snapshot the run evicts while the tournament starts are ConfigErrors naming the journal / the snapshot, not
+    tracebacks; after the eviction a rerun works."""
+    import sqlite3
+
+    import colosseum.arena.tournament.players as players_module
+    from colosseum.coordinator.checkpoint_manager import read_snapshots
+
+    root, _cfg = fake_run(tmp_path, versions=(10, 20))
+    db = root / MATCH_LOG_FILE
+    args = ["--run", root, "--field", "rnd", "--blocks", 1, "--num-envs", 2]
+    MatchLog(db, None).close()
+    with sqlite3.connect(db) as conn:
+        conn.execute("UPDATE meta SET value = '99' WHERE key = 'schema_version'")
+    other = invoke(*args, "--name", "schema")
+    assert other.exit_code == 1 and isinstance(other.exception, SystemExit), other.output
+    assert "Config error" in other.output and str(db) in other.output and "schema version 99" in other.output
+    db.unlink()
+
+    def locked(self, results, **kwargs):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(MatchLog, "append", locked)
+    busy = invoke(*args, "--name", "busy")
+    assert busy.exit_code == 1 and isinstance(busy.exception, SystemExit), busy.output
+    assert "Config error" in busy.output and str(db) in busy.output and "database is locked" in busy.output
+    monkeypatch.undo()
+
+    def evicting(agent_dir):
+        infos = read_snapshots(agent_dir)
+        shutil.rmtree(Path(agent_dir) / "ckpt_v10")              # the run evicts it right after the listing
+        return infos
+
+    monkeypatch.setattr(players_module, "read_snapshots", evicting)
+    race = invoke(*args, "--name", "race")
+    assert race.exit_code == 1 and isinstance(race.exception, SystemExit), race.output
+    assert "ckpt_v10" in race.output and "evicted by the run while the tournament started; rerun" in race.output
+    monkeypatch.undo()
+    rerun = invoke(*args, "--name", "race")
+    assert rerun.exit_code == 0, rerun.output
+    assert [c["name"] for c in report(root, "race")["candidates"]] == ["main@v20"]
