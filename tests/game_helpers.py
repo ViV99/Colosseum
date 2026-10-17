@@ -1542,11 +1542,27 @@ class PlayerErrorBot(ScriptedBot):
         raise RuntimeError("bot failure on purpose")
 
 
+def biased_model(config, agent_id: str, logits, seed: int = 0):
+    """A ``GameTestModel`` of trainable ``agent_id`` whose policy head has zero weights and bias ``logits``: it
+    plays one fixed distribution whatever it sees (``[20, 0, 0]``: always action 0)."""
+    from colosseum.core.registry import build_model
+
+    _roles, role = agent_role_of(config, agent_id)
+    torch.manual_seed(seed)
+    model = build_model(config.get_agent_config(agent_id), role)
+    head = model.inner.policy.heads["0"]
+    with torch.no_grad():
+        head.weight.zero_()
+        head.bias.copy_(torch.as_tensor(list(logits), dtype=head.bias.dtype))
+    return model
+
+
 def write_fake_run(root, game: str = "turns", *, agent: str = "main", versions=(10, 20, 30),
-                   agents: dict | None = None, **sections):
+                   agents: dict | None = None, biases: Mapping[int, Sequence[float]] | None = None, **sections):
     """A run dir as ``colosseum train`` leaves it, without training: ``config.resolved.yaml`` of
     ``make_test_config(game, agents=agents or {agent: {}}, **sections)`` and ``checkpoints/<agent>/ckpt_v<N>`` for
-    every version (``write_ckpt_dir``; seed = position, so the weights differ). Returns ``(root, config)``."""
+    every version (``write_ckpt_dir``; seed = position, so the weights differ). A version in ``biases`` gets a
+    ``biased_model`` with those logits (a policy that ignores the observation). Returns ``(root, config)``."""
     import yaml
 
     root = Path(root)
@@ -1555,7 +1571,8 @@ def write_fake_run(root, game: str = "turns", *, agent: str = "main", versions=(
     (root / "config.resolved.yaml").write_text(
         yaml.safe_dump(config.model_dump(mode="json", by_alias=True), sort_keys=False))
     for i, version in enumerate(versions):
-        write_ckpt_dir(root / "checkpoints" / agent, config, agent, policy_version=version, seed=i)
+        model = biased_model(config, agent, biases[version], seed=i) if biases and version in biases else None
+        write_ckpt_dir(root / "checkpoints" / agent, config, agent, model=model, policy_version=version, seed=i)
     return root, config
 
 

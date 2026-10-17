@@ -9,6 +9,7 @@
       matches.db               the match log (SP4: colosseum.arena.matchlog)
       league_state.json        ratings and PFSP statistics, for a run-dir resume (SP4)
       pulse_state.json         pulse bookkeeping (SP4 T6.1)
+      tournaments/<name>/      colosseum tournament dirs (SP4 T5.4)
       checkpoints/<agent>/ckpt_v<N>/{model.pt, trainer_state.pt, meta.json}
 """
 
@@ -106,6 +107,10 @@ class RunDir:
         from colosseum.arena.matchlog import MATCH_LOG_FILE
 
         return self.root / MATCH_LOG_FILE
+
+    @property
+    def tournaments_dir(self) -> Path:
+        return self.root / "tournaments"
 
     @property
     def run_id(self) -> str | None:

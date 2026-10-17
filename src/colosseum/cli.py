@@ -296,6 +296,152 @@ def record_cmd(config: str, player: str, against: tuple[str, ...], layouts: tupl
     click.echo(f"Description: {output}/{RECORD_FILE}")
 
 
+class _TournamentCommand(click.Command):
+    """Keeps the raw arguments: every ``--agent`` / ``--snapshots`` belongs to the ``--run`` before it."""
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        ctx.meta["tournament_args"] = list(args)
+        return super().parse_args(ctx, args)
+
+
+def _group_runs(args: list[str]) -> list[dict]:
+    """``[{"run", "agent", "snapshots"}]`` in command-line order (``--opt value`` and ``--opt=value``)."""
+    runs: list[dict] = []
+    i = 0
+    while i < len(args):
+        token, key, value = args[i], None, None
+        for opt in ("--run", "--agent", "--snapshots"):
+            if token == opt:
+                key, value = opt, args[i + 1] if i + 1 < len(args) else None
+                i += 1
+                break
+            if token.startswith(opt + "="):
+                key, value = opt, token[len(opt) + 1:]
+                break
+        i += 1
+        if key is None:
+            continue
+        if key == "--run":
+            runs.append({"run": value, "agent": None, "snapshots": None})
+            continue
+        if not runs:
+            raise click.UsageError(f"{key} belongs to a --run: write it after the --run it describes")
+        slot = key.removeprefix("--")
+        if runs[-1][slot] is not None:
+            raise click.UsageError(f"--run {runs[-1]['run']}: {key} given twice")
+        runs[-1][slot] = value
+    return runs
+
+
+def _run_selection(item: dict):
+    from pathlib import Path
+
+    from colosseum.arena.tournament.players import RunSelection
+
+    text = item["run"]
+    alias, sep, path = text.partition("=")
+    if not sep or not alias or "/" in alias or not path:
+        alias, path = None, text
+    p = Path(path)
+    if not p.is_dir():
+        raise click.BadParameter(f"{path}: not a directory", param_hint="'--run'")
+    return RunSelection(path=p, alias=alias, agent=item["agent"], snapshots=item["snapshots"] or "all")
+
+
+@main.command("tournament", cls=_TournamentCommand)
+@click.option("--config", "-c", default=None, type=click.Path(exists=True, dir_okay=False),
+              help="Config YAML (its env and agents); default: the first --run's config.resolved.yaml")
+@click.option("-a", "--candidate", "candidates", multiple=True,
+              help="Candidate: name=path (a checkpoint dir or .pt of any architecture) or a scripted / frozen agent "
+                   "of the config. Repeatable.")
+@click.option("--run", "runs", multiple=True,
+              help="[alias=]runs/x: candidates are its stored snapshots (repeatable; --agent / --snapshots after a "
+                   "--run apply to it). Matches go to the first run's matches.db, reports to its tournaments/<name>/.")
+@click.option("--agent", "run_agents", multiple=True, help="The --run's agent (default: its only trainable agent)")
+@click.option("--snapshots", "run_snapshots", multiple=True,
+              help="The --run's snapshots: all (default), last:N, top:N (by the run journal's rating lower bound), "
+                   "every:K")
+@click.option("--field", default=None,
+              help="Comma-separated opponents: agents of the config, -a names or snapshots [alias/]agent@vN. "
+                   "Default: every scripted / frozen agent of the config.")
+@click.option("--mode", default="gauntlet", show_default=True,
+              type=click.Choice(["gauntlet", "round-robin", "halving", "select"]))
+@click.option("--layout", "layouts", multiple=True, help="Layout (repeatable); default: the enabled layouts")
+@click.option("--blocks", default=None, type=click.IntRange(min=1),
+              help="gauntlet / round-robin: blocks per composition (default 50, provisional)")
+@click.option("--halving-blocks", default=None, type=click.IntRange(min=1),
+              help="halving / select: blocks per composition of round 0 (default 8, provisional)")
+@click.option("--confirm-blocks", default=None, type=click.IntRange(min=1),
+              help="select: blocks per composition of the confirmation stage (default 100, provisional)")
+@click.option("--finalists", default=None, type=click.IntRange(min=1), help="halving / select (default 3)")
+@click.option("--num-workers", default=1, type=click.IntRange(min=1), show_default=True, help="Worker processes")
+@click.option("--num-envs", default=8, type=click.IntRange(min=1), show_default=True, help="Envs per worker")
+@click.option("--deterministic", is_flag=True, default=False, help="Greedy policies (default: stochastic)")
+@click.option("--seed", default=0, type=int, show_default=True, help="Seed of the block seeds (domains A, B)")
+@click.option("--name", default=None, help="Tournament name (default <mode>-<YYYYmmdd-HHMMSS>); the same name "
+                                           "continues an interrupted tournament")
+@click.option("--output", "-o", default=None, type=click.Path(file_okay=False),
+              help="Without --run: the directory for matches.db and tournaments/<name>/")
+@click.option("--pin", is_flag=True, default=False, help="select with --run: pin the confirmed winner snapshot")
+@click.option("--set", "overrides", multiple=True, help="Override config values." + _SET_HELP_YAML)
+def tournament_cmd(config: str | None, candidates: tuple[str, ...], runs: tuple[str, ...], run_agents: tuple[str, ...],
+                   run_snapshots: tuple[str, ...], field: str | None, mode: str, layouts: tuple[str, ...],
+                   blocks: int | None, halving_blocks: int | None, confirm_blocks: int | None, finalists: int | None,
+                   num_workers: int, num_envs: int, deterministic: bool, seed: int, name: str | None,
+                   output: str | None, pin: bool, overrides: tuple[str, ...]) -> None:
+    """Compare candidates (run snapshots, checkpoints of any architecture, scripted / frozen agents) on common
+    seeds with seat rotations, and select the best (--mode select: screening, then confirmation on fresh seeds).
+
+    The config is checked in the "play" scope (like eval). Exit code: 0 done (also a select whose winner is not
+    confirmed), 1 config, player or env error or a dead worker, 2 bad arguments, 130 SIGINT (finished blocks are
+    kept: rerun with the same --name to continue).
+    """
+    import logging
+
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    grouped = _group_runs(click.get_current_context().meta.get("tournament_args", []))
+    if len(grouped) != len(runs):
+        raise click.UsageError("could not match --agent / --snapshots to their --run")
+    if pin and (not runs or mode != "select"):
+        raise click.UsageError("--pin needs --mode select and --run (it pins the winner in the run's storage)")
+    if output is not None and runs:
+        raise click.UsageError("--output is for tournaments without --run (with --run the reports go to "
+                               "runs/x/tournaments/<name>/)")
+    if not runs and config is None:
+        raise click.UsageError("give -c CONFIG or --run DIR")
+    with _config_errors():
+        from colosseum.arena.tournament import modes
+        from colosseum.arena.tournament.engine import TournamentError
+        from colosseum.arena.tournament.run import TournamentOptions, run_tournament
+        from colosseum.core.errors import ConfigError
+        from colosseum.eval import parse_agent_spec
+
+        try:
+            parsed = tuple(parse_agent_spec(text) for text in candidates)
+        except ConfigError as e:
+            raise click.BadParameter(str(e), param_hint="'-a'") from e
+        options = TournamentOptions(
+            mode=mode, candidates=parsed, runs=tuple(_run_selection(item) for item in grouped),
+            field=None if field is None else tuple(n.strip() for n in field.split(",") if n.strip()),
+            layouts=tuple(layouts),
+            blocks=blocks or modes.DEFAULT_BLOCKS, halving_blocks=halving_blocks or modes.DEFAULT_HALVING_BLOCKS,
+            confirm_blocks=confirm_blocks or modes.DEFAULT_CONFIRM_BLOCKS,
+            finalists=finalists or modes.DEFAULT_FINALISTS, seed=seed, deterministic=deterministic,
+            num_workers=num_workers, num_envs=num_envs, name=name, output=output, pin=pin, config_path=config,
+            overrides=_parse_overrides(overrides))
+        try:
+            outcome = run_tournament(options)
+        except TournamentError as e:
+            click.echo(f"Tournament error: {e}", err=True)
+            sys.exit(1)
+    click.echo("\n" + outcome.report.text())
+    click.echo(f"Blocks: {outcome.played_blocks} played, {outcome.reused_blocks} from the journal")
+    for path in outcome.written:
+        click.echo(f"Written: {path}")
+    for winner in outcome.pinned:
+        click.echo(f"Pinned {winner}")
+
+
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
 @click.option("--data", "-d", "data", required=True, multiple=True, type=click.Path(exists=True),
