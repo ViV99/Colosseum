@@ -9,7 +9,8 @@ Where things go:
 
 The tournament dir holds ``tournament.yaml`` (format, name, id, the request, the resolved players, layouts,
 layout weights and the seed domains), ``snapshots/`` (hard links, else copies, of every run snapshot the
-tournament plays, made before the first match: a snapshot the training evicts meanwhile still plays),
+tournament plays, made before the first match: a snapshot the training evicts meanwhile still plays; a new
+tournament empties it first, so a failed start's links never play under a retry's names),
 ``logs/`` (``tournament.log`` and the workers' logs) and the reports (``report.json``, ``report.txt``,
 ``report.html``).
 
@@ -30,6 +31,7 @@ the user to pin by hand with ``colosseum pin`` (ruling C6). ``confirmed: false``
 from __future__ import annotations
 
 import dataclasses
+import filecmp
 import functools
 import json
 import logging
@@ -164,11 +166,14 @@ class TournamentDir:
                               f"--name")
 
     def link(self, run_index: int, selection: RunSelection, info: CheckpointInfo) -> Path:
-        """The snapshot's hard-linked (else copied) ``model.pt`` + ``meta.json`` in ``snapshots/``."""
+        """The snapshot's hard-linked (else copied) ``model.pt`` + ``meta.json`` in ``snapshots/``. An existing link
+        dir is reused only when it holds the snapshot's own files (the same file, or equal bytes for a copy), never
+        by its path alone; anything else there is replaced."""
         dst = self.snapshots / f"{run_index}-{Path(selection.path).name}" / info.agent_id / info.checkpoint_id
-        if all((dst / name).is_file() for name in _SNAPSHOT_FILES):
+        if all((dst / name).is_file() for name in _SNAPSHOT_FILES) and \
+                all(_same_file(dst / name, info.path / name) for name in _SNAPSHOT_FILES):
             return dst
-        if dst.exists():          # an incomplete link dir (cannot come from this code: os.replace is atomic)
+        if dst.exists():          # another snapshot's files, or an incomplete link dir
             shutil.rmtree(dst)
         dst.parent.mkdir(parents=True, exist_ok=True)
         tmp = dst.parent / f".tmp-{info.checkpoint_id}-{uuid.uuid4().hex[:8]}"
@@ -234,6 +239,10 @@ class BlockRunner:
                         log_dir=self._log_dir, source="tournament")
             out.update({b.id: self._done[b.id] for b in todo})
         return out
+
+
+def _same_file(a: Path, b: Path) -> bool:
+    return os.path.samefile(a, b) or filecmp.cmp(a, b, shallow=False)
 
 
 def _absolute(path: str | Path) -> str:
@@ -381,6 +390,8 @@ def _new_tournament(options: TournamentOptions, config: ColosseumConfig, spec, t
         raise ConfigError(f"the match log {db} already holds {held} blocks of a tournament named {options.name!r} "
                           f"whose {TOURNAMENT_FILE} is gone ({tdir.yaml_path}); its settings cannot be checked, so "
                           f"its blocks cannot be continued: choose another --name")
+    if tdir.snapshots.exists():       # links of a start that failed before tournament.yaml: nothing uses them
+        shutil.rmtree(tdir.snapshots)
     bare = {name for name, path in options.candidates if path is None}
     fixed_names = [n for n in config.fixed_agent_ids()
                    if options.field is None or n in options.field or n in bare]

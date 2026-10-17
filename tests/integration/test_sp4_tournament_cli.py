@@ -298,3 +298,33 @@ def test_one_team_games_need_no_field_and_two_team_games_still_do(tmp_path):
     assert refused.exit_code == 1
     assert "the field is empty: name opponents with --field (agents of the config, -a players or snapshots)" \
         in refused.output
+
+
+def test_a_retried_start_never_plays_the_snapshot_links_of_a_failed_one(tmp_path):
+    """B-M6: a start that failed after linking its snapshots, retried with the same --name and another second --run
+    of the same dir name, links the new run's weights (a new tournament empties snapshots/ first); a complete link
+    dir that does not hold the snapshot's own files is replaced, not trusted by its path."""
+    import os
+
+    from colosseum.arena.tournament.players import RunSelection
+    from colosseum.arena.tournament.run import TournamentDir
+    from colosseum.coordinator.checkpoint_manager import read_snapshots
+
+    root, _cfg = fake_run(tmp_path, versions=(30,))
+    first, _ = fake_run(tmp_path / "x", "other", versions=(5,))
+    second, _ = fake_run(tmp_path / "y", "other", versions=(1, 5))          # other weights (seed by position)
+    args = ["--run", root, "--field", "rnd", "--blocks", 1, "--num-envs", 2, "--name", "retry"]
+    failed = invoke("--run", root, f"--run=old={first}", "--field", "nobody", "--blocks", 1, "--name", "retry")
+    assert failed.exit_code == 1 and "nobody" in failed.output
+    link = root / "tournaments" / "retry" / "snapshots" / "1-other" / "main" / "ckpt_v5" / "model.pt"
+    assert os.path.samefile(link, first / "checkpoints" / "main" / "ckpt_v5" / "model.pt")   # linked, then failed
+    again = invoke("--run", root, f"--run=old={second}", *args[2:])
+    assert again.exit_code == 0, again.output
+    assert os.path.samefile(link, second / "checkpoints" / "main" / "ckpt_v5" / "model.pt")
+    # a complete link dir with other files is relinked
+    tdir = TournamentDir(tmp_path / "t")
+    (info,) = read_snapshots(first / "checkpoints" / "main")
+    dst = tdir.link(1, RunSelection(first), info)
+    other = read_snapshots(second / "checkpoints" / "main")[-1]
+    assert tdir.link(1, RunSelection(second), other) == dst
+    assert os.path.samefile(dst / "model.pt", other.path / "model.pt")
