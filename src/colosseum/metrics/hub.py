@@ -95,7 +95,8 @@ class MetricsHub:
     Every ``console_interval_sec`` it also writes ``episodes``, ``system`` and ``ratings``
     records, rewrites ``ratings.json`` and prints one console line per agent (ratings aggregated over layouts).
     SP4 (spec block 7.3): the ``ratings`` record is ``{"env_steps", "layouts", "bt"?}`` with each layout's PFSP
-    table replaced by its ``pfsp_summary`` and ``bt`` the compact live Bradley-Terry summary (``bt_summary``; absent
+    table replaced by its ``pfsp_summary`` and ``bt`` the compact live Bradley-Terry summary (``bt_summary``, its
+    ``best`` among the stored snapshots that ``stored_snapshots()`` gives per agent, called at a tick; absent
     before the first refit, for a snapshot without data and when formatting the snapshot fails); ``ratings.json``
     is ``{"env_steps", "layouts", "bt"}`` with the full PFSP tables and ``bt_section``. The ratings snapshot is
     built only at a tick (``ratings`` may be a callable).
@@ -107,8 +108,10 @@ class MetricsHub:
     def __init__(self, *, writer: MetricsWriter, ratings_path: str | Path, agent_ids: list[str],
                  total_timesteps: int, log_interval: int, console_interval_sec: float,
                  wandb_logger: Any = None, clock: Callable[[], float] = time.monotonic,
-                 initial_env_steps: int = 0, initial_train_steps: dict[str, int] | None = None) -> None:
+                 initial_env_steps: int = 0, initial_train_steps: dict[str, int] | None = None,
+                 stored_snapshots: Callable[[], Mapping[str, Collection[int]] | None] | None = None) -> None:
         self._writer = writer
+        self._stored_snapshots = stored_snapshots
         self._ratings_path = Path(ratings_path)
         self._agent_ids = list(agent_ids)
         self._log_interval = max(1, int(log_interval))
@@ -195,7 +198,8 @@ class MetricsHub:
         if bt is None:
             return {}, {}
         try:
-            return bt_summary(bt, self._agent_ids), bt_section(bt)
+            stored = self._stored_snapshots() if self._stored_snapshots is not None else None
+            return bt_summary(bt, self._agent_ids, stored=stored), bt_section(bt)
         except Exception as e:  # noqa: BLE001 - ratings must never stop training
             if bt.version not in self._bt_failed_versions:
                 logger.error(f"Live ratings: formatting snapshot {bt.version} failed ({type(e).__name__}: {e}); "

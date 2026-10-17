@@ -227,6 +227,44 @@ def test_the_compact_bt_summary_and_the_console_field():
     assert console_bt({}) is None and bt_summary(None, ["main"]) == {}
 
 
+def test_the_compact_best_is_the_best_stored_snapshot():
+    """Spec block 2 ("лучшего снимка"), ruling A-M4: ``best`` is the highest-rated stored snapshot (version > 0 and
+    stored), never bucket v0 (no snapshot) or the bucket of an evicted snapshot; without one there is no ``best``."""
+    strong_v0 = {"random": -1.0, "greedy": 0.3, "main@v0": 1.5, "main@v100": 0.2, "main@v200": 0.6}
+    snapshot = _snapshot(bt_table(synthetic_bt_matches(strong_v0, n_matches=600, rng=np.random.default_rng(0),
+                                                       bias=[0.2, -0.2]), interval=100))
+    rating = {r["entity"]: r["rating"] for r in bt_section(snapshot)["2p"]["player"]}
+    assert rating["main@v0"] > rating["main@v200"] > rating["main@v100"]
+    cells = bt_summary(snapshot, ["main"])["main"]["2p"]                     # no stored set known: versions > 0
+    assert cells["best"]["entity"] == "main@v200" and cells["latest"]["entity"] == "main@v200"
+    cells = bt_summary(snapshot, ["main"], stored={"main": {100}})["main"]["2p"]   # v200 was evicted
+    assert cells["best"]["entity"] == "main@v100" and cells["latest"]["entity"] == "main@v200"
+    cells = bt_summary(snapshot, ["main"], stored={"main": {0, 300}})["main"]["2p"]   # none stored and rated
+    assert "best" not in cells and cells["latest"]["entity"] == "main@v200"
+
+
+def test_the_hub_takes_the_stored_snapshots_for_the_compact_best(tmp_path):
+    hub = MetricsHub(writer=MetricsWriter(tmp_path / "m.jsonl"), ratings_path=tmp_path / "r.json", agent_ids=["main"],
+                     total_timesteps=10, log_interval=1, console_interval_sec=0.0,
+                     stored_snapshots=lambda: {"main": {100}})
+    hub.close(env_steps=1, ratings={}, queue_depths={}, bt=_snapshot(_league_table()))
+    record = [json.loads(line) for line in (tmp_path / "m.jsonl").read_text().splitlines() if '"ratings"' in line][0]
+    assert record["bt"]["main"]["2p"]["best"]["entity"] == "main@v100"
+
+
+def test_the_launcher_gives_the_hub_the_stored_snapshot_versions(tmp_path):
+    from colosseum.launcher import Launcher
+    from game_helpers import make_test_run_dir
+
+    config = make_test_config("turns")
+    launcher = Launcher(config, make_test_run_dir(config, tmp_path))
+    assert launcher._stored_snapshot_versions() is None                      # no coordinator yet
+    launcher._coordinator = make_coordinator(config, tmp_path / "ckpt")
+    for version in (20, 40):
+        launcher._coordinator.checkpoint_manager.save("agent_0", version, {"w": np.zeros(2, np.float32)})
+    assert launcher._stored_snapshot_versions() == {"agent_0": {20, 40}}
+
+
 def test_the_console_line_rounds_the_bt_field():
     from colosseum.metrics.console import ConsoleReporter
 

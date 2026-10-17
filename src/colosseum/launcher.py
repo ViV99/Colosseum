@@ -595,6 +595,7 @@ class Launcher:
             initial_env_steps=int(self._env_step_counter.value),
             initial_train_steps={aid: int(s["policy_version"]) if s else 0 for aid, s in resume_states.items()},
             wandb_logger=self._wandb,
+            stored_snapshots=self._stored_snapshot_versions,
         )
 
     def _start_children(
@@ -955,6 +956,17 @@ class Launcher:
     def _live_snapshot(self):
         """The newest live ratings snapshot (None without live ratings or before the first refit)."""
         return None if self._live_ratings is None else self._live_ratings.latest()
+
+    def _stored_snapshot_versions(self) -> dict[str, set[int]] | None:
+        """Per trainable agent the versions of its stored snapshots, from the checkpoint manager's index (the
+        compact ratings record's ``best``, ruling A-M4); None before the coordinator exists."""
+        from colosseum.arena.entities import snapshot_version
+
+        if self._coordinator is None:
+            return None
+        manager = self._coordinator.checkpoint_manager
+        return {aid: {v for c in manager.list_checkpoints(aid) if (v := snapshot_version(c.checkpoint_id)) is not None}
+                for aid in self._coordinator.trainable_agents}
 
     def _finish_live_ratings(self):
         """Stop the refit thread and refit once more on the final data (the journal writer has flushed), unless

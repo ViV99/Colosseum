@@ -16,9 +16,9 @@ rating; keys starting with ``@`` (impossible in role names) carry per-layout ext
 ``@anchors`` (``"<group>/<component>"`` -> anchor, members and rule), ``@transitivity``
 (``TransitivityResult.to_dict()``; ``p_value`` null when untestable), ``@fit`` (convergence, iterations,
 ``approximate``) and, for one-team layouts, ``@score`` (entities and compositions; intervals null below two
-matches). Missing or non-finite numbers are null, never ``inf``. ``bt_summary(snapshot, agents)`` is the compact
-form for the ``ratings`` record of ``metrics.jsonl``: per agent and layout its latest version bucket and its best
-entity.
+matches). Missing or non-finite numbers are null, never ``inf``. ``bt_summary(snapshot, agents, stored=...)`` is the
+compact form for the ``ratings`` record of ``metrics.jsonl``: per agent and layout its latest version bucket and its
+best stored snapshot (spec block 2).
 """
 
 from __future__ import annotations
@@ -319,12 +319,21 @@ def _cell(entity: str, fitted: BTFit, unc: Uncertainty) -> dict:
             "lcb": _finite(unc.lcb.get(entity)), "games": int(fitted.games.get(entity, 0))}
 
 
-def bt_summary(snapshot: RatingsSnapshot | None, agents: Sequence[str]) -> dict:
+def bt_summary(snapshot: RatingsSnapshot | None, agents: Sequence[str],
+               stored: Mapping[str, Collection[int]] | None = None) -> dict:
     """``{agent: {layout: {"latest": cell, "best": cell}}}`` for the ``ratings`` record: ``latest`` is the agent's
-    newest version bucket, ``best`` its entity with the highest rating (Bradley-Terry layouts), or the same from the
-    mean scores of one-team layouts (cells with ``mean``, ``ci_low``, ``ci_high``, ``n``)."""
+    newest version bucket, ``best`` its best stored snapshot (spec block 2, ruling A-M4): the entity with the highest
+    rating (Bradley-Terry layouts) or mean score (one-team layouts: cells with ``mean``, ``ci_low``, ``ci_high``,
+    ``n``) among its versions > 0 that are in ``stored[agent]`` (the stored snapshot versions; None: every version
+    > 0). Bucket v0 has no snapshot and an evicted snapshot is not stored, so neither is ``best``; a layout where no
+    stored snapshot is rated has no ``best``."""
     if snapshot is None:
         return {}
+
+    def snapshot_entity(agent: str, entity: str) -> bool:
+        version = entity_version(entity)
+        return version is not None and version > 0 and (stored is None or version in stored.get(agent, ()))
+
     out: dict[str, dict] = {}
     for agent in agents:
         per_layout: dict[str, dict] = {}
@@ -334,18 +343,24 @@ def bt_summary(snapshot: RatingsSnapshot | None, agents: Sequence[str]) -> dict:
                 continue
             unc = snapshot.uncertainty[layout]
             newest = max(mine, key=lambda e: entity_version(e))
-            best = max(mine, key=lambda e: (fitted.rating[e], entity_version(e)))
-            per_layout[layout] = {"latest": _cell(newest, fitted, unc), "best": _cell(best, fitted, unc)}
+            cells = {"latest": _cell(newest, fitted, unc)}
+            snapshots = [e for e in mine if snapshot_entity(agent, e)]
+            if snapshots:
+                best = max(snapshots, key=lambda e: (fitted.rating[e], entity_version(e)))
+                cells["best"] = _cell(best, fitted, unc)
+            per_layout[layout] = cells
         for layout, summary in snapshot.scores.items():
             mine = [e for e in summary.entities if lineage(e) == agent and entity_version(e) is not None]
             if not mine:
                 continue
-            newest = max(mine, key=lambda e: entity_version(e))
-            best = max(mine, key=lambda e: (summary.entities[e].mean, entity_version(e)))
+            chosen = {"latest": max(mine, key=lambda e: entity_version(e))}
+            snapshots = [e for e in mine if snapshot_entity(agent, e)]
+            if snapshots:
+                chosen["best"] = max(snapshots, key=lambda e: (summary.entities[e].mean, entity_version(e)))
             per_layout[layout] = {
                 key: {"entity": e, "mean": summary.entities[e].mean, "ci_low": summary.entities[e].ci_low,
                       "ci_high": summary.entities[e].ci_high, "n": summary.entities[e].n}
-                for key, e in (("latest", newest), ("best", best))}
+                for key, e in chosen.items()}
         if per_layout:
             out[agent] = per_layout
     return out
