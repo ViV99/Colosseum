@@ -238,19 +238,135 @@ def test_null_intervals_never_become_inf_or_nan(tmp_path):
     json.dumps(data, allow_nan=False)
 
 
-def test_a_bootstrap_that_does_not_match_the_table_falls_back_to_laplace(tmp_path, monkeypatch):
+def _append_more(run, *, per_pair: int = 2, seed: int = 5, tag: str = "-more") -> None:
+    from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLog, RunInfo
+    from report_kit import INTERVAL, make_results
+
+    log = MatchLog(run.root / MATCH_LOG_FILE, RunInfo(run_id=run.run_id, name=run.root.name, parent_run_id=None,
+                                                      game="turns", config_hash="synthetic",
+                                                      checkpoint_interval=INTERVAL))
+    try:
+        log.append(make_results("wdl", run_id=run.run_id + tag, per_pair=per_pair, seed=seed))
+    finally:
+        log.close()
+
+
+def test_a_write_between_reads_keeps_fit_bootstrap_and_test_consistent(tmp_path, monkeypatch):
+    """The race of a live journal: a write lands right after the bootstrap read and while the builder holds an
+    older cached table (dashboard, ``table_min_age_sec``). The fit, its bootstrap intervals and the G2 test come
+    from that one read (``BootstrapData.to_table``), so they agree; the next build refits on the new journal."""
     from colosseum.arena import bt
+    from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLog
 
     run = write_run_dir(tmp_path, "wdl")
+    builder = ReportBuilder(run.root, table_min_age_sec=30.0)
+    real = bt.bootstrap_data
+    seen = []
 
-    def mismatch(*args, **kwargs):
-        raise ValueError("bootstrap data has a team pair the fit does not have")
+    def read_then_write(reader, layout, *, sources):
+        data = real(reader, layout, sources=sources)
+        seen.append(data)
+        if len(seen) == 1:
+            _append_more(run)                                 # lands after the read, before fit / bootstrap
+        return data
 
-    monkeypatch.setattr(bt, "bootstrap", mismatch)
-    ratings = build_report_data(run.root)["sections"]["ratings"]
-    assert ratings["uncertainty"] == "laplace" and any("Laplace" in n for n in ratings["notes"])
-    (group,) = ratings["layouts"]["2p"]["groups"]
-    assert all(r["ci"][0] is not None for r in group["entities"] if r["entity"] != "random")
+    monkeypatch.setattr(bt, "bootstrap_data", read_then_write)
+    try:
+        assert builder.section("anchors")["source"] == "train"     # caches the RUN_SOURCES table first
+        _append_more(run, seed=6, tag="-early")                  # newer than the cached table
+        ratings = builder.section("ratings")
+        assert ratings["uncertainty"] == "bootstrap" and ratings["notes"] == []
+        (group,) = ratings["layouts"]["2p"]["groups"]
+        games = {r["entity"]: r["games"] for r in group["entities"]}
+        expected = seen[0].to_table("2p").entity_games("2p", (bt.DATA_SOURCE,))
+        assert games == {e: n for e, n in expected.items() if e in games}
+        assert all(r["ci"][0] <= r["rating"] <= r["ci"][1] for r in group["entities"] if r["entity"] != "random")
+    finally:
+        builder.close()
+    fresh = ReportBuilder(run.root)                             # the next build sees every match
+    try:
+        (group,) = fresh.section("ratings")["layouts"]["2p"]["groups"]
+        with MatchLog.open_readonly(run.root / MATCH_LOG_FILE) as reader:
+            journal = reader.comparison_table().entity_games("2p", ("train", "pulse"))
+        assert {r["entity"]: r["games"] for r in group["entities"]} == {
+            e: n for e, n in journal.items() if e in {r["entity"] for r in group["entities"]}}
+        assert len(seen) == 2
+    finally:
+        fresh.close()
+
+
+def test_the_metrics_tail_keeps_only_the_report_kinds(tmp_path):
+    path = tmp_path / "metrics.jsonl"
+    lines = [{"kind": "train", "train_step": 1}, {"kind": "ratings", "layouts": {"big": list(range(100))}},
+             {"kind": "system", "env_steps": 1}, {"kind": "episodes", "env_steps": 1}, {"kind": "custom"}]
+    path.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    tail = MetricsTail(path)
+    assert [r["kind"] for r in tail.poll()] == ["train", "system", "episodes"]
+    assert tail.of("ratings") == [] and len(tail.of("train")) == 1
+    assert len(MetricsTail(path, kinds=None).poll()) == 5
+
+
+def test_ratings_json_is_parsed_once_per_change(tmp_path, monkeypatch):
+    import colosseum.arena.report.data as data_mod
+
+    run = write_run_dir(tmp_path, "wdl")
+    calls = []
+    real = data_mod.json.loads
+    monkeypatch.setattr(data_mod.json, "loads", lambda text, *a, **k: calls.append(1) or real(text, *a, **k))
+    builder = ReportBuilder(run.root)
+    try:
+        builder.ratings_json()
+        builder.ratings_json()
+        assert len(calls) == 1
+        path = run.root / "ratings.json"
+        path.write_text(json.dumps({"env_steps": 1, "layouts": {}}) + " " * 7)
+        assert builder.ratings_json()["env_steps"] == 1 and len(calls) == 2
+    finally:
+        builder.close()
+
+
+def test_score_compositions_are_capped_and_filtered_by_agent(tmp_path):
+    run = write_run_dir(tmp_path, "score")
+    limits = ReportLimits(entity_rows=2)
+    data = build_report_data(run.root, limits=limits)
+    layout = data["sections"]["ratings"]["layouts"]["solo"]
+    assert len(layout["entities"]) == 2 and layout["truncated"] == len(VERSIONS) + 2 - 2
+    total = len(VERSIONS) + 2                                     # one-seat teams: one composition per entity
+    assert len(layout["compositions"]) == 2 and layout["compositions_truncated"] == total - 2
+    cross = data["sections"]["matrix"]["layouts"]["solo"]
+    assert len(cross["cross_play"]) == 2 and cross["truncated"] == total - 2
+    greedy = section(run.root, "ratings", agent="greedy")["layouts"]["solo"]
+    assert [c["composition"] for c in greedy["compositions"]] == ["greedy"]
+    assert [e["entity"] for e in greedy["entities"]] == ["greedy"]
+
+
+def test_pulse_anchors_of_a_score_game_and_agents_without_pulse_results(tmp_path):
+    run = write_run_dir(tmp_path, "score", evaluation=True, pulse_versions=(160, 200))
+    anchors = build_report_data(run.root)["sections"]["anchors"]
+    assert anchors["source"] == "pulse" and not any("no results" in n for n in anchors["notes"])
+    entry = anchors["layouts"]["solo"]["main"]
+    assert entry["metric"] == "score" and [p[0] for p in entry["anchors"]["(self)"]] == [160, 200]
+    assert entry["unevaluated"] == [180] and anchors["unevaluated"] == {"main": [180]}
+    json.dumps(anchors, allow_nan=False)
+    other = write_run_dir(tmp_path, "wdl", name="no-pulse-yet", evaluation=True)
+    anchors = build_report_data(other.root)["sections"]["anchors"]
+    assert anchors["layouts"] == {} and anchors["unevaluated"] == {"main": [160, 180, 200]}
+    assert any("no results" in n for n in anchors["notes"])
+
+
+@pytest.mark.parametrize("content", [None, "agents: [unterminated"])
+def test_a_missing_or_unreadable_config_is_a_note(tmp_path, content):
+    run = write_run_dir(tmp_path, "wdl")
+    path = run.root / "config.resolved.yaml"
+    if content is None:
+        path.unlink()
+    else:
+        path.write_text(content)
+    data = build_report_data(run.root)
+    notes = data["sections"]["summary"]["notes"]
+    assert any("config.resolved.yaml" in n for n in notes)
+    assert any("config.resolved.yaml" in n for n in data["sections"]["ratings"]["notes"])
+    json.dumps(data, allow_nan=False)
 
 
 def test_a_running_score_run_without_a_journal_reads_the_live_scores(tmp_path):

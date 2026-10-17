@@ -1,8 +1,10 @@
 """``runs/<name>/run_state.json``: whether a training run is running, finished or failed (SP4 spec block 5).
 
 The launcher (``run_training``) writes ``running`` with its pid when the run dir exists, ``finished`` when
-``launch`` returns 0 / 130 / 143 (budget reached, SIGINT, SIGTERM: final checkpoints were saved) and
-``failed`` for any other exit code or an exception. Readers (report, dashboard) decide whether a
+``launch`` returns 0 / 130 / 143 (budget reached, SIGINT, SIGTERM: final checkpoints were saved),
+``stopped`` with exit code 130 for a Ctrl-C (``KeyboardInterrupt``) that reaches ``run_training`` (during the
+start, before the launcher's signal handlers: nothing was saved) and ``failed`` for any other exit code or an
+exception. Readers (report, dashboard) decide whether a
 ``running`` run is alive by its pid (``os.kill(pid, 0)``) and, on Linux, by the process start time from
 ``/proc/<pid>/stat`` recorded with it (a reused pid is not the run) — never by wall-clock timestamps.
 Other keys of the file are preserved on every rewrite. The run id is not here: it lives in ``run.json``
@@ -22,7 +24,7 @@ from typing import Any
 from colosseum.utils.fs import write_text_atomic
 
 RUN_STATE_FILE = "run_state.json"
-STATUSES = ("running", "finished", "failed")
+STATUSES = ("running", "finished", "failed", "stopped")
 _OWN_KEYS = ("status", "pid", "exit_code", "proc_start", "updated_ts")
 
 
@@ -93,8 +95,8 @@ def process_alive(state: RunState) -> bool:
 
 
 def effective_status(state: RunState | None) -> tuple[str, str]:
-    """``(status, detail)`` for display: running (alive), stopped (``running`` but the process is gone),
-    finished, failed, unknown (no file)."""
+    """``(status, detail)`` for display: running (alive), stopped (``running`` but the process is gone, or a
+    Ctrl-C during the start), finished, failed, unknown (no file)."""
     if state is None:
         return "unknown", "no run_state.json"
     if state.status == "running":
@@ -104,4 +106,6 @@ def effective_status(state: RunState | None) -> tuple[str, str]:
     code = "" if state.exit_code is None else f"exit code {state.exit_code}"
     if state.status == "finished" and state.exit_code in (130, 143):
         code += " (stopped by a signal; final checkpoints saved)"
+    if state.status == "stopped":
+        code += " (interrupted during the start; no final checkpoints)"
     return state.status, code

@@ -44,7 +44,6 @@ from typing import Any, Literal
 import numpy as np
 from pydantic import ValidationError
 
-from colosseum.arena.comparisons import ComparisonTable, PairStat
 from colosseum.coordinator.checkpoint_manager import (
     MODEL_FILE,
     CheckpointInfo,
@@ -231,7 +230,8 @@ def top_snapshot_lcb(run: Path, agent: str, run_config: ColosseumConfig, spec: G
 
     The journal may be live (a training run writes to it). ``bt.bootstrap`` needs data that decomposes the fitted
     table exactly, so each layout's fit is built from the very ``bootstrap_data`` it is bootstrapped with (one
-    read; ``_table_of``) instead of a separate ``comparison_table`` read that a write could land between."""
+    read; ``BootstrapData.to_table``) instead of a separate ``comparison_table`` read that a write could land
+    between."""
     from colosseum.arena import bt
     from colosseum.arena.live import rating_inputs
     from colosseum.arena.matchlog import MATCH_LOG_FILE, RUN_SOURCES, MatchLog, MatchLogError
@@ -256,7 +256,7 @@ def top_snapshot_lcb(run: Path, agent: str, run_config: ColosseumConfig, spec: G
                     continue
                 # spec block 2: bootstrap by matches (training) and by blocks (pulse), from the same reader
                 data = bt.bootstrap_data(reader, layout, sources=sources)
-                fit = bt.fit(_table_of(layout, data), layout, sources=(_DATA_SOURCE,), options=options,
+                fit = bt.fit(data.to_table(layout), layout, sources=(bt.DATA_SOURCE,), options=options,
                              fixed_agents=fixed_agents, random_bot=random_bot)
                 if not fit.rating:
                     continue
@@ -269,23 +269,6 @@ def top_snapshot_lcb(run: Path, agent: str, run_config: ColosseumConfig, spec: G
     combined = combine_scores(agent, fits=fits, uncertainty=uncertainty, scores=scores, layout_weights=weights,
                               quantile=run_config.checkpoint.top_k_quantile)
     return {cid: s.lcb for cid, s in combined.items() if s.lcb is not None}
-
-
-_DATA_SOURCE = "journal"
-
-
-def _table_of(layout: str, data: Any) -> ComparisonTable:
-    """The ``ComparisonTable`` of ``layout`` that ``data`` (a ``bt.BootstrapData``) decomposes: its counts rows
-    plus one ``PairStat(1, w, w * y)`` per contribution of a detailed match or block (the journal's own rule), all
-    under one source."""
-    table = ComparisonTable()
-    for a, b, stat in data.counts:
-        table.add(layout, _DATA_SOURCE, a, b, PairStat(stat.n, stat.sw, stat.swy))
-    units = [*data.matches, *(c for by_key in data.blocks.values() for c in by_key.values())]
-    for contributions in units:
-        for a, b, w, y in contributions:
-            table.add(layout, _DATA_SOURCE, a, b, PairStat(1, w, w * y))
-    return table
 
 
 def load_run_config(run: Path) -> ColosseumConfig:

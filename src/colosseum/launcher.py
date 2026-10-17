@@ -1360,6 +1360,10 @@ def run_training(config_path: str, overrides: dict | None = None) -> int:
     _record_run_state(run_dir, "running")
     try:
         code = Launcher(config, run_dir, validated=True).launch()
+    except KeyboardInterrupt:
+        # Ctrl-C before launch installed its signal handlers (the CLI exits 130): nothing was saved
+        _record_run_state(run_dir, "stopped", exit_code=130)
+        raise
     except BaseException:
         _record_run_state(run_dir, "failed", exit_code=1)
         raise

@@ -16,8 +16,11 @@ Rules:
   ``bt`` section of ``ratings.json`` (live refit, Laplace intervals; the ``@``-keyed extras give the
   bias, anchors and transitivity, contract amendment A14); otherwise they are fitted from the
   journal (sources ``train`` + ``pulse``) with ``ratings.bootstrap_samples`` bootstrap replicas and cached
-  until the journal files change (a journal that changes between the table and the bootstrap read falls
-  back to Laplace intervals with a note);
+  until the journal files change; the fit, its bootstrap and the G2 test use one read of the journal
+  (``bt.bootstrap_data`` / ``BootstrapData.to_table``), so a live writer cannot make them disagree;
+- bounded memory: ``ratings.json`` and the config are parsed once per file change, ``MetricsTail`` keeps
+  only the record kinds the page draws (``REPORT_KINDS``), score-layout compositions are capped like the
+  entity rows (``compositions_truncated``);
 - no ``inf`` / ``nan`` reaches the data: missing intervals (a score with fewer than two games, an infinite
   standard error) are ``null``;
 - anchors with pulse: a stored snapshot is "unevaluated" when the journal's ``pulse`` source has no game of
@@ -134,14 +137,21 @@ def _file_sig(*paths: Path) -> tuple:
     return tuple(sig)
 
 
+REPORT_KINDS = ("train", "system", "episodes")    # the metrics.jsonl record kinds the report draws
+
+
 class MetricsTail:
     """Incremental reader of ``metrics.jsonl``: only complete lines are parsed; a partial last line (a
-    running run is writing it) waits for the next ``poll``. A malformed complete line is counted, not raised."""
+    running run is writing it) waits for the next ``poll``. A malformed complete line is counted, not raised.
+    Only records of ``kinds`` are kept (default ``REPORT_KINDS``; e.g. the large ``ratings`` records are not:
+    the memory of a long run's dashboard stays proportional to what the page draws); None keeps every kind."""
 
-    def __init__(self, path: Path) -> None:
+    def __init__(self, path: Path, kinds: Sequence[str] | None = REPORT_KINDS) -> None:
         self.path = Path(path)
+        self.kinds = None if kinds is None else frozenset(kinds)
         self.offset = 0
         self.records: list[dict] = []
+        self._by_kind: dict[str, list[dict]] = defaultdict(list)
         self.bad_lines = 0
 
     def poll(self) -> list[dict]:
@@ -151,6 +161,7 @@ class MetricsTail:
             return self.records
         if size < self.offset:                 # rewritten (another run with the same dir): start over
             self.offset, self.records, self.bad_lines = 0, [], 0
+            self._by_kind = defaultdict(list)
         with self.path.open("rb") as fh:
             fh.seek(self.offset)
             chunk = fh.read()
@@ -165,13 +176,14 @@ class MetricsTail:
             except ValueError:
                 self.bad_lines += 1
                 continue
-            if isinstance(record, dict):
+            if isinstance(record, dict) and (self.kinds is None or record.get("kind") in self.kinds):
                 self.records.append(record)
+                self._by_kind[str(record.get("kind"))].append(record)
         self.offset += end + 1
         return self.records
 
     def of(self, kind: str) -> list[dict]:
-        return [r for r in self.records if r.get("kind") == kind]
+        return list(self._by_kind.get(kind, ()))
 
 
 def _sorted_by(records: list[dict], key: str) -> list[dict]:
@@ -204,6 +216,8 @@ class ReportBuilder:
         self.seed = seed
         self._metrics = MetricsTail(self.run_dir / "metrics.jsonl")
         self._config_cache: tuple[tuple, Any] | None = None
+        self._config_error: str | None = None
+        self._ratings_cache: tuple[tuple, Any] | None = None
         self._reader = None
         self._reader_failed: str | None = None
         self._cache: dict[tuple, Any] = {}
@@ -226,7 +240,7 @@ class ReportBuilder:
         path = self.run_dir / RESOLVED_CONFIG_FILE
         sig = _file_sig(path)
         if self._config_cache is None or self._config_cache[0] != sig:
-            cfg = None
+            cfg, error = None, None
             if path.exists():
                 try:
                     from colosseum.core.config import load_config
@@ -234,15 +248,31 @@ class ReportBuilder:
                     cfg = load_config(path)
                 except Exception as e:  # noqa: BLE001 - a report never fails on a config it cannot read
                     logger.warning(f"report: cannot load {path}: {e}")
+                    error = f"{RESOLVED_CONFIG_FILE} cannot be read ({type(e).__name__}: {e})"
+            else:
+                error = f"No {RESOLVED_CONFIG_FILE} in the run dir"
             self._config_cache = (sig, cfg)
+            self._config_error = None if error is None else (
+                f"{error}: agent kinds, the budget and the rating inputs (anchor, fixed agents) are unknown; the "
+                f"ratings use the module defaults.")
         return self._config_cache[1]
 
+    def config_note(self) -> str | None:
+        """Why the config is missing (None when it was read)."""
+        self.config()
+        return self._config_error
+
     def ratings_json(self) -> dict | None:
+        """``ratings.json`` parsed, re-read only when the file changes (None when missing or malformed)."""
         path = self.run_dir / "ratings.json"
-        try:
-            return json.loads(path.read_text())
-        except (OSError, ValueError):
-            return None
+        sig = _file_sig(path)
+        if self._ratings_cache is None or self._ratings_cache[0] != sig:
+            try:
+                data = json.loads(path.read_text())
+            except (OSError, ValueError):
+                data = None
+            self._ratings_cache = (sig, data if isinstance(data, dict) else None)
+        return self._ratings_cache[1]
 
     def reader(self):
         """The read-only journal, or None (no ``matches.db``: an SP3 run, ``match_log.enabled: false``)."""
@@ -285,10 +315,6 @@ class ReportBuilder:
         table = reader.comparison_table(sources=tuple(sources))
         self._cache[key] = (sig, now, table)
         return sig, table
-
-    def _drop_stale(self, kind: str, *rest) -> None:
-        for k in [k for k in self._cache if k[0] == kind and k[1:1 + len(rest)] == rest]:
-            del self._cache[k]
 
     def records(self, kind: str) -> list[dict]:
         self._metrics.poll()
@@ -353,6 +379,8 @@ class ReportBuilder:
         if state is None:
             notes.append("No run_state.json (an SP3 run dir or a distributed role): the state is unknown.")
         cfg = self.config()
+        if self.config_note():
+            notes.append(self.config_note())
         system = _sorted_by(self.records("system"), "env_steps")
         last = system[-1] if system else {}
         env_steps = last.get("env_steps")
@@ -404,10 +432,11 @@ class ReportBuilder:
         live = status == "running" and isinstance(rj.get("bt"), Mapping)
         notes: list[str] = []
         out_layouts: dict[str, dict] = {}
-        methods: set[str] = set()
         table = self.table()
         if table is None and not live:
             notes.append(self._journal_note())
+        elif not live and self.config_note():
+            notes.append(self.config_note())
         if live and not rj["bt"]:
             notes.append("The run has no live rating refit yet (ratings.json has an empty 'bt' section).")
         for name, kind in self.layout_kinds().items():
@@ -420,7 +449,7 @@ class ReportBuilder:
             elif live:
                 entry = self._live_layout(name, rj["bt"].get(name) or {})
             else:
-                entry = self._fitted_layout(name, notes, methods)
+                entry = self._fitted_layout(name, notes)
             if entry is None:
                 continue
             entry["outcome_kind"] = kind
@@ -429,10 +458,7 @@ class ReportBuilder:
             out_layouts[name] = entry
         if live:
             notes.append("Live ratings (ratings.json, refit every ratings.refit_interval_sec); Laplace intervals.")
-        if "laplace" in methods and not live:
-            notes.append("Some layouts have Laplace intervals: the journal changed while it was read (bootstrap "
-                         "skipped); rebuild the report for bootstrap intervals.")
-        uncertainty = "laplace" if live or "laplace" in methods else "bootstrap"
+        uncertainty = "laplace" if live or not self._bootstrap_samples() else "bootstrap"
         return {"source": "live" if live else ("journal" if table is not None else "none"),
                 "uncertainty": uncertainty, "env_steps": rj.get("env_steps"), "layouts": out_layouts,
                 "notes": notes}
@@ -445,6 +471,11 @@ class ReportBuilder:
                                     series=[s for s in g["series"] if s["lineage"] == agent]) for g in entry["groups"]]
         if "entities" in entry:
             entry["entities"] = [e for e in entry["entities"] if e["lineage"] == agent]
+        if "compositions" in entry:          # "a+a+b": sorted member entities (no '+' in entity names)
+            from colosseum.arena.entities import lineage
+
+            entry["compositions"] = [c for c in entry["compositions"]
+                                     if any(lineage(m) == agent for m in c["composition"].split("+"))]
         return entry
 
     def _bootstrap_samples(self) -> int:
@@ -511,58 +542,56 @@ class ReportBuilder:
                      "version": entity_version(str(d["entity"])), "kind": self._kind_of(str(d["entity"])),
                      "n": int(d.get("n") or 0), "mean": _finite(d.get("mean")),
                      "ci": [_finite(d.get("ci_low")), _finite(d.get("ci_high"))]} for d in score.get("entities") or []]
-        entities.sort(key=lambda r: -(r["mean"] if r["mean"] is not None else -1e18))
         comps = [{"composition": str(d["composition"]), "n": int(d.get("n") or 0), "mean": _finite(d.get("mean")),
                   "ci": [_finite(d.get("ci_low")), _finite(d.get("ci_high"))],
                   "homogeneous": bool(d.get("homogeneous"))} for d in score.get("compositions") or []]
-        return {"kind": "score", "entities": entities[: self.limits.entity_rows], "compositions": comps}
+        return self._score_payload(entities, comps)
+
+    def _score_payload(self, entities: list[dict], comps: list[dict]) -> dict:
+        """A score layout's entry: entities and compositions by mean score (descending), each list capped at
+        ``entity_rows`` with the number left out."""
+        def by_mean(r: dict) -> float:
+            return -(r["mean"] if r["mean"] is not None else -1e18)
+
+        entities, comps = sorted(entities, key=by_mean), sorted(comps, key=by_mean)
+        cap = self.limits.entity_rows
+        return {"kind": "score", "entities": entities[:cap], "truncated": max(0, len(entities) - cap),
+                "compositions": comps[:cap], "compositions_truncated": max(0, len(comps) - cap)}
 
     def _fit(self, layout: str):
-        """(fit, uncertainty, transitivity dict | None, uncertainty method), cached per table read (until the
-        journal changes)."""
-        sig, table = self._table_entry()
-        key = ("fit", layout, sig)
-        if key in self._cache:
-            return self._cache[key]
-        self._drop_stale("fit", layout)
+        """(fit, uncertainty, transitivity dict | None) of ``layout``. The fit, its bootstrap and the transitivity
+        test all use ONE read of the journal (``bt.bootstrap_data``; the fitted table is ``BootstrapData.to_table``,
+        as in ``--snapshots top:N``): a writer that appends between reads cannot make them disagree. Cached until
+        the journal files change, but not refitted more often than every ``table_min_age_sec``."""
         from colosseum.arena import bt
         from colosseum.arena.live import rating_inputs
 
+        key = ("fit", layout)
+        sig, now = self.journal_sig(), time.monotonic()      # before the read: a later write refits next time
+        hit = self._cache.get(key)
+        if hit is not None and (hit[0] == sig or now - hit[1] < self.table_min_age_sec):
+            return hit[2]
         cfg = self.config()
         if cfg is not None:
             options, fixed, random_bot = rating_inputs(cfg)
-        else:                                  # no readable config: module defaults, no fixed agents
+        else:                                  # no readable config (a note says so): module defaults
             options, fixed, random_bot = bt.DEFAULT_OPTIONS, [], None
-        fit_ = bt.fit(table, layout, sources=RUN_SOURCES, options=options, fixed_agents=fixed, random_bot=random_bot)
+        data = bt.bootstrap_data(self.reader(), layout, sources=RUN_SOURCES)
+        table = data.to_table(layout)
+        sources = (bt.DATA_SOURCE,)
+        fit_ = bt.fit(table, layout, sources=sources, options=options, fixed_agents=fixed, random_bot=random_bot)
         rng = np.random.default_rng(self.seed)
         samples = self._bootstrap_samples()
-        method = "laplace"
-        unc = None
-        if samples > 0:
-            try:
-                data = bt.bootstrap_data(self.reader(), layout, sources=RUN_SOURCES)
-                unc = bt.bootstrap(fit_, data, samples=samples, rng=rng)
-                method = "bootstrap"
-            except ValueError as e:
-                # the journal changed between the table read and the bootstrap read (a writer is active):
-                # the data no longer decomposes the fitted table; Laplace intervals of the same fit instead
-                logger.info(f"report: bootstrap of {layout} skipped ({e}); Laplace intervals")
-        if unc is None:
-            unc = bt.laplace(fit_, rng=rng)
-        try:
-            trans = bt.transitivity_test(table, fit_, sources=RUN_SOURCES).to_dict()
-        except Exception as e:  # noqa: BLE001 - the diagnostic never hides the ratings
-            logger.warning(f"report: transitivity test failed for {layout}: {e}")
-            trans = None
-        self._cache[key] = (fit_, unc, trans, method)
-        return self._cache[key]
+        unc = (bt.bootstrap(fit_, data, samples=samples, rng=rng) if samples > 0 else bt.laplace(fit_, rng=rng))
+        trans = bt.transitivity_test(table, fit_, sources=sources).to_dict()
+        self._cache[key] = (sig, now, (fit_, unc, trans))
+        return fit_, unc, trans
 
-    def _fitted_layout(self, layout: str, notes: list[str], methods: set[str]) -> dict | None:
+    def _fitted_layout(self, layout: str, notes: list[str]) -> dict | None:
         table = self.table()
         if table is None or layout not in table.layouts():
             return None
-        fit_, unc, trans, method = self._fit(layout)
-        methods.add(method)
+        fit_, unc, trans = self._fit(layout)
         groups = []
         for g in fit_.groups:
             rows = []
@@ -589,11 +618,10 @@ class ReportBuilder:
         entities = [{"entity": e, "lineage": lineage(e), "version": entity_version(e), "kind": self._kind_of(e),
                      "n": int(d["n"]), "mean": _finite(d["mean"]), "ci": [_finite(d["ci_low"]), _finite(d["ci_high"])]}
                     for e, d in summary["entities"].items()]
-        entities.sort(key=lambda r: -(r["mean"] if r["mean"] is not None else -1e18))
         comps = [{"composition": c, "n": int(d["n"]), "mean": _finite(d["mean"]),
                   "ci": [_finite(d["ci_low"]), _finite(d["ci_high"])], "homogeneous": bool(d.get("homogeneous"))}
                  for c, d in summary["compositions"].items()]
-        return {"kind": "score", "entities": entities[: self.limits.entity_rows], "compositions": comps}
+        return self._score_payload(entities, comps)
 
     # ----- matrix -----
     def _matrix(self, agent: str | None = None, layout: str | None = None) -> dict:
@@ -607,7 +635,9 @@ class ReportBuilder:
             if (layout and name != layout) or name not in table.layouts():
                 continue
             if kind == "score":
-                out[name] = {"kind": "score", "cross_play": ratings["layouts"].get(name, {}).get("compositions", [])}
+                entry = ratings["layouts"].get(name, {})
+                out[name] = {"kind": "score", "cross_play": entry.get("compositions", []),
+                             "truncated": int(entry.get("compositions_truncated", 0))}
                 continue
             order = self._lineage_order(ratings["layouts"].get(name, {}))
             skipped = 0
@@ -669,15 +699,20 @@ class ReportBuilder:
 
     # ----- anchors -----
     def _anchors(self) -> dict:
-        from colosseum.arena.entities import lineage
-
+        """Score of every snapshot against each anchor, by version. Pairwise layouts: the share of the pair
+        weight won against the anchor's team (``metric: "pairwise"``, Wilson intervals); one-team layouts: the
+        mean team score of the snapshot's team with each anchor as teammate, ``"(self)"`` for a team of the
+        snapshot alone (``metric: "score"``, normal intervals, null below two games). With pulse, only pulse
+        games, and ``unevaluated`` (per layout entry, and per agent of the pulse plan at the top) lists the stored
+        snapshots without a pulse game."""
         cfg = self.config()
         notes: list[str] = []
         pulse = bool(cfg is not None and cfg.evaluation.enabled)
         source = "pulse" if pulse else "train"
-        table = self.table((source,))
+        table = self.table()                   # the cached RUN_SOURCES table, read per source below
         if table is None:
-            return {"source": "none", "biased": False, "layouts": {}, "notes": [self._journal_note()]}
+            return {"source": "none", "biased": False, "layouts": {}, "unevaluated": {},
+                    "notes": [self._journal_note()]}
         fixed = set(cfg.fixed_agent_ids()) if cfg is not None else set()
         field = set(cfg.evaluation.field or fixed) if pulse else fixed
         kinds = self.layout_kinds()
@@ -685,32 +720,20 @@ class ReportBuilder:
         evaluated: dict[str, set[int]] = defaultdict(set)
         for name in table.layouts():
             if kinds.get(name) == "score":
-                continue
-            acc: dict[tuple[str, int, str], list[float]] = defaultdict(lambda: [0, 0.0, 0.0])
-            for a, b, stat in table.pairs(name, (source,)):
-                for x, y, flip in ((a, b, False), (b, a, True)):
-                    ex, ly = _team_entity(x), _team_lineage(y)
-                    vx = entity_version(ex) if ex is not None else None
-                    if vx is None or ly not in field:
-                        continue
-                    cell = acc[(lineage(ex), vx, ly)]
-                    cell[0] += stat.n
-                    cell[1] += stat.sw
-                    cell[2] += (stat.sw - stat.swy) if flip else stat.swy
-            per_agent: dict[str, dict] = {}
-            for (agent, version, anchor), (n, sw, swy) in sorted(acc.items()):
-                if sw <= 0:
-                    continue
-                p = swy / sw
-                per_agent.setdefault(agent, {"anchors": defaultdict(list), "unevaluated": []})
-                per_agent[agent]["anchors"][anchor].append([version, p, *wilson(p, n), n])
-                evaluated[agent].add(version)
-            for d in per_agent.values():
+                per_agent = self._score_anchors(table, name, source, field)
+            else:
+                per_agent = self._pairwise_anchors(table, name, source, field)
+            for agent, d in per_agent.items():
+                evaluated[agent].update(p[0] for series in d["anchors"].values() for p in series)
                 d["anchors"] = {k: [v[i] for i in thin(len(v), self.limits.series_points)]
                                 for k, v in sorted(d["anchors"].items())}
             if per_agent:
                 layouts[name] = per_agent
+        unevaluated: dict[str, list[int]] = {}
         if pulse:
+            plan = list(cfg.evaluation.agents) if cfg.evaluation.agents else list(cfg.get_trainable_agent_ids())
+            for agent in plan:
+                unevaluated[agent] = sorted(set(self._stored_versions(agent)) - evaluated[agent])
             for layout_entry in layouts.values():
                 for agent, d in layout_entry.items():
                     d["unevaluated"] = sorted(set(self._stored_versions(agent)) - evaluated[agent])
@@ -718,7 +741,63 @@ class ReportBuilder:
                 notes.append("Pulse evaluation is enabled but has no results yet.")
         elif not fixed:
             notes.append("The config has no scripted or frozen agents (anchors).")
-        return {"source": source, "biased": not pulse, "layouts": layouts, "notes": notes}
+        return {"source": source, "biased": not pulse, "layouts": layouts, "unevaluated": unevaluated,
+                "notes": notes}
+
+    def _pairwise_anchors(self, table, name: str, source: str, field: set[str]) -> dict[str, dict]:
+        from colosseum.arena.entities import lineage
+
+        acc: dict[tuple[str, int, str], list[float]] = defaultdict(lambda: [0, 0.0, 0.0])
+        for a, b, stat in table.pairs(name, (source,)):
+            for x, y, flip in ((a, b, False), (b, a, True)):
+                ex, ly = _team_entity(x), _team_lineage(y)
+                vx = entity_version(ex) if ex is not None else None
+                if vx is None or ly not in field:
+                    continue
+                cell = acc[(lineage(ex), vx, ly)]
+                cell[0] += stat.n
+                cell[1] += stat.sw
+                cell[2] += (stat.sw - stat.swy) if flip else stat.swy
+        per_agent: dict[str, dict] = {}
+        for (agent, version, anchor), (n, sw, swy) in sorted(acc.items()):
+            if sw <= 0:
+                continue
+            p = swy / sw
+            entry = per_agent.setdefault(agent, {"metric": "pairwise", "anchors": defaultdict(list),
+                                                 "unevaluated": []})
+            entry["anchors"][anchor].append([version, p, *wilson(p, n), n])
+        return per_agent
+
+    def _score_anchors(self, table, name: str, source: str, field: set[str]) -> dict[str, dict]:
+        """One-team layouts: a team of one versioned entity plus field members (or alone)."""
+        from colosseum.arena.entities import lineage
+
+        acc: dict[tuple[str, int, str], list[float]] = defaultdict(lambda: [0, 0.0, 0.0])
+        for key, stat in table.scores(name, (source,)):
+            members = key.entities()
+            versioned = {e for e in members if entity_version(e) is not None}
+            if len(versioned) != 1:
+                continue
+            (snapshot,) = versioned
+            mates = sorted({lineage(e) for e in members if e != snapshot})
+            if any(m not in field for m in mates):
+                continue
+            cell = acc[(lineage(snapshot), entity_version(snapshot), "+".join(mates) or "(self)")]
+            cell[0] += stat.n
+            cell[1] += stat.total
+            cell[2] += stat.total_sq
+        per_agent: dict[str, dict] = {}
+        for (agent, version, anchor), (n, total, total_sq) in sorted(acc.items()):
+            if n <= 0:
+                continue
+            mean = total / n
+            lo = hi = None
+            if n >= 2:
+                half = _Z95 * math.sqrt(max((total_sq - n * mean * mean) / (n - 1), 0.0) / n)
+                lo, hi = _finite(mean - half), _finite(mean + half)
+            entry = per_agent.setdefault(agent, {"metric": "score", "anchors": defaultdict(list), "unevaluated": []})
+            entry["anchors"][anchor].append([version, _finite(mean), lo, hi, int(n)])
+        return per_agent
 
     def _stored_versions(self, agent: str) -> list[int]:
         root = self.run_dir / "checkpoints" / agent

@@ -73,6 +73,7 @@ SMOOTHNESS = 0.5           # precision of one version step (sd ~1.41 logits); pr
 DENSE_LIMIT = 2000         # parameters; above it Newton steps use conjugate gradients
 MEAN_OF_FIXED = "mean-of-fixed"
 TRANSITIVITY_P = 0.01      # the G2 test flags p < 0.01 (spec block 2)
+DATA_SOURCE = "journal"     # the one source of ``BootstrapData.to_table``
 G2_PRIOR_SIGMA = 100.0     # logits: the G2 refit is a near-MLE; the tiny prior only keeps separation finite
 # Iterative path (above dense_limit): the fit draws ITERATIVE_SAMPLES perturb-and-solve samples of N(0, H^-1) once,
 # takes its Monte Carlo standard errors from them and keeps them in BTFit.draws, which laplace() reuses there. 400
@@ -250,6 +251,21 @@ class BootstrapData:
             for result in results:
                 bucket.extend(match_pairs(result, [snapshot_version(s.network_id) for s in result.seats]))
         return cls(blocks=blocks)
+
+    def to_table(self, layout: str, *, source: str = DATA_SOURCE) -> ComparisonTable:
+        """The ``ComparisonTable`` of ``layout`` that this data decomposes, all under one ``source``: the counts rows
+        plus one ``PairStat(1, w, w * y)`` per contribution of a detailed match or block (the journal's own rule).
+        Fit from it (``fit(data.to_table(L), L, sources=(DATA_SOURCE,))``) when the data comes from a live journal:
+        a separate ``comparison_table`` read could see a write the bootstrap read did not, and ``bootstrap`` refuses
+        data that does not decompose the fitted table."""
+        table = ComparisonTable()
+        for a, b, stat in self.counts:
+            table.add(layout, source, a, b, PairStat(stat.n, stat.sw, stat.swy))
+        units = [*self.matches, *(c for by_key in self.blocks.values() for c in by_key.values())]
+        for contributions in units:
+            for a, b, w, y in contributions:
+                table.add(layout, source, a, b, PairStat(1, w, w * y))
+        return table
 
 
 def bootstrap_data(reader: Any, layout: str, *, sources: Collection[str]) -> BootstrapData:

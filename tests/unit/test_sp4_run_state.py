@@ -86,3 +86,22 @@ def test_a_launch_exception_marks_the_run_failed(tmp_path, monkeypatch, restore_
         launcher.run_training(str(config))
     state = read_run_state(tmp_path / "runs" / "r")
     assert (state.status, state.exit_code, state.pid) == ("failed", 1, os.getpid())
+
+
+def test_a_ctrl_c_during_the_start_marks_the_run_stopped(tmp_path, monkeypatch, restore_root_logging,
+                                                          restore_global_rng):
+    """A KeyboardInterrupt inside ``launch`` before its signal handlers exist (the CLI exits 130): ``stopped`` /
+    130, not ``failed`` / 1."""
+    import colosseum.launcher as launcher
+
+    def interrupted(self):
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(launcher.Launcher, "launch", interrupted)
+    config = write_test_config(tmp_path / "cfg.yaml", "turns", run={"dir": str(tmp_path / "runs"), "name": "r"})
+    with pytest.raises(KeyboardInterrupt):
+        launcher.run_training(str(config))
+    state = read_run_state(tmp_path / "runs" / "r")
+    assert (state.status, state.exit_code) == ("stopped", 130)
+    status, detail = effective_status(state)
+    assert status == "stopped" and detail.startswith("exit code 130") and "start" in detail

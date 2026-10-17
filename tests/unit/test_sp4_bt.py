@@ -323,6 +323,15 @@ def test_json_forms_options_and_bootstrap_inputs(tmp_path):
     log.append(synthetic_journal_results(30))
     units = bootstrap_data(log, "2p", sources=TRAIN)
     assert len(units.matches) == 30 and units.counts == [] and units.blocks == {}
+    # to_table: the table the data decomposes, equal to the journal's own table, so fit + bootstrap agree
+    from colosseum.arena.bt import DATA_SOURCE
+
+    rebuilt, journal = units.to_table("2p"), log.comparison_table(sources=TRAIN)
+    assert rebuilt.sources("2p") == [DATA_SOURCE]
+    assert ([(a, b, (s.n, s.sw, s.swy)) for a, b, s in rebuilt.pairs("2p", (DATA_SOURCE,))]
+            == [(a, b, (s.n, s.sw, s.swy)) for a, b, s in journal.pairs("2p", TRAIN)])
+    refit = fit(rebuilt, "2p", sources=(DATA_SOURCE,))
+    assert bootstrap(refit, units, samples=2, rng=np.random.default_rng(0)).ci95
     log.close()
 
 

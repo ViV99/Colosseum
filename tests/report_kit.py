@@ -284,6 +284,7 @@ def sample_report_data() -> dict:
                 "solo": {"outcome_kind": "score", "kind": "score",
                          "entities": [{"entity": "main@v100", "lineage": "main", "version": 100, "kind": "trainable",
                                        "n": 40, "mean": 3.2, "ci": [2.9, 3.5]}],
+                         "truncated": 0, "compositions_truncated": 0,
                          "compositions": [{"composition": "main@v100+random", "n": 20, "mean": 2.1, "ci": [1.8, 2.4],
                                            "homogeneous": False}]}}},
             "matrix": {"min_games": 20, "notes": [], "layouts": {
@@ -293,10 +294,11 @@ def sample_report_data() -> dict:
                                               [cell(0.52, 900), None, cell(0.99, 12)],
                                               [cell(0.03, 900), cell(0.01, 12), None]]},
                        "snapshots": {"agent": "main", "axis": snap_axis, "cells": snap_cells, "thinned_from": 23}},
-                "solo": {"kind": "score", "cross_play": [{"composition": "main@v100+random", "n": 20, "mean": 2.1,
-                                                          "ci": [1.8, 2.4], "homogeneous": False}]}}},
-            "anchors": {"source": "train", "biased": True, "notes": [], "layouts": {"2p": {"main": {
-                "unevaluated": [],
+                "solo": {"kind": "score", "truncated": 0,
+                         "cross_play": [{"composition": "main@v100+random", "n": 20, "mean": 2.1, "ci": [1.8, 2.4],
+                                         "homogeneous": False}]}}},
+            "anchors": {"source": "train", "biased": True, "notes": [], "unevaluated": {}, "layouts": {"2p": {"main": {
+                "metric": "pairwise", "unevaluated": [],
                 "anchors": {"greedy": [[v, 0.3 + 0.01 * i, 0.25 + 0.01 * i, 0.35 + 0.01 * i, 40]
                                        for i, v in enumerate(versions)],
                             "random": [[v, 0.9, 0.85, 0.95, 40] for v in versions]}}}}},
