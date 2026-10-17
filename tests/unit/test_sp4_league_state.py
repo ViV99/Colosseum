@@ -68,7 +68,22 @@ def test_agents_that_left_the_config_are_dropped_with_info(caplog):
     other_game = {"layouts": {"9p": book.state_dict()["layouts"]["2p"]}}
     with caplog.at_level(logging.INFO, logger="colosseum.coordinator.ratings"):
         fresh.load_state_dict(other_game, agents=["a"])
-    assert any("layouts this game does not have" in r.getMessage() for r in caplog.records)
+    assert any("layouts this game does not have are dropped: ['9p']" in r.getMessage() for r in caplog.records)
+
+
+def test_a_layout_whose_outcome_kind_changed_is_dropped_with_its_own_reason(caplog):
+    book = RatingBook(SPEC, ["a", "b", "rnd"])
+    for result in _results():
+        book.update(result)
+    state = book.state_dict()
+    state["layouts"]["2p"]["outcome_kind"] = "rank"                # saved by a game whose 2p had three teams
+    fresh = RatingBook(SPEC, ["a", "b", "rnd"])
+    with caplog.at_level(logging.INFO, logger="colosseum.coordinator.ratings"):
+        fresh.load_state_dict(state, agents=["a", "b", "rnd"])
+    (line,) = [r.getMessage() for r in caplog.records if "League state" in r.getMessage()]
+    assert "outcome kind changed" in line and "2p (saved rank, now wdl)" in line
+    assert "does not have" not in line
+    assert fresh.snapshot()["2p"]["games"]["a"]["b"] == 0          # not restored
 
 
 def test_pfsp_statistics_round_trip_with_the_forgotten_snapshots(caplog):
@@ -87,6 +102,10 @@ def test_pfsp_statistics_round_trip_with_the_forgotten_snapshots(caplog):
     with caplog.at_level(logging.INFO, logger="colosseum.league.pfsp"):
         assert only_a.load_state_dict(state, agents=["a", "b"]) == ["b", "rnd"]
     assert set(only_a.snapshot()["2p"]) == {"a"} and "rnd@fixed" not in only_a.snapshot()["2p"]["a"]
+    lines = [r.getMessage() for r in caplog.records if "League state" in r.getMessage()]
+    # b is still in the config but no longer trainable (no PFSP owner here); rnd left the config
+    assert any("owners that are no longer trainable agents are dropped: ['b']" in line for line in lines)
+    assert any("agents not in this config are dropped: ['rnd']" in line for line in lines)
 
 
 def test_a_snapshot_forgotten_before_the_load_stays_forgotten():

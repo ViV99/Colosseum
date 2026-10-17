@@ -249,8 +249,8 @@ class Coordinator:
                                  "ratings": self._ratings.state_dict(), "pfsp": self._pfsp.state_dict()})
 
     def load_league_state(self, path: str | Path) -> bool:
-        """Restore a saved league state; False when ``path`` does not exist (an SP3 run dir). Entries of agents
-        that are not in this config are dropped (INFO). An unreadable file is a ConfigError."""
+        """Restore a saved league state; False when ``path`` does not exist (an SP3 run dir, or a run that never saved
+        it). Entries of agents that are not in this config are dropped (INFO). An unreadable file is a ConfigError."""
         import json
 
         path = Path(path)

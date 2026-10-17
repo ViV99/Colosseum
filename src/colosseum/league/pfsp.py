@@ -140,16 +140,18 @@ class PfspStats:
 
     def load_state_dict(self, state: Mapping[str, Any], *, agents: Collection[str]) -> list[str]:
         """Restore ``state_dict`` output: owners that are not tracked here and players of agents not in ``agents``
-        are dropped (one INFO line); forgotten snapshots stay forgotten (also those forgotten here before the
-        load). Returns the dropped agents."""
+        are dropped (one INFO line per reason: an owner still in ``agents`` is no longer trainable, the others left
+        the config); forgotten snapshots stay forgotten (also those forgotten here before the load). Returns the
+        dropped agents."""
         known = set(agents)
-        dropped: set[str] = set()
+        dropped: set[str] = set()            # agents not in this config (owners or players)
+        demoted: set[str] = set()            # owners still in the config, but no longer trainable here
         self._forgotten |= {(str(p[0]), str(p[1])) for p in state.get("forgotten", ()) if p[0] in known}
         table: dict[str, dict[str, dict[PlayerKey, list[float]]]] = {}
         for layout, owners in state.get("table", {}).items():
             for owner, rows in owners.items():
                 if owner not in self._halflife:
-                    dropped.add(owner)
+                    (demoted if owner in known else dropped).add(owner)
                     continue
                 for agent, network, score, games in rows:
                     player = (str(agent), str(network))
@@ -158,9 +160,12 @@ class PfspStats:
                     elif player not in self._forgotten:
                         table.setdefault(layout, {}).setdefault(owner, {})[player] = [float(score), float(games)]
         self._table = table
+        if demoted:
+            logger.info(f"League state: PFSP statistics of owners that are no longer trainable agents are dropped: "
+                        f"{sorted(demoted)}")
         if dropped:
             logger.info(f"League state: PFSP statistics of agents not in this config are dropped: {sorted(dropped)}")
-        return sorted(dropped)
+        return sorted(dropped | demoted)
 
     def snapshot(self) -> dict[str, dict[str, dict[str, dict[str, float]]]]:
         """``{layout: {owner: {"agent@net": {"score", "games"}}}}`` (JSON-ready; players sorted)."""

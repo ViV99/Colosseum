@@ -1110,8 +1110,9 @@ class Launcher:
         return states
 
     def _load_league_state(self, coordinator: Coordinator) -> None:
-        """A run-dir resume restores the resumed run's ratings and PFSP statistics (spec block 7.4); an SP3 run dir
-        has no league_state.json (INFO: they start empty). A resume from a checkpoint dir or a .pt starts empty, as
+        """A run-dir resume restores the resumed run's ratings and PFSP statistics (spec block 7.4); a run dir
+        without league_state.json (an SP3 run dir, or an SP4 run that never saved one, e.g. killed before its first
+        metrics tick) gives an INFO line and empty tables. A resume from a checkpoint dir or a .pt starts empty, as
         in SP3."""
         from pathlib import Path
 
@@ -1124,8 +1125,9 @@ class Launcher:
         if coordinator.load_league_state(path):
             logger.info(f"Resume: league state (ratings, PFSP statistics) restored from {path}")
         else:
-            logger.info(f"Resume: {resume_from} has no {LEAGUE_STATE_FILE} (an SP3 run dir); ratings and PFSP "
-                        f"statistics start empty")
+            logger.info(f"Resume: {resume_from} has no {LEAGUE_STATE_FILE} (an SP3 run dir, or a run that never "
+                        f"saved it, e.g. killed before its first metrics tick); ratings and PFSP statistics start "
+                        f"empty")
 
     def _save_league_state(self) -> None:
         """Write league_state.json (each metrics tick and at the end); a failure is an ERROR, never a crash."""

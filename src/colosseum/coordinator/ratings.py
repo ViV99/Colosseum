@@ -358,20 +358,28 @@ class RatingBook:
         return {"layouts": {layout: book.state_dict() for layout, book in self._books.items()}}
 
     def load_state_dict(self, state: Mapping[str, Any], *, agents: Collection[str]) -> list[str]:
-        """Restore ``state_dict`` output. Entries of agents not in ``agents`` are dropped and a layout the game no
-        longer has (or of another outcome kind) is skipped, each with one INFO line; returns the dropped agents."""
+        """Restore ``state_dict`` output. Entries of agents not in ``agents`` are dropped, and a layout the game no
+        longer has or whose outcome kind changed is skipped, with one INFO line per reason; returns the dropped
+        agents."""
         dropped: set[str] = set()
-        skipped = []
+        missing: list[str] = []
+        changed: list[str] = []
         for layout, saved in state.get("layouts", {}).items():
             book = self._books.get(layout)
-            if book is None or saved.get("outcome_kind") != book.outcome_kind:
-                skipped.append(layout)
+            if book is None:
+                missing.append(layout)
+                continue
+            if saved.get("outcome_kind") != book.outcome_kind:
+                changed.append(f"{layout} (saved {saved.get('outcome_kind')}, now {book.outcome_kind})")
                 continue
             book.load_state_dict(saved, set(agents), dropped)
         if dropped:
             logger.info(f"League state: ratings of agents not in this config are dropped: {sorted(dropped)}")
-        if skipped:
-            logger.info(f"League state: ratings of layouts this game does not have are dropped: {sorted(skipped)}")
+        if missing:
+            logger.info(f"League state: ratings of layouts this game does not have are dropped: {sorted(missing)}")
+        if changed:
+            logger.info(f"League state: ratings of layouts whose outcome kind changed are dropped: "
+                        f"{', '.join(sorted(changed))}")
         return sorted(dropped)
 
     def snapshot(self) -> dict[str, dict[str, Any]]:
