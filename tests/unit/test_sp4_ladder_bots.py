@@ -4,9 +4,9 @@ score falls with epsilon on the real MatchRunner, for all four ladder epsilons 0
 
 Bands (statistics-test rule): measured over 30 seeds of exactly this test's setup (200 tic-tac-toe / 150 tron
 games per bot), mean scores tic_tac_toe 0.750 / 0.634 / 0.523 / 0.285, tron 3p 0.830 / 0.554 / 0.427 / 0.309.
-The weakest asserted adjacent gap has z = mean / sd >= 3.9 (tic_tac_toe 0 vs 0.25: 0.116 +- 0.030; the
-others 4.0-12.0), so one gap inverts with probability <= 5e-5 (normal tail) and any of the six with
-<= 2e-4 < 1e-3; no inversion in the 30 seeds (smallest gap 0.042). Seed 3 is fixed."""
+The weakest asserted adjacent gap has z = mean / sd = 0.116 / 0.030 = 3.87 (tic_tac_toe 0 vs 0.25; the others
+4.0-12.0), so one gap inverts with probability about 5.5e-5 (normal tail at z = 3.867) and any of the six with
+at most 6 x 5.5e-5 = 3.3e-4 < 1e-3; no inversion in the 30 seeds (smallest gap 0.042). Seed 3 is fixed."""
 from __future__ import annotations
 
 import functools
