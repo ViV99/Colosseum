@@ -1,5 +1,5 @@
 """gRPC helpers of the SP5 wire layer: channel / server options, auth metadata and the server-side auth interceptor
-(ruling R1). T2.3 adds blob streaming in parts (``PART_BYTES``, ``send_parts``, ``receive_parts``).
+(ruling R1), and blobs in parts (T2.3; spec 4.1 "Большие данные": ``PART_BYTES``, ``send_parts``, ``receive_parts``).
 
 Which RPC needs what (:class:`AuthInterceptor`; refusals are UNAUTHENTICATED / PERMISSION_DENIED with a hint):
 - open: ``Bootstrap/Info`` and ``Bootstrap/Script`` (the installer: version check and script, no secrets);
@@ -14,12 +14,18 @@ Services outside ``colosseum.v1`` are passed through untouched; ``NodeData`` on 
 
 from __future__ import annotations
 
+import hashlib
 import hmac
-from collections.abc import Callable
+import io
+import os
+import uuid
+from collections.abc import Callable, Iterable, Iterator
+from pathlib import Path
 from typing import Any
 
 import grpc
 
+from colosseum.net.proto import colosseum_v1_pb2 as pb
 from colosseum.net.security import MD_NODE_ID, MD_NODE_SECRET, MD_TOKEN, NodeBook, Token
 
 KEEPALIVE_MS = 10_000                    # spec 4.1: a dead peer is noticed within ~10 s
@@ -198,3 +204,119 @@ class DataPortInterceptor(grpc.ServerInterceptor):
         if not self._allowed(name):
             return f"node {name[:12]} is not a node of this run (removed or banned)"
         return None
+
+
+# ---- blobs in parts (T2.3; spec 4.1 "Большие данные") -----------------------------------------------------------
+
+PART_BYTES = 1 << 20                     # blob part size
+BLOB_DIGEST_SIZE = 16                    # blake2b digest bytes (the shm cache's digest, T1.5)
+
+
+class BlobError(ValueError):
+    """A blob stream that is not a whole, consistent blob (``reason``: ``too_large``, ``offset``, ``size``,
+    ``digest``, ``empty``)."""
+
+    def __init__(self, reason: str, message: str) -> None:
+        super().__init__(message)
+        self.reason = reason
+
+
+def blob_digest(data: bytes | memoryview) -> str:
+    """blake2b-128 hex of a whole blob (the digest of ``BlobPart`` streams and uploads)."""
+    return hashlib.blake2b(data, digest_size=BLOB_DIGEST_SIZE).hexdigest()
+
+
+def _parts(read: Callable[[], bytes], total: int, digest: str, meta_json: str) -> Iterator[pb.BlobPart]:
+    offset = 0
+    while True:
+        block = read()
+        last = offset + len(block) >= total or not block
+        yield pb.BlobPart(data=block, offset=offset, total_size=total, last=last,
+                          digest=digest if offset == 0 else "", meta_json=meta_json if offset == 0 else "")
+        offset += len(block)
+        if last:
+            return
+
+
+def send_parts(data: bytes | memoryview | Path, *, meta_json: str = "", digest: str | None = None
+               ) -> Iterator[pb.BlobPart]:
+    """``data`` (bytes, or a file read part by part) as ``BlobPart``s of at most ``PART_BYTES``: the first part
+    carries ``total_size``, ``digest`` (blake2b-128 of the whole blob; computed unless given) and ``meta_json``; the
+    last has ``last``; an empty blob is one part. A file is opened once (its digest pass and the parts read the same
+    open file; blob files are replaced atomically, never rewritten in place)."""
+    if isinstance(data, Path):
+        with open(data, "rb") as f:
+            total = os.fstat(f.fileno()).st_size
+            if digest is None:
+                h = hashlib.blake2b(digest_size=BLOB_DIGEST_SIZE)
+                for block in iter(lambda: f.read(PART_BYTES), b""):
+                    h.update(block)
+                digest = h.hexdigest()
+                f.seek(0)
+            yield from _parts(lambda: f.read(PART_BYTES), total, digest, meta_json)
+        return
+    view = memoryview(data).cast("B")
+    digest = blob_digest(view) if digest is None else digest
+    offset = 0
+
+    def read() -> bytes:
+        nonlocal offset
+        block = bytes(view[offset:offset + PART_BYTES])
+        offset += len(block)
+        return block
+
+    yield from _parts(read, len(view), digest, meta_json)
+
+
+def not_modified_part(meta_json: str = "") -> pb.BlobPart:
+    """The single part of a ``GetLatest`` answer whose version is not newer (T3.1)."""
+    return pb.BlobPart(not_modified=True, last=True, meta_json=meta_json)
+
+
+def receive_parts(parts: Iterable[pb.BlobPart], *, cap: int, into: Path | None = None
+                  ) -> tuple[bytes | Path | None, str]:
+    """The blob of a part stream and its first part's ``meta_json``; ``None`` for a ``not_modified`` answer.
+    Hostile input: ``total_size`` above ``cap`` is refused at the first part (nothing allocated), parts must be
+    contiguous and end exactly at ``total_size``, the digest must match; ``BlobError`` otherwise. ``into``: write to
+    that file (atomically: a uniquely named temp file next to it, renamed at the end; removed on any error) and
+    return its path. Errors of the part iterator itself (a cut gRPC stream) propagate as they are."""
+    it = iter(parts)
+    first = next(it, None)
+    if first is None:
+        raise BlobError("empty", "blob stream without parts")
+    if first.not_modified:
+        return None, first.meta_json
+    total, digest, meta = int(first.total_size), first.digest, first.meta_json
+    if total < 0 or total > cap:
+        raise BlobError("too_large", f"blob of {total} bytes exceeds the cap of {cap} bytes")
+    h = hashlib.blake2b(digest_size=BLOB_DIGEST_SIZE)
+    tmp = None if into is None else into.with_name(f".{into.name}.part-{uuid.uuid4().hex}")
+    sink = io.BytesIO() if tmp is None else open(tmp, "xb")
+    try:
+        offset, part, done = 0, first, False
+        while True:
+            if part.offset != offset or offset + len(part.data) > total:
+                raise BlobError("offset", f"part at offset {part.offset} (expected {offset}) of a {total}-byte blob")
+            h.update(part.data)
+            sink.write(part.data)
+            offset += len(part.data)
+            if part.last:
+                done = True
+                break
+            part = next(it, None)
+            if part is None:
+                break
+        if not done or offset != total:
+            raise BlobError("size", f"blob ended at {offset} of {total} bytes")
+        if h.hexdigest() != digest:
+            raise BlobError("digest", "blob digest mismatch")
+        if tmp is None:
+            return sink.getvalue(), meta
+        sink.close()
+        os.replace(tmp, into)
+        return into, meta
+    except BaseException:
+        sink.close()
+        if tmp is not None:
+            tmp.unlink(missing_ok=True)
+        raise
