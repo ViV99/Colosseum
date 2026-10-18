@@ -54,7 +54,8 @@ def test_writer_one_json_line_per_record_with_numpy_and_nan(tmp_path):
 def test_write_json_atomic(tmp_path):
     write_json_atomic(tmp_path / "ratings.json", {"layouts": {"2p": {"elo": {"a": 1200.0}}}})
     assert json.loads((tmp_path / "ratings.json").read_text()) == {"layouts": {"2p": {"elo": {"a": 1200.0}}}}
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["ratings.json"]
+    isolated = {"xdg-data", "xdg-cache", "shm"}                    # conftest's _isolate_colosseum_dirs
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name not in isolated) == ["ratings.json"]
 
 
 def test_opponent_type_ignores_teammates():

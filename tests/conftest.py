@@ -83,6 +83,17 @@ def _isolate_filesystem(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None
     monkeypatch.setattr(tempfile, "tempdir", str(tmp_path))
 
 
+@pytest.fixture(autouse=True)
+def _isolate_colosseum_dirs(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """SP5 (T1.3): the hub / node identity dirs (``XDG_DATA_HOME``), bundles, envs and node logs
+    (``XDG_CACHE_HOME``) and the shared-memory weight cache (``COLOSSEUM_SHM_DIR``) of every test, and of every
+    process it starts (children inherit the environment: ``cli_runner.child_env``), live under ``tmp_path``."""
+    for var, sub in (("XDG_DATA_HOME", "xdg-data"), ("XDG_CACHE_HOME", "xdg-cache"), ("COLOSSEUM_SHM_DIR", "shm")):
+        path = tmp_path / sub
+        path.mkdir(exist_ok=True)
+        monkeypatch.setenv(var, str(path))
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _repo_root_stays_clean():
     """Fail the session if any test created a new top-level entry in the repo root."""

@@ -167,7 +167,8 @@ def test_unsafe_ids_are_rejected(tmp_path, bad):
         resolve_resume(str(base / "a" / "ckpt_v1"), bad)
     with pytest.raises(pydantic.ValidationError, match="Invalid agent id"):
         ColosseumConfig.model_validate({**make_config().model_dump(mode="json"), "agents": {bad: {}}})
-    assert sorted(p.name for p in tmp_path.iterdir()) == ["base"]  # nothing written outside
+    isolated = {"xdg-data", "xdg-cache", "shm"}                    # conftest's _isolate_colosseum_dirs
+    assert sorted(p.name for p in tmp_path.iterdir() if p.name not in isolated) == ["base"]  # nothing written outside
     assert sorted(p.name for p in base.iterdir()) == ["a"]
 
 
