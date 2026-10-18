@@ -17,7 +17,7 @@ from colosseum.core.config import (
     load_config,
 )
 from colosseum.core.errors import ConfigError
-from game_helpers import SP3_RUN
+from game_helpers import SP3_RUN, SP4_RUN
 
 SPEC_DEFAULTS = {
     "port": 47100, "data_port": 47102, "insecure": False, "heartbeat_sec": 1.0, "node_lost_after_sec": 10.0,
@@ -52,8 +52,8 @@ def test_the_distributed_defaults_are_the_specs():
 
 @pytest.mark.parametrize("bad, match", [
     ({"data_port": 47100}, "must differ"),
-    ({"port": -1}, "port"),
-    ({"data_port": 70000}, "data_port"),
+    ({"port": -1}, r"distributed\.port\n"),
+    ({"data_port": 70000}, r"distributed\.data_port\n"),
     ({"heartbeat_sec": 0}, "heartbeat_sec"),
     ({"node_lost_after_sec": 1.0}, "larger than distributed.heartbeat_sec"),
     ({"learner_relocate_after_sec": 5.0}, "at least distributed.node_lost_after_sec"),
@@ -80,8 +80,10 @@ def test_the_distributed_section_is_global_only_and_set_reaches_it(tmp_path):
     cfg = _load(tmp_path, _data(), {"distributed.port": 50000, "distributed.bundle.exclude": ["data/"],
                                     "distributed.relay": False})
     assert (cfg.distributed.port, cfg.distributed.bundle.exclude, cfg.distributed.relay) == (50000, ["data/"], False)
-    with pytest.raises(ConfigError):
+    with pytest.raises(ConfigError, match="Unknown config key 'agents.a.distributed'"):
         _load(tmp_path, _data(agents={"a": {}}), {"agents.a.distributed.port": 1})
+    with pytest.raises(ConfigError, match=r"unknown field\(s\) \['distributed'\] for a trainable agent"):
+        _load(tmp_path, _data(agents={"a": {"distributed": {"port": 1}}}))
     with pytest.raises(ConfigError, match="Unknown config key 'distributed.nonsense'"):
         _load(tmp_path, _data(), {"distributed.nonsense": 1})
 
@@ -99,8 +101,10 @@ def test_the_new_learner_keys_have_defaults_and_a_per_agent_override(tmp_path):
     learner = over.get_agent_config("a").learner
     assert (learner.placement.tags, learner.placement.strict, learner.recovery_interval_sec) == (["gpu", "big"], True,
                                                                                                  60.0)
-    for bad in ({"max_policy_lag": -1}, {"recovery_interval_sec": 0}, {"placement": {"host": "x"}}):
-        with pytest.raises(ValueError):
+    for bad, match in (({"max_policy_lag": -1}, r"learner\.max_policy_lag\n"),
+                       ({"recovery_interval_sec": 0}, r"learner\.recovery_interval_sec\n"),
+                       ({"placement": {"host": "x"}}, r"learner\.placement\.host\n")):
+        with pytest.raises(ValueError, match=match):
             ColosseumConfig.model_validate(_data(learner=bad))
 
 
@@ -134,6 +138,14 @@ def test_old_and_new_message_size_together_are_an_error(tmp_path):
         _load(tmp_path, _data(transport={"grpc_max_message_mb": 32}, distributed={"max_message_mb": 16}))
     with pytest.raises(ConfigError, match="unknown keys"):
         _load(tmp_path, _data(transport={"grpc_host": "x"}))
+    with pytest.raises(ConfigError, match=r"transport \(SP2-SP4\) must be a section, got int"):
+        _load(tmp_path, _data(transport=5))
+
+
+def test_a_non_section_distributed_is_refused_not_replaced(tmp_path):
+    """The rename never replaces a non-dict distributed value: the field validation refuses it."""
+    with pytest.raises(ConfigError, match=r"distributed\n\s+Input should be a valid dictionary"):
+        _load(tmp_path, _data(transport={"grpc_max_message_mb": 32}, distributed=5))
 
 
 def test_set_still_accepts_the_old_transport_keys(tmp_path, caplog):
@@ -142,12 +154,16 @@ def test_set_still_accepts_the_old_transport_keys(tmp_path, caplog):
     assert cfg.distributed.max_message_mb == 32 and len(_warnings(caplog)) == 1
 
 
-def test_a_resolved_config_of_an_sp3_run_loads_and_is_written_back_without_transport(tmp_path, caplog):
-    """SP3 / SP4 run dirs hold config.resolved.yaml with a transport section: it loads (one WARNING) and the new
-    resolved config has a distributed section instead."""
+@pytest.mark.parametrize("run_dir", [SP3_RUN, SP4_RUN], ids=["sp3", "sp4"])
+def test_a_resolved_config_of_an_sp3_sp4_run_loads_and_is_written_back_without_transport(run_dir, caplog):
+    """SP3 / SP4 run dirs hold config.resolved.yaml with a transport section: it loads read-only (one WARNING; only
+    the YAML is opened, never the journal) and the new resolved config has a distributed section instead."""
+    before = sorted(p.name for p in run_dir.iterdir())
     with caplog.at_level(logging.WARNING):
-        cfg = load_config(SP3_RUN / "config.resolved.yaml")
-    assert len(_warnings(caplog)) == 1 and cfg.distributed.max_message_mb == 64
+        cfg = load_config(run_dir / "config.resolved.yaml")
+    (warning,) = _warnings(caplog)
+    assert "the transport section is gone in SP5" in warning and cfg.distributed.max_message_mb == 64
     dumped = cfg.model_dump(mode="json", by_alias=True)
     assert "transport" not in dumped and dumped["distributed"] == SPEC_DEFAULTS
     assert ColosseumConfig.model_validate(dumped).distributed == DistributedConfig()
+    assert sorted(p.name for p in run_dir.iterdir()) == before

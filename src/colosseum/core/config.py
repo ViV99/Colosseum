@@ -884,15 +884,19 @@ def translate_transport(data: dict) -> dict:
     ignored = [k for k in TRANSPORT_IGNORED_KEYS if k in raw]
     if ignored:
         notes.append(f"{', '.join('transport.' + k for k in ignored)} ignored (the hub and nodes choose the transport)")
-    if "grpc_max_message_mb" in raw:
-        distributed = out.get("distributed")
-        distributed = dict(distributed) if isinstance(distributed, dict) else {}
-        if "max_message_mb" in distributed:
-            raise ValueError("transport.grpc_max_message_mb (SP2-SP4) and distributed.max_message_mb are both set; "
-                             "keep only distributed.max_message_mb")
-        distributed["max_message_mb"] = raw["grpc_max_message_mb"]
+    distributed = out.get("distributed")
+    for old, new in TRANSPORT_RENAMED_KEYS.items():
+        if old not in raw:
+            continue
+        if distributed is not None and not isinstance(distributed, dict):
+            continue   # not a section: left as is, so the field validation refuses it (no silent replacement)
+        distributed = dict(distributed or {})
+        if new in distributed:
+            raise ValueError(f"transport.{old} (SP2-SP4) and distributed.{new} are both set; keep only "
+                             f"distributed.{new}")
+        distributed[new] = raw[old]
         out["distributed"] = distributed
-        notes.append(f"transport.grpc_max_message_mb read as distributed.max_message_mb: {raw['grpc_max_message_mb']}")
+        notes.append(f"transport.{old} read as distributed.{new}: {raw[old]}")
     if notes:
         logger.warning(f"the transport section is gone in SP5: {'; '.join(notes)} (remove transport from the config; "
                        f"it is not kept in config.resolved.yaml)")
