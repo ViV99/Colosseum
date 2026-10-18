@@ -32,7 +32,7 @@ from colosseum.core.errors import ConfigError
 from colosseum.core.specs import ActionSpec, ObsSpec, split_unit_actions
 from colosseum.core.types import SLOT_ACT, TrajectoryChunk, check_slot_arrays
 from colosseum.envs.game import RoleSpec
-from colosseum.net.frame import FrameError, decode_frame, encode_frame, peek_meta
+from colosseum.net.frame import FrameError, decode_frame, encode_frame
 from colosseum.networks.state import State
 
 WEIGHTS_KINDS = ("latest", "snapshot", "fixed", "teacher", "init", "recovery")
@@ -385,10 +385,7 @@ def _weights_meta(meta: Mapping[str, Any]) -> WeightsMeta:
 
 def decode_weights(buf: bytes | bytearray | memoryview, *, cap: int) -> tuple[dict[str, np.ndarray], WeightsMeta]:
     """``(state_dict, meta)`` of a ``weights`` frame (views of ``buf``; FrameError if malformed)."""
-    kind, _ = peek_meta(buf)
-    if kind != "weights":
-        raise FrameError("kind", f"expected a weights frame, got {kind!r}")
-    tree, meta = decode_frame(buf, cap=cap)
+    tree, meta = decode_frame(buf, cap=cap, kind="weights")
     if not isinstance(tree, dict) or not all(isinstance(k, str) and isinstance(v, np.ndarray) for k, v in tree.items()):
         raise FrameError("weights", "a weights frame holds a dict of str -> array")
     return tree, _weights_meta(meta)
@@ -409,10 +406,7 @@ def encode_checkpoint(payload: Mapping[str, Any], *, kind: Literal["periodic", "
 
 def decode_checkpoint(buf: bytes | bytearray | memoryview, *, cap: int) -> tuple[dict, dict]:
     """``(payload as make_checkpoint_payload, meta)`` of a ``checkpoint`` frame; FrameError if malformed."""
-    kind, _ = peek_meta(buf)
-    if kind != "checkpoint":
-        raise FrameError("kind", f"expected a checkpoint frame, got {kind!r}")
-    tree, meta = decode_frame(buf, cap=cap)
+    tree, meta = decode_frame(buf, cap=cap, kind="checkpoint")
     ok = (isinstance(tree, dict) and set(tree) == {"model_state", "trainer_state"}
           and isinstance(tree["model_state"], dict)
           and all(isinstance(k, str) and isinstance(v, np.ndarray) for k, v in tree["model_state"].items())

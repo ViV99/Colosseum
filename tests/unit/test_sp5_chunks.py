@@ -258,6 +258,24 @@ def test_chunks_the_worker_buffers_build_pass_after_a_round_trip(role, teacher):
         ChunkValidator(role, agent_id="a", teacher=not teacher).validate(back)
 
 
+def test_missing_role_fields_and_a_malformed_has_teacher_are_refused():
+    gs_role = RoleSpec(ROLE.observation_space, ROLE.action_space, gymnasium.spaces.Box(-1, 1, (2,), np.float32))
+    with pytest.raises(ChunkError, match="global_state missing"):
+        ChunkValidator(gs_role, agent_id="a", teacher=False).validate(_chunk())
+    with pytest.raises(ChunkError, match="DAgger labels missing"):
+        ChunkValidator(ROLE, agent_id="a", teacher=True).validate(_chunk())
+    units_role = RoleSpec(OBS, UNITS_ACT)
+    chunk = _buffer_chunk(units_role)
+    chunk.behavior_unit_logp = None
+    with pytest.raises(ChunkError, match=r"behavior_unit_logp missing for 3 decider\(s\)"):
+        ChunkValidator(units_role, agent_id="a", teacher=False).validate(chunk)
+    dict_role = RoleSpec(OBS, DICT_ACT)
+    chunk = _buffer_chunk(dict_role, teacher=True)
+    chunk.has_teacher = chunk.has_teacher[:, None].repeat(1, 2)               # bool [S, 2]
+    with pytest.raises(ChunkError, match=r"has_teacher: bool \(4, 2\), expected bool \(4,\)"):
+        ChunkValidator(dict_role, agent_id="a", teacher=True).validate(chunk)
+
+
 def test_units_and_dict_actions_are_range_checked_per_component():
     units_role = RoleSpec(OBS, UNITS_ACT)
     chunk = _buffer_chunk(units_role)

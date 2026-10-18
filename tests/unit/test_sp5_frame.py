@@ -272,12 +272,34 @@ def test_corrupt_lz4_regions_are_refused(damage):
     assert info.value.reason in ("lz4", "flags")
 
 
-def test_non_finite_numbers_in_the_header_are_refused():
-    text = json.dumps(_base(meta={"x": 1})).replace('"x": 1', '"x": NaN').encode()
+@pytest.mark.parametrize("header, old, literal", [
+    (_base(meta={"x": 1}), '"x": 1', '"x": NaN'),
+    (_base(meta={"x": 1}), '"x": 1', '"x": Infinity'),
+    (_base(meta={"x": 1}), '"x": 1', '"x": 1e999'),                     # overflows to inf in json's float parser
+    (_base(meta={"x": 1}), '"x": 1', '"x": -1e999'),
+    (_base(tree={"t": "list", "v": [{"t": "nd", "i": 0}, {"t": "py", "v": 1}]}), '"v": 1}', '"v": -1e999}'),
+    (_base(tree={"t": "dict", "k": [7], "v": [{"t": "nd", "i": 0}]}), '"k": [7]', '"k": [1e999]'),
+])
+def test_non_finite_numbers_in_the_header_are_refused(header, old, literal):
+    text = json.dumps(header)
+    assert old in text
+    text = text.replace(old, literal).encode()
     head = struct.pack("<4sHHQ", FRAME_MAGIC, 1, 0, len(text)) + text
     with pytest.raises(FrameError) as info:
         decode_frame(head + bytes((-len(head)) % FRAME_ALIGN) + bytes(16), cap=CAP)
     assert info.value.reason == "header_json"
+
+
+def test_a_non_contiguous_buffer_is_a_frame_error():
+    buf = encode_frame({"x": np.arange(4, dtype=np.float32)})
+    strided = memoryview(buf + buf)[::2]                                    # format "B", not C-contiguous
+    numpy_view = memoryview(np.zeros((4, 8), np.float32)[:, ::2])            # another format, not C-contiguous
+    for bad in (strided, numpy_view):
+        for fn in (lambda b: decode_frame(b, cap=CAP), peek_meta, frame_sizes):
+            with pytest.raises(FrameError) as info:
+                fn(bad)
+            assert info.value.reason == "buffer"
+    assert decode_frame(memoryview(np.frombuffer(buf, np.uint8)), cap=CAP)[0]["x"].tolist() == [0, 1, 2, 3]
 
 
 def test_too_many_leaves_and_too_deep_trees_are_refused(monkeypatch):

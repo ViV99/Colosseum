@@ -192,6 +192,25 @@ def _reject_constant(name: str) -> Any:
     raise FrameError("header_json", f"non-finite number {name} in the header")
 
 
+def _finite_float(text: str) -> float:
+    """json's float parser, refusing literals that overflow to infinity (``1e999``)."""
+    value = float(text)
+    if not math.isfinite(value):
+        raise FrameError("header_json", f"number {text[:40]} in the header is not finite")
+    return value
+
+
+def _byte_view(buf: bytes | bytearray | memoryview) -> memoryview:
+    """A flat, C-contiguous byte view of ``buf``; FrameError("buffer") for anything else."""
+    try:
+        mv = memoryview(buf)
+        if not mv.c_contiguous:
+            raise FrameError("buffer", "the frame buffer is not C-contiguous")
+        return mv if mv.format == "B" and mv.ndim == 1 else mv.cast("B")
+    except (TypeError, BufferError, ValueError) as e:
+        raise FrameError("buffer", f"{type(e).__name__}: {e}") from None
+
+
 def _read_header(mv: memoryview) -> tuple[dict, int, int]:
     """``(header, flags, data start)`` of a frame; checks the prefix and the header's top-level shape."""
     if len(mv) < _PREFIX.size:
@@ -208,7 +227,8 @@ def _read_header(mv: memoryview) -> tuple[dict, int, int]:
     if _PREFIX.size + hlen > len(mv):
         raise FrameError("truncated", f"header of {hlen} bytes runs past the frame's {len(mv)} bytes")
     try:
-        header = json.loads(str(mv[_PREFIX.size:_PREFIX.size + hlen], "utf-8"), parse_constant=_reject_constant)
+        header = json.loads(str(mv[_PREFIX.size:_PREFIX.size + hlen], "utf-8"), parse_constant=_reject_constant,
+                            parse_float=_finite_float)
     except FrameError:
         raise
     except (UnicodeDecodeError, ValueError, RecursionError) as e:
@@ -342,9 +362,7 @@ def decode_frame(buf: bytes | bytearray | memoryview, *, cap: int, copy: bool = 
     views of one private copy of the data region (torch then shares them without another copy); raises
     :class:`FrameError` for anything malformed or larger than ``cap`` bytes, before allocating it, and (with ``kind``)
     for a frame of another kind."""
-    mv = memoryview(buf)
-    if mv.format != "B" or mv.ndim != 1:
-        mv = mv.cast("B")
+    mv = _byte_view(buf)
     header, flags, start = _read_header(mv)
     if kind is not None and header["kind"] != kind:
         raise FrameError("kind", f"expected a {kind} frame, got {header['kind']!r}")
@@ -382,18 +400,14 @@ def decode_frame(buf: bytes | bytearray | memoryview, *, cap: int, copy: bool = 
 
 def peek_meta(buf: bytes | bytearray | memoryview) -> tuple[str, dict]:
     """``(kind, meta)`` from the header only (routing): no arrays, no size cap beyond the header's."""
-    mv = memoryview(buf)
-    if mv.format != "B" or mv.ndim != 1:
-        mv = mv.cast("B")
+    mv = _byte_view(buf)
     header, _, _ = _read_header(mv)
     return header["kind"], header["meta"]
 
 
 def frame_sizes(buf: bytes | bytearray | memoryview) -> tuple[int, int]:
     """``(raw data bytes, stored data bytes)`` of a well-formed frame (for :meth:`Lz4Probe.observe`)."""
-    mv = memoryview(buf)
-    if mv.format != "B" or mv.ndim != 1:
-        mv = mv.cast("B")
+    mv = _byte_view(buf)
     header, _, start = _read_header(mv)
     return _check_int(header["data_bytes"], "data_bytes"), max(0, len(mv) - start)
 
