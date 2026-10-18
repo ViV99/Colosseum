@@ -104,3 +104,16 @@ def test_module_is_standalone():
                           "sys.modules['t'] = m; s.loader.exec_module(m); print('torch' in sys.modules)", T.__file__],
                          capture_output=True, text=True)
     assert out.stdout.strip() == "False", out.stderr
+
+
+def test_warning_names_the_oldest_gpu():
+    choice = torch_spec("2.14.1", "cu130", platform=LINUX,
+                        gpus=[gpu(cc="8.9", name="RTX 4070 Ti"), gpu(cc="6.1", name="GTX 1080 Ti")])
+    assert choice.backend == "cu126" and "GTX 1080 Ti" in choice.warning and "RTX 4070 Ti" not in choice.warning
+    assert "compute capability 6.1" in choice.warning
+
+
+def test_probe_nvidia_keeps_a_gpu_without_memory_total():
+    run, _ = _smi([(0, "0, NVIDIA A100-SXM4-40GB MIG, [N/A], 580.65.06, 8.0\n")])
+    assert T.probe_nvidia(run=run, environ={"PATH": "/usr/bin"}) == [
+        NvidiaGpu(0, "NVIDIA A100-SXM4-40GB MIG", 0, "580.65.06", "8.0")]

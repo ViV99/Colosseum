@@ -3,7 +3,9 @@
 Default list: every installed distribution as ``name==version`` (local version labels such as ``+cu130``
 dropped), without the packages whose build depends on the node's hardware (``torch``, ``triton``,
 ``nvidia-*``, ``cuda-*``, ``pytorch-triton*``), without ``colosseum`` and without distributions installed from
-local paths (editable or ``file://``: their sources travel in the code bundle). ``distributed.requirements``
+local paths (``file:`` URLs in ``direct_url.json``). Only editable local-path installs travel in the code
+bundle; a non-editable one (``pip install ./mylib``, a local wheel) is not shipped either (a compiled extension
+may not fit the node's platform): one WARNING names it. ``distributed.requirements``
 replaces the list with a file of the user's. The loader adds ``torch==<the hub's version>`` itself, with the
 build chosen for the node (``torch_select``).
 """
@@ -36,14 +38,19 @@ def excluded(name: str) -> bool:
     return any(fnmatchcase(canon, pattern) for pattern in EXCLUDED)
 
 
-def _from_local_path(dist: importlib.metadata.Distribution) -> bool:
+def _local_install(dist: importlib.metadata.Distribution) -> str | None:
+    """``"editable"`` / ``"copy"`` for a distribution installed from a local path (``file:`` URL), else None."""
     raw = dist.read_text("direct_url.json")
     if not raw:
-        return False
+        return None
     try:
-        return str(json.loads(raw).get("url", "")).startswith("file:")
+        info = json.loads(raw)
     except ValueError:
-        return False
+        return None
+    if not isinstance(info, dict) or not str(info.get("url", "")).startswith("file:"):
+        return None
+    dir_info = info.get("dir_info")
+    return "editable" if isinstance(dir_info, dict) and dir_info.get("editable") else "copy"
 
 
 def hub_freeze(distributions: Iterable[importlib.metadata.Distribution] | None = None) -> list[str]:
@@ -55,8 +62,16 @@ def hub_freeze(distributions: Iterable[importlib.metadata.Distribution] | None =
         if not name:
             continue
         canon = canonical_name(name)
-        if canon in seen or excluded(canon) or _from_local_path(dist):
+        if canon in seen or excluded(canon):
             seen.setdefault(canon, "")
+            continue
+        local = _local_install(dist)
+        if local is not None:
+            seen[canon] = ""
+            if local == "copy":
+                logger.warning("%s %s was installed from a local path without -e: it is neither pinned for the "
+                               "nodes nor in the code bundle, so nodes will miss it unless it is installed editable "
+                               "(pip install -e) or listed in distributed.requirements", name, dist.version)
             continue
         seen[canon] = f"{canon}=={dist.version.split('+', 1)[0]}"
     return sorted(line for line in seen.values() if line)

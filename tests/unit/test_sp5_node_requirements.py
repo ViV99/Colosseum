@@ -82,3 +82,18 @@ def test_real_environment_list_has_no_hardware_packages():
     assert "numpy" in names and "grpcio" in names
     assert not any(n == "torch" or n.startswith(("nvidia-", "cuda-")) or n in ("triton", "colosseum") for n in names)
     assert all("+" not in r for r in reqs)
+
+
+def test_non_editable_local_install_warns_and_is_left_out(tmp_path, caplog):
+    dists = _site(tmp_path, {
+        "numpy": ("2.5.4", None),
+        "mylib": ("1.0", {"url": "file:///src/mylib", "dir_info": {}}),                   # pip install ./mylib
+        "localwheel": ("2.0", {"url": "file:///tmp/localwheel-2.0.whl", "archive_info": {}}),
+        "devlib": ("0.1", {"url": "file:///src/devlib", "dir_info": {"editable": True}}),  # bundled: no warning
+    })
+    with caplog.at_level(logging.WARNING):
+        assert hub_freeze(dists) == ["numpy==2.5.4"]
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert any(w.startswith("mylib 1.0 ") for w in warnings) and any(w.startswith("localwheel 2.0 ") for w in warnings)
+    assert all("pip install -e" in w and "distributed.requirements" in w for w in warnings)

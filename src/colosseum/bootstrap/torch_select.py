@@ -141,7 +141,11 @@ def probe_nvidia(*, run: Callable[..., subprocess.CompletedProcess] = subprocess
                 continue
             try:
                 cc = cols[4] if len(cols) > 4 and parse_version(cols[4]) else None
-                gpus.append(NvidiaGpu(int(cols[0]), cols[1], int(float(cols[2])), cols[3], cc))
+                try:
+                    memory = int(float(cols[2]))
+                except ValueError:
+                    memory = 0                       # "[N/A]" (some drivers / GPUs): keep the GPU
+                gpus.append(NvidiaGpu(int(cols[0]), cols[1], memory, cols[3], cc))
             except ValueError:
                 continue
         return gpus
@@ -166,13 +170,13 @@ def torch_spec(hub_torch: str, hub_build: str, *, platform: NodePlatform,
         return TorchChoice(req, "cpu", None, None)
     driver = min((g.driver for g in gpus), key=parse_version)
     dv = parse_version(driver)
-    caps = [parse_version(g.compute_cap) for g in gpus if g.compute_cap]
-    cc = min(caps) if caps else None
+    rated = [(parse_version(g.compute_cap), g) for g in gpus if g.compute_cap]
+    cc, decider = min(rated, key=lambda item: item[0]) if rated else (None, gpus[0])   # the oldest GPU decides
     old_gpu = cc is not None and cc < CU13_MIN_COMPUTE_CAP
     hub_major = cuda_major(hub_build)
     if hub_major is not None and dv >= MIN_DRIVER.get(hub_major, (10 ** 6,)) and not (hub_major >= 13 and old_gpu):
         return TorchChoice(req, hub_build, driver, None)
-    gpu_text = f"{gpus[0].name} (driver {driver}" + (f", compute capability {'.'.join(map(str, cc))})" if cc else ")")
+    gpu_text = f"{decider.name} (driver {driver}" + (f", compute capability {'.'.join(map(str, cc))})" if cc else ")")
     if old_gpu:
         if tv[:2] <= OLD_GPU_LAST_TORCH and dv >= MIN_DRIVER[12]:
             return TorchChoice(req, OLD_GPU_BACKEND, driver,

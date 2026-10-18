@@ -334,6 +334,12 @@ def build_bundle(project_dir: Path, *, include: Sequence[str], exclude: Sequence
                     tar.addfile(_info(MANIFEST, len(manifest), 0o644), _BytesReader(manifest))
                     for name in sorted(members):
                         _add_file(tar, name, members[name])
+        archive_bytes = tmp.stat().st_size
+        if archive_bytes > MAX_ARCHIVE_BYTES:
+            raise BundleError(f"code bundle of {project} is {archive_bytes >> 20} MiB, above the "
+                              f"{MAX_ARCHIVE_BYTES >> 20} MiB nodes accept: leave large files out with "
+                              "distributed.bundle.exclude or a smaller distributed.bundle.max_file_mb (weights and "
+                              "data the nodes need are fetched from the hub, not shipped in the bundle)")
         code_hash = sha256_file(tmp)
         final = out / f"{code_hash}{ARCHIVE_SUFFIX}"
         os.replace(tmp, final)
@@ -451,16 +457,34 @@ def unpack_bundle(archive: Path, code_hash: str, *, cache_root: Path) -> Path:
                     shutil.copyfileobj(src, out, 1 << 20)
                 os.chmod(dest, 0o755 if m.mode & 0o111 else 0o644)
         (tmp / COMPLETE_MARKER).write_text(json.dumps({"code_hash": code_hash, "files": len(names)}))
-        try:
-            os.rename(tmp, target)
-        except OSError:
-            if not (target / COMPLETE_MARKER).is_file():   # another loader did not win the race: a real error
-                raise
+        _place(tmp, target)
     except (tarfile.TarError, OSError, ValueError, EOFError) as e:
         raise BundleError(f"code bundle {archive} cannot be unpacked: {e}") from e
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
     return target
+
+
+def _place(tmp: Path, target: Path) -> None:
+    """Rename the complete ``tmp`` dir to ``target``. Losing the race to another loader is fine; a ``target``
+    without the completion marker is a stale partial dir (renames are atomic, so no loader is writing it): it is
+    moved away and removed, and the rename is retried once."""
+    for attempt in range(2):
+        try:
+            os.rename(tmp, target)
+            return
+        except OSError:
+            if (target / COMPLETE_MARKER).is_file():       # another loader won the race
+                return
+            if attempt or not target.is_dir():
+                raise
+            stale = target.parent / f".stale-{target.name[:16]}-{uuid.uuid4().hex[:8]}"
+            logger.warning("code bundle: removing the incomplete directory %s (no %s)", target, COMPLETE_MARKER)
+            try:
+                os.rename(target, stale)
+            except FileNotFoundError:
+                pass                                        # removed meanwhile by another loader
+            shutil.rmtree(stale, ignore_errors=True)
 
 
 def bundle_python_path(unpacked: Path) -> list[Path]:

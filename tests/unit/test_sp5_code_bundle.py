@@ -298,3 +298,25 @@ def test_unpack_refuses_bad_manifest_entries_and_missing_archive(tmp_path):
     with pytest.raises(B.BundleError, match="not a code hash"):
         B.unpack_bundle(path, "../" + digest[3:], cache_root=tmp_path / "cache")
     assert list(B.bundles_dir(tmp_path / "cache").iterdir()) == []
+
+
+def test_stale_partial_dir_of_the_hash_is_replaced(tmp_path, caplog):
+    project = _project(tmp_path)
+    b = _build(project, tmp_path)
+    stale = B.bundles_dir(tmp_path / "cache") / b.code_hash
+    _tree(stale, {"project/half-written.py": ""})                     # no completion marker
+    with caplog.at_level(logging.WARNING):
+        target = B.unpack_bundle(b.path, b.code_hash, cache_root=tmp_path / "cache")
+    assert target == stale and (target / B.COMPLETE_MARKER).is_file()
+    assert (target / "project" / "examples" / "game.py").is_file()
+    assert not (target / "project" / "half-written.py").exists()
+    assert sorted(p.name for p in B.bundles_dir(tmp_path / "cache").iterdir()) == [b.code_hash]
+    assert "incomplete directory" in caplog.text
+
+
+def test_archive_above_the_node_limit_is_refused(tmp_path, monkeypatch):
+    project = _project(tmp_path)
+    monkeypatch.setattr(B, "MAX_ARCHIVE_BYTES", 64)
+    with pytest.raises(B.BundleError, match=r"above the 0 MiB nodes accept.*distributed\.bundle\.exclude"):
+        _build(project, tmp_path)
+    assert list((tmp_path / "out").iterdir()) == []                  # no archive and no temporary file left
