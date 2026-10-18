@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import dataclasses
 import json
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -66,6 +67,9 @@ RESULTS = [
     # pulse: a snapshot's env_steps, a solo score layout with one team
     MatchResult("p0", "solo", "score", [_seat(0, network="ckpt_v100", version_start=100, version_end=100)],
                 [TeamResult(0, 1.0, 17.5)], 100, uid="RUN/pulse/x", source="pulse", env_steps=4000, block="P/3"),
+    # train's local node is node 0 (amendment A9); generation 0 is a parked version's: both stay 0, never None
+    MatchResult("w0_e0_g1_ep0", "2p", "wdl", [_seat(0, version_start=0, version_end=0, generation=0), _seat(1)],
+                [TeamResult(0, 1.0, 1.0), TeamResult(1, 2.0, -1.0)], 4, uid="RUN/train/n0/w0_e0_g1_ep0", node=0),
 ]
 
 
@@ -99,6 +103,11 @@ def test_unset_optional_fields_stay_none_and_zero_stays_zero():
         assert not proto.seats[0].HasField(field)
     zero = result_to_proto(RESULTS[2])
     assert zero.HasField("seed") and zero.seed == 0 and zero.HasField("env_steps") and zero.env_steps == 0
+    local = pb.MatchResultProto.FromString(result_to_proto(RESULTS[5]).SerializeToString())
+    assert local.HasField("node") and local.node == 0
+    assert local.seats[0].HasField("generation") and local.seats[0].generation == 0
+    back = result_from_proto(local)
+    assert back.node == 0 and back.seats[0].generation == 0 and back.seats[1].generation is None
 
 
 def test_a_batch_of_256_results_round_trips_in_order():
@@ -254,15 +263,23 @@ def test_the_a1_oneof_members_round_trip_in_their_envelopes():
     assert pb.HubMessage.DESCRIPTOR.fields_by_name["block_ack"].number == 7
 
 
+def _without_generator_version(text: str) -> str:
+    return re.sub(r"^GRPC_GENERATED_VERSION = .*$", "GRPC_GENERATED_VERSION = <any>", text, flags=re.M)
+
+
 def test_the_committed_generated_code_matches_the_proto(tmp_path):
-    """scripts/gen_proto.sh was run after the last .proto edit: compiling the .proto gives the committed descriptor."""
+    """scripts/gen_proto.sh was run after the last .proto edit: compiling the .proto gives the committed descriptor and
+    the committed _pb2_grpc.py (up to the grpcio-tools version line)."""
     pytest.importorskip("grpc_tools", reason="grpcio-tools is in the dev extra")
     from google.protobuf import descriptor_pb2
 
     src = PROTO.parents[3]                                                  # .../src
     out = tmp_path / "set.pb"
     subprocess.run([sys.executable, "-m", "grpc_tools.protoc", f"-I{src}", f"--descriptor_set_out={out}",
-                    str(PROTO.relative_to(src))], check=True, cwd=src)
+                    f"--grpc_python_out={tmp_path}", str(PROTO.relative_to(src))], check=True, cwd=src)
+    fresh_grpc = tmp_path / PROTO.relative_to(src).with_name("colosseum_v1_pb2_grpc.py")
+    committed_grpc = Path(pb_grpc.__file__)
+    assert _without_generator_version(fresh_grpc.read_text()) == _without_generator_version(committed_grpc.read_text())
     compiled = descriptor_pb2.FileDescriptorSet.FromString(out.read_bytes()).file[0]
     committed = descriptor_pb2.FileDescriptorProto.FromString(pb.DESCRIPTOR.serialized_pb)
 

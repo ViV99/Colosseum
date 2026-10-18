@@ -19,7 +19,7 @@ in PyTorch, without Ray.
 
 ```bash
 git clone <repo-url> Colosseum && cd Colosseum
-scripts/setup-dev.sh            # uv + .venv (Python 3.12) + CPU torch + colosseum[grpc,dev,examples]
+scripts/setup-dev.sh            # uv + .venv (Python 3.12) + CPU torch + colosseum[dev,examples]
 source .venv/bin/activate
 
 colosseum validate -c configs/examples/tic_tac_toe.yaml
