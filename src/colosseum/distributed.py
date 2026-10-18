@@ -334,7 +334,7 @@ def run_distributed_learner(
     setup_process_logging(run_dir.logs, f"learner-{agent_id}", console_level=logging.INFO)
     run_dir.write_resolved_config(config)
     print(f"Run directory: {run_dir.root}", flush=True)
-    max_mb = config.transport.grpc_max_message_mb
+    max_mb = config.distributed.max_message_mb
 
     device = resolve_device(acfg.learner.device)
     # The learner role does not know which workers share its machine, so with
@@ -475,7 +475,7 @@ def _dist_worker_main(
     from colosseum.weight_store.grpc_store import GRPCWeightStore
     from colosseum.worker.rollout_worker import rollout_worker_process
 
-    max_mb = config.transport.grpc_max_message_mb
+    max_mb = config.distributed.max_message_mb
     store = GRPCWeightStore(weight_store_address, max_message_mb=max_mb)
     transports = {aid: GRPCTransport(learner_addresses[aid], max_message_mb=max_mb) for aid in agent_ids}
 

@@ -133,15 +133,17 @@ def test_benchmark_workload_is_latest_only_self_play_without_fixed_players(tmp_p
 REPO_ROOT = Path(__file__).resolve().parents[2]
 
 
-def test_benchmark_config_sets_every_section_and_every_sp4_key_explicitly(tmp_path):
+def test_benchmark_config_sets_every_section_and_every_sp4_sp5_key_explicitly(tmp_path):
     """Guard: a new config key never changes the pinned workload silently (SP1 T0.4 rule)."""
     from colosseum.core.config import ColosseumConfig
 
     cfg = bench._make_config(1, str(tmp_path))
     assert set(ColosseumConfig.model_fields) - cfg.model_fields_set <= {"agents", "bc"}
-    for name in ("match_log", "ratings", "evaluation", "checkpoint"):
+    for name in ("match_log", "ratings", "evaluation", "checkpoint", "distributed", "learner"):
         section = getattr(cfg, name)
         assert section.model_fields_set == set(type(section).model_fields), name
+    assert cfg.distributed.bundle.model_fields_set == set(type(cfg.distributed.bundle).model_fields)
+    assert cfg.learner.placement.model_fields_set == set(type(cfg.learner.placement).model_fields)
 
 
 def test_benchmark_workload_has_the_journal_on_and_pulse_and_top_k_off(tmp_path):

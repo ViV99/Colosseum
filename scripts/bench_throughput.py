@@ -239,6 +239,10 @@ def _make_config(num_workers: int, run_parent: str):
             "weight_push_interval": 5,
             "pin_memory": False,
             "torch_threads": None,  # auto: (cpu_count - num_workers * 1) // 1
+            # SP5: no lag cut (default), the recovery cadence and placement of the one machine's learner pinned
+            "max_policy_lag": None,
+            "recovery_interval_sec": 300.0,
+            "placement": {"node": None, "tags": [], "strict": False},
         },
         training={
             "total_timesteps": 10**12,  # stopped by the timer, not the budget
@@ -274,7 +278,15 @@ def _make_config(num_workers: int, run_parent: str):
         ratings={"anchor": None, "refit_interval_sec": 60.0, "bootstrap_samples": 200},
         evaluation={"enabled": False, "agents": None, "field": None, "layouts": None, "every": 1, "blocks": 25,
                     "num_envs": 8, "deterministic": False, "max_backlog": 4},   # criterion 3.6: pulse off
-        transport={"mode": "local"},
+        # SP5 (spec 9.1): every key pinned. The hub and the local node talk over loopback; heartbeat_sec 0.25 is set
+        # by T2.5 (counter quantization < 1 % of the window), until then the default.
+        distributed={
+            "port": 47100, "data_port": 47102, "insecure": False, "heartbeat_sec": 1.0, "node_lost_after_sec": 10.0,
+            "learner_relocate_after_sec": 120.0, "hub_lost_timeout_sec": 1800.0, "hub_lost_collect_sec": 300.0,
+            "shutdown_grace_sec": 20.0, "connect_timeout_sec": 5.0, "block_lease_sec": 600.0, "relay": True,
+            "results_batch": 256, "results_flush_sec": 0.25, "node_result_buffer_mb": 256.0, "max_message_mb": 64,
+            "bundle": {"include": [], "exclude": [], "max_file_mb": 10.0}, "requirements": None,
+        },
     )
 
 

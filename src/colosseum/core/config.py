@@ -1,7 +1,7 @@
 """Pydantic v2 configuration models for the Colosseum framework (config v3, SP3; v2 = SP2).
 
 Every section of the training pipeline (algorithm, environment, network,
-rollout, learner, matchmaking, checkpointing, metrics, transport, run) has its own
+rollout, learner, matchmaking, checkpointing, metrics, distributed, run) has its own
 model with sensible defaults.  The top-level :class:`ColosseumConfig` combines
 them all and can be loaded from a YAML file via :func:`load_config`.
 
@@ -17,6 +17,9 @@ SP3: ``checkpoint.keep_last`` / ``keep_every`` (``pool_size`` is read as ``keep_
 SP3: ``init`` and ``kickstart`` sections (global + per agent); ``training.kickstart_*`` are translated
 into ``kickstart``.
 SP4: the global ``match_log`` and ``ratings`` sections.
+SP5: the global ``distributed`` section and ``learner.max_policy_lag`` / ``recovery_interval_sec`` / ``placement``;
+``transport`` is gone (``mode`` / ``grpc_port`` are ignored with a WARNING, ``grpc_max_message_mb`` is read as
+``distributed.max_message_mb``).
 """
 
 from __future__ import annotations
@@ -102,13 +105,6 @@ class LRSchedule(str, Enum):
     CONSTANT = "constant"
     LINEAR = "linear"
     COSINE = "cosine"
-
-
-class TransportMode(str, Enum):
-    """Communication backend between workers and learners."""
-
-    LOCAL = "local"  # multiprocessing / shared memory (single machine)
-    GRPC = "grpc"  # distributed via gRPC
 
 
 # ---------------------------------------------------------------------------
@@ -326,10 +322,22 @@ class RolloutConfig(StrictModel):
     )
 
 
+class LearnerPlacementConfig(StrictModel):
+    """Where the hub prefers to place an agent's learner (SP5 spec block 1)."""
+
+    node: str | None = Field(default=None, description="Preferred node name (colosseum nodes list).")
+    tags: list[str] = Field(default_factory=list, description="Preferred node tags (all of them must match).")
+    strict: bool = Field(default=False, description="Never place or relocate the learner off the preference "
+                                                     "(the agent waits as pending instead).")
+
+
+_DEVICE_RE = re.compile(r"auto|cpu|cuda|cuda:\d+|mps")
+
+
 class LearnerConfig(StrictModel):
     """Learner process settings."""
 
-    device: str = Field(default="auto", description="Torch device string ('auto', 'cuda:0', 'cpu').")
+    device: str = Field(default="auto", description="Torch device: auto, cpu, cuda, cuda:N or mps.")
     queue_size: int = Field(default=64, ge=1, description="Max trajectory chunks buffered in the learner queue.")
     batch_chunks: int = Field(default=16, ge=1, description="Number of chunks aggregated into one training batch.")
     weight_push_interval: int = Field(
@@ -349,6 +357,27 @@ class LearnerConfig(StrictModel):
         description="torch threads per learner process. None = auto: 2 on CUDA; on CPU "
                     "max(1, (cpu_count - num_workers * rollout.torch_threads) // num_learners).",
     )
+    max_policy_lag: int | None = Field(
+        default=None, ge=0,
+        description="Drop chunks whose policy_version is more than this many versions behind the learner's "
+                    "(dropped_chunks.stale); null = off. The lag p50 / p95 / max is in the train records always.",
+    )
+    recovery_interval_sec: float = Field(
+        default=300.0, gt=0,
+        description="Seconds between recovery points (model + trainer state, stored by the hub, overwritten, not in "
+                    "the snapshot pool); a restarted learner loses at most this much training.",
+    )
+    placement: LearnerPlacementConfig = Field(
+        default_factory=LearnerPlacementConfig,
+        description="Preferred node of the learner (by name and / or tags); strict: never on another node.",
+    )
+
+    @field_validator("device")
+    @classmethod
+    def _check_device(cls, device: str) -> str:
+        if not _DEVICE_RE.fullmatch(device):
+            raise ValueError(f"learner.device must be auto, cpu, cuda, cuda:N or mps, got {device!r}")
+        return device
 
 
 class TrainingConfig(StrictModel):
@@ -771,26 +800,103 @@ class RunConfig(StrictModel):
         return name
 
 
-class TransportConfig(StrictModel):
-    """Communication backend settings.
+class DistributedBundleConfig(StrictModel):
+    """What the hub's code bundle holds besides the colosseum package and the project dir (SP5 spec 2.3)."""
 
-    ``mode`` and ``grpc_port`` are unused since SP1; kept for SP5 (distribution). Distributed
-    roles take their ports as command-line flags.
-    """
+    include: list[str] = Field(default_factory=list, description="Extra paths (relative to the project dir).")
+    exclude: list[str] = Field(default_factory=list, description="Paths (globs) of the project dir to leave out.")
+    max_file_mb: float = Field(default=10.0, gt=0, description="Files of the project dir larger than this are left "
+                                                               "out.")
 
-    mode: TransportMode = Field(
-        default=TransportMode.LOCAL,
-        description="Transport backend to use. Unused since SP1; kept for SP5 (distribution).",
-    )
-    grpc_port: int = Field(
-        default=50051, ge=1, le=65535,
-        description="Port for gRPC services. Unused since SP1; kept for SP5 (distribution).",
-    )
-    grpc_max_message_mb: int = Field(
-        default=64,
-        ge=1,
-        description="Max gRPC message size in MiB.",
-    )
+
+class DistributedConfig(StrictModel):
+    """The hub, its nodes and the wire (SP5 spec block 9.1). Global only. Every key has a default: a one-machine
+    config needs none of them."""
+
+    port: int = Field(default=47100, ge=0, le=65535, description="The hub's port (gRPC: sessions, blobs, the "
+                                                                  "installer, the relay); 0 = an ephemeral port "
+                                                                  "chosen at bind (hub.json has the bound one).")
+    data_port: int = Field(default=47102, ge=0, le=65535,
+                           description="A node's data port (chunks from other nodes, its learners' weights); the next "
+                                       "free one when taken; 0 = an ephemeral port chosen at bind.")
+    insecure: bool = Field(default=False, description="No TLS (trusted LAN only); the token stays required.")
+    heartbeat_sec: float = Field(default=1.0, gt=0, description="Seconds between a node's heartbeats.")
+    node_lost_after_sec: float = Field(default=10.0, gt=0, description="A node silent this long is lost.")
+    learner_relocate_after_sec: float = Field(default=120.0, gt=0,
+                                              description="A lost node's learners move after this long.")
+    hub_lost_timeout_sec: float = Field(default=1800.0, gt=0,
+                                        description="Nodes stop their processes after this long without the hub.")
+    hub_lost_collect_sec: float = Field(default=300.0, gt=0,
+                                        description="Without the hub, a learner reachable only through the relay gets "
+                                                    "no data after this long.")
+    shutdown_grace_sec: float = Field(default=20.0, gt=0, description="Distributed stop: final snapshots over the "
+                                                                       "network within this time.")
+    connect_timeout_sec: float = Field(default=5.0, gt=0, description="A direct data-port connection that takes "
+                                                                       "longer goes through the hub's relay.")
+    block_lease_sec: float = Field(default=600.0, gt=0, description="Lease of an evaluator block (hub clock).")
+    relay: bool = Field(default=True, description="Relay chunks and weights through the hub for nodes whose data "
+                                                  "port is unreachable.")
+    results_batch: int = Field(default=256, ge=1, description="Results per batch a node sends.")
+    results_flush_sec: float = Field(default=0.25, gt=0, description="A node sends a smaller batch after this long.")
+    node_result_buffer_mb: float = Field(default=256.0, gt=0,
+                                         description="Unacknowledged results a node keeps (also while the hub is "
+                                                     "away).")
+    max_message_mb: int = Field(default=64, ge=1, description="Largest gRPC message in MiB (was "
+                                                              "transport.grpc_max_message_mb).")
+    bundle: DistributedBundleConfig = Field(default_factory=DistributedBundleConfig)
+    requirements: str | None = Field(default=None, description="A requirements file for the nodes' environment "
+                                                                "instead of the hub environment's packages.")
+
+    @model_validator(mode="after")
+    def _check(self) -> DistributedConfig:
+        if self.port and self.data_port and self.data_port == self.port:  # 0 = ephemeral (P-PF2-8)
+            raise ValueError(f"distributed.data_port ({self.data_port}) must differ from distributed.port "
+                             f"({self.port})")
+        if self.node_lost_after_sec <= self.heartbeat_sec:
+            raise ValueError(f"distributed.node_lost_after_sec ({self.node_lost_after_sec}) must be larger than "
+                             f"distributed.heartbeat_sec ({self.heartbeat_sec})")
+        if self.learner_relocate_after_sec < self.node_lost_after_sec:
+            raise ValueError(f"distributed.learner_relocate_after_sec ({self.learner_relocate_after_sec}) must be at "
+                             f"least distributed.node_lost_after_sec ({self.node_lost_after_sec})")
+        return self
+
+
+# SP2 transport keys (SP5 spec 4.10): accepted in the input YAML only, never stored.
+TRANSPORT_IGNORED_KEYS = ("mode", "grpc_port")
+TRANSPORT_RENAMED_KEYS = {"grpc_max_message_mb": "max_message_mb"}
+
+
+def translate_transport(data: dict) -> dict:
+    """``transport`` of an SP1-SP4 config -> ``distributed`` (one WARNING; ConfigError-worthy conflicts raise
+    ValueError): ``mode`` / ``grpc_port`` are ignored, ``grpc_max_message_mb`` becomes ``distributed.max_message_mb``
+    (the old and the new key together are an error)."""
+    raw = data.get("transport")
+    if raw is None:
+        return {k: v for k, v in data.items() if k != "transport"}
+    if not isinstance(raw, dict):
+        raise ValueError(f"transport (SP2-SP4) must be a section, got {type(raw).__name__}; remove it (SP5 reads "
+                         f"distributed.*)")
+    unknown = sorted(set(raw) - set(TRANSPORT_IGNORED_KEYS) - set(TRANSPORT_RENAMED_KEYS))
+    if unknown:
+        raise ValueError(f"transport has unknown keys {unknown}; the section is gone in SP5 (see distributed.*)")
+    out = {k: v for k, v in data.items() if k != "transport"}
+    notes = []
+    ignored = [k for k in TRANSPORT_IGNORED_KEYS if k in raw]
+    if ignored:
+        notes.append(f"{', '.join('transport.' + k for k in ignored)} ignored (the hub and nodes choose the transport)")
+    if "grpc_max_message_mb" in raw:
+        distributed = out.get("distributed")
+        distributed = dict(distributed) if isinstance(distributed, dict) else {}
+        if "max_message_mb" in distributed:
+            raise ValueError("transport.grpc_max_message_mb (SP2-SP4) and distributed.max_message_mb are both set; "
+                             "keep only distributed.max_message_mb")
+        distributed["max_message_mb"] = raw["grpc_max_message_mb"]
+        out["distributed"] = distributed
+        notes.append(f"transport.grpc_max_message_mb read as distributed.max_message_mb: {raw['grpc_max_message_mb']}")
+    if notes:
+        logger.warning(f"the transport section is gone in SP5: {'; '.join(notes)} (remove transport from the config; "
+                       f"it is not kept in config.resolved.yaml)")
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -983,7 +1089,7 @@ class ColosseumConfig(StrictModel):
     match_log: MatchLogConfig = Field(default_factory=MatchLogConfig)
     ratings: RatingsConfig = Field(default_factory=RatingsConfig)
     bc: BCConfig = Field(default_factory=BCConfig)
-    transport: TransportConfig = Field(default_factory=TransportConfig)
+    distributed: DistributedConfig = Field(default_factory=DistributedConfig)
     run: RunConfig = Field(default_factory=RunConfig)
     agents: dict[str, AgentEntry] = Field(
         default_factory=dict,
@@ -1009,6 +1115,14 @@ class ColosseumConfig(StrictModel):
             f"(the old knobs are not kept in config.resolved.yaml)"
         )
         return {**data, "matchmaking": translated}
+
+    @model_validator(mode="before")
+    @classmethod
+    def _translate_transport(cls, data: Any) -> Any:
+        """SP2-SP4's ``transport`` section -> ``distributed`` (one WARNING; spec 4.10)."""
+        if not isinstance(data, dict) or "transport" not in data:
+            return data
+        return translate_transport(data)
 
     @model_validator(mode="before")
     @classmethod
@@ -1244,6 +1358,7 @@ def _check_override_path(parts: list[str]) -> None:
 LEGACY_OVERRIDE_KEYS: set[str] = {"checkpoint.pool_size"}
 LEGACY_OVERRIDE_KEYS.update(f"matchmaking.{knob}" for knob in SP2_MATCHMAKING_KNOBS)
 LEGACY_OVERRIDE_KEYS.update(f"training.{knob}" for knob in SP2_KICKSTART_KNOBS)
+LEGACY_OVERRIDE_KEYS.update(f"transport.{key}" for key in (*TRANSPORT_IGNORED_KEYS, *TRANSPORT_RENAMED_KEYS))
 
 
 def apply_overrides(data: dict, overrides: dict[str, Any]) -> dict:
