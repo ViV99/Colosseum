@@ -60,9 +60,12 @@ TOKEN_ENV = "COLOSSEUM_TOKEN"
 HUB_SERVER_NAME = "colosseum-hub"
 NODE_SERVER_NAME = "colosseum-node"
 MD_TOKEN, MD_NODE_ID, MD_NODE_SECRET = "x-colosseum-token", "x-colosseum-node", "x-colosseum-node-secret"
-TOKEN_RE = re.compile(r"^cst1\.([A-Za-z0-9_-]{43})\.([0-9a-f]{64})$")
-NODE_ID_RE = re.compile(r"^[0-9a-f]{32}$")
-NODE_NAME_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$")
+# \A ... \Z (not ^ ... $): a trailing newline never passes, also for callers that use .match
+TOKEN_RE = re.compile(r"\Acst1\.([A-Za-z0-9_-]{43})\.([0-9a-f]{64})\Z")
+NODE_ID_RE = re.compile(r"\A[0-9a-f]{32}\Z")
+NODE_NAME_RE = re.compile(r"\A[A-Za-z0-9][A-Za-z0-9_.-]{0,62}\Z")
+SECRET_RE = re.compile(r"\A[A-Za-z0-9_-]{43}\Z")
+FINGERPRINT_RE = re.compile(r"\A[0-9a-f]{64}\Z")
 BOOK_VERSION = 1
 CERT_BACKDATE = datetime.timedelta(days=7)          # tolerate machine clocks a few days apart
 CA_LIFETIME = datetime.timedelta(days=20 * 365)
@@ -185,7 +188,7 @@ def new_secret() -> str:
 
 
 def parse_token(text: str) -> Token:
-    m = TOKEN_RE.match(text.strip())
+    m = TOKEN_RE.fullmatch(text.strip())
     if m is None:
         raise SecurityError("malformed token: expected cst1.<43 base64url chars>.<64 hex chars> (print it with "
                             "`colosseum hub token` on the hub machine)")
@@ -351,9 +354,11 @@ class NodeBook:
         """Write both files (caller holds ``_lock`` and the exclusive file lock)."""
         nodes = {"version": BOOK_VERSION, "next_number": self._next,
                  "nodes": {nid: asdict(rec) for nid, rec in self._nodes.items()}}
-        write_private(self._dir / "nodes.json", json.dumps(nodes, indent=2, sort_keys=True))
+        # banned.json first: a crash between the two replaces leaves a ban with its node still listed (refused
+        # anyway), never a forgotten node without its ban (fail closed)
         write_private(self._dir / "banned.json",
                       json.dumps({"version": BOOK_VERSION, "banned": self._banned}, indent=2, sort_keys=True))
+        write_private(self._dir / "nodes.json", json.dumps(nodes, indent=2, sort_keys=True))
         self._seen = self._signature()
 
     @contextlib.contextmanager
@@ -396,27 +401,36 @@ class NodeBook:
             self._refresh()
             return self._banned_entry(node_id, machine_id)
 
+    def authenticate(self, node_id: str, secret: str) -> tuple[NodeRecord | None, str]:
+        """``(record, "ok")`` for a node's current secret; ``(None, "banned")`` when the secret is valid but the node
+        id or its machine id is banned; ``(None, "unknown")`` otherwise (an unknown id and a wrong secret look the
+        same, also for banned ids: a caller without the secret learns nothing)."""
+        with self._lock:
+            digest = _sha256(secret)
+            rec = self._ephemeral.get(node_id)
+            if rec is not None:
+                return (NodeRecord(**asdict(rec)), "ok") if hmac.compare_digest(rec.secret_sha256, digest) \
+                    else (None, "unknown")
+            self._refresh()
+            rec = self._nodes.get(node_id)
+            if rec is not None and rec.secret_sha256 and hmac.compare_digest(rec.secret_sha256, digest):
+                if self._banned_entry(node_id, rec.machine_id):
+                    return None, "banned"
+                return NodeRecord(**asdict(rec)), "ok"
+            if any(e.get("node_id") == node_id and e.get("secret_sha256")
+                   and hmac.compare_digest(e["secret_sha256"], digest) for e in self._banned):
+                return None, "banned"                  # a banned node with its last secret
+            return None, "unknown"
+
     def verify(self, node_id: str, secret: str) -> NodeRecord | None:
         """The node's record if ``secret`` is its current secret and it is not banned; else None."""
-        with self._lock:
-            rec = self._ephemeral.get(node_id)
-            ephemeral = rec is not None
-            if not ephemeral:
-                self._refresh()
-                rec = self._nodes.get(node_id)
-            if rec is None or not rec.secret_sha256:
-                return None
-            if not hmac.compare_digest(rec.secret_sha256, _sha256(secret)):
-                return None
-            if not ephemeral and self._banned_entry(node_id, rec.machine_id):
-                return None
-            return NodeRecord(**asdict(rec))
+        return self.authenticate(node_id, secret)[0]
 
     # -- mutations -----------------------------------------------------------
 
     def add_ephemeral(self, name: str, machine_id: str) -> tuple[NodeRecord, str]:
         """An in-memory node with number 0 and a fresh secret (``train``'s local node, A8 / A9); never stored."""
-        if not NODE_NAME_RE.match(name):
+        if not NODE_NAME_RE.fullmatch(name):
             raise SecurityError(f"invalid node name {name!r} (letters, digits, '_', '.', '-'; at most 63 chars)")
         secret = new_secret()
         with self._lock:
@@ -439,7 +453,7 @@ class NodeBook:
                  persistent: bool = True, run_id: str = "") -> tuple[NodeRecord, str]:
         """Register a new node, or re-register a known ``node_id`` (its number and name stay, the old secret stops
         working at once); returns ``(record, new secret)``. A banned node id or machine id is a SecurityError."""
-        if not NODE_NAME_RE.match(name):
+        if not NODE_NAME_RE.fullmatch(name):
             raise SecurityError(f"invalid node name {name!r} (letters, digits, '_', '.', '-'; at most 63 chars)")
         with self._mutating():
             if self._banned_entry(node_id, machine_id):
@@ -471,12 +485,17 @@ class NodeBook:
                 self._save()
 
     def ban(self, node_id: str) -> None:
-        """Forget the node and refuse its node id and machine id from now on."""
+        """Forget the node and refuse its node id and machine id from now on (the entry keeps the node's secret hash,
+        so the node itself is told it is banned). The hub's own ephemeral node cannot be banned (it would ban the
+        hub machine's id)."""
         with self._lock:
-            ephemeral = self._ephemeral.pop(node_id, None)
+            if node_id in self._ephemeral:
+                raise SecurityError("the hub's own local node cannot be banned")
         with self._mutating():
-            rec = self._nodes.pop(node_id, None) or ephemeral
+            rec = self._nodes.pop(node_id, None)
             entry = {"node_id": node_id, "machine_id": rec.machine_id if rec else "", "name": rec.name if rec else ""}
+            if rec is not None and rec.secret_sha256:
+                entry["secret_sha256"] = rec.secret_sha256
             self._banned.append(entry)
             self._save()
 
@@ -530,7 +549,7 @@ class HubIdentity:
         key = _load_key(key_path)
         ca_pem = ca_path.read_bytes()
         secret = secret_path.read_text().strip()
-        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", secret):
+        if not SECRET_RE.fullmatch(secret):
             raise SecurityError(f"{secret_path} is malformed; `colosseum hub token --rotate` makes a new one")
         cert = x509.load_pem_x509_certificate(ca_pem)
         if cert.public_key().public_numbers() != key.public_key().public_numbers():
@@ -557,14 +576,14 @@ class HubIdentity:
 
     def issue_node_certificate(self, node_id: str, public_key_pem: bytes) -> bytes:
         """A client + server certificate for the node's key (CN = node id, SAN ``colosseum-node``), signed by the CA."""
-        if not NODE_ID_RE.match(node_id):
+        if not NODE_ID_RE.fullmatch(node_id):
             raise SecurityError(f"invalid node id {node_id!r}")
         try:
             public = serialization.load_pem_public_key(public_key_pem)
         except (ValueError, TypeError) as e:
             raise SecurityError(f"the node's public key is not a PEM key ({e})") from None
-        if not isinstance(public, ec.EllipticCurvePublicKey):
-            raise SecurityError("the node's key must be an ECDSA key")
+        if not isinstance(public, ec.EllipticCurvePublicKey) or not isinstance(public.curve, ec.SECP256R1):
+            raise SecurityError("the node's key must be an ECDSA P-256 (secp256r1) key")
         ca = x509.load_pem_x509_certificate(self.ca_pem)
         now = _now()
         cert = (x509.CertificateBuilder()
@@ -593,8 +612,9 @@ class HubIdentity:
 class NodeIdentity:
     """A node's key, certificate and registration for one hub CA (module docstring)."""
 
-    def __init__(self, path: Path, key: ec.EllipticCurvePrivateKey, info: dict) -> None:
+    def __init__(self, path: Path, key: ec.EllipticCurvePrivateKey, info: dict, ca_fingerprint: str) -> None:
         self.path = path
+        self.ca_fingerprint = ca_fingerprint
         self._key = key
         self.node_id: str | None = info.get("node_id")
         self.number: int | None = info.get("number")
@@ -604,14 +624,14 @@ class NodeIdentity:
 
     @classmethod
     def load_or_create(cls, ca_fingerprint: str, root: Path | None = None) -> NodeIdentity:
-        if not re.fullmatch(r"[0-9a-f]{64}", ca_fingerprint):
+        if not FINGERPRINT_RE.fullmatch(ca_fingerprint):
             raise SecurityError(f"invalid CA fingerprint {ca_fingerprint!r}")
         path = private_dir(node_identity_dir(ca_fingerprint, root))
         key_path = path / "node.key"
         if not key_path.exists():
             _create_exclusive(key_path, _key_pem(ec.generate_private_key(ec.SECP256R1())))
         info = _read_json(path / "node.json") or {}
-        return cls(path, _load_key(key_path), info)
+        return cls(path, _load_key(key_path), info, ca_fingerprint)
 
     def public_key_pem(self) -> bytes:
         return self._key.public_key().public_bytes(serialization.Encoding.PEM,
@@ -631,12 +651,24 @@ class NodeIdentity:
         return bool(self.node_id and self.secret and self.cert_pem)
 
     def save_registration(self, reply: Any, *, hub_addresses: Sequence[str] = ()) -> None:
-        """Keep a ``RegisterReply`` (node id, number, name, certificate, secret, CA) for the next connections."""
+        """Keep a ``RegisterReply`` (node id, number, name, certificate, secret, CA) for the next connections. A reply
+        whose CA is not the one this identity is pinned to is refused; the files are replaced atomically, ``node.json``
+        last (it marks the registration complete)."""
+        ca_pem = reply.ca_pem.encode("ascii")
+        try:
+            actual = spki_fingerprint(ca_pem)
+        except ValueError as e:
+            raise SecurityError(f"the hub's reply carries no readable CA certificate ({e})") from None
+        if not hmac.compare_digest(actual, self.ca_fingerprint):
+            raise SecurityError(f"the hub's reply names CA {actual[:16]}..., this node identity is pinned to "
+                                f"{self.ca_fingerprint[:16]}...: refusing the registration")
+        if not NODE_ID_RE.fullmatch(str(reply.node_id)):
+            raise SecurityError(f"the hub's reply carries an invalid node id {reply.node_id!r}")
+        write_private(self.path / "node.crt", reply.certificate_pem.encode("ascii"), mode=0o644)
+        write_private(self.path / "ca.crt", ca_pem, mode=0o644)
         self.node_id, self.number, self.name, self.secret = reply.node_id, int(reply.number), reply.name, \
             reply.node_secret
         self.hub_addresses = list(dict.fromkeys([*hub_addresses, *self.hub_addresses]))
-        (self.path / "node.crt").write_bytes(reply.certificate_pem.encode("ascii"))
-        (self.path / "ca.crt").write_bytes(reply.ca_pem.encode("ascii"))
         write_private(self.path / "node.json", json.dumps({
             "node_id": self.node_id, "number": self.number, "name": self.name, "secret": self.secret,
             "hub_addresses": self.hub_addresses}, indent=2))

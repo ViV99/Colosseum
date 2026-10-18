@@ -277,6 +277,9 @@ def test_node_calls_need_a_registered_not_banned_node_and_its_secret(tmp_path, s
     hub.nodes.ban(record.node_id)
     assert _code(lambda: call_stream(ch, "/colosseum.v1.Hub/Session", metadata=good)) \
         == grpc.StatusCode.PERMISSION_DENIED
+    # without the secret a banned id looks like an unknown one (the ban is checked only after a valid secret)
+    assert _code(call_stream, ch, "/colosseum.v1.Hub/Session", metadata=node_metadata(record.node_id, "wrong")) \
+        == grpc.StatusCode.UNAUTHENTICATED
 
 
 def test_rotation_revokes_registered_nodes_and_the_old_token_at_once(tmp_path, servers):
@@ -468,3 +471,110 @@ def test_concurrent_node_identities_keep_one_key(tmp_path):
     again = node_identity(tmp_path, hub.fingerprint, "racing")
     assert again.public_key_pem() == keys[0] and _mode(again.path / "node.key") == 0o600
     assert not [p.name for p in again.path.iterdir() if p.name.startswith(".")]   # no temp file left
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1: hardening
+# ---------------------------------------------------------------------------
+
+
+def test_names_ids_and_tokens_with_a_trailing_newline_are_refused(tmp_path):
+    from colosseum.net.security import NODE_ID_RE, NODE_NAME_RE, TOKEN_RE
+
+    hub = hub_identity(tmp_path)
+    node = node_identity(tmp_path, hub.fingerprint)
+    assert NODE_NAME_RE.match("laptop\n") is None and NODE_ID_RE.match("0" * 32 + "\n") is None
+    assert TOKEN_RE.match(str(hub.token) + "\n") is None and TOKEN_RE.match(str(hub.token))
+    with pytest.raises(SecurityError, match="invalid node name"):
+        hub.nodes.register(machine_id="m1", name="laptop\n", tags=[], node_id=None)
+    with pytest.raises(SecurityError, match="invalid node name"):
+        hub.nodes.add_ephemeral("local\n", "m1")
+    with pytest.raises(SecurityError, match="invalid node id"):
+        hub.issue_node_certificate("0" * 32 + "\n", node.public_key_pem())
+    with pytest.raises(SecurityError, match="invalid CA fingerprint"):
+        NodeIdentity.load_or_create(hub.fingerprint + "\n", root=tmp_path / "x")
+
+
+def test_a_ban_survives_a_crash_between_the_two_book_files(tmp_path, monkeypatch):
+    """banned.json is replaced before nodes.json: a crash in between never forgets a node without its ban."""
+    import colosseum.net.security as security
+
+    hub = hub_identity(tmp_path)
+    a, secret = hub.nodes.register(machine_id="m1", name="laptop", tags=[], node_id=None)
+    real = security.write_private
+
+    def crashing(path, data, **kwargs):
+        if path.name == "nodes.json":
+            raise OSError("disk gone")
+        return real(path, data, **kwargs)
+
+    monkeypatch.setattr(security, "write_private", crashing)
+    with pytest.raises(OSError, match="disk gone"):
+        hub.nodes.ban(a.node_id)
+    monkeypatch.setattr(security, "write_private", real)
+    fresh = security.NodeBook(hub.path)
+    assert fresh.get(a.node_id) is not None                                     # still listed ...
+    assert fresh.verify(a.node_id, secret) is None and fresh.is_banned(a.node_id, None)   # ... but banned
+
+
+def test_the_hubs_own_ephemeral_node_cannot_be_banned(tmp_path):
+    hub = hub_identity(tmp_path)
+    local, secret = hub.nodes.add_ephemeral("local", "hub-machine")
+    with pytest.raises(SecurityError, match="cannot be banned"):
+        hub.nodes.ban(local.node_id)
+    assert hub.nodes.verify(local.node_id, secret) is not None and not hub.nodes.is_banned(None, "hub-machine")
+
+
+def test_a_node_of_a_banned_machine_is_told_it_is_banned(tmp_path, servers):
+    hub = hub_identity(tmp_path)
+    first = node_identity(tmp_path, hub.fingerprint, "first")
+    second = node_identity(tmp_path, hub.fingerprint, "second")
+    record_1 = register(hub, first, name="one", machine_id="shared")
+    record_2 = register(hub, second, name="two", machine_id="shared")
+    hub.nodes.ban(record_1.node_id)                                             # bans machine "shared"
+    assert hub.nodes.authenticate(record_2.node_id, second.secret) == (None, "banned")
+    assert hub.nodes.authenticate(record_2.node_id, "wrong") == (None, "unknown")
+    ch = channel(_hub_server(hub, servers, tls=False))
+    good = node_metadata(record_2.node_id, second.secret)
+    assert _code(call_stream, ch, "/colosseum.v1.Hub/Session", metadata=good) == grpc.StatusCode.PERMISSION_DENIED
+    assert _code(call_stream, ch, "/colosseum.v1.Hub/Session", metadata=node_metadata(record_2.node_id, "wrong")) \
+        == grpc.StatusCode.UNAUTHENTICATED
+
+
+def test_a_registration_reply_of_another_ca_is_refused(tmp_path):
+    hub, other = hub_identity(tmp_path), hub_identity(tmp_path, "other-hub")
+    node = node_identity(tmp_path, hub.fingerprint)
+    with pytest.raises(SecurityError, match="pinned"):
+        register(other, node)                                                   # other's CA in the reply
+    assert not node.registered and not (node.path / "node.json").exists() and not (node.path / "ca.crt").exists()
+    register(hub, node)
+    assert node.registered and _mode(node.path / "node.json") == 0o600
+    assert not [p.name for p in node.path.iterdir() if p.name.startswith(".")]   # no temp file left
+
+
+def test_node_certificates_are_issued_for_p256_keys_only(tmp_path):
+    from cryptography.hazmat.primitives import serialization
+
+    hub = hub_identity(tmp_path)
+    p384 = ec.generate_private_key(ec.SECP384R1()).public_key().public_bytes(
+        serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    with pytest.raises(SecurityError, match="secp256r1"):
+        hub.issue_node_certificate("0" * 32, p384)
+
+
+def test_every_token_and_node_method_refuses_a_caller_without_credentials(tmp_path, servers):
+    hub = hub_identity(tmp_path)
+    ch = channel(_hub_server(hub, servers, tls=False))
+    unauthenticated = grpc.StatusCode.UNAUTHENTICATED
+    assert _code(lambda: list(ch.unary_stream("/colosseum.v1.Hub/AdminStream")(b"", timeout=5))) == unauthenticated
+    assert list(ch.unary_stream("/colosseum.v1.Hub/AdminStream")(b"", metadata=token_metadata(hub.token),
+                                                                 timeout=5)) == [b"part1", b"part2"]
+    for metadata in ((), token_metadata(hub.token)):                            # the token is not a node credential
+        assert _code(lambda md: ch.stream_unary("/colosseum.v1.Hub/Upload")(iter([b"1"]), metadata=md, timeout=5),
+                     metadata) == unauthenticated
+        assert _code(lambda md: list(ch.unary_stream("/colosseum.v1.Hub/Download")(b"", metadata=md, timeout=5)),
+                     metadata) == unauthenticated
+        assert _code(lambda md: ch.stream_unary("/colosseum.v1.Hub/RelaySend")(iter([b"f"]), metadata=md, timeout=5),
+                     metadata) == unauthenticated
+        assert _code(lambda md: call_stream(ch, "/colosseum.v1.Hub/RelayInbox", metadata=md), metadata) \
+            == unauthenticated

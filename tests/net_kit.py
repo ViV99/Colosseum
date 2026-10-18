@@ -77,7 +77,8 @@ def echo_handlers() -> list[grpc.GenericRpcHandler]:
         grpc.method_handlers_generic_handler("colosseum.v1.Hub", {
             "Register": h("unary_unary", _echo), "Admin": h("unary_unary", _echo),
             "AdminStream": h("unary_stream", _two), "Session": h("stream_stream", _echo_stream),
-            "Upload": h("stream_unary", _count), "Download": h("unary_stream", _two)}),
+            "Upload": h("stream_unary", _count), "Download": h("unary_stream", _two),
+            "RelaySend": h("stream_unary", _count), "RelayInbox": h("stream_stream", _echo_stream)}),
         grpc.method_handlers_generic_handler("colosseum.v1.NodeData", {
             "Chunks": h("stream_unary", _count), "GetLatest": h("unary_stream", _two)}),
     ]

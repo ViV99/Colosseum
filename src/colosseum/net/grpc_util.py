@@ -15,15 +15,12 @@ Services outside ``colosseum.v1`` are passed through untouched; ``NodeData`` on 
 from __future__ import annotations
 
 import hmac
-import logging
 from collections.abc import Callable
 from typing import Any
 
 import grpc
 
 from colosseum.net.security import MD_NODE_ID, MD_NODE_SECRET, MD_TOKEN, NodeBook, Token
-
-logger = logging.getLogger(__name__)
 
 KEEPALIVE_MS = 10_000                    # spec 4.1: a dead peer is noticed within ~10 s
 KEEPALIVE_TIMEOUT_MS = 5_000
@@ -167,9 +164,11 @@ class AuthInterceptor(grpc.ServerInterceptor):
         if node_id is None or node_secret is None:
             return _refusing(handler, grpc.StatusCode.UNAUTHENTICATED,
                              "this call needs a registered node (x-colosseum-node / x-colosseum-node-secret)")
-        if self._nodes.is_banned(node_id, None):
-            return _refusing(handler, grpc.StatusCode.PERMISSION_DENIED, "this node is banned on this hub")
-        if self._nodes.verify(node_id, node_secret) is None:
+        _, status = self._nodes.authenticate(node_id, node_secret)   # the ban only after a valid secret
+        if status == "banned":
+            return _refusing(handler, grpc.StatusCode.PERMISSION_DENIED, "this node (or its machine) is banned on "
+                             "this hub")
+        if status != "ok":
             return _refusing(handler, grpc.StatusCode.UNAUTHENTICATED,
                              "unknown node or wrong node secret: register again with the token (the hub's identity "
                              "may have been rotated)")
