@@ -5,6 +5,9 @@ from __future__ import annotations
 
 import json
 
+import numpy as np
+import pytest
+
 from colosseum.metrics.counters import CounterBook
 
 
@@ -34,6 +37,17 @@ def test_malformed_values_are_ignored():
     book.add("f", -4)
     book.add("g", 0)
     assert book.totals() == {"e": 2}
+
+
+def test_add_takes_any_integer_and_refuses_everything_else():
+    book = CounterBook()
+    book.add("a", np.int64(3))
+    book.add("a", 2)
+    assert book.totals() == {"a": 5} and type(book.get("a")) is int
+    for bad in (True, 1.5, "2", np.float64(1.0), None):
+        with pytest.raises(TypeError):
+            book.add("a", bad)
+    assert book.totals() == {"a": 5}
 
 
 def test_a_resumed_book_continues_without_double_counting():

@@ -36,7 +36,6 @@ from __future__ import annotations
 import json
 import math
 import os
-import re
 from collections import Counter
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass, field, replace
@@ -118,7 +117,8 @@ class NodeRegistry:
         session id of a node that is not lost, whether or not its old stream was seen to close: the stream was cut
         and came back; its cells stay), ``returned`` (a lost or removed node, or a new session id: the node process
         restarted or the node was given up; the caller drops the node's cells). The entry takes this stream's
-        serial."""
+        serial. The hub's servicers and main loop (T2.3 / T2.5) must always pass ``serial`` (the ``SessionHandle``
+        serial) for a node stream: without it a late close of a superseded stream cannot be told apart."""
         entry = self._nodes.get(node_id)
         if entry is None:
             kind: Literal["new", "resumed", "returned"] = "new"
@@ -143,7 +143,8 @@ class NodeRegistry:
 
     def disconnect(self, node_id: str, serial: int | None) -> None:
         """The stream ``serial`` closed. Only the node's current stream counts (a superseded one's late close changes
-        nothing); the node keeps its session id and stays online until ``lost`` (it may come back with it)."""
+        nothing); the node keeps its session id and stays online until ``lost`` (it may come back with it). T2.3 /
+        T2.5 always pass the closed stream's serial (the one given to ``connect``)."""
         entry = self._nodes.get(node_id)
         if entry is not None and entry.state == "online" and entry.serial == serial:
             entry.connected = False
@@ -276,10 +277,12 @@ class CellTable:
         """``cells``: ``(key, epoch, incarnation)`` the node asks a lineup for (epoch 0: none yet). Returns the
         entries in request order: the epoch stays for the same incarnation and an epoch this hub process granted to
         that cell; otherwise a new epoch. Every key must be of ``node`` (ValueError)."""
-        out = []
-        for key, epoch, incarnation in cells:
+        cells = list(cells)
+        for key, _epoch, _incarnation in cells:           # every key first: a refused request allocates no epoch
             if key.node != node:
                 raise ValueError(f"cell {key} requested by node {node}")
+        out = []
+        for key, epoch, incarnation in cells:
             entry = self._cells.get(key)
             keep = (entry is not None and entry.incarnation == incarnation and entry.epoch == epoch
                     and epoch in self._granted)
@@ -474,9 +477,6 @@ class VersionRegistry:
 # Result intake
 # ---------------------------------------------------------------------------------------------------------------
 
-_NETWORK_RE = re.compile(r"ckpt_v\d+")
-
-
 @dataclass
 class _SessionSeqs:
     low: int = 0                                # every seq <= low is acked
@@ -513,7 +513,8 @@ class ResultIntake:
               node: int | None = None, uid_prefix: str | None = None) -> str | None:
         """None for a valid result, else the drop reason (``invalid`` / ``stale_generation``); never raises.
         ``agents``: every agent a result may name (current and historical); ``node`` / ``uid_prefix``: the sending
-        node's number and ``<run_id>/train/n<node>/`` (a node cannot write another node's uids)."""
+        node's number and ``<run_id>/train/n<node>/`` (a node cannot write another node's uids). T2.3 / T2.5 must
+        always pass ``node`` and ``uid_prefix`` for results a node sent: without them those two checks are off."""
         try:
             return self._check(result, spec, agents, versions, node, uid_prefix)
         except Exception:  # noqa: BLE001 - untrusted input: anything unexpected is invalid
@@ -554,13 +555,19 @@ class ResultIntake:
         if not all(math.isfinite(float(t.rank)) and math.isfinite(float(t.score)) for t in result.teams):
             return "invalid"
         for seat in result.seats:
+            if seat.generation is not None and (not isinstance(seat.generation, int) or seat.generation < 0):
+                return "invalid"
+        for seat in result.seats:
             if seat.network_id == LATEST_NETWORK_ID and versions.is_stale(seat.agent_id, seat.generation,
                                                                           seat.version_end):
                 return "stale_generation"
         return None
 
     def count_drop(self, node: int, reason: str, n: int = 1) -> bool:
-        """Count ``n`` dropped results; True the first time for (node, reason): the caller logs one WARNING."""
+        """Count ``n`` dropped results; True the first time for (node, reason): the caller logs one WARNING.
+        ``reason`` must be one of ``DROP_REASONS`` (ValueError)."""
+        if reason not in DROP_REASONS:
+            raise ValueError(f"ResultIntake.count_drop: unknown reason {reason!r}, expected one of {DROP_REASONS}")
         self.dropped[reason] += int(n)
         if (node, reason) in self._warned:
             return False

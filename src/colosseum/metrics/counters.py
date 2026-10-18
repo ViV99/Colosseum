@@ -16,6 +16,7 @@ dotted names (``"dropped_chunks.disconnect"``) are grouped by ``grouped()`` for 
 
 from __future__ import annotations
 
+import numbers
 from collections.abc import Mapping
 from typing import Any
 
@@ -50,9 +51,13 @@ class CounterBook:
         return applied
 
     def add(self, name: str, delta: int) -> None:
-        """Count ``delta`` (> 0; anything else is ignored) directly (an event of the book's owner, e.g. a snapshot
-        hold of the hub); it belongs to no source."""
-        if isinstance(delta, int) and not isinstance(delta, bool) and delta > 0:
+        """Count ``delta`` directly (an event of the book's owner, e.g. a snapshot hold of the hub); it belongs to no
+        source. ``delta``: any integral number (numpy integers included), converted with ``int``; a delta <= 0
+        counts nothing; a bool or a non-integral value is a TypeError (a programming error of the owner)."""
+        if isinstance(delta, bool) or not isinstance(delta, numbers.Integral):
+            raise TypeError(f"CounterBook.add({name!r}, {delta!r}): delta must be an integer")
+        delta = int(delta)
+        if delta > 0:
             self._totals[str(name)] = self._totals.get(str(name), 0) + delta
 
     def get(self, name: str) -> int:

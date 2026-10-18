@@ -157,6 +157,12 @@ def test_cells_are_per_node_and_a_lost_node_takes_only_its_own():
     table.request(2, [(CellKey(2, 0, 0), 0, 1)], now=0.0)
     with pytest.raises(ValueError):
         table.request(1, [(CellKey(2, 0, 1), 0, 1)], now=0.0)
+    with pytest.raises(ValueError):                                         # one foreign key refuses the request
+        table.request(1, [(CellKey(1, 1, 0), 0, 1), (CellKey(2, 0, 1), 0, 1)], now=0.0)
+    assert table.get(CellKey(1, 1, 0)) is None
+    (fresh,) = table.request(1, [(CellKey(1, 1, 0), 0, 1)], now=0.0)
+    assert fresh.epoch == 4                                                 # no epoch was burnt by the refusal
+    table.drop_cells([CellKey(1, 1, 0)])
     assert [e.key for e in table.drop_node(1)] == [CellKey(1, 0, 0), CellKey(1, 0, 1)]
     assert [e.key for e in table.live()] == [CellKey(2, 0, 0)]
 
@@ -175,10 +181,14 @@ def test_a_grant_moves_the_owner_to_previous_and_a_new_incarnation_keeps_it_as_p
 # ---- owner rotation ---------------------------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("n_agents", [1, 2, 3])
+def _agent_ids(n: int) -> list[str]:
+    return [chr(ord("a") + i) for i in range(n)]                       # owner_sequence's names
+
+
+@pytest.mark.parametrize("n_agents", [1, 2, 3, 4])
 @pytest.mark.parametrize("workers,envs", [(1, 1), (1, 3), (2, 4), (3, 8), (2, 5)])
 def test_one_node_with_simultaneous_expiry_reproduces_the_sp4_rotation(n_agents, workers, envs):
-    agents = ["a", "b", "c"][:n_agents]
+    agents = _agent_ids(n_agents)
     rotation, rounds = OwnerRotation(agents), 6
     expected = owner_sequence(workers, envs, n_agents, rounds)          # SP4's trainable[(g + round) % n]
     cells = [CellKey(1, w, e) for w in range(workers) for e in range(envs)]
@@ -193,7 +203,7 @@ def test_one_node_with_simultaneous_expiry_reproduces_the_sp4_rotation(n_agents,
 def test_workers_that_request_one_after_another_keep_the_shares_balanced(n_agents):
     """Staggered expiry: the start reproduces SP4 (workers start one after another); later rounds keep the shares
     within one cell of each other (the deficit rule prefers balance over SP4's exact sequence)."""
-    agents = ["a", "b", "c"][:n_agents]
+    agents = _agent_ids(n_agents)
     rotation, workers, envs = OwnerRotation(agents), 3, 4
     start = owner_sequence(workers, envs, n_agents, 1)[0]
     current: dict[CellKey, str] = {}
@@ -392,6 +402,7 @@ def _seat(i, **changes):
     lambda r: setattr(r.teams[1], "team", 5) or r,
     _seat(0, seat=1), _seat(0, role="hunter"), _seat(1, team=0), _seat(0, agent_id="ghost"),
     _seat(0, network_id="ckpt_vx"), _seat(0, reward=math.inf), _seat(0, version_end=-1),
+    _seat(0, generation=-1), _seat(1, generation=-3), _seat(0, generation="1"),
 ])
 def test_every_malformed_result_is_invalid_and_nothing_raises(mutate):
     assert _check(mutate(_result())) == "invalid"
@@ -442,6 +453,9 @@ def test_drops_are_counted_by_reason_and_warned_once_per_node_and_reason():
     intake = ResultIntake(journal=True)
     assert intake.count_drop(3, "invalid", 2) and not intake.count_drop(3, "invalid")
     assert intake.count_drop(4, "invalid") and intake.count_drop(3, "stale_generation")
+    assert intake.dropped == {"invalid": 4, "stale_generation": 1}
+    with pytest.raises(ValueError, match="unknown reason"):
+        intake.count_drop(3, "writer")
     assert intake.dropped == {"invalid": 4, "stale_generation": 1}
 
 
