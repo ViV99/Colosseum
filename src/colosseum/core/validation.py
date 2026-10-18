@@ -206,15 +206,17 @@ def _check_state_batch_dim(state_a: Any, state_b: Any, batches: tuple[int, int],
 
 
 def _check_state_payload(state: Any, where: str) -> None:
-    """The model state must survive the inter-process payload round trip (SP1): chunks carry
-    ``initial_state`` to the learner as numpy over ``mp.Queue`` (pickle) or gRPC (``pack_payload``)."""
+    """The model state must survive the inter-process round trip: chunks carry ``initial_state`` to the learner in
+    an array frame (SP5 spec 4.9; ``colosseum.net.frame``), which takes numpy leaves in dict / list / tuple and
+    importable namedtuples only."""
+    from colosseum.net.frame import decode_frame, encode_frame, payload_byte_cap
     from colosseum.networks.state import slice_batch, state_from_numpy, state_to_numpy
-    from colosseum.transport.serialization import pack_payload, unpack_payload
 
     if state is None:
         return
     try:
-        state_from_numpy(unpack_payload(*pack_payload(state_to_numpy(slice_batch(state, 0)))))
+        tree, _ = decode_frame(encode_frame(state_to_numpy(slice_batch(state, 0))), cap=payload_byte_cap(64))
+        state_from_numpy(tree)
     except (TypeError, ValueError) as e:
         raise ConfigError(f"{where}: initial_state cannot be sent between processes: {e}") from e
 

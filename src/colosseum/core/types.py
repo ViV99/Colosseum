@@ -203,14 +203,24 @@ def validate_slot_structure(chunk: TrajectoryChunk) -> None:
     ``reset_after`` takes only the last slot. The flags must match the slot kind (APPO
     resets the recurrent state from ``reset_after``): a terminal ACT and a PAD have
     ``reset_after``, an open ACT has not, and only ACTs are ``terminal``. The earliest broken
-    slot is reported. A cheap numpy check over ``kind`` / ``terminal`` / ``reset_after``; the
-    slot letters for the message are spelled only on failure. A teacher label (``has_teacher``) only
-    on ACT slots.
+    slot is reported. A cheap numpy check over ``kind`` / ``terminal`` / ``reset_after``
+    (:func:`check_slot_arrays`); the slot letters for the message are spelled only on failure. A teacher label
+    (``has_teacher``) only on ACT slots.
     """
-    kind = chunk.kind.cpu().numpy()
-    terminal = chunk.terminal.cpu().numpy().astype(bool)
-    reset_after = chunk.reset_after.cpu().numpy().astype(bool)
-    where = f"agent {chunk.agent_id!r}: malformed chunk v2 (policy_version {chunk.policy_version}"
+    check_slot_arrays(
+        chunk.kind.cpu().numpy(), chunk.terminal.cpu().numpy(), chunk.reset_after.cpu().numpy(),
+        None if chunk.has_teacher is None else chunk.has_teacher.cpu().numpy(),
+        agent_id=chunk.agent_id, policy_version=chunk.policy_version,
+    )
+
+
+def check_slot_arrays(kind: np.ndarray, terminal: np.ndarray, reset_after: np.ndarray,
+                      has_teacher: np.ndarray | None, *, agent_id: str, policy_version: int) -> None:
+    """The rules of :func:`validate_slot_structure` on numpy slot arrays (the SP5 learner checks a decoded payload
+    before it builds the chunk); the same ValueError messages."""
+    terminal = terminal.astype(bool, copy=False)
+    reset_after = reset_after.astype(bool, copy=False)
+    where = f"agent {agent_id!r}: malformed chunk v2 (policy_version {policy_version}"
     if not (kind.ndim == terminal.ndim == reset_after.ndim == 1
             and kind.shape == terminal.shape == reset_after.shape):
         raise ValueError(
@@ -219,42 +229,54 @@ def validate_slot_structure(chunk: TrajectoryChunk) -> None:
         )
     if kind.size == 0:
         raise ValueError(f"{where}): the chunk has no slots")
-    has_teacher = None if chunk.has_teacher is None else chunk.has_teacher.cpu().numpy().astype(bool)
-    if has_teacher is not None and has_teacher.shape != kind.shape:
-        raise ValueError(f"{where}): has_teacher must have the shape {kind.shape} of kind, got {has_teacher.shape}")
+    if has_teacher is not None:
+        has_teacher = has_teacher.astype(bool, copy=False)
+        if has_teacher.shape != kind.shape:
+            raise ValueError(f"{where}): has_teacher must have the shape {kind.shape} of kind, got "
+                             f"{has_teacher.shape}")
 
     def fail(slot: int, problem: str) -> ValueError:
         return ValueError(f"{where}, slots {_spell_slots(kind, terminal, reset_after)!r}): slot {slot}: {problem}")
 
-    unknown = np.flatnonzero(~np.isin(kind, (SLOT_ACT, SLOT_BOOT, SLOT_PAD)))
-    if unknown.size:
-        raise fail(int(unknown[0]), f"unknown slot kind {kind[unknown[0]]}")
-
     act, boot, pad = kind == SLOT_ACT, kind == SLOT_BOOT, kind == SLOT_PAD
+    unknown = ~(act | boot | pad)
+    if unknown.any():
+        first = int(np.argmax(unknown))
+        raise fail(first, f"unknown slot kind {kind[first]}")
     open_act = act & ~terminal
     ends_episode = (act & terminal) | (boot & reset_after)
-    prev_open = np.concatenate([[False], open_act[:-1]])
-    prev_pad = np.concatenate([[False], pad[:-1]])
-    prev_ends = np.concatenate([[False], ends_episode[:-1]])
-    next_pad = np.concatenate([pad[1:], [False]])
-    not_last = np.arange(kind.size) < kind.size - 1
+    prev_open = np.empty_like(open_act)
+    prev_open[0], prev_open[1:] = False, open_act[:-1]
+    prev_pad = np.empty_like(pad)
+    prev_pad[0], prev_pad[1:] = False, pad[:-1]
+    prev_ends = np.empty_like(ends_episode)
+    prev_ends[0], prev_ends[1:] = False, ends_episode[:-1]
+    next_pad = np.empty_like(pad)
+    next_pad[-1], next_pad[:-1] = False, pad[1:]
+    last = np.zeros(kind.size, dtype=bool)
+    last[-1] = True
     broken = (
         act & terminal & ~reset_after,          # a terminal ACT without reset_after
         open_act & reset_after,                 # an open ACT with reset_after
         pad & ~reset_after,                     # a PAD without reset_after
         ~act & terminal,                        # a terminal flag on a non-ACT slot
-        act & ~not_last,                        # an ACT in the last slot
+        act & last,                             # an ACT in the last slot
         open_act & next_pad,                    # an open ACT followed by a PAD
         boot & ~prev_open,                      # a BOOT that does not follow an open ACT
         pad & ~prev_pad & ~prev_ends,           # a PAD (first of a run) not after an episode end
-        boot & ~reset_after & not_last,         # a BOOT without reset_after before the last slot
-        has_teacher & ~act if has_teacher is not None else np.zeros(kind.size, dtype=bool),   # a label off ACT
+        boot & ~reset_after & ~last,            # a BOOT without reset_after before the last slot
+        has_teacher & ~act if has_teacher is not None else None,   # a label off ACT
     )
+    any_broken = broken[0] | broken[1] | broken[2] | broken[3] | broken[4] | broken[5] | broken[6] | broken[7] \
+        | broken[8]
+    if broken[9] is not None:
+        any_broken = any_broken | broken[9]
+    if not any_broken.any():
+        return
     # Earliest broken slot; ties go to the first rule in _SLOT_RULES.
-    found = [(int(np.argmax(mask)), r) for r, mask in enumerate(broken) if mask.any()]
-    if found:
-        slot, rule = min(found)
-        raise fail(slot, _SLOT_RULES[rule])
+    found = [(int(np.argmax(mask)), r) for r, mask in enumerate(broken) if mask is not None and mask.any()]
+    slot, rule = min(found)
+    raise fail(slot, _SLOT_RULES[rule])
 
 
 @dataclass
