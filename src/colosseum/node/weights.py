@@ -3,7 +3,8 @@
 Workers and evaluators read weights only from here; the writer of an agent's latest weights is its learner when the
 learner runs on this machine, else the node (versions fetched from another machine); snapshots and hub blobs (frozen,
 teacher, ``init`` and evaluation weights; immutable, by id) are written by the node. One writer per file, any number
-of readers, no locks between processes (spec 4.7 principle).
+of readers, no locks between readers and writers (spec 4.7 principle; only taking over a node lock and removing a
+dead node's files hold the cache directory's ``flock``, for a few file operations).
 
 Files in :func:`shm_dir` (``$COLOSSEUM_SHM_DIR``, else ``/dev/shm`` on Linux, else ``<tempdir>/colosseum-shm``), all
 named with the prefix ``P = colosseum-<ca8>-<run8>-n<node>`` (:func:`cache_prefix`), so two hubs, two runs and two
@@ -19,23 +20,31 @@ nodes on one machine never share a file:
 ``{P}.lock``                   JSON ``{"pid", "proc_start"}`` of the node process            node
 =============================  ===========================================================  ====================
 
-Segments are immutable: a writer writes ``.{name}.tmp-<pid>-<thread>`` (mode ``0600``) and renames it into place,
-then replaces the pointer; the writer of ``latest`` keeps the newest 2 versions and deletes older ones. A reader opens
-the segment with ``os.open`` + ``mmap`` (read-only) and decodes the frame into ``np.frombuffer`` views (no copy; the
-mapping lives while any view does; ``load_state_dict`` copies). Deleting a file a reader has mapped is safe on
-POSIX; a reader that finds the pointer's segment gone re-reads the pointer (``READ_RETRIES``). Not
-``multiprocessing.shared_memory`` (on Python 3.12 another process unlinks a segment it did not create) and not a
-seqlock (readers starve): ``research/sp5_data_plane.md`` §2.6.
+Segments are immutable plain (never lz4) frames: a writer writes ``.{name}.tmp-<pid>-<thread>`` (mode ``0600``,
+created exclusively) and renames it into place, then replaces the pointer; every ``latest`` publish rescans the
+agent's segments on disk and keeps the newest 2 versions (so a handover between the node and a learner as the
+writer leaks nothing). A reader opens the segment with ``os.open`` + ``mmap`` (read-only) and decodes the frame
+into ``np.frombuffer`` views (no copy; the mapping lives while any view does; ``load_state_dict`` copies). Deleting
+a file a reader has mapped is safe on POSIX; a reader that finds the pointer's segment gone re-reads the pointer
+(``READ_RETRIES``). Not ``multiprocessing.shared_memory`` (on Python 3.12 another process unlinks a segment it did
+not create) and not a seqlock (readers starve): ``research/sp5_data_plane.md`` §2.6.
 
-A missing (or empty) segment reads as ``None`` silently; a corrupt or mismatched one, and any other I/O error, read
-as ``None`` with one WARNING per file (per file and errno for I/O errors), so a lineup held for missing weights always
-has a log line. Before every write the free space must be ``size x 2 + 64 MiB``, else :class:`CacheFullError` (the
-node logs it as an ERROR with the hint and takes no work). :func:`cleanup_dead` removes only the files of prefixes
-whose lock names a dead process, and stray files of prefixes without a lock.
+One blob segment may serve several agents: the file name carries only ``{kind}-{blob_id}``, and blob ids are
+content-addressed (or embed the agent). :meth:`WeightCacheWriter.drop` of a blob is therefore safe only for such ids
+(content-addressed, or agent-embedding): never for an id another agent's different weights could reuse. Agent ids
+``blob`` and ``blob-*`` are refused (their files would collide with blob names).
+
+A missing (or empty) segment reads as ``None`` silently; a corrupt or mismatched segment, a corrupt or empty
+pointer, and any other I/O error read as ``None`` with one WARNING per file (per file and errno for I/O errors), so
+a lineup held for missing weights always has a log line. Before every write the free space must be
+``size x 2 + 64 MiB``, else :class:`CacheFullError` (the node logs it as an ERROR with the hint and takes no work).
+:func:`cleanup_dead` removes only the files of prefixes whose lock names a dead process, and stray files of prefixes
+without a lock.
 """
 
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 import logging
@@ -43,10 +52,12 @@ import mmap
 import os
 import re
 import shutil
+import struct
 import sys
 import tempfile
 import threading
-from collections import deque
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal
@@ -55,7 +66,7 @@ import numpy as np
 
 from colosseum.core.run_state import process_start_ticks
 from colosseum.net.chunks import WeightsMeta, decode_weights
-from colosseum.net.frame import FrameError
+from colosseum.net.frame import FLAG_LZ4, FRAME_MAGIC, FrameError
 
 logger = logging.getLogger(__name__)
 
@@ -64,6 +75,8 @@ KEEP_LATEST = 2                   # versions of an agent's latest weights kept (
 READ_RETRIES = 5
 SPACE_MARGIN_BYTES = 64 * 2**20
 BLOB_KINDS = ("fixed", "teacher", "init", "eval")
+RESERVED_AGENT_PREFIX = "blob"     # agent ids "blob" / "blob-*" would collide with blob segment names
+_FRAME_PREFIX = struct.Struct("<4sHH")   # magic, version, flags (colosseum.net.frame)
 _PREFIX_RE = re.compile(r"\.?(colosseum-[0-9a-f]{8}-[0-9a-f]{8}-n[0-9]+)[-.]")
 _HEX_ID_RE = re.compile(r"[0-9a-f]{8,}")
 _AGENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_-]*")
@@ -138,6 +151,9 @@ def split_blob_key(key: CacheKey) -> tuple[str, str]:
 def _check_agent(agent_id: str) -> str:
     if not isinstance(agent_id, str) or not _AGENT_RE.fullmatch(agent_id):
         raise ValueError(f"invalid agent id {agent_id!r}")
+    if agent_id == RESERVED_AGENT_PREFIX or agent_id.startswith(RESERVED_AGENT_PREFIX + "-"):
+        raise ValueError(f"agent id {agent_id!r} is reserved: the weight cache names blob segments "
+                         f"'<prefix>-{RESERVED_AGENT_PREFIX}-...'")
     return agent_id
 
 
@@ -171,10 +187,16 @@ def _temp_path(path: Path) -> Path:
     return path.with_name(f".{path.name}.tmp-{os.getpid()}-{threading.get_ident()}")
 
 
+_O_NOFOLLOW = getattr(os, "O_NOFOLLOW", 0)
+
+
 def _write_file(path: Path, data: bytes | memoryview) -> None:
-    """Write ``data`` to ``path`` through a ``0600`` temp file and a rename (readers never see half a file)."""
+    """Write ``data`` to ``path`` through a fresh ``0600`` temp file and a rename (readers never see half a file).
+    A stale temp of the same name (a crashed thread whose pid and thread id came back) is removed first; the temp
+    file is created exclusively and never through a symlink."""
     tmp = _temp_path(path)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    tmp.unlink(missing_ok=True)
+    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _O_NOFOLLOW, 0o600)
     try:
         with os.fdopen(fd, "wb") as fh:
             fh.write(data)
@@ -183,14 +205,24 @@ def _write_file(path: Path, data: bytes | memoryview) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _check_plain_frame(frame: bytes | memoryview) -> None:
+    """The cache holds plain frames only: readers map them zero-copy (criterion 4); an lz4 frame would be
+    decompressed into private memory by every reader."""
+    if len(frame) >= _FRAME_PREFIX.size:
+        magic, _version, flags = _FRAME_PREFIX.unpack_from(frame)
+        if magic == FRAME_MAGIC and flags & FLAG_LZ4:
+            raise ValueError("the weight cache takes plain frames only (got an lz4-compressed frame)")
+
+
 class WeightCacheWriter:
-    """Writes segments and pointers of one prefix (one process writes a given agent's latest)."""
+    """Writes segments and pointers of one prefix (one process writes a given agent's latest at a time; when that
+    writer changes, e.g. the node while the learner is remote and the learner once it runs here, the next writer
+    prunes what the previous one left, because every publish rescans the agent's segments on disk)."""
 
     def __init__(self, root: Path, prefix: str) -> None:
         self.root = Path(root)
         self.prefix = prefix
         self.root.mkdir(parents=True, exist_ok=True)
-        self._kept: dict[str, deque[str]] = {}
 
     def _check_space(self, size: int) -> None:
         free = shutil.disk_usage(self.root).free
@@ -198,31 +230,34 @@ class WeightCacheWriter:
             raise CacheFullError(f"{size / 2**20:.1f} MiB segment, {free / 2**20:.1f} MiB free: "
                                  + FULL_HINT.format(root=self.root))
 
-    def _kept_of(self, agent_id: str) -> deque[str]:
-        kept = self._kept.get(agent_id)
-        if kept is None:                  # a restarted writer adopts what an earlier incarnation left
-            pattern = re.compile(re.escape(f"{self.prefix}-{agent_id}-v") + r"([0-9]+)")
-            found = sorted((int(m.group(1)), p.name) for p in self.root.iterdir()
-                           if (m := pattern.fullmatch(p.name)))
-            kept = self._kept[agent_id] = deque(name for _, name in found)
-        return kept
+    def _prune(self, agent_id: str, keep: str) -> None:
+        """Delete ``agent_id``'s latest segments on disk except ``keep`` and the newest ``KEEP_LATEST - 1`` others."""
+        pattern = re.compile(re.escape(f"{self.prefix}-{agent_id}-v") + r"([0-9]+)")
+        others = sorted(((int(m.group(1)), name) for name in os.listdir(self.root)
+                         if name != keep and (m := pattern.fullmatch(name))), reverse=True)
+        for _, name in others[KEEP_LATEST - 1:]:
+            (self.root / name).unlink(missing_ok=True)
 
     def publish_latest(self, agent_id: str, frame: bytes, *, version: int, generation: int,
                        teacher_active: bool) -> str:
         """Write version ``version`` of ``agent_id``'s latest weights, point the pointer at it, keep the newest
-        ``KEEP_LATEST`` versions; returns the segment name."""
+        ``KEEP_LATEST`` versions; returns the segment name. If the pointer cannot be written, a segment this call
+        created is removed again and the error is raised."""
         name = segment_name(self.prefix, CacheKey("latest", agent_id), version)
+        _check_plain_frame(frame)
         self._check_space(len(frame))
-        kept = self._kept_of(agent_id)
-        _write_file(self.root / name, frame)
+        segment = self.root / name
+        existed = segment.exists()
+        _write_file(segment, frame)
         pointer = {"segment": name, "version": int(version), "generation": int(generation), "size": len(frame),
                    "digest": frame_digest(frame), "teacher_active": bool(teacher_active)}
-        _write_file(self.root / pointer_name(self.prefix, agent_id), json.dumps(pointer).encode("utf-8"))
-        if name in kept:
-            kept.remove(name)
-        kept.append(name)
-        while len(kept) > KEEP_LATEST:
-            (self.root / kept.popleft()).unlink(missing_ok=True)
+        try:
+            _write_file(self.root / pointer_name(self.prefix, agent_id), json.dumps(pointer).encode("utf-8"))
+        except BaseException:
+            if not existed:
+                segment.unlink(missing_ok=True)
+            raise
+        self._prune(agent_id, name)
         return name
 
     def put(self, key: CacheKey, frame: bytes) -> str:
@@ -230,6 +265,7 @@ class WeightCacheWriter:
         if key.kind == "latest":
             raise ValueError("latest weights go through publish_latest")
         name = segment_name(self.prefix, key)
+        _check_plain_frame(frame)
         if not (self.root / name).exists():
             self._check_space(len(frame))
             _write_file(self.root / name, frame)
@@ -277,8 +313,9 @@ class WeightCacheReader:
             data = json.loads((self.root / name).read_bytes())
         except FileNotFoundError:
             return None
-        except ValueError:
-            return None                   # mid-replace on a platform without atomic rename: next poll
+        except ValueError as e:           # empty or corrupt (renames are atomic: never half a pointer)
+            self._warn_once(name, None, f"weight cache pointer {name} is not JSON ({e}); ignored")
+            return None
         except OSError as e:
             self._io_error(name, e)
             return None
@@ -372,7 +409,8 @@ def _read_lock(lock: Path) -> tuple[int, int | None] | None:
 
 
 def _owner_alive(lock: Path) -> bool:
-    """Whether the process a lock file names still runs (pid, and its start time where the OS tells it)."""
+    """Whether the process a lock file names still runs (pid, and its start time where the OS tells it).
+    The same rule as ``colosseum.core.run_state.process_alive`` (T4.4 makes that portable; then use it here)."""
     owner = _read_lock(lock)
     if owner is None or owner[0] <= 0:
         return False
@@ -391,38 +429,41 @@ def _lock_body() -> bytes:
     return json.dumps({"pid": os.getpid(), "proc_start": process_start_ticks(os.getpid())}).encode("utf-8")
 
 
+@contextmanager
+def _dir_lock(root: Path) -> Iterator[None]:
+    """An exclusive ``flock`` on the cache directory itself, held for a few file operations: taking a lock over,
+    and removing a dead owner's lock and files, are then exclusive between processes (the directory is never
+    removed, unlike a lock file, so every process locks the same inode)."""
+    fd = os.open(root, os.O_RDONLY)
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        yield
+    finally:
+        os.close(fd)                      # closing the descriptor releases the flock
+
+
 def acquire_node_lock(root: Path, prefix: str) -> Path:
     """Write ``{P}.lock`` with this process's pid and start time (before any segment of the prefix);
-    CacheLockedError if a live process owns the prefix already. A new lock is created exclusively (a complete temp
-    file hard-linked to the lock name), so two nodes starting at once cannot both win; a dead owner's lock is
-    replaced."""
+    CacheLockedError if a live process owns the prefix already. The check and the write run under the directory's
+    ``flock``, so of two processes taking over a missing or dead owner's lock exactly one wins."""
     root = Path(root)
     root.mkdir(parents=True, exist_ok=True)
     lock = root / f"{prefix}.lock"
-    tmp = _temp_path(lock)
-    fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    try:
-        with os.fdopen(fd, "wb") as fh:
-            fh.write(_lock_body())
-        try:
-            os.link(tmp, lock)
-            return lock
-        except FileExistsError:
-            pass
+    with _dir_lock(root):
         owner = _read_lock(lock)
         if owner is not None and owner[0] != os.getpid() and _owner_alive(lock):
             raise CacheLockedError(f"weight cache {lock} belongs to the running process {owner[0]} (another node of "
                                    f"the same identity and run on this machine?)")
-        os.replace(tmp, lock)
-        return lock
-    finally:
-        tmp.unlink(missing_ok=True)
+        _write_file(lock, _lock_body())
+    return lock
 
 
 def _unlink(root: Path, name: str) -> bool:
     try:
-        (root / name).unlink(missing_ok=True)
+        (root / name).unlink()
         return True
+    except FileNotFoundError:
+        return False
     except OSError as e:                  # e.g. another user's file in a sticky /dev/shm
         logger.debug(f"weight cache {root}: cannot remove {name}: {e}")
         return False
@@ -440,24 +481,25 @@ def release_node_lock(root: Path, prefix: str) -> None:
     left alone with a WARNING (its owner took the prefix over)."""
     root = Path(root)
     lock = root / f"{prefix}.lock"
-    owner = _read_lock(lock)
-    if owner is not None and owner[0] != os.getpid() and _owner_alive(lock):
-        logger.warning(f"weight cache {lock} belongs to the running process {owner[0]}; its files are kept")
+    if not root.is_dir():
         return
-    try:
+    with _dir_lock(root):
+        owner = _read_lock(lock)
+        if owner is not None and owner[0] != os.getpid() and _owner_alive(lock):
+            logger.warning(f"weight cache {lock} belongs to the running process {owner[0]}; its files are kept")
+            return
         names = os.listdir(root)
-    except FileNotFoundError:
-        return
-    removed = [name for name in _prefix_files(prefix, names) if _unlink(root, name)]
-    if f"{prefix}.lock" in names and _unlink(root, f"{prefix}.lock"):
-        removed.append(f"{prefix}.lock")
+        removed = [name for name in _prefix_files(prefix, names) if _unlink(root, name)]
+        if f"{prefix}.lock" in names and _unlink(root, f"{prefix}.lock"):
+            removed.append(f"{prefix}.lock")
     logger.debug(f"weight cache {prefix}: removed {len(removed)} files")
 
 
 def cleanup_dead(root: Path) -> list[str]:
     """Remove the files of every prefix whose lock names a dead process, and stray files of prefixes without a lock
     (a lock is always written before a prefix's first segment). Live owners' files are never touched; other files
-    in ``root`` neither. Returns the removed names."""
+    in ``root`` neither. Each prefix is re-checked and removed under the directory's ``flock`` (an owner that took
+    the prefix over since the listing keeps everything). Returns the removed names."""
     root = Path(root)
     try:
         names = os.listdir(root)
@@ -468,14 +510,14 @@ def cleanup_dead(root: Path) -> list[str]:
     for prefix in sorted(prefixes):
         lock_name = f"{prefix}.lock"
         lock = root / lock_name
-        if lock_name in names:
-            if _owner_alive(lock):
-                continue
-        elif lock.exists():               # the owner started after the listing: its files are not stray
-            continue
-        removed += [name for name in _prefix_files(prefix, names) if _unlink(root, name)]
-        if lock_name in names and not _owner_alive(lock) and _unlink(root, lock_name):   # not a new owner's lock
-            removed.append(lock_name)
+        if lock_name in names and _owner_alive(lock):
+            continue                      # cheap pre-check without the directory lock
+        with _dir_lock(root):
+            if lock.exists() and (_owner_alive(lock) or lock_name not in names):
+                continue                  # alive now, or an owner that started after the listing
+            removed += [name for name in _prefix_files(prefix, names) if _unlink(root, name)]
+            if lock_name in names and _unlink(root, lock_name):
+                removed.append(lock_name)
     if removed:
         logger.info(f"weight cache {root}: removed {len(removed)} files of dead nodes")
     return removed

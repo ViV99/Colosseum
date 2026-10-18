@@ -11,12 +11,14 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 
 import numpy as np
 import pytest
 
 from colosseum.core.run_state import process_start_ticks
 from colosseum.net.chunks import WeightsMeta, encode_weights
+from colosseum.net.frame import FLAG_LZ4, encode_frame
 from colosseum.node import weights
 from colosseum.node.weights import (
     BLOB_KINDS,
@@ -310,3 +312,149 @@ def test_release_removes_only_this_prefix_and_never_a_live_foreign_owners_files(
     (root / f"{other}.lock").write_text(json.dumps({"pid": parent, "proc_start": process_start_ticks(parent)}))
     release_node_lock(root, other)                                             # not ours: kept, WARNING only
     assert len(os.listdir(root)) == 3
+
+
+# ---------------------------------------------------------------------------
+# Fix round 1 (T1.5 review)
+# ---------------------------------------------------------------------------
+
+
+def test_agent_ids_blob_and_blob_dash_are_reserved(tmp_path):
+    writer, reader = _pair(tmp_path)
+    for agent in ("blob", "blob-fixed", "blob-x"):
+        with pytest.raises(ValueError, match="reserved"):
+            writer.publish_latest(agent, _frame(agent, 1, 1.0), version=1, generation=1, teacher_active=False)
+        with pytest.raises(ValueError, match="reserved"):
+            writer.put(CacheKey("snapshot", agent, "ckpt_v1"), _frame(agent, 1, 1.0, kind="snapshot"))
+        with pytest.raises(ValueError, match="reserved"):
+            reader.read_latest(agent)
+    writer.publish_latest("blobby", _frame("blobby", 1, 1.0), version=1, generation=1, teacher_active=False)
+    writer.publish_latest("blob_net", _frame("blob_net", 1, 1.0), version=1, generation=1, teacher_active=False)
+    assert reader.read_latest("blobby").meta.agent_id == "blobby"
+    assert not any("-blob-" in f for f in _files(tmp_path))
+
+
+def test_a_writer_handover_leaks_no_segments(tmp_path):
+    """The node publishes fetched versions while the learner is remote, the learner publishes once it runs here (and
+    the other way round): every publish prunes on disk, so at most KEEP_LATEST segments of the agent remain."""
+    node_writer, reader = _pair(tmp_path)
+    learner_writer = WeightCacheWriter(tmp_path / "shm", node_writer.prefix)
+    for version in range(1, 9):
+        writer = (node_writer, learner_writer)[(version // 2) % 2]          # two publishes each, alternating
+        writer.publish_latest("main", _frame("main", version, float(version)), version=version, generation=1,
+                              teacher_active=False)
+        segments = [f for f in _files(tmp_path) if "-main-v" in f]
+        assert len(segments) <= weights.KEEP_LATEST and f"{node_writer.prefix}-main-v{version}" in segments
+        assert reader.read_latest("main").meta.policy_version == version
+    assert sorted(f for f in _files(tmp_path) if "-main-v" in f) == [f"{node_writer.prefix}-main-v7",
+                                                                     f"{node_writer.prefix}-main-v8"]
+
+
+_ACQUIRER = """
+import sys, time
+from pathlib import Path
+from colosseum.node import weights
+root, prefix, work, index = Path(sys.argv[1]), sys.argv[2], Path(sys.argv[3]), sys.argv[4]
+real_write = weights._write_file
+def slow_write(path, data):
+    if path.name.endswith('.lock'):
+        time.sleep(0.3)                     # widen the take-over window: without exclusivity both would win
+    real_write(path, data)
+weights._write_file = slow_write
+(work / f'ready-{index}').write_text('1')
+deadline = time.monotonic() + 30
+while not (work / 'go').exists() and time.monotonic() < deadline:
+    time.sleep(0.001)
+try:
+    weights.acquire_node_lock(root, prefix)
+    result = 'won'
+except weights.CacheLockedError:
+    result = 'locked'
+(work / f'result-{index}').write_text(result)
+while not (work / 'stop').exists() and time.monotonic() < deadline:
+    time.sleep(0.01)
+"""
+
+
+def test_two_processes_taking_over_a_dead_lock_exactly_one_wins(tmp_path):
+    root, work = tmp_path / "shm", tmp_path / "work"
+    work.mkdir()
+    prefix = cache_prefix(CA, RUN, 5)
+    (root / f"{prefix}.lock").write_text(json.dumps({"pid": _dead_pid(), "proc_start": None}))
+    procs = [subprocess.Popen([sys.executable, "-c", _ACQUIRER, str(root), prefix, str(work), str(i)])
+             for i in range(2)]
+    try:
+        deadline = time.monotonic() + 60
+        while not all((work / f"ready-{i}").exists() for i in range(2)):
+            assert time.monotonic() < deadline and all(p.poll() is None for p in procs)
+            time.sleep(0.01)
+        (work / "go").write_text("1")
+        while not all((work / f"result-{i}").exists() for i in range(2)):
+            assert time.monotonic() < deadline and all(p.poll() is None for p in procs)
+            time.sleep(0.01)
+        results = sorted((work / f"result-{i}").read_text() for i in range(2))
+        assert results == ["locked", "won"]
+        owner = json.loads((root / f"{prefix}.lock").read_text())["pid"]
+        assert owner in [p.pid for p in procs]
+    finally:
+        (work / "stop").write_text("1")
+        for p in procs:
+            p.wait(timeout=30)
+
+
+def test_a_corrupt_or_empty_pointer_is_ignored_with_one_warning_per_file(tmp_path, caplog):
+    _, reader = _pair(tmp_path)
+    shm = tmp_path / "shm"
+    (shm / "colosseum-abababab-01234567-n1-main.latest").write_bytes(b"")
+    (shm / "colosseum-abababab-01234567-n1-other.latest").write_bytes(b"{not json")
+    (shm / "colosseum-abababab-01234567-n1-third.latest").write_text(json.dumps({"segment": "/etc/passwd",
+                                                                                 "version": 1, "generation": 1}))
+    for _ in range(3):
+        assert reader.read_latest("main") is None and reader.latest_version("other") is None
+        assert reader.read_latest("third") is None
+    warned = [r.getMessage() for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warned) == 3 and all("ignored" in m for m in warned)
+
+
+def test_a_failed_pointer_write_removes_the_new_segment(tmp_path, monkeypatch):
+    writer, reader = _pair(tmp_path)
+    writer.publish_latest("main", _frame("main", 1, 1.0), version=1, generation=1, teacher_active=False)
+    real_write = weights._write_file
+
+    def failing_pointer(path, data):
+        if path.name.endswith(".latest"):
+            raise OSError(errno.ENOSPC, "no space left", str(path))
+        real_write(path, data)
+
+    monkeypatch.setattr(weights, "_write_file", failing_pointer)
+    with pytest.raises(OSError, match="no space"):
+        writer.publish_latest("main", _frame("main", 2, 2.0), version=2, generation=1, teacher_active=False)
+    assert [f for f in _files(tmp_path) if "-main-v" in f] == ["colosseum-abababab-01234567-n1-main-v1"]
+    assert reader.read_latest("main").meta.policy_version == 1
+
+
+def test_a_stale_temp_file_or_symlink_is_replaced_not_followed(tmp_path):
+    root = tmp_path / "shm"
+    target = root / "colosseum-abababab-01234567-n1-main-ckpt_v1"
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"precious")
+    os.symlink(victim, weights._temp_path(target))                            # planted at our temp name
+    weights._write_file(target, b"payload")
+    assert target.read_bytes() == b"payload" and victim.read_bytes() == b"precious"
+    weights._temp_path(target).write_bytes(b"half of a crashed write")
+    weights._write_file(target, b"again")
+    assert target.read_bytes() == b"again" and os.listdir(root) == [target.name]
+
+
+def test_the_writer_refuses_lz4_frames(tmp_path):
+    writer, _ = _pair(tmp_path)
+    sd = {"w": np.zeros(4096, np.float32)}
+    meta = {"agent_id": "main", "kind": "latest", "generation": 1, "policy_version": 1, "teacher_active": False,
+            "checkpoint_id": None, "architecture": None, "roles": None}
+    compressed = encode_frame(sd, kind="weights", meta=meta, compress=True)
+    assert int.from_bytes(compressed[6:8], "little") & FLAG_LZ4
+    with pytest.raises(ValueError, match="plain frames"):
+        writer.publish_latest("main", compressed, version=1, generation=1, teacher_active=False)
+    with pytest.raises(ValueError, match="plain frames"):
+        writer.put(blob_key("fixed", "main", "z1"), compressed)
+    assert _files(tmp_path) == []
