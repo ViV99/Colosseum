@@ -9,6 +9,7 @@ import logging
 import pytest
 import yaml
 
+from colosseum.core import config as config_module
 from colosseum.core.config import (
     ColosseumConfig,
     DistributedBundleConfig,
@@ -17,6 +18,7 @@ from colosseum.core.config import (
     load_config,
 )
 from colosseum.core.errors import ConfigError
+from colosseum.node import weights
 from game_helpers import SP3_RUN, SP4_RUN
 
 SPEC_DEFAULTS = {
@@ -167,3 +169,18 @@ def test_a_resolved_config_of_an_sp3_sp4_run_loads_and_is_written_back_without_t
     assert "transport" not in dumped and dumped["distributed"] == SPEC_DEFAULTS
     assert ColosseumConfig.model_validate(dumped).distributed == DistributedConfig()
     assert sorted(p.name for p in run_dir.iterdir()) == before
+
+
+@pytest.mark.parametrize("agent_id", ["blob", "blob-net", "blob-"])
+def test_agent_ids_blob_and_blob_dash_are_reserved_by_the_weight_cache(tmp_path, agent_id):
+    """T1.5 fix round 1: ``blob`` / ``blob-*`` would collide with the weight cache's blob files, so a config fails
+    at validate time, not when a node first caches the agent's weights."""
+    assert config_module.RESERVED_AGENT_PREFIX == weights.RESERVED_AGENT_PREFIX
+    with pytest.raises(ConfigError, match=r"reserved by the shared-memory weight cache.*rename the agent"):
+        config_module.check_agent_id(agent_id)
+    path = tmp_path / "cfg.yaml"
+    path.write_text(yaml.safe_dump({"env": {"game_class": "x.Y"}, "agents": {agent_id: {}}}))
+    with pytest.raises(ConfigError, match="reserved by the shared-memory weight cache"):
+        load_config(path)
+    for fine in ("blobby", "blob_net", "my-blob"):
+        assert config_module.check_agent_id(fine) == fine

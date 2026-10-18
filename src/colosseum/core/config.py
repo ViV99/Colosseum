@@ -77,6 +77,9 @@ def check_path_component(value: str, what: str) -> str:
 # The metrics record kinds / global metric namespaces (``colosseum.metrics.jsonl.METRIC_KINDS``):
 # an agent with one of these ids would collide with them in metrics.jsonl and WandB (T6.4).
 RESERVED_AGENT_IDS = frozenset({"ratings", "system", "episodes", "train"})
+# The SP5 shared-memory weight cache names hub blob segments ``<prefix>-blob-<kind>-<id>``
+# (``colosseum.node.weights.RESERVED_AGENT_PREFIX``): agent ids ``blob`` and ``blob-*`` would collide with them.
+RESERVED_AGENT_PREFIX = "blob"
 
 
 def check_agent_id(value: str) -> str:
@@ -84,13 +87,18 @@ def check_agent_id(value: str) -> str:
 
     An agent id is a safe path component (:func:`check_path_component`) without ``.``,
     so every agent is addressable as ``--set agents.<id>.<section>.<key>=...``, and not
-    one of :data:`RESERVED_AGENT_IDS`.
+    one of :data:`RESERVED_AGENT_IDS`, nor ``blob`` / ``blob-*`` (:data:`RESERVED_AGENT_PREFIX`).
     """
     check_path_component(value, "agent id")
     if "." in value:
         raise ConfigError(f"Invalid agent id {value!r}: '.' is not allowed (it separates --set path parts)")
     if value in RESERVED_AGENT_IDS:
         raise ConfigError(f"Invalid agent id {value!r}: reserved for global metrics")
+    if value == RESERVED_AGENT_PREFIX or value.startswith(RESERVED_AGENT_PREFIX + "-"):
+        raise ConfigError(f"Invalid agent id {value!r}: the names '{RESERVED_AGENT_PREFIX}' and "
+                          f"'{RESERVED_AGENT_PREFIX}-*' are reserved by the shared-memory weight cache (its blob "
+                          f"files); rename the agent (e.g. '{RESERVED_AGENT_PREFIX}_net' or "
+                          f"'my_{RESERVED_AGENT_PREFIX}')")
     return value
 
 
