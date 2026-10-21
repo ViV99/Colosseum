@@ -600,6 +600,11 @@ class WorkerIO:
         self.pump()
         return self._stopped
 
+    def note_snapshot(self, agent_id: str, checkpoint_id: str) -> None:
+        """The worker body loaded this snapshot itself (from its first lineups): a later lineup naming it does not
+        read and load it again."""
+        self._given.add((agent_id, checkpoint_id))
+
     def take_lineups(self) -> dict[int, CellLineup]:
         """The pending lineups by env (the worker body reads its first ones before the loop exists)."""
         self.pump()

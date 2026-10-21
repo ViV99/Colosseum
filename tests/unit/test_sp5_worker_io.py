@@ -189,6 +189,18 @@ def test_lineups_are_merged_per_env_and_each_snapshot_is_loaded_once():
     assert cmd.evict == {"a": ["ckpt_v5"]} and "ckpt_v5" in cmd.new_checkpoints["a"]   # reloaded after the evict
 
 
+def test_a_snapshot_the_worker_body_loaded_itself_is_not_read_again():
+    cache = FakeCache()
+    snap = Key("snapshot", "a", "ckpt_v5")
+    cache.blobs[snap] = {"w": np.zeros(2, np.float32)}
+    io, node_end = _io(cache)
+    io.note_snapshot("a", "ckpt_v5")                                  # from the first lineups (T2.4 review)
+    node_end.send(WorkerLineups([CellLineup(0, _lineup(), {0: Key("latest", "a"), 1: snap})]))
+    assert _wait(lambda: (io.pump(), bool(io._lineups))[1])
+    cmd = io.poll_command()
+    assert cmd.lineups[0] is not None and cmd.new_checkpoints == {} and cache.reads == []
+
+
 def test_a_snapshot_missing_from_the_cache_is_an_error():
     io, node_end = _io(FakeCache())
     node_end.send(WorkerLineups([CellLineup(0, _lineup(), {1: Key("snapshot", "a", "ckpt_v5")})]))

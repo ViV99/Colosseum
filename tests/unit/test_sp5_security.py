@@ -23,6 +23,7 @@ from colosseum.net.security import (
     NODE_SERVER_NAME,
     TOKEN_ENV,
     HubIdentity,
+    HubUnreachableError,
     NodeIdentity,
     SecurityError,
     Token,
@@ -238,6 +239,21 @@ def test_a_wrong_fingerprint_is_refused_before_any_call(tmp_path, servers):
     port = _hub_server(hub, servers)
     with pytest.raises(SecurityError, match="fingerprint"):
         fetch_hub_ca("127.0.0.1", port, fingerprint=other.fingerprint, timeout=5.0)
+
+
+def test_an_unreachable_hub_is_told_apart_from_a_refusal(tmp_path, servers):
+    import socket
+
+    hub = hub_identity(tmp_path)
+    with socket.socket() as closed:                                  # bound, not listening: the connect is refused
+        closed.bind(("127.0.0.1", 0))
+        with pytest.raises(HubUnreachableError, match="cannot reach the hub"):
+            fetch_hub_ca("127.0.0.1", closed.getsockname()[1], fingerprint=hub.fingerprint, timeout=5.0)
+    plain = _hub_server(hub, servers, tls=False)                    # a hub without TLS: no retry would help
+    with pytest.raises(SecurityError) as info:
+        fetch_hub_ca("127.0.0.1", plain, fingerprint=hub.fingerprint, timeout=5.0)
+    assert not isinstance(info.value, HubUnreachableError) and "--insecure" in str(info.value)
+    assert issubclass(HubUnreachableError, SecurityError)
 
 
 def test_a_client_trusting_another_ca_or_no_tls_cannot_connect(tmp_path, servers):

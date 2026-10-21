@@ -30,8 +30,7 @@
    re-requests after ``LINEUP_RETRY_SEC`` (WARNING once per key); a grant waiting longer than
    ``max(ttl, LINEUP_WAIT_SEC)`` is given up the same way (P-PF2-12). A worker gets its routes and ``WeightsReady``
    when its control connection opens, before its first ``WorkerLineups``. Snapshots no cell references any more
-   leave the cache after ``CACHE_DROP_DELAY_SEC`` (a worker reads a delivered snapshot only when its loop takes the
-   lineup).
+   leave the cache after ``CACHE_DROP_DELAY_SEC`` (safe by an ordering invariant, see ``_prune_cache``).
 7. **Announces.** ``evictions`` -> ``WorkerEvict`` to every worker; ``env_steps`` is kept for the learners (b).
 8. **Heartbeat** every ``distributed.heartbeat_sec``: env steps, ``dropped_results``, processes, load, cached keys
    and the node counters (``lineup_fetch_failed``, ``dropped_results_node_buffer``, ``worker_restarts``: A2).
@@ -65,8 +64,9 @@ import threading
 import time
 import uuid
 from collections import Counter, deque
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
+from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -75,6 +75,7 @@ import grpc
 
 from colosseum.net.proto import colosseum_v1_pb2 as pb
 from colosseum.net.security import Token
+from colosseum.node.books import CellTracker, ResultBuffer
 from colosseum.node.procs import ChildSpec, ChildSupervisor
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC
 
@@ -97,6 +98,7 @@ CACHE_DROP_DELAY_SEC = 10.0     # an unreferenced snapshot stays this long in th
 EXIT_DRAIN_SEC = 1.0            # an exited child's control connection is read to its end within this (P-PF2-11)
 FIXED_RETRY_SEC = 2.0           # a failed fetch of a Welcome.fixed blob is retried after this
 TRANSFER_THREADS = 4
+TRANSFER_JOIN_SEC = 5.0         # at the end, transfers still running are waited for this long before the cleanup
 DOWNLOAD_TIMEOUT_SEC = 300.0
 REGISTER_TIMEOUT_SEC = 30.0
 FETCH_CA_TIMEOUT_SEC = 10.0
@@ -105,243 +107,8 @@ PENDING_EVENTS_KEPT = 100       # events kept while the hub is away (oldest drop
 LOOP_WAIT_SEC = 0.05
 CHILD_MESSAGES_PER_PASS = 256   # messages read from one child connection per pass (others get their turn)
 CACHE_PRUNE_SEC = 1.0
-_CA_UNREACHABLE = "cannot fetch the hub certificate"   # security.fetch_hub_ca: the hub is unreachable, not refused
 _REFUSALS = (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED,
              grpc.StatusCode.FAILED_PRECONDITION)
-
-
-# ---------------------------------------------------------------------------------------------------------------
-# The books: results and cells
-# ---------------------------------------------------------------------------------------------------------------
-
-
-class ResultBuffer:
-    """The node's unacked result batches (spec 4.3). Results are gathered into batches of at most ``batch`` results or
-    every ``flush_sec`` (``due``), numbered per session from 1; ``make(seq, results)`` builds the message once (a
-    ``ResultBatch``) and ``size_of(message)`` its encoded size. A batch is kept until its ack, also while the hub is
-    away; ``limit_bytes`` bounds the kept bytes: a new batch that does not fit is dropped whole and counted in
-    ``dropped`` (one WARNING; overview deviation: the newest is dropped, the oldest keep being resent).
-    ``unacked()`` lists the kept messages in seq order; ``resend_all()`` the same, marking them sent now (after every
-    reconnect); ``overdue(after_sec)`` the kept batches sent ``after_sec`` ago or earlier, marking them sent again
-    (P-PF2-4 a: a refused or lost batch is resent on a live session too); ``give_up()`` counts every kept and pending
-    result as dropped (the stop, P-PF2-4 b)."""
-
-    def __init__(self, *, batch: int, flush_sec: float, limit_bytes: int, make: Callable[[int, list], Any],
-                 size_of: Callable[[Any], int], clock: Callable[[], float]) -> None:
-        self._batch, self._flush_sec, self._limit = max(1, int(batch)), float(flush_sec), int(limit_bytes)
-        self._make, self._size_of, self._clock = make, size_of, clock
-        self._pending: list = []
-        self._since = clock()
-        self._next_seq = 1
-        self._kept: dict[int, list] = {}          # seq -> [message, size, sent_at, results]
-        self._bytes = 0
-        self.dropped = 0
-        self._warned = False
-
-    def add(self, results: Iterable) -> list[Any]:
-        """Gather ``results``; returns the messages cut now (to send)."""
-        out = []
-        for r in results:
-            if not self._pending:
-                self._since = self._clock()
-            self._pending.append(r)
-            if len(self._pending) >= self._batch:
-                out.extend(self._cut())
-        return out
-
-    def due(self) -> list[Any]:
-        """The pending results as one message once ``flush_sec`` passed since the first of them."""
-        if self._pending and self._clock() - self._since >= self._flush_sec:
-            return self._cut()
-        return []
-
-    def flush(self) -> list[Any]:
-        return self._cut() if self._pending else []
-
-    def _cut(self) -> list[Any]:
-        batch, self._pending = self._pending, []
-        message = self._make(self._next_seq, batch)
-        size = int(self._size_of(message))
-        if self._bytes + size > self._limit:
-            self.dropped += len(batch)
-            if not self._warned:
-                self._warned = True
-                logger.warning(f"node result buffer full ({self._bytes / 2**20:.1f} MB unacked); dropped {len(batch)} "
-                               f"match results (dropped_match_results.node_buffer; further drops are only counted)")
-            return []
-        self._kept[self._next_seq] = [message, size, self._clock(), len(batch)]
-        self._next_seq += 1
-        self._bytes += size
-        return [message]
-
-    def ack(self, seqs: Iterable[int]) -> int:
-        n = 0
-        for seq in seqs:
-            kept = self._kept.pop(int(seq), None)
-            if kept is not None:
-                self._bytes -= kept[1]
-                n += 1
-        return n
-
-    def unacked(self) -> list[Any]:
-        return [self._kept[seq][0] for seq in sorted(self._kept)]
-
-    def resend_all(self) -> list[Any]:
-        now = self._clock()
-        for seq in self._kept:
-            self._kept[seq][2] = now
-        return self.unacked()
-
-    def overdue(self, after_sec: float) -> list[Any]:
-        now = self._clock()
-        out = []
-        for seq in sorted(self._kept):
-            kept = self._kept[seq]
-            if now - kept[2] >= after_sec:
-                kept[2] = now
-                out.append(kept[0])
-        return out
-
-    def give_up(self) -> int:
-        """Count every unacked and pending result as dropped and forget them; returns how many (one WARNING)."""
-        n = sum(k[3] for k in self._kept.values()) + len(self._pending)
-        self._kept.clear()
-        self._pending = []
-        self._bytes = 0
-        if n:
-            self.dropped += n
-            logger.warning(f"node: gave up {n} match results the hub did not acknowledge before the stop "
-                           f"(dropped_match_results.node_buffer)")
-        return n
-
-    @property
-    def pending(self) -> int:
-        """Results gathered but not cut into a batch yet."""
-        return len(self._pending)
-
-    @property
-    def last_acked(self) -> int:
-        """Every seq below the smallest kept one is acked (``Hello.last_acked_seq``)."""
-        return (min(self._kept) if self._kept else self._next_seq) - 1
-
-    @property
-    def kept_bytes(self) -> int:
-        return self._bytes
-
-
-@dataclass
-class _Cell:
-    worker: int
-    env: int
-    incarnation: int
-    epoch: int = 0
-    deadline: float | None = None       # node monotonic; None: no lineup yet / due now; inf: whole run
-    waiting: Any = None                 # a grant waiting for its weights: (lineup, keys)
-    waiting_since: float = 0.0
-    ttl: float = 0.0                    # of the waiting grant
-    keys: dict = field(default_factory=dict)   # seat -> key of the lineup the worker has or has been sent
-    requested: bool = False             # in a LineupRequest without an answer yet
-    retry_at: float = 0.0
-
-
-class CellTracker:
-    """The node's cells (spec 4.2, R11): which need a lineup (new incarnation, TTL expired, refused grant), grants
-    that wait for their weights, and the cache keys every live or waiting lineup references (``referenced``: a key
-    that is not referenced may leave the cache). ``retry_sec``: how long a requested cell without an answer, or one
-    whose fetch failed, waits before it is requested again.
-
-    Grants carry no incarnation, so a cell takes a grant only while it is requested, or a late one of the epoch it
-    has; a worker restarted while its cells were requested asks again only after ``retry_sec`` (the answer to the
-    dead incarnation's request comes first on the ordered stream and is refused), so a new incarnation never plays
-    an old incarnation's epoch (whose match uids it would repeat)."""
-
-    def __init__(self, *, retry_sec: float, clock: Callable[[], float]) -> None:
-        self._cells: dict[tuple[int, int], _Cell] = {}
-        self._retry = float(retry_sec)
-        self._clock = clock
-        self._hold: dict[int, float] = {}       # worker -> no request before (its dead incarnation's was unanswered)
-
-    def add_worker(self, worker: int, envs: int, incarnation: int) -> None:
-        hold = self._hold.pop(worker, 0.0)
-        for e in range(envs):
-            self._cells[(worker, e)] = _Cell(worker, e, incarnation, retry_at=hold)
-
-    def drop_worker(self, worker: int) -> None:
-        keys = [k for k in self._cells if k[0] == worker]
-        if any(self._cells[k].requested for k in keys):
-            self._hold[worker] = self._clock() + self._retry
-        for key in keys:
-            del self._cells[key]
-
-    def due(self) -> list[tuple[int, int, int, int]]:
-        """Cells to request now, as ``(worker, env, epoch, incarnation)``; marks them requested."""
-        now = self._clock()
-        out = []
-        for c in self._cells.values():
-            if c.waiting is not None or now < c.retry_at:
-                continue
-            if c.deadline is None or now >= c.deadline:
-                c.requested = True
-                c.retry_at = now + self._retry
-                out.append((c.worker, c.env, c.epoch, c.incarnation))
-        return sorted(out)
-
-    def granted(self, worker: int, env: int, epoch: int, ttl_sec: float, lineup: Any, keys: Mapping) -> bool:
-        """A grant: kept as waiting until delivered; False for a cell this node no longer has (a dead incarnation)
-        or one that asked for nothing (class docstring)."""
-        c = self._cells.get((worker, env))
-        if c is None or not (c.requested or (c.epoch and int(epoch) == c.epoch)):
-            return False
-        now = self._clock()
-        c.requested = False
-        c.epoch = int(epoch)
-        c.deadline = float("inf") if ttl_sec <= 0 else now + float(ttl_sec)
-        c.waiting = (lineup, dict(keys))
-        c.waiting_since = now
-        c.ttl = float(ttl_sec)
-        return True
-
-    def waiting(self) -> list[tuple[int, int, Any, dict]]:
-        return [(c.worker, c.env, c.waiting[0], c.waiting[1]) for c in self._cells.values() if c.waiting is not None]
-
-    def deliver(self, worker: int, env: int) -> tuple[Any, dict]:
-        """The waiting grant's weights are cached: it goes to the worker now."""
-        c = self._cells[(worker, env)]
-        lineup, keys = c.waiting
-        c.waiting = None
-        c.keys = keys
-        return lineup, keys
-
-    def failed(self, worker: int, env: int) -> None:
-        """Fetching the waiting grant's weights failed: drop it, keep the old lineup, ask again after ``retry_sec``."""
-        c = self._cells.get((worker, env))
-        if c is None:
-            return
-        c.waiting = None
-        c.deadline = None
-        c.retry_at = self._clock() + self._retry
-
-    def stale_waiting(self, wait_sec: float) -> list[tuple[int, int, dict]]:
-        """``(worker, env, keys)`` of the grants waiting ``max(ttl, wait_sec)`` or longer (P-PF2-12)."""
-        now = self._clock()
-        return sorted((c.worker, c.env, c.waiting[1]) for c in self._cells.values()
-                      if c.waiting is not None and now - c.waiting_since >= max(c.ttl, wait_sec))
-
-    def referenced(self) -> set:
-        keys = set()
-        for c in self._cells.values():
-            keys.update(c.keys.values())
-            if c.waiting is not None:
-                keys.update(c.waiting[1].values())
-        return keys
-
-    def live(self) -> list[tuple[int, int, int, int]]:
-        """``(worker, env, epoch, incarnation)`` of the cells with an epoch (``Hello.live_cells``)."""
-        return sorted((c.worker, c.env, c.epoch, c.incarnation) for c in self._cells.values() if c.epoch)
-
-    def epoch(self, worker: int, env: int) -> int:
-        c = self._cells.get((worker, env))
-        return 0 if c is None else c.epoch
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -387,6 +154,14 @@ class _FetchDone:
 @dataclass
 class _StopRequested:
     reason: str
+
+
+class _BadSeat(ValueError):
+    """A grant names a player this node cannot seat; ``player`` = (agent, network) (one WARNING per player)."""
+
+    def __init__(self, message: str, agent: str, network: str) -> None:
+        super().__init__(message)
+        self.player = (agent, network)
 
 
 class _Refused(Exception):
@@ -460,12 +235,13 @@ class NodeAgent:
         self.session_id = uuid.uuid4().hex
         self.supervisor = ChildSupervisor()
         self.cells = CellTracker(retry_sec=LINEUP_RETRY_SEC, clock=time.monotonic)
-        self.counters: Counter = Counter(lineup_fetch_failed=0, worker_restarts=0)
+        self._counters: Counter = Counter(lineup_fetch_failed=0, worker_restarts=0)
         self._inbox: queue.SimpleQueue = queue.SimpleQueue()
         self._wake_r, self._wake_w = os.pipe()
         os.set_blocking(self._wake_r, False)
         os.set_blocking(self._wake_w, False)
         self._closed = False
+        self._wake_lock = threading.Lock()
         self._run: _Run | None = None
         self._run_serial = 0
         self._session: Any = None
@@ -480,6 +256,7 @@ class NodeAgent:
         self._pool = ThreadPoolExecutor(max_workers=TRANSFER_THREADS, thread_name_prefix="node-transfer")
         self._fetching: dict[Any, Future] = {}
         self._fetch_warned: set = set()
+        self._refused_players: set = set()        # (agent, network) of refused grants (warned once)
         self._cached: set = set()                   # snapshot keys this node put into the cache
         self._unref_since: dict[Any, float] = {}
         self._control: dict[str, mpc.Connection] = {}
@@ -549,13 +326,16 @@ class NodeAgent:
     # ---- identity and session -------------------------------------------------------------------------------
 
     def _post(self, item: object) -> None:
+        """Any thread: put ``item`` into the inbox and wake the loop. The wake pipe is written under ``_wake_lock``,
+        which ``_close`` holds while it marks the node closed, so no byte reaches a reused descriptor number."""
         self._inbox.put(item)
-        if self._closed:
-            return
-        try:
-            os.write(self._wake_w, b"w")
-        except (BlockingIOError, OSError):        # a wake is pending already, or the node closed
-            pass
+        with self._wake_lock:
+            if self._closed:
+                return
+            try:
+                os.write(self._wake_w, b"w")
+            except (BlockingIOError, OSError):    # a wake is pending already
+                pass
 
     def _plain(self) -> bool:
         return self.options.insecure or self.options.loopback_plain
@@ -608,7 +388,13 @@ class NodeAgent:
         """``Register`` with the token (retried while the hub is unreachable); None when stopped meanwhile."""
         from colosseum.net.grpc_util import channel_options, token_metadata
         from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
-        from colosseum.net.security import HUB_SERVER_NAME, SecurityError, fetch_hub_ca, hub_channel_credentials
+        from colosseum.net.security import (
+            HUB_SERVER_NAME,
+            HubUnreachableError,
+            SecurityError,
+            fetch_hub_ca,
+            hub_channel_credentials,
+        )
         from colosseum.node.hardware import machine_id
 
         opts = self.options
@@ -634,10 +420,10 @@ class NodeAgent:
                     raise _Refused(f"the hub refused the registration ({_rpc_text(e)})") from None
                 logger.warning(f"node: cannot register with the hub at {opts.hub_address} yet ({_rpc_text(e)}); "
                                f"retrying in {delay:.1f} s")
+            except HubUnreachableError as e:                             # nothing refused: the hub is not up (yet)
+                logger.warning(f"node: {e}; retrying in {delay:.1f} s")
             except SecurityError as e:
-                if not str(e).startswith(_CA_UNREACHABLE):
-                    raise _Refused(str(e)) from None
-                logger.warning(f"node: {e}; retrying in {delay:.1f} s")   # the hub is not up (yet)
+                raise _Refused(str(e)) from None
             finally:
                 if channel is not None:
                     channel.close()
@@ -885,7 +671,6 @@ class NodeAgent:
             blob_key,
             cache_prefix,
             cleanup_dead,
-            release_node_lock,
             shm_dir,
         )
         from colosseum.players.registry import BotSpec, resolve_player_roles
@@ -910,20 +695,11 @@ class NodeAgent:
             if fb.kind == "fixed":
                 frozen_keys[fb.agent_id] = key
         dist = config.distributed
-        root = shm_dir()
-        prefix = cache_prefix(self.options.token.ca_fingerprint, run_id, number)
-        cleanup_dead(root)
-        lock = acquire_node_lock(root, prefix)                    # once per run (P-PF2 brief note)
-        authkey = os.urandom(32)
+        teachers = _scripted_teachers(config)
+        agent_roles = {a: list(roles[a]) for a in trainable}
+        agent_configs = {a: config.get_agent_config(a) for a in trainable}
+        role_specs = {a: agent_role_spec(spec, roles[a]) for a in trainable}
         ca8, run8 = self.options.token.ca_fingerprint[:8], run_id[:8]
-        node_address = address(ca8, run8, number, "node")
-        try:
-            lst = listener(node_address, authkey)
-        except BaseException:
-            release_node_lock(root, prefix)
-            raise
-        acceptor = Acceptor(lst, lambda conn, hello: self._post(_Accepted(conn, hello)), authkey=authkey,
-                            name=f"node-{number}")
         log_dir = Path(self.options.log_dir) if self.options.log_dir is not None else node_log_dir(ca8, run_id)
         log_dir.mkdir(parents=True, exist_ok=True)
         if self.options.shutdown_grace_sec is not None:
@@ -937,27 +713,42 @@ class NodeAgent:
             from colosseum.node.hardware import default_slots
 
             workers = default_slots(self._hw)["workers"]
+        results = ResultBuffer(batch=dist.results_batch, flush_sec=dist.results_flush_sec,
+                               limit_bytes=int(dist.node_result_buffer_mb * 2**20), make=_result_batch,
+                               size_of=lambda m: m.ByteSize(), clock=time.monotonic)
+        root = shm_dir()
+        prefix = cache_prefix(self.options.token.ca_fingerprint, run_id, number)
+        cleanup_dead(root)
+        # Resources from here on: everything opened is released again if the start fails (a retrying node must be
+        # able to take its lock and bind its listener's name again).
+        lock = lst = acceptor = None
+        try:
+            lock = acquire_node_lock(root, prefix)                # once per run (P-PF2 brief note)
+            authkey = os.urandom(32)
+            node_address = address(ca8, run8, number, "node")
+            lst = listener(node_address, authkey)
+            acceptor = Acceptor(lst, lambda conn, hello: self._post(_Accepted(conn, hello)), authkey=authkey,
+                                name=f"node-{number}")
+            run = _Run(
+                serial=self._run_serial + 1, run_id=run_id, number=number, config=config, spec=spec,
+                agent_ids=trainable, agent_roles=agent_roles, agent_configs=agent_configs, role_specs=role_specs,
+                bots=bots, fixed_roles={a: tuple(roles[a]) for a in scripted}, teachers=teachers,
+                fixed_keys=fixed_keys, frozen_keys=frozen_keys, root=root, prefix=prefix,
+                writer=WeightCacheWriter(root, prefix), reader=WeightCacheReader(root, prefix), lock=lock,
+                authkey=authkey, node_address=node_address, listener=lst, acceptor=acceptor, log_dir=log_dir,
+                results=results, heartbeat_sec=float(dist.heartbeat_sec), envs=int(config.rollout.envs_per_worker),
+                workers=int(workers), grace=grace)
+        except BaseException:
+            _release_partial_start(acceptor, lst, root if lock is not None else None, prefix)
+            raise
         self._run_serial += 1
-        self._run = _Run(
-            serial=self._run_serial, run_id=run_id, number=number, config=config, spec=spec, agent_ids=trainable,
-            agent_roles={a: list(roles[a]) for a in trainable},
-            agent_configs={a: config.get_agent_config(a) for a in trainable},
-            role_specs={a: agent_role_spec(spec, roles[a]) for a in trainable},
-            bots=bots, fixed_roles={a: tuple(roles[a]) for a in scripted}, teachers=_scripted_teachers(config),
-            fixed_keys=fixed_keys, frozen_keys=frozen_keys, root=root, prefix=prefix,
-            writer=WeightCacheWriter(root, prefix), reader=WeightCacheReader(root, prefix), lock=lock,
-            authkey=authkey, node_address=node_address, listener=lst, acceptor=acceptor, log_dir=log_dir,
-            results=ResultBuffer(batch=dist.results_batch, flush_sec=dist.results_flush_sec,
-                                 limit_bytes=int(dist.node_result_buffer_mb * 2**20), make=_result_batch,
-                                 size_of=lambda m: m.ByteSize(), clock=time.monotonic),
-            heartbeat_sec=float(dist.heartbeat_sec), envs=int(config.rollout.envs_per_worker), workers=int(workers),
-            grace=grace)
+        self._run = run
         if welcome.learners:
             logger.warning(f"node: learner assignments {[la.agent_id for la in welcome.learners]} are not handled "
                            f"by this node yet (T2.4 b)")
         logger.info(f"node {number} ({self._name}): serving run {run_id[:8]} with {workers} workers; "
                     f"{len(fixed_keys)} fixed blobs to fetch; logs in {log_dir}")
-        self._maybe_start_workers(self._run, time.monotonic())
+        self._maybe_start_workers(run, time.monotonic())
 
     def _maybe_start_workers(self, run: _Run, now: float) -> None:
         """Fetch the missing ``Welcome.fixed`` blobs; once all are cached, start the workers."""
@@ -1002,8 +793,12 @@ class NodeAgent:
                 lineup = lineup_from_proto(grant.lineup)
                 lineup.epoch = int(grant.epoch)
                 keys = self._seat_keys(run, lineup)
-            except ValueError as e:
-                logger.warning(f"node: refused a lineup grant for worker {grant.worker}, env {grant.env}: {e}")
+            except ValueError as e:                  # the cell asks again after LINEUP_RETRY_SEC: warn once
+                player = getattr(e, "player", None) or ("", str(e))
+                if player not in self._refused_players:
+                    self._refused_players.add(player)
+                    logger.warning(f"node: refused a lineup grant for worker {grant.worker}, env {grant.env}: {e} "
+                                   f"(further grants naming it are refused silently)")
                 continue
             self.cells.granted(int(grant.worker), int(grant.env), int(grant.epoch), float(grant.ttl_sec), lineup,
                                keys)
@@ -1022,17 +817,20 @@ class NodeAgent:
                 if agent in run.frozen_keys:
                     keys[i] = run.frozen_keys[agent]
                 elif agent not in run.bots:
-                    raise ValueError(f"seat {i}: {agent!r} is no fixed player of this run")
+                    raise _BadSeat(f"seat {i}: {agent!r} is no fixed player of this run", agent, net)
             elif agent not in run.agent_ids:
-                raise ValueError(f"seat {i}: {agent!r} is no trainable agent of this run")
+                raise _BadSeat(f"seat {i}: {agent!r} is no trainable agent of this run", agent, net)
             elif net == LATEST_NETWORK_ID:
                 keys[i] = CacheKey("latest", agent)
             elif snapshot_version(net) is not None:
                 key = CacheKey("snapshot", agent, net)
-                segment_name(run.prefix, key)                      # ValueError for a malformed id
+                try:
+                    segment_name(run.prefix, key)
+                except ValueError as e:
+                    raise _BadSeat(f"seat {i}: {e}", agent, net) from None
                 keys[i] = key
             else:
-                raise ValueError(f"seat {i}: unknown network {net!r}")
+                raise _BadSeat(f"seat {i}: unknown network {net!r}", agent, net)
         return keys
 
     def _on_command(self, cmd: pb.Command) -> None:
@@ -1071,7 +869,7 @@ class NodeAgent:
     def _expire_waiting(self) -> None:
         for worker, env, keys in self.cells.stale_waiting(LINEUP_WAIT_SEC):
             self.cells.failed(worker, env)
-            self.counters["lineup_fetch_failed"] += 1
+            self._counters["lineup_fetch_failed"] += 1
             run = self._run
             missing = [k for k in keys.values() if run is None or not self._has(run, k)]
             for key in missing:
@@ -1152,7 +950,7 @@ class NodeAgent:
         failed = [(w, e) for w, e, _lineup, keys in self.cells.waiting() if done.key in keys.values()]
         for worker, env in failed:
             self.cells.failed(worker, env)
-            self.counters["lineup_fetch_failed"] += 1
+            self._counters["lineup_fetch_failed"] += 1
         self._warn_fetch(done.key, f"{done.error}; {len(failed)} lineups keep their old one")
 
     def _warn_fetch(self, key: Any, why: str) -> None:
@@ -1164,7 +962,14 @@ class NodeAgent:
 
     def _prune_cache(self, run: _Run, now: float) -> None:
         """Snapshots no cell references for ``CACHE_DROP_DELAY_SEC`` leave the cache (``Welcome.fixed`` blobs and
-        latest pointers stay)."""
+        latest pointers stay).
+
+        Invariant (a worker never misses a delivered snapshot): a key stops being referenced only when ``deliver``
+        replaces its cell's lineup, and ``_deliver`` sends the replacing ``WorkerLineups`` on the same ordered control
+        connection at once; a worker pumps every pending control message before each cache read
+        (``WorkerIO.poll_command``), so it never reads a lineup that was replaced, and the snapshot of the lineup it
+        does read is still referenced. Any new delivery path must keep this (replace a cell's keys only together
+        with sending the replacing lineup). The delay is a margin, not what makes it safe."""
         referenced = self.cells.referenced()
         for key in list(self._cached):
             if key in referenced or key in self._fetching:
@@ -1314,7 +1119,7 @@ class NodeAgent:
             if self.supervisor.may_restart(name):
                 incarnation = self.supervisor.restart(name)
                 self.cells.add_worker(worker, run.envs, incarnation)
-                self.counters["worker_restarts"] += 1
+                self._counters["worker_restarts"] += 1
                 logger.info(f"node: restarted {name} (incarnation {incarnation})")
             else:
                 self._disabled.add(name)
@@ -1335,16 +1140,17 @@ class NodeAgent:
         return "alive" if proc is not None and proc.exitcode is None else "dead"
 
     def _node_counters(self, run: _Run) -> dict[str, int]:
-        return {"lineup_fetch_failed": int(self.counters["lineup_fetch_failed"]),
+        return {"lineup_fetch_failed": int(self._counters["lineup_fetch_failed"]),
                 "dropped_results_node_buffer": int(run.results.dropped),
-                "worker_restarts": int(self.counters["worker_restarts"])}
+                "worker_restarts": int(self._counters["worker_restarts"])}
 
     def _send_heartbeat(self, run: _Run) -> None:
         try:
             load = float(os.getloadavg()[0])
         except (AttributeError, OSError):
             load = 0.0
-        cached = sorted(f"{k.kind}:{k.agent_id}:{k.ident}" for k in (*self._cached, *run.fixed_keys))
+        cached = sorted(f"{k.kind}:{k.agent_id}:{k.ident}"
+                        for k in (*self._cached, *(k for k in run.fixed_keys if self._has(run, k))))
         self._send(pb.NodeMessage(heartbeat=pb.Heartbeat(
             env_steps=self._env_steps(), dropped_results=int(run.results.dropped),
             procs=[pb.ProcState(name=n, state=self._proc_state(n), restarts=max(0, self.supervisor.incarnation(n) - 1))
@@ -1407,9 +1213,14 @@ class NodeAgent:
             self._done = True
 
     def _close(self) -> None:
-        """Children, connections, threads, the cache files and the session (every path out of ``run``)."""
+        """Children, connections, threads, the session, then the cache files (every path out of ``run``). The order
+        matters: the node is marked closed first (thread callbacks no longer wake the loop), the transfers are
+        cancelled (the channel closes) and their threads waited for (``TRANSFER_JOIN_SEC``) before the prefix's
+        files are removed, so no download puts a segment after the cleanup; the wake pipe closes last."""
         from colosseum.node.weights import release_node_lock
 
+        with self._wake_lock:
+            self._closed = True
         if self.supervisor.alive():
             self.supervisor.stop_all(0.0)
         run = self._run
@@ -1421,17 +1232,22 @@ class NodeAgent:
                 pass
         for conn in list(self._child_conns):
             self._close_conn(conn)
-        self._pool.shutdown(wait=False, cancel_futures=True)
         if self._session is not None:
             self._session.close()
         if self._channel is not None:
-            self._channel.close()
+            self._channel.close()                    # cancels the downloads in flight
+        in_flight = list(self._fetching.values())
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        if in_flight:
+            _, stuck = wait_futures(in_flight, timeout=TRANSFER_JOIN_SEC)
+            if stuck:
+                logger.warning(f"node: {len(stuck)} transfers did not end within {TRANSFER_JOIN_SEC:.0f} s; a "
+                               f"segment they write later is removed by the next node's cleanup_dead")
         if run is not None and run.lock is not None:
             try:
                 release_node_lock(run.root, run.prefix)
             except Exception as e:  # noqa: BLE001 - leftovers are removed by the next node's cleanup_dead
                 logger.warning(f"node: cannot remove the weight cache files of {run.prefix}: {e}")
-        self._closed = True
         for fd in (self._wake_r, self._wake_w):
             try:
                 os.close(fd)
@@ -1442,6 +1258,25 @@ class NodeAgent:
 # ---------------------------------------------------------------------------------------------------------------
 # Helpers and entry points
 # ---------------------------------------------------------------------------------------------------------------
+
+
+def _release_partial_start(acceptor: Any, lst: Any, root: Path | None, prefix: str) -> None:
+    """Undo what a failed run start opened: the acceptor thread, the listener (its socket name) and the node lock
+    with the prefix's files (``root`` None: the lock was not taken)."""
+    from colosseum.node.weights import release_node_lock
+
+    if acceptor is not None:
+        acceptor.close()
+    if lst is not None:
+        try:
+            lst.close()
+        except OSError:
+            pass
+    if root is not None:
+        try:
+            release_node_lock(root, prefix)
+        except Exception as e:  # noqa: BLE001 - leftovers are removed by the next node's cleanup_dead
+            logger.warning(f"node: cannot remove the weight cache files of {prefix}: {e}")
 
 
 def _slot_index(name: str) -> int:

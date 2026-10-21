@@ -127,6 +127,7 @@ def _play(io: Any, cache: Any, *, node: int, worker: int, incarnation: int, conf
                 raise RuntimeError(f"worker {worker}: snapshot {key.agent_id}/{key.ident} of a granted lineup is not "
                                    f"in the weight cache")
             checkpoints.setdefault(key.agent_id, {})[key.ident] = cached.state_dict
+            io.note_snapshot(key.agent_id, key.ident)
     seed = config.training.seed
     logger.info(f"Worker {worker}: starting (node {node}, incarnation {incarnation}) with {num_envs} envs "
                 f"({config.rollout.vec_env}), chunk_length={config.rollout.chunk_length}, agents={agent_ids}, "

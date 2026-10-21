@@ -110,6 +110,7 @@ class FakeHub:
         self.run_id = uuid.uuid4().hex
         self.welcome_fields: dict = {}
         self.lineup_for: Callable[[int, int], Lineup | None] = lambda worker, env: None
+        self.grants_sent: list[tuple[int, int, int]] = []     # (worker, env, epoch) of every grant sent
         self.hold_acks = False
         self.refuse_once: set[int] = set()     # result seqs refused once (as a full journal writer does: no ack)
         self.paused = False
@@ -218,9 +219,9 @@ class FakeHub:
     def not_found(self, kind: str, agent: str, ident: str) -> None:
         self.blobs.missing.add((kind, agent, ident))
 
-    def serve_frozen(self, agent: str, path: Path) -> str:
-        """Register frozen agent ``agent``'s weights (``agents.<agent>.path``) as a fixed blob listed in the Welcome;
-        returns its blob id."""
+    def serve_frozen(self, agent: str, path: Path, *, gate: threading.Event | None = None) -> str:
+        """Register frozen agent ``agent``'s weights (``agents.<agent>.path``) as a fixed blob listed in the Welcome
+        (``gate``: its download is held until set); returns its blob id."""
         from colosseum.core.registry import env_spec
         from colosseum.net.chunks import WeightsMeta, encode_weights
         from colosseum.players.registry import load_frozen
@@ -230,7 +231,7 @@ class FakeHub:
             agent_id=agent, kind="fixed", generation=0, policy_version=0, architecture=dict(frozen.networks),
             roles=tuple(frozen.roles)))
         blob_id = blob_ident("fixed", agent, frame)
-        self.serve_blob("fixed", agent, blob_id, frame)
+        self.serve_blob("fixed", agent, blob_id, frame, gate=gate)
         self.welcome_fields.setdefault("fixed", []).append(pb.FixedBlob(agent_id=agent, blob_id=blob_id,
                                                                         kind="fixed"))
         return blob_id
@@ -321,6 +322,7 @@ class FakeHub:
                     continue
                 self.cells.grant(cell.key, "a", self.ttl_sec, now)
                 lineup = Lineup(layout=lineup.layout, seats=list(lineup.seats), epoch=cell.epoch)
+                self.grants_sent.append((cell.key.worker, cell.key.env, cell.epoch))
                 grants.append(pb.Grant(worker=cell.key.worker, env=cell.key.env, epoch=cell.epoch,
                                        ttl_sec=self.ttl_sec, lineup=lineup_to_proto(lineup)))
             if grants:

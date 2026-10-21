@@ -76,6 +76,11 @@ class SecurityError(Exception):
     """A refusal or a broken identity (exit 1 at the CLI); the message says what to do."""
 
 
+class HubUnreachableError(SecurityError):
+    """``fetch_hub_ca`` could not reach the hub at all (no connection, a timeout): nothing was refused, so a node may
+    retry. A ``SecurityError`` for callers that treat every failure alike."""
+
+
 # ---------------------------------------------------------------------------
 # Directories and files
 # ---------------------------------------------------------------------------
@@ -687,13 +692,17 @@ class NodeIdentity:
 
 def fetch_hub_ca(host: str, port: int, *, fingerprint: str, timeout: float) -> bytes:
     """The hub's certificate (= its CA, R15) from an unverified TLS handshake, accepted only if its SPKI fingerprint
-    is the token's. SecurityError otherwise (a wrong token, another hub, or interception)."""
+    is the token's. HubUnreachableError when no TLS connection could be made (refused, unreachable, timed out);
+    SecurityError otherwise (no TLS on that address, a wrong token, another hub, or interception)."""
     try:
         pem = ssl.get_server_certificate((host, int(port)), timeout=timeout).encode("ascii")
-    except (OSError, ssl.SSLError, TimeoutError) as e:
+    except ssl.SSLError as e:
         raise SecurityError(f"cannot fetch the hub certificate from {host}:{port} ({type(e).__name__}: {e}); is the "
                             f"hub running with TLS on that address? (a hub started with --insecure needs --insecure "
                             f"here)") from None
+    except (OSError, TimeoutError) as e:
+        raise HubUnreachableError(f"cannot reach the hub at {host}:{port} to fetch its certificate "
+                                  f"({type(e).__name__}: {e}); is it running and is the address right?") from None
     actual = spki_fingerprint(pem)
     if not hmac.compare_digest(actual, fingerprint):
         raise SecurityError(f"the certificate at {host}:{port} has fingerprint {actual[:16]}..., the token names "

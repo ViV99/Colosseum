@@ -113,6 +113,52 @@ def test_the_node_registers_with_the_token_and_keeps_its_identity(tmp_path, hub_
     assert any("refused the registration" in r.getMessage() for r in caplog.records)
 
 
+def test_an_unreachable_hub_is_retried_and_a_foreign_hub_certificate_is_refused(tmp_path, hub_factory, caplog):
+    import socket
+
+    from hub_kit import serve
+
+    hub = hub_factory(_config())                                     # its token: the node's credentials
+    with caplog.at_level(logging.WARNING), socket.socket() as closed:
+        closed.bind(("127.0.0.1", 0))                                # bound, not listening: nobody answers
+        node = run_node_in_thread(toy_node_options(tmp_path, hub, insecure=False,
+                                                   hub_address=f"127.0.0.1:{closed.getsockname()[1]}"))
+        try:
+            wait_for(lambda: len([r for r in caplog.records if "cannot reach the hub" in r.getMessage()]) >= 2)
+            assert node.thread.is_alive()                            # retried, not refused
+        finally:
+            assert node.stop() == 0
+    foreign = serve(tmp_path / "foreign")                            # TLS with another CA than the token's
+    try:
+        with caplog.at_level(logging.ERROR):
+            refused = agent_mod.NodeAgent(toy_node_options(tmp_path, hub, insecure=False, hub_address=foreign.address,
+                                                           identity_root=tmp_path / "foreign-id"))
+            assert refused.run() == 1
+        assert any("fingerprint" in r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR)
+    finally:
+        foreign.stop()
+
+
+def test_a_run_that_fails_to_start_releases_its_lock_listener_and_acceptor(tmp_path, hub_factory, monkeypatch):
+    import threading
+
+    from colosseum.net.local import address, listener
+    from colosseum.node.weights import cache_prefix
+
+    def broken(**kwargs):
+        raise RuntimeError("a failure after the lock, the listener and the acceptor")
+
+    monkeypatch.setattr(agent_mod, "_Run", broken)
+    hub = hub_factory(_config())
+    node = run_node_in_thread(toy_node_options(tmp_path, hub))
+    node.thread.join(30)
+    assert node.exit_code == 1
+    prefix = cache_prefix(hub.token.ca_fingerprint, hub.run_id, 1)
+    assert not list(shm_dir().glob(f"{prefix}*")) and not list(shm_dir().glob(f".{prefix}*"))
+    assert not [t for t in threading.enumerate() if t.name.startswith("accept-node-") and t.is_alive()]
+    listener(address(hub.token.ca_fingerprint[:8], hub.run_id[:8], 1, "node"), b"k" * 32).close()   # free again
+
+
 def test_workers_start_on_welcome_and_ask_lineups_for_every_env(hub_factory, node_factory):
     hub = hub_factory(_config())
     hub.grant(lambda worker, env: FIXED)
@@ -121,11 +167,19 @@ def test_workers_start_on_welcome_and_ask_lineups_for_every_env(hub_factory, nod
     assert _requests(hub)[0] == [(0, 0, 0, 1), (0, 1, 0, 1)]
     wait_for(lambda: len(hub.results()) >= 20)
     pattern = _uid_re(hub, node.agent.number)
+    played: dict[int, set[int]] = {}
     for result in hub.results():
         m = pattern.fullmatch(result.uid)
-        assert m is not None, result.uid
-        assert (m.group(1), m.group(2)) in {("0", "5"), ("1", "6")} and result.node == node.agent.number
-    wait_for(lambda: any(sorted(c[2] for c in cells) == [5, 6] for cells in _requests(hub)[1:]), timeout=10)
+        assert m is not None and result.node == node.agent.number, result.uid
+        played.setdefault(int(m.group(1)), set()).add(int(m.group(2)))
+    # Each env plays one epoch the hub granted it (a retried first request may make the hub grant another, which
+    # the node refuses); the two envs' epochs differ; the renewal after the TTL carries them.
+    assert sorted(played) == [0, 1] and all(len(epochs) == 1 for epochs in played.values())
+    epochs = {env: next(iter(e)) for env, e in played.items()}
+    assert epochs[0] != epochs[1] and all(e >= 5 for e in epochs.values())
+    assert all((0, env, epoch) in hub.grants_sent for env, epoch in epochs.items())
+    wait_for(lambda: any(sorted(c[2] for c in cells) == sorted(epochs.values()) for cells in _requests(hub)[1:]),
+             timeout=10)
     assert node.stop() == 0
 
 
@@ -150,7 +204,7 @@ def test_a_refused_batch_is_resent_on_the_live_session(hub_factory, node_factory
     hub.grant(lambda worker, env: FIXED)
     hub.refuse_once = {2}
     node = node_factory(hub)
-    wait_for(lambda: [b.seq for b in hub.messages("results")].count(2) == 2)
+    wait_for(lambda: [b.seq for b in hub.messages("results")].count(2) >= 2)
     wait_for(lambda: 2 in hub.acked)
     assert node.stop() == 0
     hub.sync()
@@ -309,21 +363,21 @@ def test_a_lineup_waits_for_its_snapshot_and_a_failed_fetch_keeps_the_old_one(hu
     gate.set()
     wait_for(lambda: _results_with(hub, "ckpt_v5"))
 
-    once = []
+    asked = []                    # requests received when ckpt_v9 was granted (the grant's own request included)
 
     def lineup_for(worker, env):
-        if env == 0 and not once:
-            once.append(True)
+        if env == 0 and not asked:
+            asked.append(len(hub.messages("lineup_request")))
             return SNAP9
         return SNAP5 if env == 0 else FIXED
 
+    hub.ttl_sec = 60.0            # from now on a renewal comes only after 60 s: a request for (0, 0) is a retry
     hub.grant(lineup_for)
     wait_for(lambda: ("snapshot", "a", "ckpt_v9") in hub.blobs.requests())
     wait_for(lambda: any(h.counters["lineup_fetch_failed"] == 1 for h in hub.heartbeats()))
     played = len(_results_with(hub, "ckpt_v5"))
-    asked = len(hub.messages("lineup_request"))
     wait_for(lambda: len(_results_with(hub, "ckpt_v5")) > played)   # the old lineup keeps playing
-    wait_for(lambda: any((0, 0) == c[:2] for cells in _requests(hub)[asked:] for c in cells))
+    wait_for(lambda: any((0, 0) == c[:2] for cells in _requests(hub)[asked[0]:] for c in cells))
     assert node.stop() == 0
     hub.sync()
     assert hub.heartbeats()[-1].counters["lineup_fetch_failed"] == 1
@@ -348,17 +402,53 @@ def test_evictions_reach_the_workers_and_leave_the_cache(hub_factory, node_facto
 
 
 def test_frozen_players_come_from_the_hubs_blobs(hub_factory, node_factory, tmp_path):
+    import threading
+
     base = _config()
     path = write_ckpt_dir(tmp_path / "frozen", base, "a", policy_version=3)
     config = _config(agents={"a": {}, "random": scripted_agent(), "froz": frozen_agent(path)})
     hub = hub_factory(config)
-    blob_id = hub.serve_frozen("froz", path)
+    gate = threading.Event()
+    blob_id = hub.serve_frozen("froz", path, gate=gate)
     hub.grant(lambda worker, env: Lineup("2p", [SeatAssignment("froz", "fixed", False),
                                                 SeatAssignment("random", "fixed", False)]))
     node = node_factory(hub)
+    wait_for(lambda: len(hub.heartbeats()) >= 2)
+    assert all(not h.cached_keys for h in hub.heartbeats())        # not fetched yet: not reported as cached
+    gate.set()
+    wait_for(lambda: any(f"blob:froz:fixed-{blob_id}" in h.cached_keys for h in hub.heartbeats()))
     wait_for(lambda: [r for r in hub.results() if r.seats[0].agent_id == "froz"])
     order = [kind for kind, _ in hub.timeline]
     assert hub.timeline[0] == ("download", ("fixed", "froz", blob_id)) and order.index("lineup_request") > 0
     assert all(r.seats[0].network_id == "fixed" for r in hub.results())
     assert node.stop() == 0
     assert not list(shm_dir().glob(f"{node.agent.cache_prefix}*"))  # the node removed its cache files
+
+
+def test_a_download_in_flight_at_the_stop_leaves_no_segment_behind(hub_factory, node_factory):
+    import threading
+
+    config = _config()
+    hub = hub_factory(config)
+    gate = threading.Event()
+    _serve_snapshot(hub, config, 5, gate)
+    hub.grant(lambda worker, env: SNAP5 if env == 0 else FIXED)
+    node = node_factory(hub)
+    wait_for(lambda: ("snapshot", "a", "ckpt_v5") in hub.blobs.requests())
+    prefix = node.agent.cache_prefix
+    assert node.stop() == 0                                         # the download is still held by the hub
+    gate.set()
+    time.sleep(0.5)
+    assert not list(shm_dir().glob(f"{prefix}*")) and not list(shm_dir().glob(f".{prefix}*"))
+
+
+def test_a_grant_naming_an_unknown_player_is_refused_with_one_warning(hub_factory, node_factory, caplog):
+    ghost = Lineup("2p", [SeatAssignment("ghost", "fixed", False), SeatAssignment("random", "fixed", False)])
+    hub = hub_factory(_config())
+    hub.grant(lambda worker, env: ghost if env == 0 else FIXED)
+    with caplog.at_level(logging.WARNING):
+        node = node_factory(hub)
+        wait_for(lambda: sum((0, 0) == c[:2] for cells in _requests(hub) for c in cells) >= 4)   # asked again
+        assert node.stop() == 0
+    refused = [r for r in caplog.records if "refused a lineup grant" in r.getMessage()]
+    assert len(refused) == 1 and "ghost" in refused[0].getMessage()

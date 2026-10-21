@@ -140,3 +140,34 @@ def test_a_grant_waiting_too_long_for_its_weights_is_given_up():
     assert cells.stale_waiting(30.0) == [(0, 0, {0: "k"})]          # max(ttl, wait): 30 s for a 5 s ttl
     clock.t = 60.0
     assert [(w, e) for w, e, _ in cells.stale_waiting(30.0)] == [(0, 0), (0, 1)]
+
+
+def test_a_new_incarnation_never_takes_an_epoch_of_a_dead_one_however_late_its_answer():
+    clock = Clock()                                                 # review round 1: uids / seeds never repeat
+    cells = CellTracker(retry_sec=1.0, clock=clock)
+    cells.add_worker(0, 1, incarnation=1)
+    cells.due()
+    cells.granted(0, 0, epoch=7, ttl_sec=5.0, lineup="L7", keys={})
+    cells.deliver(0, 0)
+    clock.t = 6.0
+    assert cells.due() == [(0, 0, 7, 1)]                            # incarnation 1 asks to renew epoch 7 ...
+    cells.drop_worker(0)                                            # ... and dies before the answer
+    clock.t = 7.5
+    cells.add_worker(0, 1, incarnation=2)
+    assert cells.due() == [(0, 0, 0, 2)]
+    clock.t = 9.0                                                   # the old answer arrives > retry_sec later
+    assert not cells.granted(0, 0, epoch=7, ttl_sec=5.0, lineup="L7", keys={})
+    assert cells.granted(0, 0, epoch=8, ttl_sec=5.0, lineup="L8", keys={})   # the hub's answer for incarnation 2
+    assert cells.live() == [(0, 0, 8, 2)]
+    cells.drop_worker(0)                                            # floors only rise over restarts
+    cells.add_worker(0, 1, incarnation=3)
+    clock.t = 20.0
+    cells.due()
+    assert not cells.granted(0, 0, epoch=8, ttl_sec=5.0, lineup="L8", keys={})
+    assert not cells.granted(0, 0, epoch=5, ttl_sec=5.0, lineup="L5", keys={})
+
+
+def test_the_books_live_in_their_own_module_and_the_agent_re_exports_them():
+    from colosseum.node import agent, books
+
+    assert agent.ResultBuffer is books.ResultBuffer and agent.CellTracker is books.CellTracker
