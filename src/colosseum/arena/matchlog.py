@@ -36,7 +36,8 @@ Order is by row id (insertion order), never by the informational ``ts``.
 loop submits results to its bounded queue (a full queue drops and counts them), the thread appends them in batches,
 feeds the in-memory ``ComparisonTable`` of the live ratings with what it journaled, compacts every
 ``compact_interval_sec``, and flushes its queue on ``stop``. A write error is an ERROR in the log and a count,
-never an exception in the training process.
+never an exception in the training process. SP5 (R8): a tokened submit is all or nothing and is committed as a
+whole; the hub accounts and acks a node's batch only from its ``Commit``.
 """
 
 from __future__ import annotations
@@ -53,6 +54,7 @@ import time
 from collections.abc import Callable, Collection, Iterator, Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Any
 
 from colosseum.arena.comparisons import (
     ComparisonTable,
@@ -150,6 +152,7 @@ class AppendStats:
     duplicates: int = 0         # uid already in the journal: ignored
     accepted: list[bool] = field(default_factory=list)   # per result: journaled (detailed or counted)
     degraded: bool = False
+    rows: list[int | None] = field(default_factory=list)  # per result: its matches.id (None: duplicate / counts only)
 
 
 @dataclass
@@ -689,6 +692,7 @@ class MatchLog(_Store):
                     self._write_counts(acc)
                     stats.counted += 1
                     stats.accepted.append(True)
+                    stats.rows.append(None)
                     continue
                 size = estimated_size(result)
                 cur = self._conn.execute(
@@ -700,6 +704,7 @@ class MatchLog(_Store):
                 if cur.rowcount == 0:
                     stats.duplicates += 1
                     stats.accepted.append(False)
+                    stats.rows.append(None)
                     continue
                 match = int(cur.lastrowid)
                 self._conn.executemany(
@@ -715,6 +720,7 @@ class MatchLog(_Store):
                     train_matches += 1
                 stats.detailed += 1
                 stats.accepted.append(True)
+                stats.rows.append(match)
             if train_matches:
                 self._bump_detail(train_bytes, train_matches)
 
@@ -1079,12 +1085,14 @@ _SIZE_KEYS = ("file_bytes", "wal_bytes", "detail_bytes", "detail_matches", "othe
 @dataclass(frozen=True)
 class WriterStats:
     """What the writer did so far (an immutable snapshot; the main loop reads it for the ``system`` record).
-    Every submitted result ends up in exactly one of ``written``, ``duplicates``, ``dropped`` and ``pending``. One
-    exception, in the journal and not in these counters: a batch that an abandoned thread was writing (``stop``) is
-    counted as dropped and may still be committed, at most ``WRITE_BATCH`` results."""
+    Every submitted result ends up in exactly one of ``written``, ``duplicates``, ``dropped`` and ``pending``,
+    except the results of a tokened submit (SP5) that was refused or got a failed ``Commit``: those are in none (their
+    sender resends them). One exception, in the journal and not in these counters: a batch that an abandoned thread
+    was writing (``stop``) is counted as dropped and may still be committed, at most ``WRITE_BATCH`` results."""
 
     written: int = 0            # journaled results (detailed or counted)
     dropped: int = 0            # lost: writer queue full, write errors, not written at stop, journal unusable
+    #                             (tokened results only when still queued or in flight at the stop)
     duplicates: int = 0         # uids already in the journal
     write_errors: int = 0       # failed appends, compaction passes and table feeds; a failed open or a dead thread
     compactions: int = 0
@@ -1104,27 +1112,63 @@ class WriterStats:
         return out
 
 
+@dataclass(frozen=True)
+class Commit:
+    """What the writer did with one tokened ``submit`` (SP5 R8): the results journaled as new rows (in commit order;
+    ``accepted``), how many were duplicates (uid already in the journal), the highest ``matches.id`` of this commit
+    (None: nothing detailed), or ``failed`` (a write error, or the writer died before writing it: nothing of the
+    token is in the journal by this writer's doing; the caller does not account or ack it, the sender resends)."""
+
+    token: Any
+    accepted: list[MatchResult]
+    duplicates: int
+    last_row: int | None
+    failed: bool = False
+
+
+@dataclass
+class _Group:
+    """One ``submit``'s results: written in one transaction (a group never spans two batches)."""
+
+    results: list[MatchResult]
+    token: Any = None                 # None: an untokened submit (SP4 behaviour: no Commit)
+
+
 class MatchLogWriter:
     """Journal writer thread (module docstring). ``log_factory()`` opens the thread's own ``MatchLog`` (called in
     the thread: a ``MatchLog`` connection belongs to the thread that opened it); ``table`` (optional) gets every
     journaled result; ``clock`` measures the compaction cadence and the stop deadline (monotonic).
 
-    Thread rules: the thread touches nothing of the caller but its queue, its stats, its in-flight count and the
-    evicted entities (all under its lock) and ``table`` (internally locked). ``submit``, ``note_evicted`` and
-    ``stop`` are called from one thread (the main loop).
+    Thread rules: the thread touches nothing of the caller but its queue, its stats, its in-flight count, the evicted
+    entities and the commits (all under its lock) and ``table`` (internally locked). ``submit``, ``take_commits``,
+    ``note_evicted`` and ``stop`` are called from one thread (the main loop).
+
+    Submits are groups: a tokened ``submit`` is written in one transaction (with the batch it is part of; a batch
+    takes whole groups up to ``WRITE_BATCH`` results, or one larger group); an untokened one is cut into groups of
+    ``WRITE_BATCH``. ``queue_size`` bounds the queued results.
+
+    - Without a token (SP4): what does not fit is dropped and counted (``dropped``, one WARNING); no ``Commit``.
+    - With a token (SP5, R8): all or nothing: a submit that does not fit, or reaches a stopped or dead writer, is
+      refused whole (the return value is its size) and NOT counted as dropped (the caller resends it later or
+      accounts it otherwise); after the thread wrote its group, ``take_commits`` returns a ``Commit`` for the token.
+      A write error (or the thread's death) gives a failed ``Commit`` (``write_errors`` counts the error; the results
+      are not counted as dropped: the sender resends them).
 
     Accounting: a batch the thread took from the queue is "in flight" (``pending``) until its append returns.
     When ``stop`` gives up waiting for the thread, the in-flight and queued results are counted as dropped and the
-    writer is abandoned: whatever the thread does afterwards no longer changes the stats. The thread's append of the
-    in-flight batch may still commit, so the journal can then hold up to ``WRITE_BATCH`` results that are also
-    counted as dropped (an over-count, never a loss). When the journal cannot be opened or the thread dies, the
-    writer is dead: queued and later results are counted as dropped."""
+    writer is abandoned: whatever the thread does afterwards no longer changes the stats or the commits. The thread's
+    append of the in-flight batch may still commit, so the journal can then hold up to ``WRITE_BATCH`` results that
+    are also counted as dropped (an over-count, never a loss). When the journal cannot be opened or the thread dies,
+    the writer is ``dead``: queued untokened results are counted as dropped, queued tokened groups get failed
+    commits, later submits are refused."""
 
     def __init__(self, log_factory: Callable[[], MatchLog], *, queue_size: int = WRITER_QUEUE_SIZE,
                  compact_interval_sec: float, window_bytes: int, table: ComparisonTable | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._factory = log_factory
-        self._queue: queue.Queue = queue.Queue(maxsize=int(queue_size))
+        self._groups: queue.Queue[_Group] = queue.Queue()
+        self._capacity = int(queue_size)
+        self._queued = 0                 # results in queued groups (under the lock)
         self._interval = float(compact_interval_sec)
         self._window = int(window_bytes)
         self._untouched_limit = max(int(window_bytes), UNTOUCHED_WARNING_FLOOR)
@@ -1133,10 +1177,12 @@ class MatchLogWriter:
         self._lock = threading.Lock()
         self._stats = WriterStats()
         self._in_flight = 0
+        self._commits: list[Commit] = []
         self._abandoned = False      # stop() gave up waiting: the thread's late updates are ignored
         self._activity = "starting"  # what the thread is doing (set by the thread; named when stop() gives up)
         self._dead = False           # the thread cannot write (the journal is unusable or the thread died)
         self._evicted: set[EntityKey] = set()
+        self._current: list[_Group] = []   # the groups the thread is writing (failed commits if it dies meanwhile)
         self._stop = threading.Event()
         self._deadline = math.inf
         self._thread: threading.Thread | None = None
@@ -1147,21 +1193,40 @@ class MatchLogWriter:
         with self._lock:
             return self._snapshot_locked()
 
+    @property
+    def dead(self) -> bool:
+        """The journal is unusable (it could not be opened, or the thread died): submits are refused."""
+        return self._dead
+
     def _snapshot_locked(self) -> WriterStats:
-        return replace(self._stats, pending=self._queue.qsize() + self._in_flight)
+        return replace(self._stats, pending=self._queued + self._in_flight)
 
     def _bump_locked(self, **delta: int) -> None:
         self._stats = replace(self._stats, **{k: getattr(self._stats, k) + v for k, v in delta.items()})
 
-    def _drain_locked(self) -> int:
-        """Remove everything queued; returns how many results that was."""
-        n = 0
+    def _drain_locked(self) -> list[_Group]:
+        """Remove every queued group."""
+        out = []
         while True:
             try:
-                self._queue.get_nowait()
+                out.append(self._groups.get_nowait())
             except queue.Empty:
-                return n
-            n += 1
+                break
+        self._queued = 0
+        return out
+
+    def _settle_locked(self, groups: Sequence[_Group], *, failed_commits: bool) -> int:
+        """Results of ``groups`` that will never be written: untokened ones are counted as dropped (returned);
+        tokened ones get failed commits when ``failed_commits`` (else they are counted as dropped too, at stop)."""
+        dropped = 0
+        for group in groups:
+            if group.token is not None and failed_commits:
+                self._commits.append(Commit(group.token, [], 0, None, failed=True))
+            else:
+                dropped += len(group.results)
+        if dropped:
+            self._bump_locked(dropped=dropped)
+        return dropped
 
     def _thread_update(self, *, values: Mapping | None = None, **delta: int) -> bool:
         """A stats update by the thread; ignored (False) once the writer is abandoned."""
@@ -1177,21 +1242,31 @@ class MatchLogWriter:
         self._thread = threading.Thread(target=self._run, name="match-log-writer", daemon=True)
         self._thread.start()
 
-    def submit(self, results: Sequence[MatchResult]) -> int:
-        """Queue ``results`` without blocking; returns how many were dropped (queue full, the writer stopped or
-        dead; counted, the first time a WARNING)."""
+    def submit(self, results: Sequence[MatchResult], *, token: Any = None) -> int:
+        """Queue ``results`` without blocking (class docstring); returns how many were not taken."""
+        results = list(results)
+        if not results:
+            return 0
         with self._lock:
             if self._stop.is_set() or self._dead:
+                if token is not None:
+                    return len(results)
                 reason = "is stopped" if self._stop.is_set() else "is not running (the journal is unusable)"
-                dropped = len(results)
+                taken = 0
+            elif token is not None:
+                if self._queued + len(results) > self._capacity:
+                    return len(results)
+                taken = len(results)
             else:
-                reason = f"queue is full ({self._queue.maxsize} results)"
-                dropped = 0
-                for result in results:
-                    try:
-                        self._queue.put_nowait(result)
-                    except queue.Full:
-                        dropped += 1
+                reason = f"queue is full ({self._capacity} results)"
+                taken = max(0, min(len(results), self._capacity - self._queued))
+            if token is not None:
+                self._groups.put_nowait(_Group(results, token))
+            else:                                    # no atomicity needed: batches as in SP4
+                for start in range(0, taken, WRITE_BATCH):
+                    self._groups.put_nowait(_Group(results[start:min(taken, start + WRITE_BATCH)]))
+            self._queued += taken
+            dropped = len(results) - taken
             if dropped:
                 self._bump_locked(dropped=dropped)
         if dropped and not self._warned_drop:
@@ -1199,6 +1274,12 @@ class MatchLogWriter:
             logger.warning(f"Match log writer {reason}; dropped {dropped} match results (counted in "
                            f"dropped_match_results; further drops are only counted)")
         return dropped
+
+    def take_commits(self) -> list[Commit]:
+        """The commits of tokened submits since the last call, in commit order (main loop)."""
+        with self._lock:
+            out, self._commits = self._commits, []
+        return out
 
     def note_evicted(self, entities: Collection[EntityKey]) -> None:
         """Entities of evicted snapshots: their training matches are folded at the next compaction pass."""
@@ -1208,10 +1289,10 @@ class MatchLogWriter:
     def stop(self, timeout: float) -> WriterStats:
         """Stop compacting, write what is queued, close the journal; within ``timeout`` seconds. What could not be
         written in time (queued, or in flight when the thread does not stop in time) is counted as dropped (one
-        WARNING); the returned stats are final. A thread that does not stop in time is abandoned; the WARNING names
-        what it was doing. Its in-flight batch may still be committed (an over-count of at most ``WRITE_BATCH`` in
-        ``dropped``); stuck in compaction or another journal operation, it has no results in flight. Idempotent;
-        harmless without ``start``."""
+        WARNING; tokened groups too: the run is over); the returned stats are final. A thread that does not stop in
+        time is abandoned; the WARNING names what it was doing. Its in-flight batch may still be committed (an
+        over-count of at most ``WRITE_BATCH`` in ``dropped``); stuck in compaction or another journal operation, it
+        has no results in flight. Idempotent; harmless without ``start``."""
         timeout = max(0.0, float(timeout))
         self._deadline = self._clock() + max(0.0, timeout - _STOP_MARGIN_SEC)
         self._stop.set()
@@ -1224,9 +1305,9 @@ class MatchLogWriter:
             if alive:
                 self._abandoned = True
                 in_flight, self._in_flight = self._in_flight, 0
-            left = self._drain_locked()
-            if in_flight + left:
-                self._bump_locked(dropped=in_flight + left)
+                if in_flight:
+                    self._bump_locked(dropped=in_flight)
+            left = self._settle_locked(self._drain_locked(), failed_commits=False)
             final = self._snapshot_locked()
         if alive:
             if in_flight:
@@ -1245,26 +1326,36 @@ class MatchLogWriter:
 
     # ---- the thread --------------------------------------------------------------------------------------------
 
-    def _take(self, timeout: float) -> list[MatchResult]:
-        """Up to ``WRITE_BATCH`` queued results, now in flight; waits up to ``timeout`` for the first."""
-        batch: list[MatchResult] = []
+    def _take(self, timeout: float) -> list[_Group]:
+        """Whole groups up to ``WRITE_BATCH`` results (at least one group), now in flight; waits up to ``timeout``
+        for the first."""
+        groups: list[_Group] = []
         if timeout > 0:
             try:
-                batch.append(self._queue.get(timeout=timeout))
+                groups.append(self._groups.get(timeout=timeout))
             except queue.Empty:
                 return []
         with self._lock:
             if self._abandoned:
-                if batch:
-                    self._bump_locked(dropped=len(batch))
+                if groups:
+                    self._bump_locked(dropped=len(groups[0].results))
                 return []
-            while len(batch) < WRITE_BATCH:
+            if not groups:
                 try:
-                    batch.append(self._queue.get_nowait())
+                    groups.append(self._groups.get_nowait())
+                except queue.Empty:
+                    return []
+            total = len(groups[0].results)
+            while total < WRITE_BATCH:
+                try:
+                    group = self._groups.get_nowait()
                 except queue.Empty:
                     break
-            self._in_flight = len(batch)
-        return batch
+                groups.append(group)
+                total += len(group.results)
+            self._queued -= total
+            self._in_flight = total
+        return groups
 
     def _error(self, what: str, error: Exception) -> None:
         """One ERROR per failure; the traceback only with the first."""
@@ -1272,7 +1363,8 @@ class MatchLogWriter:
                      exc_info=not self._warned_error)
         self._warned_error = True
 
-    def _write(self, log: MatchLog, batch: list[MatchResult]) -> None:
+    def _write(self, log: MatchLog, groups: list[_Group]) -> None:
+        batch = [r for g in groups for r in g.results]
         self._activity = f"writing {len(batch)} results"
         try:
             stats = log.append(batch)
@@ -1281,15 +1373,29 @@ class MatchLogWriter:
                 if self._abandoned:
                     return
                 self._in_flight = 0
-                self._bump_locked(dropped=len(batch), write_errors=1)
-            self._error(f"writing {len(batch)} results failed; they are counted in dropped_match_results", e)
+                self._bump_locked(write_errors=1)
+                lost = self._settle_locked(groups, failed_commits=True)
+            what = (f"writing {len(batch)} results failed; {lost} are counted in dropped_match_results"
+                    + (", the others go back to their senders" if lost < len(batch) else ""))
+            self._error(what, e)
             return
+        commits = []
+        offset = 0
+        for group in groups:
+            n = len(group.results)
+            if group.token is not None:
+                flags = stats.accepted[offset:offset + n]
+                rows = [r for r in stats.rows[offset:offset + n] if r is not None]
+                commits.append(Commit(group.token, [r for r, ok in zip(group.results, flags, strict=True) if ok],
+                                      flags.count(False), max(rows) if rows else None))
+            offset += n
         with self._lock:
             if self._abandoned:                     # counted as dropped by stop()
                 return
             self._in_flight = 0
             self._bump_locked(written=stats.detailed + stats.counted, duplicates=stats.duplicates)
             self._stats = replace(self._stats, degraded=stats.degraded)
+            self._commits.extend(commits)
         if self._table is None:
             return
         self._activity = "adding journaled results to the live comparison table"
@@ -1335,33 +1441,37 @@ class MatchLogWriter:
             return
         self._thread_update(values={"sizes": sizes})
 
-    def _die(self) -> None:
-        """The thread cannot write any more: the in-flight and queued results are dropped, and so are later ones
-        (``submit``)."""
+    def _die(self, in_flight: Sequence[_Group] = ()) -> None:
+        """The thread cannot write any more: untokened in-flight and queued results are dropped, tokened groups get
+        failed commits (their senders resend them to the journal-off path); later submits are refused."""
         with self._lock:
             self._dead = True
             if self._abandoned:
                 return
-            lost = self._in_flight + self._drain_locked()
             self._in_flight = 0
-            self._bump_locked(dropped=lost, write_errors=1)
+            self._bump_locked(write_errors=1)
+            self._settle_locked([*in_flight, *self._drain_locked()], failed_commits=True)
 
     def _loop(self, log: MatchLog) -> None:
         self._refresh_sizes(log)
         last_compact = self._clock()
         while not self._stop.is_set():
             self._activity = "waiting for results"
-            batch = self._take(0.2)
-            if batch:
-                self._write(log, batch)
+            groups = self._take(0.2)
+            if groups:
+                self._current = groups
+                self._write(log, groups)
+                self._current = []
             if not self._stop.is_set() and self._clock() - last_compact >= self._interval:
                 self._compact(log)
                 last_compact = self._clock()
         while self._clock() < self._deadline:          # stop(): flush the queue, no more compaction
-            batch = self._take(0.0)
-            if not batch:
+            groups = self._take(0.0)
+            if not groups:
                 break
-            self._write(log, batch)
+            self._current = groups
+            self._write(log, groups)
+            self._current = []
         self._refresh_sizes(log)
 
     def _run(self) -> None:
@@ -1378,7 +1488,7 @@ class MatchLogWriter:
         except Exception as e:  # noqa: BLE001 - reported; results are only counted from now on
             logger.error(f"Match log: the match-log writer thread died ({type(e).__name__}: {e}); match results "
                          f"are counted as dropped from now on, training goes on", exc_info=True)
-            self._die()
+            self._die(self._current)
         finally:
             self._activity = "closing the journal"
             log.close()

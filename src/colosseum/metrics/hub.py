@@ -15,6 +15,7 @@ from colosseum.arena.live import RatingsSnapshot, bt_section, bt_summary, consol
 from colosseum.league.pfsp import compact_ratings
 from colosseum.metrics.aggregator import EpisodeAggregator, SystemStats
 from colosseum.metrics.console import ConsoleReporter
+from colosseum.metrics.counters import CounterBook
 from colosseum.metrics.jsonl import MetricsWriter, write_json_atomic
 
 logger = logging.getLogger(__name__)
@@ -103,6 +104,9 @@ class MetricsHub:
     ``initial_env_steps`` / ``initial_train_steps`` are the counters a resumed run continues from (rate baselines,
     see ``SystemStats``). ``agent_ids`` are the trainable agents: one console line each, and the only opponents of
     the console's arena win rate (ruling P11).
+    SP5 (amendment A2): ``on_intake_stats`` takes the learners' intake reports: the last queue depth per agent
+    (``intake_queue_depths``) and the cumulative chunk drops of each learner incarnation in ``intake_book`` (source
+    ``learner/<agent>/<generation>``, names ``dropped_chunks.<reason>``).
     """
 
     def __init__(self, *, writer: MetricsWriter, ratings_path: str | Path, agent_ids: list[str],
@@ -128,6 +132,8 @@ class MetricsHub:
         self._last_returns: dict[str, float] = {}
         self._bt_failed_versions: set[int] = set()     # live snapshots whose formatting failed (logged once each)
         self._system_values: dict[str, Any] = {}       # merged into every system record (SP4 T6.1)
+        self.intake_book = CounterBook()                # learner-side chunk drops per incarnation (SP5, A2)
+        self._intake_depths: dict[str, int] = {}        # the last reported intake depth per agent (SP5)
 
     def on_train_metrics(self, metrics: dict) -> None:
         agent_id = str(metrics.get("agent_id", "agent_0"))
@@ -143,7 +149,19 @@ class MetricsHub:
             self._last_logged_step[agent_id] = step
 
     def on_worker_stats(self, stats: dict) -> None:
+        """A worker's stats dict: ``worker_id``, SP5 also ``node`` and ``incarnation`` (``SystemStats`` keys)."""
         self._system.on_worker_stats(stats)
+
+    def on_intake_stats(self, agent_id: str, generation: int, depth: int, dropped: Mapping[str, int]) -> None:
+        """A learner's intake report (SP5 ``IntakeStats``, A2): ``depth`` is its queue depth now; ``dropped`` its
+        cumulative chunk drops by reason since that learner incarnation (``generation``) started."""
+        self._intake_depths[str(agent_id)] = int(depth)
+        self.intake_book.report(f"learner/{agent_id}/{int(generation)}",
+                                {f"dropped_chunks.{reason}": int(n) for reason, n in dropped.items()})
+
+    def intake_queue_depths(self) -> dict[str, int]:
+        """The last intake depth each learner reported (``on_intake_stats``), by agent."""
+        return dict(self._intake_depths)
 
     def set_system_value(self, key: str, value: Any) -> None:
         """A value merged at the top level of every later ``system`` record (SP4 T6.1: the pulse counters)."""

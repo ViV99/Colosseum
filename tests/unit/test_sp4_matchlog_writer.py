@@ -182,7 +182,7 @@ def test_a_batch_still_in_flight_at_the_stop_deadline_is_counted_as_dropped(capl
     results = synthetic_journal_results(3 * WRITE_BATCH)
     writer.submit(results)
     writer.start()
-    assert _wait(lambda: writer.stats.pending == len(results) and writer._queue.qsize() == 2 * WRITE_BATCH)
+    assert _wait(lambda: writer.stats.pending == len(results) and writer._queued == 2 * WRITE_BATCH)
     with caplog.at_level(logging.WARNING, logger="colosseum.arena.matchlog"):
         stats = writer.stop(timeout=1.0)
     assert (stats.written, stats.dropped, stats.pending) == (0, len(results), 0)

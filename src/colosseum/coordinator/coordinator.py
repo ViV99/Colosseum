@@ -211,13 +211,15 @@ class Coordinator:
         agents = self._context.trainable
         if not agents:
             raise ValueError("Coordinator has no trainable agents")
-        who = type(self._matchmaker).__name__
-        lineups = []
-        for e in range(num_envs):
-            lineup = self._matchmaker.lineup_for(agents[(env_offset + e + self._refresh_round) % len(agents)])
-            check_lineup(self._context, lineup, who)
-            lineups.append(lineup)
-        return lineups
+        return [self.lineup_for(agents[(env_offset + e + self._refresh_round) % len(agents)])
+                for e in range(num_envs)]
+
+    def lineup_for(self, owner: str) -> Lineup:
+        """The matchmaker's lineup for ``owner`` (SP5: the hub asks per cell, its rotation picks the owner); it
+        passes ``check_lineup`` (ValueError naming the matchmaker class)."""
+        lineup = self._matchmaker.lineup_for(owner)
+        check_lineup(self._context, lineup, type(self._matchmaker).__name__)
+        return lineup
 
     def report_match_result(self, result: MatchResult) -> None:
         """Keep the result; update the ratings and the PFSP statistics of its layout, then
@@ -240,13 +242,16 @@ class Coordinator:
             table["pfsp"] = pfsp.get(layout, {})
         return compact_ratings(snap) if compact else snap
 
-    def save_league_state(self, path: str | Path, *, env_steps: int) -> None:
+    def save_league_state(self, path: str | Path, *, env_steps: int, journal_row: int | None = None) -> None:
         """Write the ratings (``RatingBook``) and the PFSP statistics (with the forgotten snapshots) atomically to
-        ``path`` (spec block 7.4). A custom matchmaker's own state (``on_result``) is not saved."""
+        ``path`` (spec block 7.4). A custom matchmaker's own state (``on_result``) is not saved. ``journal_row``
+        (SP5, R8): the highest journal row id whose result is accounted in this state (every row up to it is; None:
+        no journal, or nothing journaled yet); ``load_league_state`` ignores it, a resume replays the rows after it."""
         from colosseum.metrics.jsonl import write_json_atomic
 
         write_json_atomic(path, {"version": LEAGUE_STATE_VERSION, "env_steps": int(env_steps),
-                                 "ratings": self._ratings.state_dict(), "pfsp": self._pfsp.state_dict()})
+                                 "ratings": self._ratings.state_dict(), "pfsp": self._pfsp.state_dict(),
+                                 "journal_row": None if journal_row is None else int(journal_row)})
 
     def load_league_state(self, path: str | Path) -> bool:
         """Restore a saved league state; False when ``path`` does not exist (an SP3 run dir, or a run that never saved

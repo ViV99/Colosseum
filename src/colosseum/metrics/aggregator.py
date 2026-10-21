@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -204,6 +204,16 @@ class EpisodeAggregator:
 # largest value it reported, so it never decreases (SP4 spec block 7.2).
 CUMULATIVE_WORKER_KEYS = ("dropped_results", "dropped_reward_episodes")
 
+# A worker's key: (node number or None, worker id, incarnation).
+WorkerKey = tuple[int | None, int, int]
+
+
+def worker_key(stats: Mapping[str, Any]) -> WorkerKey:
+    """The key of a worker stats dict: ``(node, worker_id, incarnation)``; SP4's dicts (no ``node``, no
+    ``incarnation``) key ``(None, worker_id, 0)``."""
+    node = stats.get("node")
+    return (None if node is None else int(node), int(stats["worker_id"]), int(stats.get("incarnation", 0)))
+
 
 class SystemStats:
     """Throughput and queue health between two snapshots (SP1 behavior, unchanged).
@@ -214,6 +224,9 @@ class SystemStats:
     Per-worker stats older than ``worker_timeout_sec`` (a dead or stuck worker) are forgotten, except the
     ``CUMULATIVE_WORKER_KEYS`` counters, which are kept for the whole run. ``dropped_match_results`` = the workers'
     dropped results + the journal writer's (``match_log["dropped"]``).
+    Worker stats are keyed by (node, worker, incarnation) (``worker_key``): counters of every incarnation of every
+    worker of every node add up, so the run-level counters stay monotonic across joins, restarts and resumes (SP5
+    spec 8). The SP4 path (no ``node``, no ``incarnation``) keys ``(None, worker, 0)`` and behaves as before.
     """
 
     def __init__(self, clock: Callable[[], float] = time.monotonic, *, initial_env_steps: int = 0,
@@ -225,14 +238,14 @@ class SystemStats:
         self._last_train_steps: dict[str, int] = {a: int(s) for a, s in (initial_train_steps or {}).items()}
         self._train_steps: dict[str, int] = dict(self._last_train_steps)
         self._worker_timeout = float(worker_timeout_sec)
-        self._workers: dict[int, tuple[float, dict]] = {}
-        self._cumulative: dict[str, dict[int, int]] = {key: {} for key in CUMULATIVE_WORKER_KEYS}
+        self._workers: dict[WorkerKey, tuple[float, dict]] = {}
+        self._cumulative: dict[str, dict[WorkerKey, int]] = {key: {} for key in CUMULATIVE_WORKER_KEYS}
 
     def on_train_step(self, agent_id: str, train_step: int) -> None:
         self._train_steps[agent_id] = max(int(train_step), self._train_steps.get(agent_id, 0))
 
     def on_worker_stats(self, stats: dict) -> None:
-        worker = int(stats["worker_id"])
+        worker = worker_key(stats)
         self._workers[worker] = (self._clock(), dict(stats))
         for key, per_worker in self._cumulative.items():
             if key in stats:

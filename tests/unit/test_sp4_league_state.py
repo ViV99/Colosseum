@@ -129,7 +129,7 @@ def test_the_coordinator_saves_and_loads_league_state(tmp_path):
     coordinator.save_league_state(path, env_steps=1234)
     saved = json.loads(path.read_text())
     assert (saved["version"], saved["env_steps"]) == (1, 1234) and set(saved) == {"version", "env_steps", "ratings",
-                                                                                   "pfsp"}
+                                                                                   "pfsp", "journal_row"}
     fresh = make_coordinator(config, tmp_path / "ckpt2")
     assert fresh.load_league_state(tmp_path / "missing.json") is False
     assert fresh.load_league_state(path) is True
