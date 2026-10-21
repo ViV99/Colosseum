@@ -13,6 +13,7 @@ import re
 import signal
 import time
 
+import numpy as np
 import pytest
 
 from colosseum.core.types import Lineup, SeatAssignment
@@ -590,3 +591,135 @@ def test_stop_learner_uploads_its_final_and_release_keeps_the_session(hub_factor
         wait_for(lambda: len(hub.heartbeats()) > beats + 1)          # the session stays, with heartbeats
         assert len(hub.events(SessionOpened)) == sessions
         assert node.stop() == 0
+    hub.sync()
+    assert not hub.node_events("learner_failed")                  # also after the node handled every exit
+
+
+
+def test_an_oversized_checkpoint_fails_the_learner_with_its_size_and_the_setting(hub_factory, node_factory,
+                                                                                 monkeypatch):
+    monkeypatch.setattr(agent_mod.NodeAgent, "_frame_cap", lambda self: 2048)   # the node's cap only (b)
+    hub = _learner_hub(hub_factory)
+    node_factory(hub)
+    failed = wait_for(lambda: hub.node_events("learner_failed"), timeout=60)[0]
+    assert "max_message_mb" in failed.message and "checkpoint v" in failed.message and failed.proc == "learner-a"
+    (warning,) = [e for e in hub.node_events("warning") if e.proc == "learner-a"]
+    assert warning.message == failed.message
+
+
+def test_a_learner_that_fails_to_start_reports_why_and_is_never_routed_to(hub_factory, node_factory):
+    from colosseum.net.chunks import WeightsMeta, encode_weights
+
+    hub = _learner_hub(hub_factory)
+    frame = encode_weights({"bogus": np.zeros(3, np.float32)}, WeightsMeta(agent_id="a", kind="init", generation=0,
+                                                                          policy_version=0))
+    hub.serve_blob("init", "a", "bad-init", frame)
+    hub.welcome(fixed=[pb.FixedBlob(agent_id="a", blob_id="bad-init", kind="init")])
+    node = node_factory(hub)
+    error = wait_for(lambda: hub.node_events("child_error"), timeout=60)[0]
+    assert error.proc == "learner-a" and error.error_kind == "crash" and "learner a (generation 1)" in error.context
+    wait_for(lambda: hub.node_events("learner_failed"))
+    assert node.agent._learner_routes.get("a") is None                # no worker was sent to its listener
+    assert node.stop() == 0
+
+
+def _recovery_blobs(hub, config, version):
+    """A ``recovery`` weights frame and ``trainer_state`` bytes of ``a`` at policy version ``version`` (A28)."""
+    from colosseum.core.registry import env_spec
+    from colosseum.core.roles import agent_role_spec, resolve_agent_roles
+    from colosseum.learner.factory import build_algorithm
+    from colosseum.learner.learner import make_checkpoint_payload, set_policy_version
+    from colosseum.net.chunks import WeightsMeta, encode_weights
+
+    spec = env_spec(config)
+    role = agent_role_spec(spec, resolve_agent_roles(config, spec)["a"])
+    algo = build_algorithm(config.get_agent_config("a"), role, spec, device="cpu", teacher=None)
+    set_policy_version(algo, version)
+    payload = make_checkpoint_payload("a", algo)
+    hub.serve_blob("recovery", "a", "rec7", encode_weights(payload["model_state"], WeightsMeta(
+        agent_id="a", kind="recovery", generation=1, policy_version=version)))
+    hub.serve_blob("trainer_state", "a", "ts7", payload["trainer_state_bytes"])
+
+
+def test_a_learner_resumes_from_its_start_blobs_and_takes_its_version_floor(hub_factory, node_factory):
+    hub = hub_factory(_learner_config())
+    _recovery_blobs(hub, hub.config, 7)
+    hub.welcome(learners=[pb.LearnerAssignment(agent_id="a", generation=1, version_floor=0, device="cpu",
+                                               weights_blob="rec7", trainer_state_blob="ts7")])
+    hub.grant(lambda worker, env: SELF_PLAY if hub.versions("a") else None)
+    node = node_factory(hub)
+    assert wait_for(lambda: hub.versions("a"), timeout=60)[0].version == 7      # the resumed version
+    assert {("recovery", "a", "rec7"), ("trainer_state", "a", "ts7")} <= set(hub.blobs.requests())
+    hub.send_command("stop_learner", learner=pb.LearnerAssignment(agent_id="a", generation=1), reason="test")
+    wait_for(lambda: node.agent.supervisor.get("learner-a").exitcode is not None and not node.agent.learners.agents())
+    announced = len(hub.versions("a"))
+    hub.send_command("start_learner", learner=pb.LearnerAssignment(
+        agent_id="a", generation=1, version_floor=12, device="cpu", weights_blob="rec7", trainer_state_blob="ts7"))
+    wait_for(lambda: len(hub.versions("a")) > announced, timeout=60)
+    assert hub.versions("a")[announced].version == 12                         # the floor lifts the resumed 7
+    assert node.stop() == 0
+
+
+def test_a_start_state_that_cannot_be_fetched_fails_the_learner(hub_factory, node_factory):
+    hub = hub_factory(_learner_config())
+    hub.welcome(learners=[pb.LearnerAssignment(agent_id="a", generation=1, device="cpu", weights_blob="missing")])
+    node = node_factory(hub)
+    failed = wait_for(lambda: hub.node_events("learner_failed"))[0]
+    assert failed.proc == "learner-a" and "start state not fetched" in failed.message and "NOT_FOUND" in failed.message
+    assert node.agent.supervisor.get("learner-a") is None                     # never spawned
+    assert node.stop() == 0
+
+
+def test_a_final_not_uploaded_before_the_deadline_is_a_warning_event(hub_factory, node_factory):
+    hub = _learner_hub(hub_factory)
+
+    def slow_final(header, data):
+        if header.kind == "final":
+            time.sleep(4.0)                                         # the hub answers after the node's deadline
+        return pb.UploadReply(accepted=True, checkpoint_id=f"ckpt_v{header.version}")
+
+    hub.upload_reply = slow_final
+    node = node_factory(hub, shutdown_grace_sec=1.0)
+    wait_for(lambda: max(_train_steps(hub), default=0) >= 2, timeout=60)
+    assert node.stop() == 0
+    hub.sync()
+    warnings = [e for e in hub.node_events("warning") if e.proc == "learner-a"]
+    assert len(warnings) == 1 and "not uploaded before the stop deadline" in warnings[0].message
+    kinds = [e.kind for e in hub.messages("event")]
+    assert kinds.index("warning") < kinds.index("run_stopped")
+
+
+def test_a_release_counts_given_up_results_once(hub_factory, node_factory):
+    hub = hub_factory(_config(distributed={"heartbeat_sec": 0.02}))       # a heartbeat due in every pass
+    hub.grant(lambda worker, env: FIXED)
+    node = node_factory(hub, shutdown_grace_sec=1.0)
+    wait_for(lambda: len(hub.results()) >= 20)
+    hub.hold_acks = True                                            # what is unacked at the release is given up
+    wait_for(lambda: len(hub.messages("results")) >= 3 + len(hub.acked))
+    hub.send_command("release", reason="test")
+    wait_for(lambda: hub.node_events("run_stopped"))
+    beats = len(hub.heartbeats())
+    wait_for(lambda: len(hub.heartbeats()) > beats + 5)
+    assert node.stop() == 0
+    hub.sync()
+    counts = [h.counters["dropped_results_node_buffer"] for h in hub.heartbeats()]
+    assert counts == sorted(counts) and counts[-1] > 0                # cumulative: never down, never twice
+
+
+def test_a_download_in_flight_at_a_release_leaves_no_segment_behind(hub_factory, node_factory):
+    import threading
+
+    config = _config()
+    hub = hub_factory(config)
+    gate = threading.Event()
+    _serve_snapshot(hub, config, 5, gate)
+    hub.grant(lambda worker, env: SNAP5 if env == 0 else FIXED)
+    node = node_factory(hub, shutdown_grace_sec=1.0)
+    wait_for(lambda: ("snapshot", "a", "ckpt_v5") in hub.blobs.requests())
+    prefix = node.agent.cache_prefix
+    hub.send_command("release", reason="test")
+    wait_for(lambda: node.agent.run_id is None)
+    gate.set()                                                      # the download completes after the release
+    time.sleep(1.0)
+    assert not list(shm_dir().glob(f"{prefix}*")) and not list(shm_dir().glob(f".{prefix}*"))
+    assert node.stop() == 0

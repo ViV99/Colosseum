@@ -3,11 +3,12 @@ messages, owned by the node agent's main loop (``colosseum.node.agent``).
 
 A learner assignment (``Welcome.learners`` or ``Command(start_learner)``) downloads its start blobs first (A28: a
 ``recovery`` weights frame and ``trainer_state`` bytes), then waits until every ``Welcome.fixed`` blob is cached
-(teacher and ``init`` weights come from there) and is spawned from the main-loop thread (PDEATHSIG). After its
-control hello the workers are routed to its listener; ``VersionPublished`` becomes a ``VersionAnnounce`` (the latest
-one kept while the hub is away), ``LearnerMetrics`` / ``IntakeReport`` feed ``MetricsBatch``, the hub's env steps
-are forwarded (``LearnerEnvSteps``). ``stop_learner`` sends ``Stop`` (the final snapshot is uploaded by the agent);
-a learner that ends without being stopped is ``learner_failed`` (until T4.2: the hub stops the run).
+(teacher and ``init`` weights come from there) and is spawned from the main-loop thread (PDEATHSIG). At its first
+``VersionPublished`` (after its intake runs) the workers are routed to its listener; every ``VersionPublished``
+becomes a ``VersionAnnounce`` (the latest one kept while the hub is away), ``LearnerMetrics`` / ``IntakeReport``
+feed ``MetricsBatch``, the hub's env steps are forwarded (``LearnerEnvSteps``). ``stop_learner`` sends ``Stop`` (the
+final snapshot is uploaded by the agent); a learner that ends without being stopped is ``learner_failed`` (until
+T4.2: the hub stops the run).
 
 ``NodeLearners`` talks to the agent only through ``LearnerHost`` (the agent's ``_LearnerHost`` adapter): the
 supervisor, posting into the inbox, sending to a child, setting a worker route, events, a connected-only send, the
@@ -57,6 +58,8 @@ class LearnerEntry:
     listener_name: str = ""
     version: int = -1
     stop_reason: str = ""
+    failure: str = ""                  # why the node gave up on it (its learner_failed message)
+    routed: bool = False               # the workers were routed to its listener
 
 
 class LearnerHost(Protocol):
@@ -97,6 +100,12 @@ class NodeLearners:
 
     def of(self, name: str) -> LearnerEntry | None:
         return next((e for e in self._entries.values() if e.name == name), None)
+
+    def note_failure(self, name: str, text: str) -> None:
+        """The node closed ``name``'s connection for ``text``: its ``learner_failed`` says so."""
+        entry = self.of(name)
+        if entry is not None and not entry.failure:
+            entry.failure = text
 
     def agents(self) -> list[str]:
         return list(self._entries)
@@ -241,8 +250,10 @@ class NodeLearners:
                     f"{la.version_floor})")
 
     def on_connected(self, name: str) -> None:
-        """The learner's control hello: route the workers to it (its listener exists by now)."""
-        from colosseum.net.local import LearnerEnvSteps, LearnerRoute, Stop
+        """The learner's control hello. Workers are routed to its listener only at its first ``VersionPublished``
+        (``learner_process`` publishes before it trains, after its intake runs): a learner whose start failed opens
+        the control connection only to report the error, and its listener never existed."""
+        from colosseum.net.local import LearnerEnvSteps, Stop
 
         entry = self.of(name)
         if entry is None:
@@ -253,7 +264,6 @@ class NodeLearners:
         entry.state = "running"
         if self.hub_env_steps:
             self._host.send_child(name, LearnerEnvSteps(self.hub_env_steps))
-        self._host.set_route(LearnerRoute(entry.agent_id, entry.listener_name, False, entry.generation))
 
     def stop(self, agent: str, reason: str) -> None:
         """``stop_learner``: ``Stop`` to the learner (it sends its final snapshot, which is uploaded); workers no
@@ -282,12 +292,13 @@ class NodeLearners:
         route = routes.get(entry.agent_id)
         if route is not None and route.address is not None:
             self._host.set_route(LearnerRoute(entry.agent_id, None, False, 0))
-        if entry.state == "stopping" and code == 0:
+        if entry.state == "stopping" and code == 0 and not entry.failure:
             logger.info(f"node: learner {entry.agent_id} stopped")
             return
-        logger.error(f"node: learner {entry.agent_id} ended (exit {code}) without being stopped; see {log_path}")
+        why = entry.failure or "without being stopped"
+        logger.error(f"node: learner {entry.agent_id} ended (exit {code}): {why}; see {log_path}")
         self._host.event("learner_failed", proc=name, exit_code=int(code or 0), log_path=log_path,
-                         generation=entry.generation)
+                         generation=entry.generation, message=entry.failure)
 
     # ---- messages -----------------------------------------------------------------------------------------------
 
@@ -300,7 +311,12 @@ class NodeLearners:
         if entry is None:
             logger.warning(f"node: unexpected {type(message).__name__} from {name}")
         elif isinstance(message, VersionPublished):
+            from colosseum.net.local import LearnerRoute
+
             entry.version = max(entry.version, int(message.version))
+            if not entry.routed and entry.state == "running":
+                entry.routed = True
+                self._host.set_route(LearnerRoute(entry.agent_id, entry.listener_name, False, entry.generation))
             info = VersionInfo(agent_id=entry.agent_id, generation=int(message.generation),
                                version=int(message.version), size=int(message.size), digest=message.digest,
                                node=self._host.number, teacher_active=bool(message.teacher_active))

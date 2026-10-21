@@ -143,3 +143,21 @@ def test_set_policy_version_keeps_the_rest_of_the_state():
     set_policy_version(algo, 12)
     after = algo.state_dict()
     assert algo.policy_version == 12 and after["consumed_samples"] == before["consumed_samples"]
+
+
+def test_a_checkpoint_above_the_cap_is_refused_by_the_learner_with_its_facts(tmp_path):
+    import numpy as np
+    import pytest
+
+    from colosseum.net.local import CheckpointTooLargeError
+
+    node_conn, learner_conn = mp.Pipe()
+    cache = WeightCacheWriter(shm_dir(), cache_prefix("ab" * 32, secrets.token_hex(4) * 4, 1))
+    outputs = NodeOutputs(ControlChannel(learner_conn), cache, agent_id="a", generation=1, cap_bytes=4096)
+    payload = {"agent_id": "a", "policy_version": 3, "model_state": {"w": np.zeros(4096, np.float32)},
+               "trainer_state_bytes": b"t", "final": False}
+    with pytest.raises(CheckpointTooLargeError) as info:
+        outputs.send_checkpoint(payload, kind="periodic", block=True)
+    text = str(info.value)
+    assert "learner 'a'" in text and "periodic checkpoint v3" in text and "distributed.max_message_mb" in text
+    assert not node_conn.poll(0.2)                                    # nothing reached the node

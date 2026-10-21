@@ -27,8 +27,9 @@
 5. **Messages from children.** ``WorkerResults`` -> ``ResultBuffer``; ``WorkerProgress`` -> per (worker,
    incarnation) cumulative env steps (their sum is the session's counter: it never decreases) and counters
    (``MetricsBatch.workers``); ``ChildError`` -> ``Event(child_error)`` with ``node <n> (<name>), `` prepended to the
-   child's context. Learners: their control hello -> ``LearnerRoute`` to every worker (and to every worker that
-   connects later); ``VersionPublished`` -> ``VersionAnnounce`` (the latest one kept while the hub is away);
+   child's context. Learners (``node.learners``): their first ``VersionPublished`` -> ``LearnerRoute`` to every
+   worker (and to every worker that connects later); ``VersionPublished`` -> ``VersionAnnounce`` (the latest one
+   kept while the hub is away);
    ``CheckpointHeader`` + frame -> an ``Upload`` in the transfer pool (``checkpoint`` / ``final``), its reply logged (a
    refused periodic one is a WARNING, a refused final an ERROR); ``LearnerMetrics`` -> ``MetricsBatch.train``;
    ``IntakeReport`` -> ``MetricsBatch.intake``.
@@ -230,6 +231,7 @@ class _Run:
     grace: float
     started: bool = False
     fixed_retry_at: dict = field(default_factory=dict)
+    closed: bool = False                # torn down: transfers of this run put nothing into the cache
 
 
 def _hostname_name() -> str:
@@ -296,7 +298,7 @@ class NodeAgent:
         self._stats_changed: set[tuple[int, int]] = set()
         self._learner_routes: dict[str, Any] = {}   # agent -> LearnerRoute sent to every worker
         self.learners = NodeLearners(_LearnerHost(self))   # the learners this node runs (node.learners)
-        self._uploads: dict[Future, tuple[str, str, int]] = {}  # in flight: (kind, agent, version)
+        self._uploads: dict[str, tuple[Future, str, str, int]] = {}   # token -> (future, kind, agent, version)
         self._released: set[str] = set()            # run ids this node released (never served again)
         self._releasing = False
         self._dropped_carry = 0                     # dropped_results_node_buffer of released runs (per session)
@@ -639,6 +641,8 @@ class NodeAgent:
         run = self._run
         if self._stopping:
             self._stop_step(now)
+            if self._run is not run:                 # released in this pass: nothing of the old run is sent
+                return
         elif run is not None:
             if not run.started:
                 self._maybe_start_workers(run, now)
@@ -997,6 +1001,8 @@ class NodeAgent:
         _state, meta = decode_weights(data, cap=len(data))
         if meta.agent_id != key.agent_id:
             raise ValueError(f"the frame holds weights of {meta.agent_id!r}")
+        if run.closed:
+            raise RuntimeError("the run was torn down (stopped or released) meanwhile")
         run.writer.put(key, data)
 
     def _on_fetch_done(self, done: _FetchDone) -> None:
@@ -1119,8 +1125,20 @@ class NodeAgent:
                 message = conn.recv()
                 frame = None
                 if isinstance(message, CheckpointHeader):     # its frame follows at once (one send under a lock)
-                    frame = conn.recv_bytes(self._frame_cap())
-            except (EOFError, OSError):
+                    cap = self._frame_cap()
+                    if int(message.size) > cap:
+                        self._oversized_checkpoint(name, message, cap)
+                        self._close_conn(conn)     # the frame stays unread: the learner's connection ends
+                        return
+                    # A blocking read of one whole frame: a learner SIGSTOPped in the middle of it stalls the loop
+                    # (SIGKILL gives EOF at once); bounding it is T4.4's.
+                    frame = conn.recv_bytes(cap)
+            except EOFError:
+                self._close_conn(conn)
+                return
+            except OSError as e:                         # not an end between messages: say what happened
+                logger.error(f"node: reading from {name} failed ({type(e).__name__}: {e}); its connection is closed")
+                self.learners.note_failure(name, f"the node could not read its message ({e})")
                 self._close_conn(conn)
                 return
             except Exception:  # noqa: BLE001 - an unreadable message: only this connection closes
@@ -1131,6 +1149,16 @@ class NodeAgent:
                 self._on_checkpoint(name, message, frame)
             else:
                 self._on_child_message(name, message)
+
+    def _oversized_checkpoint(self, name: str, header: Any, cap: int) -> None:
+        """A checkpoint header announcing a frame above the cap (the learner checks first, so this is a learner of
+        another cap or a broken one): ERROR, a ``warning`` event, and the text for its ``learner_failed``."""
+        from colosseum.net.local import checkpoint_too_large
+
+        text = checkpoint_too_large(header.agent_id, header.kind, int(header.version), int(header.size), cap)
+        logger.error(f"node: {name}: {text}")
+        self._event("warning", proc=name, message=text)
+        self.learners.note_failure(name, text)
 
     def _on_child_message(self, name: str, message: Any) -> None:
         from colosseum.net.local import ChildError, WorkerProgress, WorkerResults
@@ -1226,7 +1254,7 @@ class NodeAgent:
             return
         token = uuid.uuid4().hex
         future = self._pool.submit(self._upload, kind, header, frame, token)
-        self._uploads[token] = future
+        self._uploads[token] = (future, header.kind, header.agent_id, int(header.version))
 
         def done(f: Future) -> None:
             error = "cancelled" if f.cancelled() else (None if f.exception() is None else _rpc_text(f.exception()))
@@ -1236,6 +1264,7 @@ class NodeAgent:
         future.add_done_callback(done)
 
     def _upload(self, kind: str, header: Any, frame: bytes, token: str) -> pb.UploadReply:
+        # The transfer pool runs uploads until T4.2's node.uploads.UploadQueue (A29) replaces this path.
         """A transfer-pool thread: one ``Upload`` (header, then the frame in parts)."""
         from colosseum.net.grpc_util import blob_digest, node_metadata, send_parts
         from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
@@ -1349,7 +1378,11 @@ class NodeAgent:
                 return
             if self._uploads:
                 logger.error(f"node: {len(self._uploads)} snapshot uploads did not finish before the stop's deadline; "
-                             f"they are cancelled")
+                             f"they are not waited for any longer")
+                for _future, kind, agent, version in self._uploads.values():
+                    if kind == "final":                  # the hub's log says so too (A1 "warning")
+                        self._event("warning", proc=f"learner-{agent}",
+                                    message=f"final v{version} not uploaded before the stop deadline")
             if run is not None:
                 run.results.give_up()
                 if self._connected:
@@ -1418,7 +1451,10 @@ class NodeAgent:
             pass
         for conn in list(self._child_conns):
             self._close_conn(conn)
-        in_flight = [*self._fetching.values(), *self._uploads.values()]
+        run.closed = True                            # a download still running puts nothing any more
+        in_flight = [*self._fetching.values(), *(u[0] for u in self._uploads.values())]
+        for future in in_flight:
+            future.cancel()                          # not started yet: never runs
         if in_flight:
             _, stuck = wait_futures(in_flight, timeout=TRANSFER_JOIN_SEC)
             if stuck:

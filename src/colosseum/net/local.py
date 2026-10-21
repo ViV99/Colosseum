@@ -1049,17 +1049,36 @@ class ConnectionIntake:
             pass
 
 
+class CheckpointTooLargeError(ValueError):
+    """A checkpoint frame above the message cap: neither the node nor the hub would take it."""
+
+
+def checkpoint_too_large(agent_id: str, kind: str, version: int, size: int, cap: int) -> str:
+    """The one text for a checkpoint above the cap (learner and node): agent, kind, version, size, cap and the
+    setting to raise."""
+    from colosseum.net.frame import DECOMPRESSED_SIZE_FACTOR
+
+    mb = cap // (DECOMPRESSED_SIZE_FACTOR * 2**20)
+    return (f"the {kind} checkpoint v{version} of learner {agent_id!r} is {size / 2**20:.1f} MiB, above the cap of "
+            f"{cap / 2**20:.0f} MiB ({DECOMPRESSED_SIZE_FACTOR} x distributed.max_message_mb = {mb}); raise "
+            f"distributed.max_message_mb")
+
+
 class NodeOutputs:
     """``LearnerOutputs`` of a node's learner (module docstring): weights into the cache + ``VersionPublished``,
-    checkpoints as ``CheckpointHeader`` + frame, metrics as ``LearnerMetrics``; all on ``control``."""
+    checkpoints as ``CheckpointHeader`` + frame, metrics as ``LearnerMetrics``; all on ``control``. ``cap_bytes``:
+    a checkpoint frame above it raises ``CheckpointTooLargeError`` (the learner then fails with that reason instead of
+    a frame the node cannot read)."""
 
     checkpoints = True
 
-    def __init__(self, control: ControlChannel, cache: WeightCacheWriter, *, agent_id: str, generation: int) -> None:
+    def __init__(self, control: ControlChannel, cache: WeightCacheWriter, *, agent_id: str, generation: int,
+                 cap_bytes: int | None = None) -> None:
         self._control = control
         self._cache = cache
         self.agent_id = agent_id
         self.generation = int(generation)
+        self._cap = cap_bytes
         self._cache_error_logged = False
 
     def publish_weights(self, payload: WeightPayload) -> None:
@@ -1087,6 +1106,9 @@ class NodeOutputs:
         from colosseum.net.chunks import encode_checkpoint
 
         frame = encode_checkpoint(payload, kind=kind, generation=self.generation)
+        if self._cap is not None and len(frame) > self._cap:
+            raise CheckpointTooLargeError(checkpoint_too_large(self.agent_id, kind, int(payload["policy_version"]),
+                                                               len(frame), self._cap))
         header = CheckpointHeader(kind, self.agent_id, self.generation, int(payload["policy_version"]), len(frame))
         return self._control.send_with_frame(header, frame)
 

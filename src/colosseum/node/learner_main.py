@@ -85,7 +85,7 @@ def _learner_main(*, name: str, incarnation: int, node: int, agent_id: str, gene
                                   cap_bytes=cap_bytes)
         intake.env_steps = int(env_steps)
         outputs = NodeOutputs(channel, WeightCacheWriter(Path(cache_root), cache_prefix), agent_id=agent_id,
-                              generation=generation)
+                              generation=generation, cap_bytes=cap_bytes)
         learner_process(agent_id=agent_id, algorithm_factory=lambda: algorithm, intake=intake, outputs=outputs,
                         config=config.learner, stop_event=intake.stop_flag, checkpoint_interval=checkpoint_interval,
                         resume_state=resume_state, progress_counter=intake, total_timesteps=total_timesteps,
