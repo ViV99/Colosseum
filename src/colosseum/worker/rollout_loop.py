@@ -36,11 +36,19 @@ slots of every collecting seat (slot rules of spec block 4):
 - **Match results** (SP4 spec block 1) carry each latest seat's policy version at the episode's start (at the env's
   reset, which ``step`` does before its weight sync, so the first decision may use one sync newer weights) and end
   (``MatchRunner(version_fn=...)`` reads ``policy_versions``, which change when weights are synced, also
-  mid-episode) and the uid ``<run_id>/train/w<W>_e<E>_ep<K>`` (``match_id`` without a run id). A result
+  mid-episode) and the uid ``<run_id>/train/w<W>_e<E>_ep<K>`` (SP4; ``match_id`` without a run id), or
+  ``<uid_prefix>w<W>_e<E>_g<epoch>_ep<K>`` for a node worker's epoch lineups (``uid_prefix = <run_id>/train/n<node>/``,
+  SP5 spec 4.3; the episode seeds then come from ``cell_seed_fn``, spec 7.6). A result
   ``LoopIO.report_result`` could not deliver (it returns False) is counted in ``stats["dropped_results"]``.
+- **Agents named by a new lineup** (SP5, P-PF2-5): a command whose lineups seat the latest weights of an agent whose
+  first payload has not been loaded yet polls that agent's weights at once (not only at the next periodic sync), so
+  the agent's first episode never plays its factory weights when weights exist.
 - Snapshot eviction (spec block 3): ids in ``WorkerCommand.evict`` are unloaded as soon as no env's
   current or staged lineup uses them; a later lineup naming one gets the agent's latest weights
-  (``MatchRunner``'s SP1 fallback).
+  (``MatchRunner``'s SP1 fallback). A command's evictions apply before its ``new_checkpoints``: a snapshot delivered
+  again (an evicted snapshot granted anew, SP5) cancels its pending eviction. A node worker passes
+  ``snapshot_fallback=False``: its lineups name only cached snapshots (R11), and a missing one is an error, never
+  latest + collect (spec 4.2).
 - **Scripted kickstart teachers (DAgger).** For an agent in ``teachers`` every decision of a seat that
   collects for it is also given to a teacher instance of that (agent, env, seat) with the same ``obs``,
   ``mask`` and ``info`` (copies); its checked action goes into the ACT slot (``teacher_action``,
@@ -155,6 +163,9 @@ class RolloutLoop:
         teachers: Mapping[str, BotSpec] | None = None,
         run_id: str | None = None,
         wait_for_first_weights: Callable[[], bool] | None = None,
+        cell_seed_fn: Callable[[int, int], int | None] | None = None,
+        uid_prefix: str | None = None,
+        snapshot_fallback: bool = True,
     ) -> None:
         if len(lineups) != num_envs:
             raise ValueError(f"worker {worker_id}: need one lineup per env: {len(lineups)} lineups for {num_envs} envs")
@@ -215,6 +226,7 @@ class RolloutLoop:
             # Model pool: agent -> network id -> model ("latest" + frozen checkpoints).
             self._models: dict[str, dict[str, PolicyModel]] = {}
             self._policy_versions: dict[str, int] = {aid: 0 for aid in self._agent_ids}
+            self._weights_loaded: set[str] = set()              # agents with at least one payload loaded
             self._pending_evict: set[tuple[str, str]] = set()   # (agent, snapshot id) to unload once unused
             for aid in self._agent_ids:
                 latest = self._model_factories[aid]()
@@ -240,7 +252,8 @@ class RolloutLoop:
                 vec_env=vec_env, lineups=lineups, models=self, observer=self, seed=seed,
                 max_idle_steps=max_idle_steps, context=f"worker {worker_id}, ", match_id_prefix=f"w{worker_id}_e",
                 version_fn=self._policy_versions.get, source="train",
-                uid_prefix=f"{run_id}/train/" if run_id else "",
+                uid_prefix=uid_prefix if uid_prefix is not None else (f"{run_id}/train/" if run_id else ""),
+                snapshot_fallback=snapshot_fallback, cell_seed_fn=cell_seed_fn,
             )
             for e in range(num_envs):
                 for seat, assignment in enumerate(self._runner.lineup(e).seats):
@@ -281,6 +294,7 @@ class RolloutLoop:
     def _load_weights(self, aid: str, payload: WeightPayload) -> None:
         self._models[aid][LATEST_NETWORK_ID].load_state_dict(payload.to_torch_state_dict())
         self._policy_versions[aid] = int(payload.policy_version)
+        self._weights_loaded.add(aid)
         if aid in self._teacher_active:
             self._teacher_active[aid] = bool(payload.teacher_active)
 
@@ -365,20 +379,28 @@ class RolloutLoop:
         cmd = self._io.poll_command()
         if cmd is None:
             return
+        for aid, ckpt_ids in cmd.evict.items():
+            loaded = self._models.get(aid, {})
+            self._pending_evict.update((aid, c) for c in ckpt_ids if c in loaded and c != LATEST_NETWORK_ID)
         for aid, ckpts in cmd.new_checkpoints.items():
             for ckpt_id, sd in ckpts.items():
+                self._pending_evict.discard((aid, ckpt_id))     # delivered again after its eviction: keep it
                 self._add_checkpoint(aid, ckpt_id, sd)
         if len(cmd.lineups) > self._runner.num_envs:
             raise ValueError(
                 f"worker {self.worker_id}: a command has {len(cmd.lineups)} lineups for "
                 f"{self._runner.num_envs} envs"
             )
+        named: set[str] = set()
         for e, lineup in enumerate(cmd.lineups):
             if lineup is not None:
                 self._runner.set_next_lineup(e, lineup)
-        for aid, ckpt_ids in cmd.evict.items():
-            loaded = self._models.get(aid, {})
-            self._pending_evict.update((aid, c) for c in ckpt_ids if c in loaded and c != LATEST_NETWORK_ID)
+                named.update(s.agent_id for s in lineup.seats if s.network_id == LATEST_NETWORK_ID)
+        for aid in sorted(named - self._weights_loaded):
+            if aid in self._models:                             # first weights of a newly seated agent (P-PF2-5)
+                payload = self._io.poll_weights(aid)
+                if payload is not None:
+                    self._load_weights(aid, payload)
         if self._pending_evict:
             self._unload_unused()
 

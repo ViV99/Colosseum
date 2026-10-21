@@ -1,44 +1,45 @@
-"""Learner process: receives trajectory chunks, trains the model, pushes weights.
+"""Learner process: receives trajectory chunks, trains the model, publishes weights.
 
 Each learner owns one trainable agent. It:
-1. collects exactly ``batch_chunks`` chunk payloads (numpy,
-   ``TrajectoryChunk.to_payload()``) from its queue and decodes them;
+1. collects exactly ``batch_chunks`` chunks from its intake (``ChunkIntake``: on a node the
+   ``net.local.ConnectionIntake``, which decodes and checks frames; SP4's queue path ``QueueIntake``, which
+   decodes ``TrajectoryChunk.to_payload()`` dicts);
 2. sets the algorithm's progress (share of the env-step budget) and trains;
 3. publishes new weights (numpy ``WeightPayload``, with the scripted teacher's
-   ``teacher_active`` flag) to every worker's size-1 mailbox (newest wins);
+   ``teacher_active`` flag) through its outputs (``LearnerOutputs``): the node's shared-memory
+   weight cache (``NodeOutputs``), or SP4's size-1 worker mailboxes, newest wins (``QueueOutputs``);
 4. sends checkpoint payloads (numpy weights + trainer-state bytes, see
-   ``make_checkpoint_payload``) and metrics to the main process, and a final
-   snapshot when it stops.
+   ``make_checkpoint_payload``) and metrics through the outputs, and the final
+   snapshot through the outputs when it stops.
 
-Nothing this process puts on a queue contains a torch tensor (R6-02).
+Nothing this process sends contains a torch tensor (R6-02).
 
-Progress and stopping: in local mode ``progress = min(1, env_step_counter /
-total_timesteps)`` from the shared counter that workers increment; the main
-process is the only budget authority and sets ``stop_event`` at the budget, so
-the learner runs until ``stop_event``. In distributed mode there is no shared
-counter: ``progress = consumed_samples / total_timesteps``, where
-``consumed_samples`` counts this learner's ACT slots (decisions, not env steps;
-one budget semantics for distributed mode is SP5), and the learner stops by
+Progress and stopping: ``progress = min(1, env_step_counter / total_timesteps)`` from the global env-step
+counter ``progress_counter.value`` (on a node: the hub's counter, through ``ConnectionIntake.value``; SP4's
+local mode: the shared counter that workers increment); the hub (SP4: the main process) is the only budget
+authority and sets ``stop_event`` at the budget, so the learner runs until ``stop_event``. Without a counter
+(``None``, SP2's distributed roles until T7.2): ``progress = consumed_samples / total_timesteps``, where
+``consumed_samples`` counts this learner's ACT slots (decisions, not env steps), and the learner stops by
 itself once ``consumed_samples >= total_timesteps``.
+
+``version_floor`` (SP5, R9): a learner generation starts at the hub's version floor, so versions never go back.
 """
 
 from __future__ import annotations
 
 import io
 import logging
-import multiprocessing as mp
 import threading
 import time
 from collections.abc import Callable
 from queue import Empty, Full
-from typing import Any
+from typing import TYPE_CHECKING, Any
 
 import numpy as np
 import torch
 
 from colosseum.algorithms.base import BaseAlgorithm
 from colosseum.core.config import LearnerConfig
-from colosseum.core.ipc import SharedCounter, put_latest
 from colosseum.core.types import (
     TrajectoryChunk,
     WeightPayload,
@@ -46,7 +47,10 @@ from colosseum.core.types import (
     state_dict_to_numpy,
     validate_slot_structure,
 )
-from colosseum.utils.process import SHUTDOWN_GRACE_SEC, flush_queue, parent_alive
+from colosseum.utils.process import SHUTDOWN_GRACE_SEC, parent_alive
+
+if TYPE_CHECKING:
+    from colosseum.net.local import ChunkIntake, LearnerOutputs
 
 logger = logging.getLogger(__name__)
 
@@ -109,42 +113,51 @@ def apply_resume_state(algorithm: BaseAlgorithm, resume_state: dict) -> None:
     logger.info(f"Resumed from {resume_state.get('source')} at policy_version {algorithm.policy_version}")
 
 
+def set_policy_version(algorithm: BaseAlgorithm, version: int) -> None:
+    """Set ``algorithm``'s policy version (R9: a new learner generation starts at the hub's version floor); the
+    rest of its state is unchanged (a ``state_dict`` round trip, as ``apply_resume_state`` does without a trainer
+    state)."""
+    state = algorithm.state_dict()
+    state["policy_version"] = int(version)
+    algorithm.load_state_dict(state)
+
+
 def learner_process(
     *,
     agent_id: str,
     algorithm_factory: Callable[[], BaseAlgorithm],
-    trajectory_queue: mp.Queue,
-    weight_queues: list[mp.Queue],
+    intake: ChunkIntake,
+    outputs: LearnerOutputs,
     config: LearnerConfig,
-    stop_event: mp.Event,
-    metrics_queue: mp.Queue | None = None,
-    checkpoint_queue: mp.Queue | None = None,
+    stop_event: Any,
     checkpoint_interval: int = 0,
     resume_state: dict | None = None,
-    progress_counter: SharedCounter | None = None,
+    progress_counter: Any | None = None,
     total_timesteps: int = 0,
     weight_sync_interval: float = 5.0,
+    version_floor: int = 0,
+    recovery_interval_sec: float | None = None,
 ) -> None:
     """Main learner process function (see module docstring).
 
     Args:
         agent_id: the trainable agent this learner owns
         algorithm_factory: factory to create the algorithm (includes network)
-        trajectory_queue: queue to receive chunk payloads (``TrajectoryChunk.to_payload()``)
-        weight_queues: list of queues to push weights to workers
+        intake: where decoded, checked chunks come from (``net.local.ConnectionIntake`` on a node,
+            ``QueueIntake`` on SP4's queue path); ``collect_batch`` takes exactly ``batch_chunks`` of them
+        outputs: where weights, checkpoints and metrics go (``NodeOutputs`` / ``QueueOutputs``)
         config: learner configuration
-        stop_event: set to signal the learner to stop
-        metrics_queue: optional queue to send metrics to the main process
-        checkpoint_queue: optional queue for checkpoint payloads (``make_checkpoint_payload``)
-            to the main process; a final snapshot is always sent when the loop ends
+        stop_event: ``.is_set()`` / ``.wait(t)``: the run stops (``ConnectionIntake.stop_flag`` on a node)
         checkpoint_interval: send a checkpoint every N policy versions (0 = only the final one)
         resume_state: optional ``checkpoint_manager.resolve_resume`` result (numpy
             weights, trainer-state bytes or None, policy_version) to resume from
-        progress_counter: the global env-step counter (local mode); None in
-            distributed mode, where progress is ``consumed_samples / total_timesteps``
+        progress_counter: ``.value`` = the global env-step counter (the hub's, through ``ConnectionIntake``;
+            SP4's ``SharedCounter``); None: progress is ``consumed_samples / total_timesteps`` (SP2 distributed)
         total_timesteps: ``training.total_timesteps`` (0 = no budget: progress stays 0)
-        weight_sync_interval: the workers' ``rollout.weight_sync_interval_sec``; sizes
-            the exit wait for pending weight payloads (see ``_weight_flush_timeout``)
+        weight_sync_interval: the workers' ``rollout.weight_sync_interval_sec`` (``QueueOutputs.finish``)
+        version_floor: the first version this learner may publish (R9: the hub's max announced + 1); the
+            policy version is raised to it before the first publish
+        recovery_interval_sec: recovery points (T4.2); None: none
     """
     logger.info(f"Learner [{agent_id}]: starting on device={resolve_device(config.device)}")
 
@@ -156,6 +169,10 @@ def learner_process(
     if resume_state is not None:
         apply_resume_state(algorithm, resume_state)
         consumed_samples = int(algorithm.state_dict().get("consumed_samples", 0))
+    if version_floor > algorithm.policy_version:
+        logger.info(f"Learner [{agent_id}]: policy version {algorithm.policy_version} raised to the hub's floor "
+                    f"{version_floor}")
+        set_policy_version(algorithm, version_floor)
     train_step = int(algorithm.policy_version)
 
     total_chunks_received = 0
@@ -165,8 +182,7 @@ def learner_process(
     replay_buffer = algorithm.create_replay_buffer(config.queue_size * 4)
 
     try:
-        # Push initial weights to workers
-        _push_weights(algorithm, agent_id, weight_queues)
+        _publish_weights(algorithm, agent_id, outputs)    # the first weights (the workers' first-weights wait)
 
         while not stop_event.is_set():
             if (progress_counter is None and total_timesteps > 0
@@ -175,7 +191,7 @@ def learner_process(
                 break
 
             # Block until exactly batch_chunks chunks arrived (None: stop requested).
-            chunks = collect_batch(trajectory_queue, config.batch_chunks, stop_event, agent_id=agent_id)
+            chunks = collect_batch(intake, config.batch_chunks, stop_event, agent_id=agent_id)
             if chunks is None:
                 break
             total_chunks_received += len(chunks)
@@ -200,25 +216,22 @@ def learner_process(
             metrics["policy_lag_mean"] = float(np.mean(lags))
             metrics["policy_lag_max"] = float(np.max(lags))
 
-            # Push updated weights to all workers at configured interval
+            # Publish updated weights at the configured interval
             if train_step % config.weight_push_interval == 0:
-                _push_weights(algorithm, agent_id, weight_queues)
+                _publish_weights(algorithm, agent_id, outputs)
 
-            if checkpoint_queue is not None and checkpoint_interval > 0:
+            if outputs.checkpoints and checkpoint_interval > 0:
                 pv = algorithm.policy_version
                 if pv > 0 and pv % checkpoint_interval == 0 and pv != last_ckpt_version:
-                    if send_checkpoint(checkpoint_queue, make_checkpoint_payload(agent_id, algorithm), block=False):
+                    if outputs.send_checkpoint(make_checkpoint_payload(agent_id, algorithm), kind="periodic",
+                                               block=False):
                         last_ckpt_version = pv
 
-            if metrics_queue is not None:
-                metrics["agent_id"] = agent_id
-                metrics["train_step"] = train_step
-                metrics["chunks_received"] = total_chunks_received
-                metrics["consumed_samples"] = consumed_samples
-                try:
-                    metrics_queue.put_nowait(metrics)
-                except Full:
-                    pass  # Non-critical, don't block on metrics
+            metrics["agent_id"] = agent_id
+            metrics["train_step"] = train_step
+            metrics["chunks_received"] = total_chunks_received
+            metrics["consumed_samples"] = consumed_samples
+            outputs.send_metrics(metrics)       # never blocks on a full sink
 
             if train_step % 10 == 0:
                 logger.info(
@@ -226,25 +239,19 @@ def learner_process(
                     f"progress={progress:.3f}, loss={metrics.get('total_loss', 0.0):.4f}"
                 )
     finally:
-        _release_weight_queues(
-            weight_queues, trajectory_queue, stop_event, timeout=_weight_flush_timeout(weight_sync_interval),
-        )
+        outputs.finish(stop_event)
 
-    if checkpoint_queue is not None:
-        # Final snapshot on every stop. The main process saves it before tearing children down (R3-07).
-        if send_checkpoint(checkpoint_queue, make_checkpoint_payload(agent_id, algorithm, final=True),
-                           block=True, timeout=FINAL_CHECKPOINT_TIMEOUT_SEC):
-            logger.info(f"Learner [{agent_id}]: sent final checkpoint v{algorithm.policy_version}")
-        # Wait until the snapshot is flushed into the pipe while the main process reads it.
-        # Given up only once the main process is gone (it terminates us after its grace
-        # period otherwise), so this process never hangs.
-        flush_queue(checkpoint_queue, warn_after=SHUTDOWN_GRACE_SEC)
+    # Final snapshot on every stop (R3-07); the outputs deliver it (a node: header + frame on the control
+    # connection; SP4: a blocking put, flushed while the main process reads it).
+    if outputs.checkpoints and outputs.send_checkpoint(make_checkpoint_payload(agent_id, algorithm, final=True),
+                                                       kind="final", block=True):
+        logger.info(f"Learner [{agent_id}]: sent final checkpoint v{algorithm.policy_version}")
 
     logger.info(f"Learner [{agent_id}]: finished. Total train_steps={train_step}")
 
 
 def _progress(
-    progress_counter: SharedCounter | None,
+    progress_counter: Any | None,
     consumed_samples: int,
     total_timesteps: int,
 ) -> float:
@@ -334,13 +341,14 @@ def collect_batch(
     poll_interval: float = 0.5,
     agent_id: str | None = None,
 ) -> list[TrajectoryChunk] | None:
-    """Block until exactly ``batch_size`` chunk v2 payloads arrived; decode them.
+    """Block until exactly ``batch_size`` chunks arrived; decode payloads.
 
-    Waits in ``poll_interval`` slices and returns None as soon as ``stop_event``
-    is set (a partial batch is dropped: no training on incomplete batches).
-    Every decoded chunk's slot structure is checked (``validate_slot_structure``):
+    ``q`` is a queue of chunk v2 payload dicts (SP4) or a chunk intake (``ChunkIntake``) whose items are
+    ``TrajectoryChunk`` objects, decoded and checked already. Waits in ``poll_interval`` slices and returns None as
+    soon as ``stop_event`` is set (a partial batch is dropped: no training on incomplete batches).
+    Every decoded payload's slot structure is checked (``validate_slot_structure``):
     a broken chunk raises ``ValueError`` naming its agent instead of silently
-    corrupting the V-trace targets. With ``agent_id``, a chunk of another agent (a
+    corrupting the V-trace targets. With ``agent_id``, a payload of another agent (a
     misrouted worker in distributed mode) raises ``ValueError``.
     """
     chunks: list[TrajectoryChunk] = []
@@ -350,6 +358,9 @@ def collect_batch(
         try:
             payload = q.get(timeout=poll_interval)
         except Empty:
+            continue
+        if isinstance(payload, TrajectoryChunk):     # from an intake: decoded and checked already
+            chunks.append(payload)
             continue
         if not isinstance(payload, dict):
             raise TypeError(
@@ -364,14 +375,8 @@ def collect_batch(
     return chunks
 
 
-def _push_weights(
-    algorithm: BaseAlgorithm,
-    agent_id: str,
-    weight_queues: list,
-) -> None:
-    """Publish the current weights to every worker mailbox (newest wins)."""
-    payload = WeightPayload.from_model(agent_id, algorithm.policy_version, algorithm.model,
-                                       teacher_active=bool(getattr(algorithm, "teacher_active", False)))
-    for wq in weight_queues:
-        if not put_latest(wq, payload):
-            logger.debug(f"Learner [{agent_id}]: weight mailbox busy, v{payload.policy_version} not delivered")
+def _publish_weights(algorithm: BaseAlgorithm, agent_id: str, outputs: LearnerOutputs) -> None:
+    """Publish the current weights (numpy, with the scripted teacher's ``teacher_active``) through ``outputs``."""
+    outputs.publish_weights(WeightPayload.from_model(
+        agent_id, algorithm.policy_version, algorithm.model,
+        teacher_active=bool(getattr(algorithm, "teacher_active", False))))

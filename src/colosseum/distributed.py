@@ -318,6 +318,7 @@ def run_distributed_learner(
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
     from colosseum.learner.factory import build_algorithm, resolve_teacher
     from colosseum.learner.learner import learner_process, resolve_device
+    from colosseum.net.local import QueueIntake, QueueOutputs
 
     setup_process_logging(None, f"learner-{agent_id}", console_level=logging.INFO)
     config = load_config(config_path, overrides)
@@ -414,14 +415,14 @@ def run_distributed_learner(
         learner_process(
             agent_id=agent_id,
             algorithm_factory=algorithm_factory,
-            trajectory_queue=chunk_queue,
-            weight_queues=weight_sink,
+            intake=QueueIntake(chunk_queue, agent_id=agent_id),
+            outputs=QueueOutputs(weight_queues=weight_sink, checkpoint_queue=checkpoint_queue,
+                                 trajectory_queue=chunk_queue,
+                                 weight_sync_interval=acfg.rollout.weight_sync_interval_sec),
             config=acfg.learner,
             stop_event=stop_event,
-            metrics_queue=None,
             progress_counter=None,
             total_timesteps=config.training.total_timesteps,
-            checkpoint_queue=checkpoint_queue,
             checkpoint_interval=config.checkpoint.interval,
             weight_sync_interval=acfg.rollout.weight_sync_interval_sec,
         )

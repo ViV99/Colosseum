@@ -17,7 +17,8 @@ from colosseum.core.tree import tree_map, tree_stack
 from colosseum.core.types import SLOT_ACT, TrajectoryChunk
 from colosseum.envs.game import RoleSpec
 from colosseum.envs.spaces import Units
-from colosseum.learner.learner import _push_weights
+from colosseum.learner.learner import _publish_weights
+from colosseum.net.local import QueueOutputs
 from colosseum.networks.state import cat_batch
 from game_helpers import NumpyOnlyQueue, chunk_v2_payload, learner_role, make_test_model, synthetic_chunk
 
@@ -114,13 +115,13 @@ def test_appo_reports_labels_and_switches_the_teacher_flag_off_at_lambda_zero():
     algo = APPO(model, AlgorithmConfig(), ActionSpec.from_space(ROLE3.action_space),
                 kickstart=KickstartLoss(None, initial_lambda=0.5, decay_steps=2))
     queue = NumpyOnlyQueue(maxsize=1)
-    _push_weights(algo, "a", [queue])
+    _publish_weights(algo, "a", QueueOutputs(weight_queues=[queue]))
     assert algo.teacher_active and queue.get_nowait().teacher_active is True
     metrics = algo.train_step(chunks)
     assert metrics["kickstart_loss"] > 0 and metrics["kickstart_label_frac"] == pytest.approx(1.0)
     algo.train_step(chunks)                                              # lambda decays to 0
     assert not algo.teacher_active
-    _push_weights(algo, "a", [queue])
+    _publish_weights(algo, "a", QueueOutputs(weight_queues=[queue]))
     assert queue.get_nowait().teacher_active is False
     plain = APPO(make_test_model(ROLE3), AlgorithmConfig(), ActionSpec.from_space(ROLE3.action_space))
     assert not plain.teacher_active and "kickstart_label_frac" not in plain.train_step(chunks)

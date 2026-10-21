@@ -7,7 +7,8 @@ import numpy as np
 
 from colosseum.core.ipc import drain_latest, put_latest
 from colosseum.core.types import WeightPayload
-from colosseum.learner.learner import _push_weights
+from colosseum.learner.learner import _publish_weights
+from colosseum.net.local import QueueOutputs
 from game_helpers import learner_role, make_test_model
 
 
@@ -87,7 +88,7 @@ def test_push_weights_leaves_only_the_newest_payload():
     algo, mailbox = _Algo(), queue.Queue(maxsize=1)
     for version in range(1, 6):
         algo.policy_version = version
-        _push_weights(algo, "a", [mailbox])
+        _publish_weights(algo, "a", QueueOutputs(weight_queues=[mailbox]))
     assert mailbox.get_nowait().policy_version == 5
 
 

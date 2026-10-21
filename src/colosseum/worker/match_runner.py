@@ -53,6 +53,8 @@ current version; None without ``version_fn``). A lineup's
 explicit ``seed`` replaces the derived episode seed (``SeedSequence([seed, env, episode])``); the episode seed (when
 there is one) goes into ``MatchResult.seed``, the lineup's ``block`` into ``MatchResult.block``, and the uid is the
 lineup's ``uid`` or ``uid_prefix + match_id``. ``source`` (one of ``MATCH_SOURCES``) is copied into every result.
+A lineup with an ``epoch`` (SP5) makes the match id ``<prefix><env>_g<epoch>_ep<K>`` and, with ``cell_seed_fn``, the
+episode seed ``SeedSequence([cell_seed_fn(env, epoch), K])`` (None when it returns None).
 """
 
 from __future__ import annotations
@@ -189,6 +191,7 @@ class MatchRunner:
         source: str = "train",
         uid_prefix: str = "",
         snapshot_fallback: bool = True,
+        cell_seed_fn: Callable[[int, int], int | None] | None = None,
     ) -> None:
         if source not in MATCH_SOURCES:
             raise ValueError(f"MatchRunner: source must be one of {MATCH_SOURCES}, got {source!r}")
@@ -208,6 +211,7 @@ class MatchRunner:
         self._source = source
         self._uid_prefix = uid_prefix
         self._snapshot_fallback = bool(snapshot_fallback)
+        self._cell_seed_fn = cell_seed_fn
         self._episodes_finished = 0
         self._warned_missing: set[tuple[str, str]] = set()
         self._bots: dict[tuple[str, int, int], ScriptedBot] = {}
@@ -509,7 +513,10 @@ class MatchRunner:
             for s, a in enumerate(env_state.lineup.seats)
         ]
         lineup = env_state.lineup
-        match_id = f"{self._prefix}{e}_ep{env_state.episode_index}"
+        if lineup.epoch is not None:
+            match_id = f"{self._prefix}{e}_g{lineup.epoch}_ep{env_state.episode_index}"
+        else:
+            match_id = f"{self._prefix}{e}_ep{env_state.episode_index}"
         return MatchResult(
             match_id=match_id,
             layout=layout,
@@ -567,8 +574,14 @@ class MatchRunner:
         requests = {}
         for e in envs:
             lineup = self._envs[e].lineup
-            seed = (int(lineup.seed) if lineup.seed is not None
-                    else self._episode_seed(e, self._envs[e].episode_index))
+            k = self._envs[e].episode_index
+            if lineup.seed is not None:
+                seed = int(lineup.seed)
+            elif lineup.epoch is not None and self._cell_seed_fn is not None:
+                cell = self._cell_seed_fn(e, int(lineup.epoch))
+                seed = None if cell is None else int(np.random.SeedSequence([int(cell), k]).generate_state(1)[0])
+            else:
+                seed = self._episode_seed(e, k)
             requests[e] = (seed, lineup.layout)
         results = self._vec_env.reset(requests)
         for e in envs:

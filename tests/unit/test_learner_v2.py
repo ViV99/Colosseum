@@ -21,7 +21,7 @@ from colosseum.learner.learner import (
     make_checkpoint_payload,
     resolve_device,
 )
-from game_helpers import NumpyOnlyQueue, RecordingLearnerAlgorithm, chunk_v2_payload, learner_appo
+from game_helpers import NumpyOnlyQueue, RecordingLearnerAlgorithm, chunk_v2_payload, learner_appo, queue_learner_io
 
 
 def _collect_in_thread(q, batch_size, stop):
@@ -37,9 +37,11 @@ def _run_learner(algo, payloads, until, *, batch_chunks, timeout=10.0, **kwargs)
     traj, stop = NumpyOnlyQueue(), threading.Event()
     for payload in payloads:
         traj.put(payload)
-    kwargs.setdefault("weight_queues", [NumpyOnlyQueue(maxsize=1)])
+    io = queue_learner_io(traj, weight_queues=kwargs.pop("weight_queues", [NumpyOnlyQueue(maxsize=1)]),
+                          metrics_queue=kwargs.pop("metrics_queue", None),
+                          checkpoint_queue=kwargs.pop("checkpoint_queue", None))
     thread = threading.Thread(target=learner_process, kwargs=dict(
-        agent_id="a", algorithm_factory=lambda: algo, trajectory_queue=traj,
+        agent_id="a", algorithm_factory=lambda: algo, **io,
         config=LearnerConfig(batch_chunks=batch_chunks, device="cpu"), stop_event=stop, **kwargs,
     ))
     thread.start()
@@ -129,9 +131,9 @@ def test_without_a_counter_progress_counts_act_slots_and_the_learner_stops_itsel
     for _ in range(6):
         traj.put(chunk_v2_payload(S=4))           # "AAAB": 3 ACT slots per chunk
     thread = threading.Thread(target=learner_process, kwargs=dict(
-        agent_id="a", algorithm_factory=lambda: algo, trajectory_queue=traj,
-        weight_queues=[NumpyOnlyQueue(maxsize=1)], config=LearnerConfig(batch_chunks=2, device="cpu"),
-        stop_event=threading.Event(), total_timesteps=12,
+        agent_id="a", algorithm_factory=lambda: algo,
+        **queue_learner_io(traj, weight_queues=[NumpyOnlyQueue(maxsize=1)]),
+        config=LearnerConfig(batch_chunks=2, device="cpu"), stop_event=threading.Event(), total_timesteps=12,
     ))
     thread.start()
     thread.join(timeout=10)
@@ -157,9 +159,9 @@ def test_final_checkpoint_is_sent_on_stop():
     stop, ckq = threading.Event(), NumpyOnlyQueue()
     stop.set()
     learner_process(
-        agent_id="a", algorithm_factory=learner_appo, trajectory_queue=NumpyOnlyQueue(),
-        weight_queues=[NumpyOnlyQueue(maxsize=1)], config=LearnerConfig(batch_chunks=2, device="cpu"),
-        stop_event=stop, checkpoint_queue=ckq, checkpoint_interval=100,
+        agent_id="a", algorithm_factory=learner_appo,
+        **queue_learner_io(NumpyOnlyQueue(), weight_queues=[NumpyOnlyQueue(maxsize=1)], checkpoint_queue=ckq),
+        config=LearnerConfig(batch_chunks=2, device="cpu"), stop_event=stop, checkpoint_interval=100,
     )
     final = ckq.get_nowait()
     assert final["final"] is True and final["agent_id"] == "a" and final["policy_version"] == 0
@@ -193,9 +195,10 @@ def test_resume_continues_train_step_consumed_samples_and_lr_progress():
         traj.put(chunk_v2_payload(version=2 + version))
     stop = threading.Event()
     thread = threading.Thread(target=learner_process, kwargs=dict(
-        agent_id="a", algorithm_factory=factory, trajectory_queue=traj, weight_queues=[NumpyOnlyQueue(maxsize=1)],
+        agent_id="a", algorithm_factory=factory,
+        **queue_learner_io(traj, weight_queues=[NumpyOnlyQueue(maxsize=1)], metrics_queue=mq),
         config=LearnerConfig(batch_chunks=2, weight_push_interval=1, device="cpu"), stop_event=stop,
-        metrics_queue=mq, resume_state=_resume_state(source), progress_counter=counter, total_timesteps=1000,
+        resume_state=_resume_state(source), progress_counter=counter, total_timesteps=1000,
     ))
     thread.start()
     deadline = time.monotonic() + 60
@@ -219,7 +222,7 @@ def test_resume_pushes_the_restored_weights():
     stop.set()
     learner_process(
         agent_id="a", algorithm_factory=lambda: built.append(learner_appo()) or built[-1],
-        trajectory_queue=NumpyOnlyQueue(), weight_queues=[wq], config=LearnerConfig(batch_chunks=2, device="cpu"),
+        **queue_learner_io(NumpyOnlyQueue(), weight_queues=[wq]), config=LearnerConfig(batch_chunks=2, device="cpu"),
         stop_event=stop, resume_state=state,
     )
     assert built[0].policy_version == 1

@@ -48,8 +48,9 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
 
     Checkpoints are sent to a worker only once (as deltas), so ``new_checkpoints`` of all
     drained commands are merged, and ``evict`` lists of all drained commands are merged (union,
-    first-seen order). Lineups are merged per env: a later command's lineup wins, and a ``None``
-    entry keeps the earlier command's lineup for that env.
+    first-seen order); the merge keeps the order of an eviction and a delivery of the same id (the later one wins,
+    as ``RolloutLoop`` applies a command's evictions before its deliveries). Lineups are merged per env: a later
+    command's lineup wins, and a ``None`` entry keeps the earlier command's lineup for that env.
     """
     latest: WorkerCommand | None = None
     merged: dict[str, dict[str, Any]] = {}
@@ -60,11 +61,16 @@ def _drain_commands(command_queue: Any) -> WorkerCommand | None:
             cmd = command_queue.get_nowait()
         except queue.Empty:
             break
-        for aid, ckpts in cmd.new_checkpoints.items():
-            merged.setdefault(aid, {}).update(ckpts)
-        for aid, ckpt_ids in cmd.evict.items():
+        for aid, ckpt_ids in cmd.evict.items():     # a command's evictions apply before its deliveries
             bucket = evict.setdefault(aid, [])
             bucket.extend(c for c in ckpt_ids if c not in bucket)
+            for c in ckpt_ids:
+                merged.get(aid, {}).pop(c, None)        # delivered by an earlier command, evicted since
+        for aid, ckpts in cmd.new_checkpoints.items():
+            merged.setdefault(aid, {}).update(ckpts)
+            if aid in evict:
+                evict[aid] = [c for c in evict[aid] if c not in ckpts]   # evicted earlier, delivered again
+        evict = {aid: ids for aid, ids in evict.items() if ids}
         if len(cmd.lineups) > len(lineups):
             lineups.extend([None] * (len(cmd.lineups) - len(lineups)))
         for e, lineup in enumerate(cmd.lineups):

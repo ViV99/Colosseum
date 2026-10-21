@@ -15,7 +15,7 @@ import time
 
 from colosseum.core.config import LearnerConfig
 from colosseum.learner.learner import learner_process
-from game_helpers import chunk_v2_payload, learner_appo
+from game_helpers import chunk_v2_payload, learner_appo, queue_learner_io
 
 BIG_NUM_ACTIONS = 8192      # policy head 16 x 8192 floats: ~0.5 MB per weight payload
 WEIGHT_QUEUE_SIZE = 1       # newest-wins mailbox per (agent, worker), as the launcher uses
@@ -35,7 +35,7 @@ def _start_learner(ctx, weights, stop, total_timesteps: int):
     for version in range(2):
         traj.put(_payload(version))
     proc = ctx.Process(target=learner_process, kwargs=dict(
-        agent_id="a", algorithm_factory=_big_appo, trajectory_queue=traj, weight_queues=[weights],
+        agent_id="a", algorithm_factory=_big_appo, **queue_learner_io(traj, weight_queues=[weights]),
         config=LearnerConfig(batch_chunks=2, weight_push_interval=1, device="cpu"),
         stop_event=stop, total_timesteps=total_timesteps,
     ))
@@ -99,7 +99,7 @@ def test_learner_budget_exit_does_not_deadlock_with_a_worker_blocked_on_chunks()
     weights = ctx.Queue(maxsize=WEIGHT_QUEUE_SIZE)
     stop = ctx.Event()
     proc = ctx.Process(target=learner_process, kwargs=dict(
-        agent_id="a", algorithm_factory=_big_appo, trajectory_queue=traj, weight_queues=[weights],
+        agent_id="a", algorithm_factory=_big_appo, **queue_learner_io(traj, weight_queues=[weights]),
         config=LearnerConfig(batch_chunks=2, weight_push_interval=1, device="cpu"),
         stop_event=stop, total_timesteps=ONE_BATCH,
     ))

@@ -1711,3 +1711,20 @@ class FakeArena:
                                         source="tournament", seed=lu.seed, block=b.id))
             out[b.id] = rows
         return out
+
+
+# ---------------------------------------------------------------------------
+# SP5 (T2.2): learner_process on SP4's queues
+# ---------------------------------------------------------------------------
+
+
+def queue_learner_io(trajectory_queue, *, weight_queues=(), metrics_queue=None, checkpoint_queue=None,
+                     agent_id: str | None = None, weight_sync_interval: float = 5.0) -> dict:
+    """``intake`` / ``outputs`` keywords of ``learner_process`` over SP4-style queues (``QueueIntake`` /
+    ``QueueOutputs``), for tests written against the SP4 signature."""
+    from colosseum.net.local import QueueIntake, QueueOutputs
+
+    return {"intake": QueueIntake(trajectory_queue, agent_id=agent_id),
+            "outputs": QueueOutputs(weight_queues=list(weight_queues), checkpoint_queue=checkpoint_queue,
+                                    metrics_queue=metrics_queue, trajectory_queue=trajectory_queue,
+                                    weight_sync_interval=weight_sync_interval)}

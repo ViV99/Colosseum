@@ -393,23 +393,25 @@ class WeightPayload:
     """Model weights flowing from a learner to workers (numpy, never torch).
 
     ``teacher_active``: True while a scripted kickstart teacher has lambda > 0: the worker keeps asking it
-    (DAgger).
+    (DAgger). ``generation`` (SP5): the learner generation that published the weights (0: unknown / SP4 path).
     """
 
     agent_id: str
     policy_version: int
     state_dict: dict[str, np.ndarray] = field(default_factory=dict)
     teacher_active: bool = False
+    generation: int = 0
 
     @classmethod
     def from_model(cls, agent_id: str, policy_version: int, model: nn.Module,
-                   teacher_active: bool = False) -> WeightPayload:
+                   teacher_active: bool = False, generation: int = 0) -> WeightPayload:
         """Snapshot ``model``'s current weights as a numpy payload."""
         return cls(
             agent_id=agent_id,
             policy_version=int(policy_version),
             state_dict=state_dict_to_numpy(model.state_dict()),
             teacher_active=bool(teacher_active),
+            generation=int(generation),
         )
 
     def to_torch_state_dict(self) -> dict[str, torch.Tensor]:

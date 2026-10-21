@@ -275,6 +275,7 @@ def _learner_main(
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
     from colosseum.learner.factory import apply_init, build_algorithm
     from colosseum.learner.learner import learner_process, resolve_device
+    from colosseum.net.local import QueueIntake, QueueOutputs
     from colosseum.utils.seeding import apply_global_seed
 
     apply_global_seed(seed)
@@ -294,12 +295,12 @@ def _learner_main(
     learner_process(
         agent_id=agent_id,
         algorithm_factory=algorithm_factory,
-        trajectory_queue=trajectory_queue,
-        weight_queues=weight_queues,
+        intake=QueueIntake(trajectory_queue, agent_id=agent_id),
+        outputs=QueueOutputs(weight_queues=weight_queues, checkpoint_queue=checkpoint_queue,
+                             metrics_queue=metrics_queue, trajectory_queue=trajectory_queue,
+                             weight_sync_interval=config.rollout.weight_sync_interval_sec),
         config=config.learner,
         stop_event=stop_event,
-        metrics_queue=metrics_queue,
-        checkpoint_queue=checkpoint_queue,
         checkpoint_interval=checkpoint_interval,
         resume_state=resume_state,
         progress_counter=progress_counter,
