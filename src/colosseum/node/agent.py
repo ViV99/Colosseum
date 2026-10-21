@@ -90,6 +90,7 @@ import grpc
 from colosseum.net.proto import colosseum_v1_pb2 as pb
 from colosseum.net.security import Token
 from colosseum.node.books import CellTracker, ResultBuffer
+from colosseum.node.learners import LearnerBlobsDone, NodeLearners
 from colosseum.node.procs import ChildSpec, ChildSupervisor
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC
 
@@ -115,7 +116,6 @@ TRANSFER_THREADS = 4
 TRANSFER_JOIN_SEC = 1.0         # at the end, cancelled transfers are waited for this long before the cache cleanup
 DOWNLOAD_TIMEOUT_SEC = 300.0
 UPLOAD_TIMEOUT_SEC = 300.0
-TRAIN_METRICS_KEPT = 1000       # learner train records kept while the hub is away (oldest dropped)
 _UPLOAD_KINDS = {"periodic": "checkpoint", "final": "final", "recovery": "recovery"}
 REGISTER_TIMEOUT_SEC = 30.0
 FETCH_CA_TIMEOUT_SEC = 10.0
@@ -174,15 +174,6 @@ class _StopRequested:
 
 
 @dataclass
-class _LearnerBlobsDone:
-    agent_id: str
-    generation: int
-    resume_state: dict | None
-    error: str | None
-    serial: int
-
-
-@dataclass
 class _UploadDone:
     token: str                         # the upload's key in NodeAgent._uploads
     kind: str                          # the checkpoint kind (periodic / final / recovery)
@@ -190,23 +181,6 @@ class _UploadDone:
     version: int
     reply: Any                         # pb.UploadReply, or None after a transfer error
     error: str | None
-
-
-@dataclass
-class _Learner:
-    """A learner this node runs for the run (``state``: ``fetching`` its start blobs, ``ready`` to spawn (once every
-    ``Welcome.fixed`` blob is cached), ``starting`` (spawned, no hello yet), ``running``, ``stopping`` (``Stop``
-    sent))."""
-
-    agent_id: str
-    generation: int
-    assignment: Any                    # pb.LearnerAssignment
-    name: str
-    state: str = "fetching"
-    resume_state: dict | None = None
-    listener_name: str = ""
-    version: int = -1
-    stop_reason: str = ""
 
 
 class _BadSeat(ValueError):
@@ -321,12 +295,8 @@ class NodeAgent:
         self._worker_stats: dict[tuple[int, int], dict[str, int]] = {}
         self._stats_changed: set[tuple[int, int]] = set()
         self._learner_routes: dict[str, Any] = {}   # agent -> LearnerRoute sent to every worker
-        self._learners: dict[str, _Learner] = {}    # agent -> its learner on this node
-        self._pending_versions: dict[str, pb.NodeMessage] = {}   # agent -> VersionAnnounce not sent yet (hub away)
+        self.learners = NodeLearners(_LearnerHost(self))   # the learners this node runs (node.learners)
         self._uploads: dict[Future, tuple[str, str, int]] = {}  # in flight: (kind, agent, version)
-        self._train_metrics: deque = deque(maxlen=TRAIN_METRICS_KEPT)
-        self._intake_stats: dict[str, pb.IntakeStats] = {}
-        self._hub_env_steps = 0                     # Announce.env_steps (forwarded to the learners)
         self._released: set[str] = set()            # run ids this node released (never served again)
         self._releasing = False
         self._dropped_carry = 0                     # dropped_results_node_buffer of released runs (per session)
@@ -583,8 +553,7 @@ class NodeAgent:
         run = self._run
         state = ("" if run is None else run.run_id, tuple(self.cells.live()), self._env_steps(),
                  0 if run is None else run.results.last_acked, 0 if run is None else run.envs,
-                 tuple((e.agent_id, e.generation, max(e.version, 0)) for e in self._learners.values()
-                       if e.state in ("running", "stopping")))
+                 self.learners.hello_entries())
         with self._hello_lock:
             self._hello_state = state
 
@@ -637,8 +606,8 @@ class NodeAgent:
                 self._on_fetch_done(item)
             elif isinstance(item, _StopRequested):
                 self._begin_stop(item.reason)
-            elif isinstance(item, _LearnerBlobsDone):
-                self._on_learner_blobs(item)
+            elif isinstance(item, LearnerBlobsDone):
+                self.learners.on_blobs(item)
             elif isinstance(item, _UploadDone):
                 self._on_upload_done(item)
             else:
@@ -660,9 +629,7 @@ class NodeAgent:
                 if not self._send(pb.NodeMessage(event=self._events[0])):
                     break
                 self._events.popleft()
-            for agent, message in list(self._pending_versions.items()):
-                if self._send(message):
-                    del self._pending_versions[agent]
+            self.learners.resend_pending()
         elif isinstance(item, SessionLost):
             if self._connected:
                 logger.warning(f"node: the session with the hub ended ({item.reason}); reconnecting")
@@ -675,7 +642,7 @@ class NodeAgent:
         elif run is not None:
             if not run.started:
                 self._maybe_start_workers(run, now)
-            self._start_pending_learners(run)
+            self.learners.start_pending(run)
             self._request_lineups()
             self._expire_waiting()
             self._deliver(run)
@@ -743,10 +710,10 @@ class NodeAgent:
             return
         logger.info(f"node: session resumed for run {run.run_id[:8]} (node {run.number})")
         listed = {la.agent_id for la in welcome.learners}
-        for agent in [a for a in self._learners if a not in listed]:
-            self._stop_learner(agent, "the hub no longer assigns it here")
+        for agent in [a for a in self.learners.agents() if a not in listed]:
+            self.learners.stop(agent, "the hub no longer assigns it here")
         for la in welcome.learners:
-            self._assign_learner(run, la)
+            self.learners.assign(run, la)
 
     def _start_run(self, welcome: pb.Welcome) -> None:
         from colosseum.core.config import ColosseumConfig
@@ -834,7 +801,7 @@ class NodeAgent:
         self._run_serial += 1
         self._run = run
         for la in welcome.learners:
-            self._assign_learner(run, la)
+            self.learners.assign(run, la)
         logger.info(f"node {number} ({self._name}): serving run {run_id[:8]} with {workers} workers; "
                     f"{len(fixed_keys)} fixed blobs to fetch; logs in {log_dir}")
         self._maybe_start_workers(run, time.monotonic())
@@ -929,9 +896,9 @@ class NodeAgent:
             self._begin_stop(f"the hub released this node ({cmd.reason or 'release'})", release=True)
         elif cmd.kind == "start_learner":
             if self._run is not None and not self._stopping:
-                self._assign_learner(self._run, cmd.learner)
+                self.learners.assign(self._run, cmd.learner)
         elif cmd.kind == "stop_learner":
-            self._stop_learner(cmd.learner.agent_id, cmd.reason or "stop_learner")
+            self.learners.stop(cmd.learner.agent_id, cmd.reason or "stop_learner")
         else:
             logger.info(f"node: command {cmd.kind!r} is not handled by this node yet; ignored")
 
@@ -939,14 +906,7 @@ class NodeAgent:
         from colosseum.net.local import WorkerEvict
         from colosseum.node.weights import CacheKey
 
-        if announce.env_steps and int(announce.env_steps) > self._hub_env_steps:
-            from colosseum.net.local import LearnerEnvSteps
-
-            self._hub_env_steps = int(announce.env_steps)
-            for entry in self._learners.values():
-                conn = self._control.get(entry.name)
-                if conn is not None:
-                    self._child_send(entry.name, conn, LearnerEnvSteps(self._hub_env_steps))
+        self.learners.forward_env_steps(int(announce.env_steps))
         keys = [CacheKey("snapshot", ev.agent_id, ev.checkpoint_id) for ev in announce.evictions]
         if keys and self._run is not None:
             for name, conn in list(self._control.items()):
@@ -1115,7 +1075,7 @@ class NodeAgent:
             elif self.supervisor.role(name) == "worker":
                 self._on_worker_connected(name, conn)
             elif self.supervisor.role(name) == "learner":
-                self._on_learner_connected(name, conn)
+                self.learners.on_connected(name)
         elif hello.channel == "route":
             self._child_conns[conn] = name
             self._route_conns.add(conn)
@@ -1193,38 +1153,7 @@ class NodeAgent:
             self._event("child_error", proc=name, error_kind=message.kind, message=message.message,
                         context=f"node {self._number} ({self._name}), {message.context}", log_path=log_path)
         else:
-            self._on_learner_message(name, message)
-
-    def _on_learner_message(self, name: str, message: Any) -> None:
-        """``VersionPublished`` -> ``VersionAnnounce``; ``LearnerMetrics`` / ``IntakeReport`` -> ``MetricsBatch``."""
-        from colosseum.net.local import IntakeReport, LearnerMetrics, VersionPublished
-        from colosseum.net.messages import VersionInfo, version_to_proto
-
-        entry = self._learner_of(name)
-        if entry is None:
-            logger.warning(f"node: unexpected {type(message).__name__} from {name}")
-        elif isinstance(message, VersionPublished):
-            entry.version = max(entry.version, int(message.version))
-            info = VersionInfo(agent_id=entry.agent_id, generation=int(message.generation),
-                               version=int(message.version), size=int(message.size), digest=message.digest,
-                               node=self._number, teacher_active=bool(message.teacher_active))
-            announce = pb.NodeMessage(version=pb.VersionAnnounce(info=version_to_proto(info)))
-            if self._connected and self._send(announce):
-                self._pending_versions.pop(entry.agent_id, None)
-            else:
-                self._pending_versions[entry.agent_id] = announce        # only the latest matters
-        elif isinstance(message, LearnerMetrics):
-            values = {k: float(v) for k, v in message.metrics.items()
-                      if isinstance(v, (int, float)) and not isinstance(v, bool)}
-            self._train_metrics.append(pb.TrainMetrics(
-                agent_id=entry.agent_id, generation=entry.generation,
-                train_step=int(message.metrics.get("train_step", 0)), values=values))
-        elif isinstance(message, IntakeReport):
-            self._intake_stats[entry.agent_id] = pb.IntakeStats(
-                agent_id=entry.agent_id, generation=entry.generation, depth=int(message.depth),
-                dropped={k: int(v) for k, v in message.dropped.items()})
-        else:
-            logger.warning(f"node: unexpected {type(message).__name__} from {name}")
+            self.learners.on_message(name, message)
 
     def _close_conn(self, conn: mpc.Connection) -> None:
         name = self._child_conns.pop(conn, None)
@@ -1259,7 +1188,7 @@ class NodeAgent:
         role = self.supervisor.role(name)
         log_path = "" if run is None else str(run.log_dir / f"{name}.log")
         if role == "learner":
-            self._on_learner_exit(name, code, log_path)
+            self.learners.on_exit(name, code, log_path, self._learner_routes)
             return
         if name in self._reported:
             logger.info(f"node: {name} exited (code {code}) after reporting its error; not restarted")
@@ -1279,133 +1208,7 @@ class NodeAgent:
                 logger.error(f"node: {name} died too often; its slot is disabled")
                 self._event("slot_disabled", proc=name, exit_code=int(code or 0), log_path=log_path)
 
-    # ---- learners -----------------------------------------------------------------------------------------------
-
-    def _learner_of(self, name: str) -> _Learner | None:
-        return next((e for e in self._learners.values() if e.name == name), None)
-
-    def _assign_learner(self, run: _Run, la: pb.LearnerAssignment) -> None:
-        """A learner assignment (``Welcome.learners`` or ``start_learner``): its start blobs are downloaded first;
-        an agent whose learner runs here already keeps it (generations change only from T4.1 on)."""
-        agent = la.agent_id
-        if agent not in run.agent_ids:
-            logger.warning(f"node: refused a learner assignment for {agent!r}: no trainable agent of this run")
-            return
-        current = self._learners.get(agent)
-        if current is not None:
-            if current.generation != int(la.generation):
-                logger.warning(f"node: learner {agent} generation {la.generation} assigned while generation "
-                               f"{current.generation} runs here; ignored")
-            return
-        assignment = pb.LearnerAssignment()
-        assignment.CopyFrom(la)
-        entry = self._learners[agent] = _Learner(agent, int(la.generation), assignment, f"learner-{agent}")
-        if not la.weights_blob:
-            entry.state = "ready"
-            return
-        serial, generation = run.serial, entry.generation
-        future = self._pool.submit(self._fetch_learner_blobs, run, assignment)
-
-        def done(f: Future) -> None:
-            error = "cancelled" if f.cancelled() else (None if f.exception() is None else _rpc_text(f.exception()))
-            self._post(_LearnerBlobsDone(agent, generation, None if error else f.result(), error, serial))
-
-        future.add_done_callback(done)
-
-    def _fetch_learner_blobs(self, run: _Run, la: pb.LearnerAssignment) -> dict:
-        """A transfer-pool thread: the start state of an assignment (A28: a ``recovery`` weights frame and the
-        ``trainer_state`` bytes)."""
-        from colosseum.node.learner_main import resume_state_from_blobs
-
-        weights = self._download_bytes(run, "recovery", la.agent_id, la.weights_blob)
-        trainer = (self._download_bytes(run, "trainer_state", la.agent_id, la.trainer_state_blob)
-                   if la.trainer_state_blob else None)
-        return resume_state_from_blobs(weights, trainer, env_steps=int(la.env_steps),
-                                       source=f"hub recovery blob {la.weights_blob}")
-
-    def _on_learner_blobs(self, done: _LearnerBlobsDone) -> None:
-        entry = self._learners.get(done.agent_id)
-        if (self._run is None or self._run.serial != done.serial or entry is None or entry.state != "fetching"
-                or entry.generation != done.generation):
-            return
-        if done.error is not None:
-            del self._learners[done.agent_id]
-            logger.error(f"node: the start state of learner {done.agent_id} could not be fetched: {done.error}")
-            self._event("learner_failed", proc=entry.name, message=f"start state not fetched: {done.error}",
-                        generation=entry.generation)
-            return
-        entry.resume_state = done.resume_state
-        entry.state = "ready"
-
-    def _start_pending_learners(self, run: _Run) -> None:
-        ready = [e for e in self._learners.values() if e.state == "ready"]
-        if not ready or not all(self._has(run, k) for k in run.fixed_keys):
-            return                                   # teacher / init weights come from the fixed blobs
-        for entry in ready:
-            try:
-                self._start_learner(run, entry)
-            except Exception as e:  # noqa: BLE001 - this learner cannot start: the hub decides (until T4.2: stop)
-                del self._learners[entry.agent_id]
-                logger.exception(f"node: learner {entry.agent_id} cannot start")
-                self._event("learner_failed", proc=entry.name, message=f"{type(e).__name__}: {e}",
-                            generation=entry.generation)
-
-    def _start_learner(self, run: _Run, entry: _Learner) -> None:
-        """Spawn ``entry``'s learner (from the main-loop thread only: PDEATHSIG)."""
-        from colosseum.net.frame import payload_byte_cap
-        from colosseum.net.local import address, learner_proc_name
-        from colosseum.node.learner_main import init_from_cached, learner_target, teacher_for
-        from colosseum.utils.seeding import learner_seed
-
-        agent, la = entry.agent_id, entry.assignment
-        incarnation = self.supervisor.incarnation(entry.name) + 1
-        entry.listener_name = address(self.options.token.ca_fingerprint[:8], run.run_id[:8], run.number,
-                                      learner_proc_name(agent, incarnation))
-        config = run.agent_configs[agent]
-        if la.device:
-            config = config.model_copy(update={"learner": config.learner.model_copy(update={"device": la.device})})
-
-        def cached(kind: str) -> Any:
-            key = next((k for k, k_kind in run.fixed_keys.items() if k_kind == kind and k.agent_id == agent), None)
-            if key is None:
-                return None
-            weights = run.reader.get(key)
-            if weights is None:
-                raise RuntimeError(f"the {kind} blob of {agent!r} is not in the weight cache")
-            return weights
-
-        teacher = teacher_for(run.config, agent, cached=cached("teacher"), bot=run.teachers.get(agent))
-        init = cached("init")
-        kwargs = dict(name=entry.name, log_dir=str(run.log_dir), node=run.number, agent_id=agent,
-                      generation=entry.generation, listener_name=entry.listener_name,
-                      node_address=run.node_address, authkey=run.authkey, config=config,
-                      role_spec=run.role_specs[agent], spec=run.spec,
-                      seed=learner_seed(run.config.training.seed, run.agent_ids.index(agent)), teacher=teacher,
-                      init_state=None if init is None else init_from_cached(run.config, agent, init),
-                      resume_state=entry.resume_state, version_floor=int(la.version_floor),
-                      env_steps=max(int(la.env_steps), self._hub_env_steps), num_learners=len(self._learners),
-                      cache_root=str(run.root), cache_prefix=run.prefix,
-                      checkpoint_interval=int(run.config.checkpoint.interval),
-                      total_timesteps=int(run.config.training.total_timesteps),
-                      cap_bytes=payload_byte_cap(run.config.distributed.max_message_mb))
-        self.supervisor.start(ChildSpec(entry.name, "learner", learner_target, kwargs))
-        entry.state, entry.resume_state = "starting", None
-        logger.info(f"node: started learner {agent} (generation {entry.generation}, version floor "
-                    f"{la.version_floor})")
-
-    def _on_learner_connected(self, name: str, conn: mpc.Connection) -> None:
-        from colosseum.net.local import LearnerEnvSteps, LearnerRoute, Stop
-
-        entry = self._learner_of(name)
-        if entry is None:
-            return
-        if entry.state == "stopping":
-            self._child_send(name, conn, Stop(entry.stop_reason or "stop_learner"))
-            return
-        entry.state = "running"
-        if self._hub_env_steps:
-            self._child_send(name, conn, LearnerEnvSteps(self._hub_env_steps))
-        self._set_route(LearnerRoute(entry.agent_id, entry.listener_name, False, entry.generation))
+    # ---- learners (node.learners) and uploads ------------------------------------------------------------------
 
     def _set_route(self, route: Any) -> None:
         """Where every worker (and every worker that connects later) sends ``route.agent_id``'s chunks."""
@@ -1414,44 +1217,9 @@ class NodeAgent:
             if self.supervisor.role(name) == "worker":
                 self._child_send(name, conn, route)
 
-    def _stop_learner(self, agent: str, reason: str) -> None:
-        """``stop_learner``: ``Stop`` to the learner (it sends its final snapshot, which is uploaded); workers no
-        longer send it chunks."""
-        from colosseum.net.local import LearnerRoute, Stop
-
-        entry = self._learners.get(agent)
-        if entry is None:
-            return
-        if entry.state in ("fetching", "ready"):
-            del self._learners[agent]                # never started (a fetch still running is ignored on arrival)
-            return
-        entry.state, entry.stop_reason = "stopping", reason
-        conn = self._control.get(entry.name)
-        if conn is not None:
-            self._child_send(entry.name, conn, Stop(reason))
-        self._set_route(LearnerRoute(agent, None, False, 0))
-        logger.info(f"node: stopping learner {agent} ({reason})")
-
-    def _on_learner_exit(self, name: str, code: int | None, log_path: str) -> None:
-        from colosseum.net.local import LearnerRoute
-
-        entry = self._learner_of(name)
-        if entry is None:
-            return
-        del self._learners[entry.agent_id]
-        route = self._learner_routes.get(entry.agent_id)
-        if route is not None and route.address is not None:
-            self._set_route(LearnerRoute(entry.agent_id, None, False, 0))
-        if entry.state == "stopping" and code == 0:
-            logger.info(f"node: learner {entry.agent_id} stopped")
-            return
-        logger.error(f"node: learner {entry.agent_id} ended (exit {code}) without being stopped; see {log_path}")
-        self._event("learner_failed", proc=name, exit_code=int(code or 0), log_path=log_path,
-                    generation=entry.generation)
-
     def _on_checkpoint(self, name: str, header: Any, frame: bytes) -> None:
         """A learner's snapshot: an ``Upload`` in the transfer pool (``checkpoint`` / ``final``)."""
-        entry = self._learner_of(name)
+        entry = self.learners.of(name)
         kind = _UPLOAD_KINDS.get(header.kind)
         if entry is None or kind is None or header.agent_id != entry.agent_id:
             logger.warning(f"node: dropped a {header.kind!r} checkpoint of {header.agent_id!r} from {name}")
@@ -1526,16 +1294,17 @@ class NodeAgent:
             load=load, cached_keys=cached, counters=self._node_counters(run))))
 
     def _send_metrics(self) -> None:
-        if not (self._stats_changed or self._train_metrics or self._intake_stats):
+        learners = self.learners
+        if not (self._stats_changed or learners.train_metrics or learners.intake_stats):
             return
         workers = [pb.WorkerStats(worker=w, incarnation=i, counters=self._worker_stats.get((w, i), {}))
                    for w, i in sorted(self._stats_changed)]
-        batch = pb.MetricsBatch(workers=workers, train=list(self._train_metrics),
-                                intake=list(self._intake_stats.values()))
+        batch = pb.MetricsBatch(workers=workers, train=list(learners.train_metrics),
+                                intake=list(learners.intake_stats.values()))
         if self._send(pb.NodeMessage(metrics=batch)):
             self._stats_changed.clear()
-            self._train_metrics.clear()
-            self._intake_stats.clear()
+            learners.train_metrics.clear()
+            learners.intake_stats.clear()
 
     # ---- the stop ---------------------------------------------------------------------------------------------
 
@@ -1605,8 +1374,9 @@ class NodeAgent:
         self._run = None
         self.supervisor = ChildSupervisor()
         self.cells = CellTracker(retry_sec=LINEUP_RETRY_SEC, clock=time.monotonic)
-        for book in (self._learners, self._learner_routes, self._pending_versions, self._uploads, self._fetching,
-                     self._unref_since, self._intake_stats, self._control, self._child_conns):
+        self.learners.clear()
+        for book in (self._learner_routes, self._uploads, self._fetching, self._unref_since, self._control,
+                     self._child_conns):
             book.clear()
         for book in (self._cached, self._route_conns, self._reported, self._disabled):
             book.clear()
@@ -1658,6 +1428,59 @@ class NodeAgent:
                 release_node_lock(run.root, run.prefix)
             except Exception as e:  # noqa: BLE001 - leftovers are removed by the next node's cleanup_dead
                 logger.warning(f"node: cannot remove the weight cache files of {run.prefix}: {e}")
+
+
+class _LearnerHost:
+    """``node.learners.LearnerHost`` over the agent: the narrow interface ``NodeLearners`` uses."""
+
+    def __init__(self, agent: NodeAgent) -> None:
+        self._agent = agent
+
+    @property
+    def supervisor(self) -> ChildSupervisor:
+        return self._agent.supervisor
+
+    @property
+    def number(self) -> int:
+        return self._agent._number
+
+    @property
+    def ca8(self) -> str:
+        return self._agent.options.token.ca_fingerprint[:8]
+
+    def current_run(self) -> Any:
+        return self._agent._run
+
+    def post(self, item: object) -> None:
+        self._agent._post(item)
+
+    def send_child(self, name: str, message: Any) -> bool:
+        conn = self._agent._control.get(name)
+        return conn is not None and self._agent._child_send(name, conn, message)
+
+    def set_route(self, route: Any) -> None:
+        self._agent._set_route(route)
+
+    def event(self, kind: str, **fields: Any) -> None:
+        self._agent._event(kind, **fields)
+
+    def send_if_connected(self, message: pb.NodeMessage) -> bool:
+        return self._agent._connected and self._agent._send(message)
+
+    def send(self, message: pb.NodeMessage) -> bool:
+        return self._agent._send(message)
+
+    def submit(self, fn: Any, *args: Any) -> Future:
+        return self._agent._pool.submit(fn, *args)
+
+    def download_bytes(self, run: Any, kind: str, agent_id: str, ident: str) -> bytes:
+        return self._agent._download_bytes(run, kind, agent_id, ident)
+
+    def fixed_cached(self, run: Any) -> bool:
+        return all(self._agent._has(run, k) for k in run.fixed_keys)
+
+    def rpc_text(self, error: BaseException) -> str:
+        return _rpc_text(error)
 
 
 # ---------------------------------------------------------------------------------------------------------------
