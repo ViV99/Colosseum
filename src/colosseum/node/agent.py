@@ -13,17 +13,25 @@
 3. **Welcome** (once per run; a second one after a reconnect starts nothing new): the config, the env spec, the
    agents, the shared-memory cache (``cleanup_dead``, the node lock once per run, writer and reader), the children's
    listener (``Acceptor`` with an ``os.urandom(32)`` key), then every ``Welcome.fixed`` blob fetched into the cache;
-   then ``workers`` workers (``worker-<i>``). Learners of ``Welcome.learners`` are T2.4 (b).
+   then ``workers`` workers (``worker-<i>``) and the learners of ``Welcome.learners`` (``learner-<agent>``; their
+   ``recovery`` / ``trainer_state`` start blobs, A28, are downloaded first; teacher and ``init`` weights come from the
+   ``Welcome.fixed`` blobs in the cache). A second Welcome of the same run starts the learners it lists that do not
+   run here and stops the ones it no longer lists.
 4. **Children** run under ``ChildSupervisor``. Each pass waits on the wake pipe, the children's connections and
    their sentinels, reads the ready connections first, then the inbox, then the exits (P-PF2-11: an exited child's
    control connection is read to its end, bounded by ``EXIT_DRAIN_SEC``, before it counts as "reported" or "died").
    A worker that reported a ``ChildError`` is not restarted (the hub stops the run, A12); one that died without a
    report is ``proc_died`` and restarts with a new incarnation (new cells, new epochs) within ``WORKER_RESTARTS``,
-   else its slot is ``slot_disabled``.
+   else its slot is ``slot_disabled``. A learner that ends without being stopped is ``learner_failed`` (until T4.2:
+   the hub stops the run); workers are routed away from it (``LearnerRoute(agent, None)``).
 5. **Messages from children.** ``WorkerResults`` -> ``ResultBuffer``; ``WorkerProgress`` -> per (worker,
    incarnation) cumulative env steps (their sum is the session's counter: it never decreases) and counters
    (``MetricsBatch.workers``); ``ChildError`` -> ``Event(child_error)`` with ``node <n> (<name>), `` prepended to the
-   child's context.
+   child's context. Learners: their control hello -> ``LearnerRoute`` to every worker (and to every worker that
+   connects later); ``VersionPublished`` -> ``VersionAnnounce`` (the latest one kept while the hub is away);
+   ``CheckpointHeader`` + frame -> an ``Upload`` in the transfer pool (``checkpoint`` / ``final``), its reply logged (a
+   refused periodic one is a WARNING, a refused final an ERROR); ``LearnerMetrics`` -> ``MetricsBatch.train``;
+   ``IntakeReport`` -> ``MetricsBatch.intake``.
 6. **Lineups (R11).** ``CellTracker.due()`` -> one ``LineupRequest`` per pass; a grant waits until every key of its
    seats is in the cache (a ``latest`` pointer, a snapshot, a frozen agent's blob), fetching the missing snapshots and
    blobs in the transfer pool; a failed fetch keeps the old lineup, counts ``lineup_fetch_failed`` per grant and
@@ -31,18 +39,24 @@
    ``max(ttl, LINEUP_WAIT_SEC)`` is given up the same way (P-PF2-12). A worker gets its routes and ``WeightsReady``
    when its control connection opens, before its first ``WorkerLineups``. Snapshots no cell references any more
    leave the cache after ``CACHE_DROP_DELAY_SEC`` (safe by an ordering invariant, see ``_prune_cache``).
-7. **Announces.** ``evictions`` -> ``WorkerEvict`` to every worker; ``env_steps`` is kept for the learners (b).
+7. **Announces.** ``evictions`` -> ``WorkerEvict`` to every worker; ``env_steps`` -> ``LearnerEnvSteps`` to every
+   learner (LR progress).
 8. **Heartbeat** every ``distributed.heartbeat_sec``: env steps, ``dropped_results``, processes, load, cached keys
    and the node counters (``lineup_fetch_failed``, ``dropped_results_node_buffer``, ``worker_restarts``: A2).
    ``MetricsBatch`` every ``METRICS_FLUSH_SEC``; due result batches every pass, unacked ones again after
    ``RESULT_RESEND_SEC`` on a live session (P-PF2-4) and all of them after every reconnect.
-9. **Commands.** ``stop_run`` stops (item 10); ``start_learner`` / ``stop_learner`` / ``release`` are T2.4 (b) /
-   T6.3, ``set_evaluators`` / ``update_code`` T5.1 / T8.3: logged and ignored here.
+9. **Commands.** ``stop_run`` stops (item 10); ``start_learner`` / ``stop_learner`` start or stop one learner
+   (stopped, it sends its final snapshot, which is uploaded); ``release`` stops like item 10, then forgets the run
+   (its children, cache files, lock and listener) and keeps the session (``once``: the node then exits 0; serving
+   another run is T6.3's); ``set_evaluators`` / ``update_code`` (T5.1 / T8.3) are logged and ignored.
 10. **Stop** (``stop_run`` or ``request_stop``): ``Stop`` to every child; the loop keeps reading results until every
     child exited or the grace passed (``LOCAL_CHILD_GRACE_SEC`` for the local node, ``distributed.shutdown_grace_sec -
     5`` otherwise); the rest is killed; the result buffer is flushed and its acks awaited until the grace's deadline +
-    ``ACK_WAIT_EXTRA_SEC``; what is still unacked then is counted in ``dropped_results_node_buffer`` (P-PF2-4 b); a
-    last ``Heartbeat``, ``Event(run_stopped)``; the node's cache files and lock are removed; the session closes.
+    ``ACK_WAIT_EXTRA_SEC``, as are the uploads in flight (the learners' finals); what is still unacked then is counted
+    in ``dropped_results_node_buffer`` (P-PF2-4 b); a last ``Heartbeat``, ``Event(run_stopped)``; the transfers
+    still running are cancelled (``TRANSFER_JOIN_SEC``); the node's cache files and lock are removed; the session
+    closes. Worst case of a local node (``LOCAL_CHILD_GRACE_SEC`` 5 s): 5 s grace + 2 s kill + 1 s acks / uploads +
+    1 s transfer join = 9 s, plus the session's close (immediate while the hub answers; ``HubSession`` bounds it).
 
 Threads besides the loop: the session reader (``HubSession``), the listener's ``Acceptor`` and the transfer pool;
 they only post into the inbox (a ``SimpleQueue`` plus a non-blocking wake pipe in the loop's ``wait`` list). The
@@ -98,8 +112,11 @@ CACHE_DROP_DELAY_SEC = 10.0     # an unreferenced snapshot stays this long in th
 EXIT_DRAIN_SEC = 1.0            # an exited child's control connection is read to its end within this (P-PF2-11)
 FIXED_RETRY_SEC = 2.0           # a failed fetch of a Welcome.fixed blob is retried after this
 TRANSFER_THREADS = 4
-TRANSFER_JOIN_SEC = 5.0         # at the end, transfers still running are waited for this long before the cleanup
+TRANSFER_JOIN_SEC = 1.0         # at the end, cancelled transfers are waited for this long before the cache cleanup
 DOWNLOAD_TIMEOUT_SEC = 300.0
+UPLOAD_TIMEOUT_SEC = 300.0
+TRAIN_METRICS_KEPT = 1000       # learner train records kept while the hub is away (oldest dropped)
+_UPLOAD_KINDS = {"periodic": "checkpoint", "final": "final", "recovery": "recovery"}
 REGISTER_TIMEOUT_SEC = 30.0
 FETCH_CA_TIMEOUT_SEC = 10.0
 CONNECT_RETRY_SEC = (0.5, 10.0)  # registration retries while the hub is unreachable (doubling)
@@ -154,6 +171,42 @@ class _FetchDone:
 @dataclass
 class _StopRequested:
     reason: str
+
+
+@dataclass
+class _LearnerBlobsDone:
+    agent_id: str
+    generation: int
+    resume_state: dict | None
+    error: str | None
+    serial: int
+
+
+@dataclass
+class _UploadDone:
+    token: str                         # the upload's key in NodeAgent._uploads
+    kind: str                          # the checkpoint kind (periodic / final / recovery)
+    agent_id: str
+    version: int
+    reply: Any                         # pb.UploadReply, or None after a transfer error
+    error: str | None
+
+
+@dataclass
+class _Learner:
+    """A learner this node runs for the run (``state``: ``fetching`` its start blobs, ``ready`` to spawn (once every
+    ``Welcome.fixed`` blob is cached), ``starting`` (spawned, no hello yet), ``running``, ``stopping`` (``Stop``
+    sent))."""
+
+    agent_id: str
+    generation: int
+    assignment: Any                    # pb.LearnerAssignment
+    name: str
+    state: str = "fetching"
+    resume_state: dict | None = None
+    listener_name: str = ""
+    version: int = -1
+    stop_reason: str = ""
 
 
 class _BadSeat(ValueError):
@@ -267,11 +320,20 @@ class NodeAgent:
         self._progress: dict[tuple[int, int], int] = {}            # (worker, incarnation) -> cumulative env steps
         self._worker_stats: dict[tuple[int, int], dict[str, int]] = {}
         self._stats_changed: set[tuple[int, int]] = set()
-        self._learner_routes: dict[str, Any] = {}   # agent -> LearnerRoute sent to every worker (T2.4 b fills it)
-        self._hub_env_steps = 0                     # Announce.env_steps (forwarded to learners in T2.4 b)
+        self._learner_routes: dict[str, Any] = {}   # agent -> LearnerRoute sent to every worker
+        self._learners: dict[str, _Learner] = {}    # agent -> its learner on this node
+        self._pending_versions: dict[str, pb.NodeMessage] = {}   # agent -> VersionAnnounce not sent yet (hub away)
+        self._uploads: dict[Future, tuple[str, str, int]] = {}  # in flight: (kind, agent, version)
+        self._train_metrics: deque = deque(maxlen=TRAIN_METRICS_KEPT)
+        self._intake_stats: dict[str, pb.IntakeStats] = {}
+        self._hub_env_steps = 0                     # Announce.env_steps (forwarded to the learners)
+        self._released: set[str] = set()            # run ids this node released (never served again)
+        self._releasing = False
+        self._dropped_carry = 0                     # dropped_results_node_buffer of released runs (per session)
+        self._heartbeat_sec = 1.0
         self._events: deque = deque(maxlen=PENDING_EVENTS_KEPT)
         self._hello_lock = threading.Lock()
-        self._hello_state: tuple = ("", (), 0, 0, 0)
+        self._hello_state: tuple = ("", (), 0, 0, 0, ())
         self._next_heartbeat = 0.0
         self._next_metrics = 0.0
         self._next_prune = 0.0
@@ -507,18 +569,22 @@ class NodeAgent:
         from colosseum.net.messages import PROTOCOL_VERSION
 
         with self._hello_lock:
-            run_id, live, env_steps, last_acked, _envs = self._hello_state
+            run_id, live, env_steps, last_acked, _envs, learners = self._hello_state
         return pb.Hello(node_id=self._node_id, session_id=self.session_id, protocol_major=PROTOCOL_VERSION[0],
                         protocol_minor=PROTOCOL_VERSION[1], code_hash="", hardware=self._hardware(),
                         slots=self._slots(), data_addresses=[], run_id=run_id,
                         live_cells=[pb.LiveCell(worker=w, env=e, epoch=ep, incarnation=i) for w, e, ep, i in live],
-                        env_steps=env_steps, last_acked_seq=last_acked, learners=[], name=self._name,
+                        env_steps=env_steps, last_acked_seq=last_acked,
+                        learners=[pb.RunningLearner(agent_id=a, generation=g, version=v) for a, g, v in learners],
+                        name=self._name,
                         tags=list(self.options.tags))
 
     def _update_hello_state(self) -> None:
         run = self._run
         state = ("" if run is None else run.run_id, tuple(self.cells.live()), self._env_steps(),
-                 0 if run is None else run.results.last_acked, 0 if run is None else run.envs)
+                 0 if run is None else run.results.last_acked, 0 if run is None else run.envs,
+                 tuple((e.agent_id, e.generation, max(e.version, 0)) for e in self._learners.values()
+                       if e.state in ("running", "stopping")))
         with self._hello_lock:
             self._hello_state = state
 
@@ -571,6 +637,10 @@ class NodeAgent:
                 self._on_fetch_done(item)
             elif isinstance(item, _StopRequested):
                 self._begin_stop(item.reason)
+            elif isinstance(item, _LearnerBlobsDone):
+                self._on_learner_blobs(item)
+            elif isinstance(item, _UploadDone):
+                self._on_upload_done(item)
             else:
                 self._on_session_event(item)
 
@@ -590,6 +660,9 @@ class NodeAgent:
                 if not self._send(pb.NodeMessage(event=self._events[0])):
                     break
                 self._events.popleft()
+            for agent, message in list(self._pending_versions.items()):
+                if self._send(message):
+                    del self._pending_versions[agent]
         elif isinstance(item, SessionLost):
             if self._connected:
                 logger.warning(f"node: the session with the hub ended ({item.reason}); reconnecting")
@@ -602,13 +675,21 @@ class NodeAgent:
         elif run is not None:
             if not run.started:
                 self._maybe_start_workers(run, now)
+            self._start_pending_learners(run)
             self._request_lineups()
             self._expire_waiting()
             self._deliver(run)
             if now >= self._next_prune:
                 self._next_prune = now + CACHE_PRUNE_SEC
                 self._prune_cache(run, now)
-        if run is None or self._done:
+        if self._done:
+            return
+        if run is None:                              # released (or no Welcome yet): heartbeats keep the session
+            if self._released and self._connected and now >= self._next_heartbeat:
+                self._next_heartbeat = now + self._heartbeat_sec
+                self._send(pb.NodeMessage(heartbeat=pb.Heartbeat(
+                    env_steps=self._env_steps(), dropped_results=self._dropped_carry,
+                    counters=self._node_counters(None))))
             return
         for message in run.results.due():
             self._send(message)
@@ -645,6 +726,10 @@ class NodeAgent:
             return
         run = self._run
         if run is None:
+            if self._released:
+                logger.warning(f"node: run {welcome.run_id[:8]} not served: this node released its run (serving "
+                               f"another run is the join command's, T6.3)")
+                return
             try:
                 self._start_run(welcome)
             except Exception as e:  # noqa: BLE001 - a config, env or cache problem: this node cannot serve the run
@@ -657,6 +742,11 @@ class NodeAgent:
                            f"ignored (switching runs is the join command's, T6.3)")
             return
         logger.info(f"node: session resumed for run {run.run_id[:8]} (node {run.number})")
+        listed = {la.agent_id for la in welcome.learners}
+        for agent in [a for a in self._learners if a not in listed]:
+            self._stop_learner(agent, "the hub no longer assigns it here")
+        for la in welcome.learners:
+            self._assign_learner(run, la)
 
     def _start_run(self, welcome: pb.Welcome) -> None:
         from colosseum.core.config import ColosseumConfig
@@ -743,9 +833,8 @@ class NodeAgent:
             raise
         self._run_serial += 1
         self._run = run
-        if welcome.learners:
-            logger.warning(f"node: learner assignments {[la.agent_id for la in welcome.learners]} are not handled "
-                           f"by this node yet (T2.4 b)")
+        for la in welcome.learners:
+            self._assign_learner(run, la)
         logger.info(f"node {number} ({self._name}): serving run {run_id[:8]} with {workers} workers; "
                     f"{len(fixed_keys)} fixed blobs to fetch; logs in {log_dir}")
         self._maybe_start_workers(run, time.monotonic())
@@ -836,6 +925,13 @@ class NodeAgent:
     def _on_command(self, cmd: pb.Command) -> None:
         if cmd.kind == "stop_run":
             self._begin_stop(f"the hub stopped the run ({cmd.reason or 'stop_run'})")
+        elif cmd.kind == "release":
+            self._begin_stop(f"the hub released this node ({cmd.reason or 'release'})", release=True)
+        elif cmd.kind == "start_learner":
+            if self._run is not None and not self._stopping:
+                self._assign_learner(self._run, cmd.learner)
+        elif cmd.kind == "stop_learner":
+            self._stop_learner(cmd.learner.agent_id, cmd.reason or "stop_learner")
         else:
             logger.info(f"node: command {cmd.kind!r} is not handled by this node yet; ignored")
 
@@ -843,8 +939,14 @@ class NodeAgent:
         from colosseum.net.local import WorkerEvict
         from colosseum.node.weights import CacheKey
 
-        if announce.env_steps:
-            self._hub_env_steps = max(self._hub_env_steps, int(announce.env_steps))
+        if announce.env_steps and int(announce.env_steps) > self._hub_env_steps:
+            from colosseum.net.local import LearnerEnvSteps
+
+            self._hub_env_steps = int(announce.env_steps)
+            for entry in self._learners.values():
+                conn = self._control.get(entry.name)
+                if conn is not None:
+                    self._child_send(entry.name, conn, LearnerEnvSteps(self._hub_env_steps))
         keys = [CacheKey("snapshot", ev.agent_id, ev.checkpoint_id) for ev in announce.evictions]
         if keys and self._run is not None:
             for name, conn in list(self._control.items()):
@@ -908,24 +1010,30 @@ class NodeAgent:
 
         future.add_done_callback(done)
 
-    def _download(self, run: _Run, key: Any) -> None:
-        """A transfer-pool thread: ``Download`` the key's frame, check it, put it into the cache."""
-        from colosseum.net.chunks import decode_weights
+    def _download_bytes(self, run: _Run, kind: str, agent_id: str, ident: str) -> bytes:
+        """A transfer-pool thread: one ``Download`` (checked: size, offsets, digest; capped)."""
         from colosseum.net.frame import payload_byte_cap
         from colosseum.net.grpc_util import node_metadata, receive_parts
         from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
+
+        parts = pb_grpc.HubStub(self._channel).Download(
+            pb.BlobRequest(kind=kind, agent_id=agent_id, ident=ident),
+            metadata=node_metadata(self._node_id, self._node_secret), timeout=DOWNLOAD_TIMEOUT_SEC)
+        data, _meta = receive_parts(parts, cap=payload_byte_cap(run.config.distributed.max_message_mb))
+        if data is None:
+            raise ValueError("the hub answered not_modified")
+        return data
+
+    def _download(self, run: _Run, key: Any) -> None:
+        """A transfer-pool thread: ``Download`` the key's frame, check it, put it into the cache."""
+        from colosseum.net.chunks import decode_weights
         from colosseum.node.weights import split_blob_key
 
         if key.kind == "snapshot":
             kind, ident = "snapshot", key.ident
         else:
             kind, ident = split_blob_key(key)
-        parts = pb_grpc.HubStub(self._channel).Download(
-            pb.BlobRequest(kind=kind, agent_id=key.agent_id, ident=ident),
-            metadata=node_metadata(self._node_id, self._node_secret), timeout=DOWNLOAD_TIMEOUT_SEC)
-        data, _meta = receive_parts(parts, cap=payload_byte_cap(run.config.distributed.max_message_mb))
-        if data is None:
-            raise ValueError("the hub answered not_modified")
+        data = self._download_bytes(run, kind, key.agent_id, ident)
         _state, meta = decode_weights(data, cap=len(data))
         if meta.agent_id != key.agent_id:
             raise ValueError(f"the frame holds weights of {meta.agent_id!r}")
@@ -1006,6 +1114,8 @@ class NodeAgent:
                 self._child_send(name, conn, Stop("the node stops"))
             elif self.supervisor.role(name) == "worker":
                 self._on_worker_connected(name, conn)
+            elif self.supervisor.role(name) == "learner":
+                self._on_learner_connected(name, conn)
         elif hello.channel == "route":
             self._child_conns[conn] = name
             self._route_conns.add(conn)
@@ -1030,7 +1140,14 @@ class NodeAgent:
             logger.debug(f"node: cannot send {type(message).__name__} to {name}: {e}")
             return False
 
+    def _frame_cap(self) -> int:
+        from colosseum.net.frame import payload_byte_cap
+
+        return payload_byte_cap(self._run.config.distributed.max_message_mb if self._run is not None else self._max_mb)
+
     def _read_child(self, conn: mpc.Connection) -> None:
+        from colosseum.net.local import CheckpointHeader
+
         name = self._child_conns.get(conn, "?")
         for _ in range(CHILD_MESSAGES_PER_PASS):
             try:
@@ -1040,6 +1157,9 @@ class NodeAgent:
                     conn.recv_bytes()               # frames for other machines: T3.2
                     continue
                 message = conn.recv()
+                frame = None
+                if isinstance(message, CheckpointHeader):     # its frame follows at once (one send under a lock)
+                    frame = conn.recv_bytes(self._frame_cap())
             except (EOFError, OSError):
                 self._close_conn(conn)
                 return
@@ -1047,7 +1167,10 @@ class NodeAgent:
                 logger.exception(f"node: unreadable message from {name}; its connection is closed")
                 self._close_conn(conn)
                 return
-            self._on_child_message(name, message)
+            if frame is not None:
+                self._on_checkpoint(name, message, frame)
+            else:
+                self._on_child_message(name, message)
 
     def _on_child_message(self, name: str, message: Any) -> None:
         from colosseum.net.local import ChildError, WorkerProgress, WorkerResults
@@ -1073,8 +1196,35 @@ class NodeAgent:
             self._on_learner_message(name, message)
 
     def _on_learner_message(self, name: str, message: Any) -> None:
-        """Learner messages (``VersionPublished``, checkpoints, metrics, intake reports): T2.4 (b)."""
-        logger.warning(f"node: unexpected {type(message).__name__} from {name}")
+        """``VersionPublished`` -> ``VersionAnnounce``; ``LearnerMetrics`` / ``IntakeReport`` -> ``MetricsBatch``."""
+        from colosseum.net.local import IntakeReport, LearnerMetrics, VersionPublished
+        from colosseum.net.messages import VersionInfo, version_to_proto
+
+        entry = self._learner_of(name)
+        if entry is None:
+            logger.warning(f"node: unexpected {type(message).__name__} from {name}")
+        elif isinstance(message, VersionPublished):
+            entry.version = max(entry.version, int(message.version))
+            info = VersionInfo(agent_id=entry.agent_id, generation=int(message.generation),
+                               version=int(message.version), size=int(message.size), digest=message.digest,
+                               node=self._number, teacher_active=bool(message.teacher_active))
+            announce = pb.NodeMessage(version=pb.VersionAnnounce(info=version_to_proto(info)))
+            if self._connected and self._send(announce):
+                self._pending_versions.pop(entry.agent_id, None)
+            else:
+                self._pending_versions[entry.agent_id] = announce        # only the latest matters
+        elif isinstance(message, LearnerMetrics):
+            values = {k: float(v) for k, v in message.metrics.items()
+                      if isinstance(v, (int, float)) and not isinstance(v, bool)}
+            self._train_metrics.append(pb.TrainMetrics(
+                agent_id=entry.agent_id, generation=entry.generation,
+                train_step=int(message.metrics.get("train_step", 0)), values=values))
+        elif isinstance(message, IntakeReport):
+            self._intake_stats[entry.agent_id] = pb.IntakeStats(
+                agent_id=entry.agent_id, generation=entry.generation, depth=int(message.depth),
+                dropped={k: int(v) for k, v in message.dropped.items()})
+        else:
+            logger.warning(f"node: unexpected {type(message).__name__} from {name}")
 
     def _close_conn(self, conn: mpc.Connection) -> None:
         name = self._child_conns.pop(conn, None)
@@ -1108,6 +1258,9 @@ class NodeAgent:
         run = self._run
         role = self.supervisor.role(name)
         log_path = "" if run is None else str(run.log_dir / f"{name}.log")
+        if role == "learner":
+            self._on_learner_exit(name, code, log_path)
+            return
         if name in self._reported:
             logger.info(f"node: {name} exited (code {code}) after reporting its error; not restarted")
             return
@@ -1125,8 +1278,222 @@ class NodeAgent:
                 self._disabled.add(name)
                 logger.error(f"node: {name} died too often; its slot is disabled")
                 self._event("slot_disabled", proc=name, exit_code=int(code or 0), log_path=log_path)
-        elif role == "learner":
-            self._event("learner_failed", proc=name, exit_code=int(code or 0), log_path=log_path)   # T2.4 (b)
+
+    # ---- learners -----------------------------------------------------------------------------------------------
+
+    def _learner_of(self, name: str) -> _Learner | None:
+        return next((e for e in self._learners.values() if e.name == name), None)
+
+    def _assign_learner(self, run: _Run, la: pb.LearnerAssignment) -> None:
+        """A learner assignment (``Welcome.learners`` or ``start_learner``): its start blobs are downloaded first;
+        an agent whose learner runs here already keeps it (generations change only from T4.1 on)."""
+        agent = la.agent_id
+        if agent not in run.agent_ids:
+            logger.warning(f"node: refused a learner assignment for {agent!r}: no trainable agent of this run")
+            return
+        current = self._learners.get(agent)
+        if current is not None:
+            if current.generation != int(la.generation):
+                logger.warning(f"node: learner {agent} generation {la.generation} assigned while generation "
+                               f"{current.generation} runs here; ignored")
+            return
+        assignment = pb.LearnerAssignment()
+        assignment.CopyFrom(la)
+        entry = self._learners[agent] = _Learner(agent, int(la.generation), assignment, f"learner-{agent}")
+        if not la.weights_blob:
+            entry.state = "ready"
+            return
+        serial, generation = run.serial, entry.generation
+        future = self._pool.submit(self._fetch_learner_blobs, run, assignment)
+
+        def done(f: Future) -> None:
+            error = "cancelled" if f.cancelled() else (None if f.exception() is None else _rpc_text(f.exception()))
+            self._post(_LearnerBlobsDone(agent, generation, None if error else f.result(), error, serial))
+
+        future.add_done_callback(done)
+
+    def _fetch_learner_blobs(self, run: _Run, la: pb.LearnerAssignment) -> dict:
+        """A transfer-pool thread: the start state of an assignment (A28: a ``recovery`` weights frame and the
+        ``trainer_state`` bytes)."""
+        from colosseum.node.learner_main import resume_state_from_blobs
+
+        weights = self._download_bytes(run, "recovery", la.agent_id, la.weights_blob)
+        trainer = (self._download_bytes(run, "trainer_state", la.agent_id, la.trainer_state_blob)
+                   if la.trainer_state_blob else None)
+        return resume_state_from_blobs(weights, trainer, env_steps=int(la.env_steps),
+                                       source=f"hub recovery blob {la.weights_blob}")
+
+    def _on_learner_blobs(self, done: _LearnerBlobsDone) -> None:
+        entry = self._learners.get(done.agent_id)
+        if (self._run is None or self._run.serial != done.serial or entry is None or entry.state != "fetching"
+                or entry.generation != done.generation):
+            return
+        if done.error is not None:
+            del self._learners[done.agent_id]
+            logger.error(f"node: the start state of learner {done.agent_id} could not be fetched: {done.error}")
+            self._event("learner_failed", proc=entry.name, message=f"start state not fetched: {done.error}",
+                        generation=entry.generation)
+            return
+        entry.resume_state = done.resume_state
+        entry.state = "ready"
+
+    def _start_pending_learners(self, run: _Run) -> None:
+        ready = [e for e in self._learners.values() if e.state == "ready"]
+        if not ready or not all(self._has(run, k) for k in run.fixed_keys):
+            return                                   # teacher / init weights come from the fixed blobs
+        for entry in ready:
+            try:
+                self._start_learner(run, entry)
+            except Exception as e:  # noqa: BLE001 - this learner cannot start: the hub decides (until T4.2: stop)
+                del self._learners[entry.agent_id]
+                logger.exception(f"node: learner {entry.agent_id} cannot start")
+                self._event("learner_failed", proc=entry.name, message=f"{type(e).__name__}: {e}",
+                            generation=entry.generation)
+
+    def _start_learner(self, run: _Run, entry: _Learner) -> None:
+        """Spawn ``entry``'s learner (from the main-loop thread only: PDEATHSIG)."""
+        from colosseum.net.frame import payload_byte_cap
+        from colosseum.net.local import address, learner_proc_name
+        from colosseum.node.learner_main import init_from_cached, learner_target, teacher_for
+        from colosseum.utils.seeding import learner_seed
+
+        agent, la = entry.agent_id, entry.assignment
+        incarnation = self.supervisor.incarnation(entry.name) + 1
+        entry.listener_name = address(self.options.token.ca_fingerprint[:8], run.run_id[:8], run.number,
+                                      learner_proc_name(agent, incarnation))
+        config = run.agent_configs[agent]
+        if la.device:
+            config = config.model_copy(update={"learner": config.learner.model_copy(update={"device": la.device})})
+
+        def cached(kind: str) -> Any:
+            key = next((k for k, k_kind in run.fixed_keys.items() if k_kind == kind and k.agent_id == agent), None)
+            if key is None:
+                return None
+            weights = run.reader.get(key)
+            if weights is None:
+                raise RuntimeError(f"the {kind} blob of {agent!r} is not in the weight cache")
+            return weights
+
+        teacher = teacher_for(run.config, agent, cached=cached("teacher"), bot=run.teachers.get(agent))
+        init = cached("init")
+        kwargs = dict(name=entry.name, log_dir=str(run.log_dir), node=run.number, agent_id=agent,
+                      generation=entry.generation, listener_name=entry.listener_name,
+                      node_address=run.node_address, authkey=run.authkey, config=config,
+                      role_spec=run.role_specs[agent], spec=run.spec,
+                      seed=learner_seed(run.config.training.seed, run.agent_ids.index(agent)), teacher=teacher,
+                      init_state=None if init is None else init_from_cached(run.config, agent, init),
+                      resume_state=entry.resume_state, version_floor=int(la.version_floor),
+                      env_steps=max(int(la.env_steps), self._hub_env_steps), num_learners=len(self._learners),
+                      cache_root=str(run.root), cache_prefix=run.prefix,
+                      checkpoint_interval=int(run.config.checkpoint.interval),
+                      total_timesteps=int(run.config.training.total_timesteps),
+                      cap_bytes=payload_byte_cap(run.config.distributed.max_message_mb))
+        self.supervisor.start(ChildSpec(entry.name, "learner", learner_target, kwargs))
+        entry.state, entry.resume_state = "starting", None
+        logger.info(f"node: started learner {agent} (generation {entry.generation}, version floor "
+                    f"{la.version_floor})")
+
+    def _on_learner_connected(self, name: str, conn: mpc.Connection) -> None:
+        from colosseum.net.local import LearnerEnvSteps, LearnerRoute, Stop
+
+        entry = self._learner_of(name)
+        if entry is None:
+            return
+        if entry.state == "stopping":
+            self._child_send(name, conn, Stop(entry.stop_reason or "stop_learner"))
+            return
+        entry.state = "running"
+        if self._hub_env_steps:
+            self._child_send(name, conn, LearnerEnvSteps(self._hub_env_steps))
+        self._set_route(LearnerRoute(entry.agent_id, entry.listener_name, False, entry.generation))
+
+    def _set_route(self, route: Any) -> None:
+        """Where every worker (and every worker that connects later) sends ``route.agent_id``'s chunks."""
+        self._learner_routes[route.agent_id] = route
+        for name, conn in list(self._control.items()):
+            if self.supervisor.role(name) == "worker":
+                self._child_send(name, conn, route)
+
+    def _stop_learner(self, agent: str, reason: str) -> None:
+        """``stop_learner``: ``Stop`` to the learner (it sends its final snapshot, which is uploaded); workers no
+        longer send it chunks."""
+        from colosseum.net.local import LearnerRoute, Stop
+
+        entry = self._learners.get(agent)
+        if entry is None:
+            return
+        if entry.state in ("fetching", "ready"):
+            del self._learners[agent]                # never started (a fetch still running is ignored on arrival)
+            return
+        entry.state, entry.stop_reason = "stopping", reason
+        conn = self._control.get(entry.name)
+        if conn is not None:
+            self._child_send(entry.name, conn, Stop(reason))
+        self._set_route(LearnerRoute(agent, None, False, 0))
+        logger.info(f"node: stopping learner {agent} ({reason})")
+
+    def _on_learner_exit(self, name: str, code: int | None, log_path: str) -> None:
+        from colosseum.net.local import LearnerRoute
+
+        entry = self._learner_of(name)
+        if entry is None:
+            return
+        del self._learners[entry.agent_id]
+        route = self._learner_routes.get(entry.agent_id)
+        if route is not None and route.address is not None:
+            self._set_route(LearnerRoute(entry.agent_id, None, False, 0))
+        if entry.state == "stopping" and code == 0:
+            logger.info(f"node: learner {entry.agent_id} stopped")
+            return
+        logger.error(f"node: learner {entry.agent_id} ended (exit {code}) without being stopped; see {log_path}")
+        self._event("learner_failed", proc=name, exit_code=int(code or 0), log_path=log_path,
+                    generation=entry.generation)
+
+    def _on_checkpoint(self, name: str, header: Any, frame: bytes) -> None:
+        """A learner's snapshot: an ``Upload`` in the transfer pool (``checkpoint`` / ``final``)."""
+        entry = self._learner_of(name)
+        kind = _UPLOAD_KINDS.get(header.kind)
+        if entry is None or kind is None or header.agent_id != entry.agent_id:
+            logger.warning(f"node: dropped a {header.kind!r} checkpoint of {header.agent_id!r} from {name}")
+            return
+        token = uuid.uuid4().hex
+        future = self._pool.submit(self._upload, kind, header, frame, token)
+        self._uploads[token] = future
+
+        def done(f: Future) -> None:
+            error = "cancelled" if f.cancelled() else (None if f.exception() is None else _rpc_text(f.exception()))
+            self._post(_UploadDone(token, header.kind, header.agent_id, int(header.version),
+                                   None if error else f.result(), error))
+
+        future.add_done_callback(done)
+
+    def _upload(self, kind: str, header: Any, frame: bytes, token: str) -> pb.UploadReply:
+        """A transfer-pool thread: one ``Upload`` (header, then the frame in parts)."""
+        from colosseum.net.grpc_util import blob_digest, node_metadata, send_parts
+        from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
+
+        digest = blob_digest(frame)
+        up = pb.UploadHeader(kind=kind, agent_id=header.agent_id, generation=int(header.generation),
+                             version=int(header.version), total_size=len(frame), digest=digest, request_id=token)
+
+        def parts():
+            yield pb.UploadPart(header=up)
+            for part in send_parts(frame, digest=digest):
+                if part.data:
+                    yield pb.UploadPart(data=part.data)
+
+        return pb_grpc.HubStub(self._channel).Upload(parts(), metadata=node_metadata(self._node_id, self._node_secret),
+                                                     timeout=UPLOAD_TIMEOUT_SEC)
+
+    def _on_upload_done(self, done: _UploadDone) -> None:
+        self._uploads.pop(done.token, None)
+        what = f"the {done.kind} snapshot v{done.version} of {done.agent_id}"
+        if done.error is None and done.reply.accepted:
+            logger.info(f"node: uploaded {what} ({done.reply.checkpoint_id})")
+            return
+        why = done.error if done.error is not None else f"refused: {done.reply.reason}"
+        level = logging.ERROR if done.kind == "final" else logging.WARNING
+        logger.log(level, f"node: the hub did not take {what} ({why})")
 
     # ---- heartbeats and metrics -------------------------------------------------------------------------------
 
@@ -1139,10 +1506,11 @@ class NodeAgent:
         proc = self.supervisor.get(name)
         return "alive" if proc is not None and proc.exitcode is None else "dead"
 
-    def _node_counters(self, run: _Run) -> dict[str, int]:
+    def _node_counters(self, run: _Run | None) -> dict[str, int]:
+        """The A2 node counters, cumulative per session (a released run's drops are carried)."""
+        dropped = self._dropped_carry + (0 if run is None else int(run.results.dropped))
         return {"lineup_fetch_failed": int(self._counters["lineup_fetch_failed"]),
-                "dropped_results_node_buffer": int(run.results.dropped),
-                "worker_restarts": int(self._counters["worker_restarts"])}
+                "dropped_results_node_buffer": dropped, "worker_restarts": int(self._counters["worker_restarts"])}
 
     def _send_heartbeat(self, run: _Run) -> None:
         try:
@@ -1152,27 +1520,33 @@ class NodeAgent:
         cached = sorted(f"{k.kind}:{k.agent_id}:{k.ident}"
                         for k in (*self._cached, *(k for k in run.fixed_keys if self._has(run, k))))
         self._send(pb.NodeMessage(heartbeat=pb.Heartbeat(
-            env_steps=self._env_steps(), dropped_results=int(run.results.dropped),
+            env_steps=self._env_steps(), dropped_results=self._dropped_carry + int(run.results.dropped),
             procs=[pb.ProcState(name=n, state=self._proc_state(n), restarts=max(0, self.supervisor.incarnation(n) - 1))
                    for n in self.supervisor.names()],
             load=load, cached_keys=cached, counters=self._node_counters(run))))
 
     def _send_metrics(self) -> None:
-        if not self._stats_changed:
+        if not (self._stats_changed or self._train_metrics or self._intake_stats):
             return
         workers = [pb.WorkerStats(worker=w, incarnation=i, counters=self._worker_stats.get((w, i), {}))
                    for w, i in sorted(self._stats_changed)]
-        if self._send(pb.NodeMessage(metrics=pb.MetricsBatch(workers=workers))):
+        batch = pb.MetricsBatch(workers=workers, train=list(self._train_metrics),
+                                intake=list(self._intake_stats.values()))
+        if self._send(pb.NodeMessage(metrics=batch)):
             self._stats_changed.clear()
+            self._train_metrics.clear()
+            self._intake_stats.clear()
 
     # ---- the stop ---------------------------------------------------------------------------------------------
 
-    def _begin_stop(self, reason: str) -> None:
+    def _begin_stop(self, reason: str, *, release: bool = False) -> None:
+        """Item 10 (``release``: then forget the run and keep the session)."""
         from colosseum.net.local import Stop
 
         if self._stopping:
             return
         self._stopping = True
+        self._releasing = release and self._run is not None
         now = time.monotonic()
         run = self._run
         logger.info(f"node: stopping ({reason})")
@@ -1201,8 +1575,12 @@ class NodeAgent:
             self._stop_phase = "acks"
             return
         if self._stop_phase == "acks":
-            if run is not None and run.results.unacked() and time.monotonic() < self._ack_deadline:
+            waiting = run is not None and (run.results.unacked() or self._uploads)
+            if waiting and time.monotonic() < self._ack_deadline:
                 return
+            if self._uploads:
+                logger.error(f"node: {len(self._uploads)} snapshot uploads did not finish before the stop's deadline; "
+                             f"they are cancelled")
             if run is not None:
                 run.results.give_up()
                 if self._connected:
@@ -1210,49 +1588,76 @@ class NodeAgent:
                     self._send_heartbeat(run)
             if self._connected:
                 self._send(pb.NodeMessage(event=pb.Event(kind="run_stopped")))
+            if self._releasing and run is not None:
+                self._forget_run(run)
+                if self.options.once:
+                    self._done = True
+                return
             self._done = True
 
-    def _close(self) -> None:
-        """Children, connections, threads, the session, then the cache files (every path out of ``run``). The order
-        matters: the node is marked closed first (thread callbacks no longer wake the loop), the transfers are
-        cancelled (the channel closes) and their threads waited for (``TRANSFER_JOIN_SEC``) before the prefix's
-        files are removed, so no download puts a segment after the cleanup; the wake pipe closes last."""
-        from colosseum.node.weights import release_node_lock
+    def _forget_run(self, run: _Run) -> None:
+        """After ``release``: the run's resources go (``_teardown_run``) and so do its books; the session stays.
+        This node serves nothing further of this run (``_released``); serving another run is T6.3's."""
+        self._teardown_run(run)
+        self._dropped_carry += int(run.results.dropped)
+        self._heartbeat_sec = run.heartbeat_sec
+        self._released.add(run.run_id)
+        self._run = None
+        self.supervisor = ChildSupervisor()
+        self.cells = CellTracker(retry_sec=LINEUP_RETRY_SEC, clock=time.monotonic)
+        for book in (self._learners, self._learner_routes, self._pending_versions, self._uploads, self._fetching,
+                     self._unref_since, self._intake_stats, self._control, self._child_conns):
+            book.clear()
+        for book in (self._cached, self._route_conns, self._reported, self._disabled):
+            book.clear()
+        self._stopping, self._releasing, self._stop_phase = False, False, ""
+        logger.info(f"node: released run {run.run_id[:8]}; the session stays open")
 
+    def _close(self) -> None:
+        """Children, the session, transfers, then the run's resources and cache files (every path out of ``run``).
+        The order matters: the node is marked closed first (thread callbacks no longer wake the loop), the transfers
+        are cancelled (the channel closes) and waited for (``TRANSFER_JOIN_SEC``) before the prefix's files are
+        removed, so no download puts a segment after the cleanup; the wake pipe closes last."""
         with self._wake_lock:
             self._closed = True
         if self.supervisor.alive():
             self.supervisor.stop_all(0.0)
-        run = self._run
-        if run is not None:
-            run.acceptor.close()
-            try:
-                run.listener.close()
-            except OSError:
-                pass
-        for conn in list(self._child_conns):
-            self._close_conn(conn)
         if self._session is not None:
             self._session.close()
         if self._channel is not None:
-            self._channel.close()                    # cancels the downloads in flight
-        in_flight = list(self._fetching.values())
+            self._channel.close()                    # cancels the downloads and uploads in flight
         self._pool.shutdown(wait=False, cancel_futures=True)
-        if in_flight:
-            _, stuck = wait_futures(in_flight, timeout=TRANSFER_JOIN_SEC)
-            if stuck:
-                logger.warning(f"node: {len(stuck)} transfers did not end within {TRANSFER_JOIN_SEC:.0f} s; a "
-                               f"segment they write later is removed by the next node's cleanup_dead")
-        if run is not None and run.lock is not None:
-            try:
-                release_node_lock(run.root, run.prefix)
-            except Exception as e:  # noqa: BLE001 - leftovers are removed by the next node's cleanup_dead
-                logger.warning(f"node: cannot remove the weight cache files of {run.prefix}: {e}")
+        if self._run is not None:
+            self._teardown_run(self._run)
         for fd in (self._wake_r, self._wake_w):
             try:
                 os.close(fd)
             except OSError:
                 pass
+
+    def _teardown_run(self, run: _Run) -> None:
+        """Close the run's acceptor, listener and child connections; wait ``TRANSFER_JOIN_SEC`` for the transfers
+        in flight; remove the node's cache files and lock (a segment a transfer writes later is a stray file of a
+        prefix without a lock, which the next node's ``cleanup_dead`` removes)."""
+        from colosseum.node.weights import release_node_lock
+
+        run.acceptor.close()
+        try:
+            run.listener.close()
+        except OSError:
+            pass
+        for conn in list(self._child_conns):
+            self._close_conn(conn)
+        in_flight = [*self._fetching.values(), *self._uploads.values()]
+        if in_flight:
+            _, stuck = wait_futures(in_flight, timeout=TRANSFER_JOIN_SEC)
+            if stuck:
+                logger.warning(f"node: {len(stuck)} transfers did not end within {TRANSFER_JOIN_SEC:.0f} s")
+        if run.lock is not None:
+            try:
+                release_node_lock(run.root, run.prefix)
+            except Exception as e:  # noqa: BLE001 - leftovers are removed by the next node's cleanup_dead
+                logger.warning(f"node: cannot remove the weight cache files of {run.prefix}: {e}")
 
 
 # ---------------------------------------------------------------------------------------------------------------

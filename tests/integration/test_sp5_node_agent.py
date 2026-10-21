@@ -452,3 +452,141 @@ def test_a_grant_naming_an_unknown_player_is_refused_with_one_warning(hub_factor
         assert node.stop() == 0
     refused = [r for r in caplog.records if "refused a lineup grant" in r.getMessage()]
     assert len(refused) == 1 and "ghost" in refused[0].getMessage()
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Learners on the node (T2.4 b)
+# ---------------------------------------------------------------------------------------------------------------
+
+SELF_PLAY = Lineup("2p", [SeatAssignment("a", "latest", True), SeatAssignment("a", "latest", False)])
+
+
+def _learner_config(**sections):
+    return _config(checkpoint={"interval": 3}, learner={"batch_chunks": 2, "weight_push_interval": 1},
+                   **sections)
+
+
+def _learner_hub(hub_factory, **kw):
+    """A hub that assigns ``a``'s learner to the node and grants ``a`` vs ``a`` only once ``a``'s first version is
+    announced."""
+    hub = hub_factory(_learner_config(), **kw)
+    hub.welcome(learners=[pb.LearnerAssignment(agent_id="a", generation=1, version_floor=0, device="cpu",
+                                               env_steps=0)])
+    hub.grant(lambda worker, env: SELF_PLAY if hub.versions("a") else None)
+    return hub
+
+
+def _train_steps(hub):
+    return [t.train_step for m in hub.messages("metrics") for t in m.train if t.agent_id == "a"]
+
+
+def test_a_learner_trains_on_the_node_and_uploads_its_snapshots(hub_factory, node_factory, monkeypatch):
+    monkeypatch.setattr(node_session, "RECONNECT_MIN_SEC", 0.05)
+    monkeypatch.setattr(node_session, "RECONNECT_MAX_SEC", 0.2)
+    hub = _learner_hub(hub_factory)
+    node = node_factory(hub)
+    first = wait_for(lambda: hub.versions("a"), timeout=60)[0]
+    assert (first.generation, first.version, first.node) == (1, 0, node.agent.number) and first.size > 0
+    wait_for(lambda: max(_train_steps(hub), default=0) >= 3, timeout=60)
+    wait_for(lambda: hub.uploads_of("checkpoint"), timeout=60)
+    versions = [v.version for v in hub.versions("a")]
+    assert versions == sorted(versions) and versions[-1] > 0
+    wait_for(lambda: any(m.intake for m in hub.messages("metrics")))     # IntakeReport: every 1 s
+    hub.announce(env_steps=1000)                                    # the hub's global counter: LR progress
+    wait_for(lambda: any(t.values["progress"] > 0 for m in hub.messages("metrics") for t in m.train), timeout=60)
+    hub.close_session()                                             # a reconnect: the Hello names the learner,
+    wait_for(lambda: len(hub.events(SessionOpened)) >= 2)           # the second Welcome starts nothing new
+    (running,) = hub.events(SessionOpened)[1].hello.learners
+    assert (running.agent_id, running.generation) == ("a", 1) and running.version >= 0
+    time.sleep(0.5)
+    assert node.agent.supervisor.incarnation("learner-a") == 1 and node.agent.supervisor.get("learner-a").is_alive()
+    prefix = node.agent.cache_prefix
+    start = time.monotonic()
+    hub.send_command("stop_run", reason="grace=5")
+    node.thread.join(30)
+    assert node.exit_code == 0 and time.monotonic() - start < 30
+    hub.sync()
+    (final,) = hub.uploads_of("final")
+    assert final.agent_id == "a" and final.generation == 1 and final.version >= versions[-1]
+    assert hub.node_events("run_stopped")
+    assert not node.agent.supervisor.alive()
+    assert not list(shm_dir().glob(f"{prefix}*")) and not list(shm_dir().glob(f".{prefix}*"))
+
+
+def test_a_killed_learner_blocks_neither_the_worker_nor_the_node(hub_factory, node_factory):
+    hub = _learner_hub(hub_factory)
+    node = node_factory(hub)
+    wait_for(lambda: max(_train_steps(hub), default=0) >= 2, timeout=60)
+    learner = node.agent.supervisor.get("learner-a")
+    os.kill(learner.pid, signal.SIGKILL)
+    failed = wait_for(lambda: hub.node_events("learner_failed"))[0]
+    assert failed.proc == "learner-a" and failed.exit_code == -signal.SIGKILL and failed.generation == 1
+    results, beats = len(hub.results()), len(hub.heartbeats())
+    wait_for(lambda: len(hub.results()) > results + 10 and len(hub.heartbeats()) > beats + 2)
+
+    def drops():
+        finals = {}
+        for m in hub.messages("metrics"):
+            for w in m.workers:
+                finals[(w.worker, w.incarnation)] = dict(w.counters)
+        return sum(c.get("dropped_chunks_no_learner", 0) + c.get("dropped_chunks_disconnect", 0)
+                   for c in finals.values())
+
+    wait_for(lambda: drops() > 0)                                  # its chunks are dropped and counted
+    assert node.agent.supervisor.get("worker-0").exitcode is None
+    assert node.stop() == 0
+
+
+def test_children_die_with_their_node(tmp_path, hub_factory):
+    from node_kit import pid_alive, spawned_children, start_node_process
+
+    hub = _learner_hub(hub_factory)
+    proc = start_node_process(toy_node_options(tmp_path, hub), tmp_path / "node-process-logs")
+    try:
+        wait_for(lambda: hub.versions("a") and hub.results(), timeout=60)
+        children = wait_for(lambda: (lambda c: c if len(c) >= 2 else None)(spawned_children(proc.pid)))
+        os.kill(proc.pid, signal.SIGKILL)
+        proc.join(10)
+        wait_for(lambda: not any(pid_alive(pid) for pid in children), timeout=5)
+    finally:
+        if proc.is_alive():
+            proc.kill()
+            proc.join(5)
+
+
+def test_stop_finishes_within_the_local_grace(hub_factory, node_factory):
+    hub = _learner_hub(hub_factory)
+    node = node_factory(hub, shutdown_grace_sec=agent_mod.LOCAL_CHILD_GRACE_SEC)
+    wait_for(lambda: max(_train_steps(hub), default=0) >= 2, timeout=60)
+    start = time.monotonic()
+    hub.send_command("stop_run", reason="grace=5")
+    node.thread.join(30)
+    assert time.monotonic() - start < agent_mod.LOCAL_CHILD_GRACE_SEC + 2.0 and node.exit_code == 0
+    hub.sync()
+    assert hub.uploads_of("final")
+
+
+def test_stop_learner_uploads_its_final_and_release_keeps_the_session(hub_factory, node_factory, caplog):
+    hub = _learner_hub(hub_factory)
+    hub.upload_reply = lambda header, data: pb.UploadReply(accepted=header.kind != "final", reason="test refusal")
+    with caplog.at_level(logging.WARNING):
+        node = node_factory(hub)
+        wait_for(lambda: max(_train_steps(hub), default=0) >= 2, timeout=60)
+        hub.send_command("stop_learner", learner=pb.LearnerAssignment(agent_id="a", generation=1), reason="remove")
+        wait_for(lambda: hub.uploads_of("final"), timeout=30)
+        wait_for(lambda: node.agent.supervisor.get("learner-a").exitcode is not None)
+        wait_for(lambda: any("did not take the final snapshot" in r.getMessage() and r.levelno == logging.ERROR
+                             for r in caplog.records))
+        assert not hub.node_events("learner_failed")
+        worker = node.agent.supervisor.get("worker-0")
+        prefix = node.agent.cache_prefix
+        hub.send_command("release", reason="test")
+        wait_for(lambda: hub.node_events("run_stopped"))
+        wait_for(lambda: node.agent.run_id is None)
+        assert node.thread.is_alive() and worker.exitcode is not None
+        assert not list(shm_dir().glob(f"{prefix}*"))
+        sessions = len(hub.events(SessionOpened))
+        beats = len(hub.heartbeats())
+        wait_for(lambda: len(hub.heartbeats()) > beats + 1)          # the session stays, with heartbeats
+        assert len(hub.events(SessionOpened)) == sessions
+        assert node.stop() == 0

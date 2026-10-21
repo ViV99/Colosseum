@@ -122,6 +122,9 @@ class FakeHub:
         self.accounted: list[str] = []
         self.acked: list[int] = []
         self.errors: list[str] = []
+        self.uploads: list[tuple[pb.UploadHeader, bytes]] = []     # every upload handled, in order
+        self.upload_reply: Callable[[pb.UploadHeader, bytes], pb.UploadReply] = (
+            lambda header, data: pb.UploadReply(accepted=True, checkpoint_id=f"ckpt_v{header.version}"))
         self._held: list[tuple[str, str, int]] = []
         self._stop = threading.Event()
         self._thread = threading.Thread(target=self._loop, name="fake-hub", daemon=True)
@@ -236,6 +239,13 @@ class FakeHub:
                                                                         kind="fixed"))
         return blob_id
 
+    def versions(self, agent: str | None = None) -> list[pb.VersionInfo]:
+        """Every ``VersionAnnounce``'s info received (of ``agent``), in arrival order."""
+        return [m.info for m in self.messages("version") if agent is None or m.info.agent_id == agent]
+
+    def uploads_of(self, kind: str) -> list[pb.UploadHeader]:
+        return [h for h, _ in list(self.uploads) if h.kind == kind]
+
     def heartbeats(self) -> list[pb.Heartbeat]:
         return self.messages("heartbeat")
 
@@ -304,8 +314,10 @@ class FakeHub:
                 return
             self._on_message(ev, handle)
         elif isinstance(ev, UploadIn):
+            data = ev.path.read_bytes()
             ev.path.unlink(missing_ok=True)
-            ev.reply.set_result(pb.UploadReply(accepted=True, checkpoint_id=f"ckpt_v{ev.header.version}"))
+            self.uploads.append((ev.header, data))
+            ev.reply.set_result(self.upload_reply(ev.header, data))
 
     def _on_message(self, ev: NodeMessageIn, handle: SessionHandle) -> None:
         kind = ev.message.WhichOneof("m")
@@ -379,3 +391,42 @@ class NodeThread:
 
 def run_node_in_thread(options: NodeOptions) -> NodeThread:
     return NodeThread(options)
+
+
+def start_node_process(options: NodeOptions, log_dir: Path) -> Any:
+    """The node as a spawned process (``node.agent.local_node_target``: the child signal policy and logging of a
+    hub's local node); returns the started ``Process``."""
+    import multiprocessing as mp
+
+    from colosseum.node.agent import local_node_target
+
+    proc = mp.get_context("spawn").Process(target=local_node_target, kwargs={"options": options,
+                                                                            "log_dir": str(log_dir)}, daemon=False)
+    proc.start()
+    return proc
+
+
+def spawned_children(pid: int) -> list[int]:
+    """Linux: the pids of ``pid``'s live children started by multiprocessing's spawn (``/proc``; zombies excluded)."""
+    out = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            stat = (entry / "stat").read_text()
+            cmdline = (entry / "cmdline").read_bytes()
+        except OSError:
+            continue
+        fields = stat.rsplit(")", 1)[1].split()
+        if int(fields[1]) == pid and fields[0] != "Z" and b"spawn_main" in cmdline:
+            out.append(int(entry.name))
+    return out
+
+
+def pid_alive(pid: int) -> bool:
+    """The process exists and is not a zombie."""
+    try:
+        state = Path(f"/proc/{pid}/stat").read_text().rsplit(")", 1)[1].split()[0]
+    except OSError:
+        return False
+    return state != "Z"
