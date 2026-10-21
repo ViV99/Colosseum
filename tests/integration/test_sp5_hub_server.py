@@ -5,9 +5,11 @@ order, converted results, cut and resume, loss, outbound overflow), blobs in par
 registered blobs, path rules of P-PF2-9), uploads spooled and checked, admin calls, the relay placeholders."""
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import threading
+import time
 
 import grpc
 import numpy as np
@@ -55,6 +57,11 @@ def _session(hub, session_id="s1", **kw) -> FakeNode:
 
 def _code(excinfo) -> grpc.StatusCode:
     return excinfo.value.code()
+
+
+def _blob_name(kind: str, agent: str, ident: str, suffix: str = ".frame") -> str:
+    """The documented blob file name: ``<kind>-<32 hex of blake2b(agent id)>-<ident><suffix>``."""
+    return f"{kind}-{hashlib.blake2b(agent.encode(), digest_size=16).hexdigest()}-{ident}{suffix}"
 
 
 # ---- registration ---------------------------------------------------------------------------------------------
@@ -190,7 +197,7 @@ def test_a_malformed_result_batch_reaches_the_inbox_as_an_error(hub, monkeypatch
 
 
 def test_a_cut_stream_resumes_and_resent_batches_are_accounted_once(tmp_path):
-    hub = serve(tmp_path, hold_acks=True, node_lost_after_sec=2.0)
+    hub = serve(tmp_path, hold_acks=True, node_lost_after_sec=60.0)   # never lost here: the test is a resume
     try:
         node = _session(hub)
         n = node.number
@@ -257,6 +264,10 @@ def test_a_silent_node_is_lost_and_comes_back_with_new_epochs(tmp_path):
         grants = node.wait_for("grants")[0].grants
         old = {g.epoch for g in grants}
         poll_until(lambda: hub.loop.call(lambda: hub.loop.registry.by_id(node.node_id).state) == "lost")
+
+        def no_more_losses():                                    # the returned node must not be lost again
+            hub.loop.node_lost_after_sec = 60.0
+        hub.loop.call(no_more_losses)
         assert hub.loop.call(lambda: [c for c in hub.loop.cells.live() if c.key.node == node.number]) == []
         node.wait_ended()                                        # the hub closed the lost node's stream
         node.open("s2", live_cells=[(g.worker, g.env, g.epoch, 0) for g in grants])
@@ -323,7 +334,7 @@ def test_snapshots_are_converted_once_and_served_in_parts(hub, monkeypatch):
     tree, meta = decode_weights(d0, cap=1 << 30)
     assert meta == WeightsMeta(agent_id="a", kind="snapshot", generation=0, policy_version=5, checkpoint_id="ckpt_v5")
     assert np.array_equal(tree["w"], state["w"].numpy()) and np.array_equal(tree["b"], state["b"].numpy())
-    assert sorted(p.name for p in (hub.run_dir.root / "blobs").iterdir()) == ["snapshot-a-ckpt_v5.frame"]
+    assert sorted(p.name for p in (hub.run_dir.root / "blobs").iterdir()) == [_blob_name("snapshot", "a", "ckpt_v5")]
     assert len(calls) == 1
     with pytest.raises(grpc.RpcError) as e:
         node.download("snapshot", "a", "ckpt_v6")
@@ -361,7 +372,48 @@ def test_blob_paths_are_validated_before_any_path_is_formed(hub):
         blobs.register_fixed("x", b"f", kind="snapshot", agent_id="bot")
     assert not (root / "blobs").exists() or list((root / "blobs").iterdir()) == []
     blobs.register_fixed("state1", b"raw", kind="trainer_state", agent_id="a")
-    assert blobs.frame_path("trainer_state", "a", "state1") == root / "blobs" / "trainer_state-a-state1.bin"
+    assert blobs.frame_path("trainer_state", "a", "state1") == root / "blobs" / _blob_name("trainer_state", "a",
+                                                                                         "state1", ".bin")
+
+
+def test_agent_ids_follow_the_config_rule_and_never_name_blob_files(hub):
+    """Agent ids are checked with ``check_agent_id`` (no length limit of the hub's own: a 200-char config id is
+    served), blob file names stay bounded and never contain the agent id, and triples that would join to the same
+    ``kind-agent-ident`` string get different files."""
+    long_id = "L" * 200
+    ckpt = hub.run_dir.checkpoints / long_id / "ckpt_v3"
+    ckpt.mkdir(parents=True)
+    torch.save({"w": torch.arange(4, dtype=torch.float32)}, ckpt / "model.pt")
+    node = hub.registered_node()
+    data, _ = node.download("snapshot", long_id, "ckpt_v3")
+    tree, meta = decode_weights(data, cap=1 << 30)
+    assert meta.agent_id == long_id and meta.policy_version == 3 and np.array_equal(tree["w"], np.arange(4.0))
+
+    hub.blobs.register_fixed("b-c", b"one", kind="fixed", agent_id="a")
+    hub.blobs.register_fixed("c", b"two", kind="fixed", agent_id="a-b")
+    first, second = hub.blobs.frame_path("fixed", "a", "b-c"), hub.blobs.frame_path("fixed", "a-b", "c")
+    assert first != second and first.read_bytes() == b"one" and second.read_bytes() == b"two"
+    assert node.download("fixed", "a", "b-c")[0] == b"one" and node.download("fixed", "a-b", "c")[0] == b"two"
+
+    hub.blobs.register_fixed("x", b"long", kind="teacher", agent_id=long_id)
+    names = [p.name for p in (hub.run_dir.root / "blobs").iterdir()]
+    assert all(long_id not in n and "-a-" not in n and len(n) <= 13 + 1 + 32 + 1 + 160 + 6 for n in names)
+    assert sorted(names) == sorted([_blob_name("snapshot", long_id, "ckpt_v3"), _blob_name("fixed", "a", "b-c"),
+                                    _blob_name("fixed", "a-b", "c"), _blob_name("teacher", long_id, "x")])
+
+    for agent in ("ratings", "a.b", "x" * 300):                  # refused by the config rule / beyond NAME_MAX
+        assert hub.blobs.frame_path("snapshot", agent, "ckpt_v3") is None
+    with pytest.raises(ValueError):
+        hub.blobs.register_fixed("x", b"f", kind="fixed", agent_id="a.b")
+    with pytest.raises(grpc.RpcError) as e:
+        node.download("snapshot", "x" * 300, "ckpt_v3")
+    assert _code(e) == grpc.StatusCode.NOT_FOUND
+
+
+def test_missing_snapshots_leave_no_conversion_lock(hub):
+    for v in range(50):
+        assert hub.blobs.frame_path("snapshot", "a", f"ckpt_v{v}") is None
+    assert hub.blobs._convert_locks == {}
 
 
 # ---- uploads --------------------------------------------------------------------------------------------------
@@ -409,6 +461,55 @@ def test_an_upload_the_main_loop_does_not_answer_times_out_and_leaves_no_file(tm
         assert list((hub.run_dir.root / ".incoming").iterdir()) == []
     finally:
         hub.stop()
+
+
+@pytest.mark.parametrize("method", ["Register", "Upload", "Admin"])
+def test_server_stop_ends_a_handler_that_waits_for_the_main_loop(tmp_path, monkeypatch, method):
+    """A Register / Upload / Admin call the main loop never answers (the loop stopped draining the inbox) ends
+    within about a poll interval of ``server.stop``, not after its 30-60 s reply timeout; an upload's spool file is
+    removed."""
+    ended: dict[str, float] = {}
+    real = getattr(hub_server.HubServicer, method)
+
+    def watched(self, request, context):
+        try:
+            return real(self, request, context)
+        finally:
+            ended[method] = time.monotonic()
+
+    monkeypatch.setattr(hub_server.HubServicer, method, watched)  # before serve(): the server binds the method
+    hub = serve(tmp_path)
+    node = hub.registered_node() if method != "Register" else hub.node()
+    hub.loop.stop()                                              # nothing answers from now on
+    errors: list = []
+
+    def call():
+        try:
+            if method == "Register":
+                node.register(machine_id="m2")
+            elif method == "Upload":
+                node.upload(_header(b"payload"), b"payload")
+            else:
+                node.stub().Admin(pb.AdminRequest(command="hub.status"), metadata=token_metadata(hub.identity.token),
+                                  timeout=30)
+        except grpc.RpcError as e:
+            errors.append(e.code())
+
+    client = threading.Thread(target=call, daemon=True)
+    try:
+        client.start()
+        poll_until(lambda: hub.inbox.qsize() >= 1)               # the handler posted its event and waits
+        time.sleep(0.2)
+        assert method not in ended
+    finally:
+        start = time.monotonic()
+        hub.stop()
+    poll_until(lambda: method in ended, timeout=10.0)
+    assert ended[method] - start <= 3.0
+    client.join(10)
+    assert not client.is_alive()
+    incoming = hub.run_dir.root / ".incoming"
+    assert not incoming.exists() or list(incoming.iterdir()) == []
 
 
 # ---- admin, relay ---------------------------------------------------------------------------------------------

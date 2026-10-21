@@ -134,11 +134,18 @@ class HubSession:
 
     def close(self) -> None:
         """End the stream (outbound sentinel), stop the thread (cancelling a stream that does not end within
-        ``CLOSE_TIMEOUT_SEC``), close the channel. No reconnect afterwards."""
+        ``CLOSE_TIMEOUT_SEC``), close the channel. No reconnect afterwards. Called from the session thread itself
+        (the ``inbox`` callback) it does not wait: the thread stops once the callback returns, and a timer cancels a
+        stream that does not end within ``CLOSE_TIMEOUT_SEC``."""
         self._closing.set()
         stream = self._stream
         if stream is not None:
             stream.end()
+        if threading.current_thread() is self._thread:
+            timer = threading.Timer(CLOSE_TIMEOUT_SEC, self._cancel_if_running, args=(stream,))
+            timer.daemon = True
+            timer.start()
+            return
         if not self._thread.is_alive():
             return
         self._thread.join(CLOSE_TIMEOUT_SEC / 2)
@@ -146,6 +153,10 @@ class HubSession:
         if self._thread.is_alive() and stream is not None and stream.call is not None:
             stream.call.cancel()
         self._thread.join(CLOSE_TIMEOUT_SEC / 2)
+
+    def _cancel_if_running(self, stream: _Stream | None) -> None:
+        if self._thread.is_alive() and stream is not None and stream.call is not None:
+            stream.call.cancel()
 
     # ---- the session thread -------------------------------------------------------------------------------------
 
