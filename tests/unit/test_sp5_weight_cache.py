@@ -32,6 +32,7 @@ from colosseum.node.weights import (
     blob_key,
     cache_prefix,
     cleanup_dead,
+    frame_digest,
     release_node_lock,
     shm_dir,
     split_blob_key,
@@ -71,8 +72,8 @@ def test_the_cache_dir_and_the_prefix(tmp_path, monkeypatch):
 def test_publish_and_read_the_latest_weights(tmp_path):
     writer, reader = _pair(tmp_path)
     assert reader.read_latest("main") is None and reader.latest_version("main") is None
-    name = writer.publish_latest("main", _frame("main", 7, 1.5, generation=2, teacher_active=True), version=7,
-                                 generation=2, teacher_active=True)
+    frame = _frame("main", 7, 1.5, generation=2, teacher_active=True)
+    name, digest = writer.publish_latest("main", frame, version=7, generation=2, teacher_active=True)
     assert name == "colosseum-abababab-01234567-n1-main-v7"
     assert reader.latest_version("main") == (7, 2)
     cached = reader.read_latest("main")
@@ -83,7 +84,7 @@ def test_publish_and_read_the_latest_weights(tmp_path):
     assert reader.read_latest("main", newer_than=7) is None and reader.read_latest("main", newer_than=6) is not None
     pointer = json.loads((tmp_path / "shm" / "colosseum-abababab-01234567-n1-main.latest").read_text())
     assert set(pointer) == {"segment", "version", "generation", "size", "digest", "teacher_active"}
-    assert pointer["size"] == cached.nbytes and len(pointer["digest"]) == 32
+    assert pointer["size"] == cached.nbytes and pointer["digest"] == digest == frame_digest(frame)
     assert stat.S_IMODE(os.stat(tmp_path / "shm" / name).st_mode) == 0o600
 
 
@@ -458,3 +459,22 @@ def test_the_writer_refuses_lz4_frames(tmp_path):
     with pytest.raises(ValueError, match="plain frames"):
         writer.put(blob_key("fixed", "main", "z1"), compressed)
     assert _files(tmp_path) == []
+
+
+def test_a_held_directory_lock_is_waited_for_with_a_bound_and_named(tmp_path, monkeypatch):
+    import fcntl
+
+    root = tmp_path / "shm"
+    root.mkdir(exist_ok=True)
+    monkeypatch.setattr(weights, "DIR_LOCK_TIMEOUT_SEC", 0.3)
+    fd = os.open(root, os.O_RDONLY)                    # another open file description: flock conflicts with it
+    try:
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        start = time.monotonic()
+        with pytest.raises(CacheLockedError, match=str(root)):
+            acquire_node_lock(root, cache_prefix(CA, RUN, 1))
+        assert time.monotonic() - start < 5.0
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        assert acquire_node_lock(root, cache_prefix(CA, RUN, 1)).exists()   # free again: taken at once
+    finally:
+        os.close(fd)

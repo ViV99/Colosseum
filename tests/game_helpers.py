@@ -109,6 +109,18 @@ class TurnTakingGame(MultiAgentEnv):
         return self._result(rewards)
 
 
+class ContractBreakingGame(TurnTakingGame):
+    """``TurnTakingGame`` that breaks the env contract at its 3rd step: seat 5, outside the 2-seat layout, acts
+    (``EpisodeTracker`` raises ``EnvContractError`` naming worker, env, seat, episode step and layout; SP5 T2.4)."""
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        result = super().step(actions)
+        if self.t >= 3:
+            return StepResult(acting={5}, obs={5: _vec(0.0, 5, 1.0)}, action_masks={5: np.array([True, True, False])},
+                              rewards={})
+        return result
+
+
 class SimultaneousGame(MultiAgentEnv):
     """Matching pennies: both seats act every step for ``length`` steps. Obs ``[t / length, seat]``;
     ``Discrete(2)``; seat 0 gets +1 if the actions match, else -1; seat 1 the opposite."""

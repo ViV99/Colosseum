@@ -4,6 +4,7 @@
 version floor lifts the first published version; SP4's queue path (``QueueIntake`` / ``QueueOutputs``) is unchanged."""
 from __future__ import annotations
 
+import json
 import multiprocessing as mp
 import secrets
 import threading
@@ -107,6 +108,9 @@ def test_the_learner_trains_from_frames_through_its_intake(tmp_path):
         latest = WeightCacheReader(shm_dir(), prefix).read_latest("a")
         assert latest is not None and latest.meta.policy_version == published[-1].version
         assert latest.meta.generation == 1
+        pointer = json.loads((shm_dir() / f"{prefix}-a.latest").read_text())
+        (same,) = [p for p in node.of(VersionPublished) if p.version == pointer["version"]]
+        assert (same.digest, same.size) == (pointer["digest"], pointer["size"])    # the cache's own digest
     finally:
         node.conn.send(Stop("test"))
         thread.join(30)

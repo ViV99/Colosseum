@@ -1059,16 +1059,15 @@ class NodeOutputs:
 
     def publish_weights(self, payload: WeightPayload) -> None:
         from colosseum.net.chunks import WeightsMeta, encode_weights
-        from colosseum.node.weights import CacheFullError, frame_digest
+        from colosseum.node.weights import CacheFullError
 
         meta = WeightsMeta(agent_id=self.agent_id, kind="latest", generation=self.generation,
                            policy_version=int(payload.policy_version), teacher_active=bool(payload.teacher_active))
         frame = encode_weights(payload.state_dict, meta)
-        digest = frame_digest(frame)
         try:
-            segment = self._cache.publish_latest(self.agent_id, frame, version=meta.policy_version,
-                                                 generation=self.generation, teacher_active=meta.teacher_active,
-                                                 digest=digest)
+            segment, digest = self._cache.publish_latest(self.agent_id, frame, version=meta.policy_version,
+                                                         generation=self.generation,
+                                                         teacher_active=meta.teacher_active)
         except CacheFullError as e:
             logger.error(f"learner {self.agent_id}: v{meta.policy_version} not published: {e}",
                          exc_info=not self._cache_error_logged)

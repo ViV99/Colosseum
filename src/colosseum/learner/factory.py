@@ -131,6 +131,15 @@ def resolve_teacher(config: ColosseumConfig, agent_id: str, spec: GameSpec) -> T
     return TeacherSpec(kind="neural", source=source, frozen=frozen, **settings)
 
 
+def teacher_from_frozen(config: ColosseumConfig, agent_id: str, frozen: FrozenSpec) -> TeacherSpec:
+    """A neural kickstart teacher of trainable ``agent_id`` from weights the hub sent (a ``teacher`` blob, SP5): the
+    agent's effective ``kickstart`` settings with ``frozen`` (its own architecture and roles, checked by the hub
+    with ``resolve_teacher``); reads no file."""
+    ks = config.get_agent_config(agent_id).kickstart
+    return TeacherSpec(kind="neural", source=frozen.source, lambda_=float(ks.lambda_), decay_steps=int(ks.decay_steps),
+                       kl=ks.kl, frozen=frozen)
+
+
 def build_teacher_model(agent_config: ColosseumConfig, teacher: TeacherSpec, spec: GameSpec) -> PolicyModel:
     """The neural teacher's model (its own architecture, weights loaded, eval mode); ConfigError when the
     weights do not fit."""
@@ -341,6 +350,15 @@ def resolve_init(config: ColosseumConfig, agent_id: str, spec: GameSpec) -> Init
     if unexpected:
         report.append(f"  not in the model (ignored): {unexpected}")
     return InitState(model_state={k: state[k] for k in matched}, strict=False, source=source, report=report)
+
+
+def init_from_blob(config: ColosseumConfig, agent_id: str, model_state: dict[str, np.ndarray],
+                   source: str) -> InitState:
+    """``init`` weights of trainable ``agent_id`` from an ``init`` blob the hub sent (SP5): ``model_state`` is what
+    the hub's ``resolve_init`` kept (all tensors, or the matching ones when partial), ``strict`` the agent's
+    ``init.strict``; ``report`` is empty (the hub logged it). Reads no file."""
+    return InitState(model_state=dict(model_state), strict=bool(config.get_agent_config(agent_id).init.strict),
+                     source=source, report=[])
 
 
 def apply_init(model: PolicyModel, init: InitState) -> None:

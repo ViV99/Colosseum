@@ -56,6 +56,7 @@ import struct
 import sys
 import tempfile
 import threading
+import time
 from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -74,6 +75,8 @@ SHM_DIR_ENV = "COLOSSEUM_SHM_DIR"
 KEEP_LATEST = 2                   # versions of an agent's latest weights kept (the pointer's and the previous one)
 READ_RETRIES = 5
 SPACE_MARGIN_BYTES = 64 * 2**20
+DIR_LOCK_TIMEOUT_SEC = 10.0        # the cache directory's flock is waited for at most this long
+DIR_LOCK_RETRY_SEC = 0.01
 BLOB_KINDS = ("fixed", "teacher", "init", "eval")
 RESERVED_AGENT_PREFIX = "blob"     # agent ids "blob" / "blob-*" would collide with blob segment names
 _FRAME_PREFIX = struct.Struct("<4sHH")   # magic, version, flags (colosseum.net.frame)
@@ -239,20 +242,21 @@ class WeightCacheWriter:
             (self.root / name).unlink(missing_ok=True)
 
     def publish_latest(self, agent_id: str, frame: bytes, *, version: int, generation: int,
-                       teacher_active: bool, digest: str | None = None) -> str:
+                       teacher_active: bool) -> tuple[str, str]:
         """Write version ``version`` of ``agent_id``'s latest weights, point the pointer at it, keep the newest
-        ``KEEP_LATEST`` versions; returns the segment name. ``digest``: ``frame_digest(frame)`` when the caller has it
-        already (one hash pass per publish). If the pointer cannot be written, a segment this call created is removed
-        again and the error is raised."""
+        ``KEEP_LATEST`` versions; returns ``(segment name, digest)``, the digest (``frame_digest``) computed here in
+        one pass over the frame (never taken from the caller: the pointer's digest is what readers and the hub
+        trust). If the pointer cannot be written, a segment this call created is removed again and the error is
+        raised."""
         name = segment_name(self.prefix, CacheKey("latest", agent_id), version)
         _check_plain_frame(frame)
         self._check_space(len(frame))
+        digest = frame_digest(frame)
         segment = self.root / name
         existed = segment.exists()
         _write_file(segment, frame)
         pointer = {"segment": name, "version": int(version), "generation": int(generation), "size": len(frame),
-                   "digest": digest if digest is not None else frame_digest(frame),
-                   "teacher_active": bool(teacher_active)}
+                   "digest": digest, "teacher_active": bool(teacher_active)}
         try:
             _write_file(self.root / pointer_name(self.prefix, agent_id), json.dumps(pointer).encode("utf-8"))
         except BaseException:
@@ -260,7 +264,7 @@ class WeightCacheWriter:
                 segment.unlink(missing_ok=True)
             raise
         self._prune(agent_id, name)
-        return name
+        return name, digest
 
     def put(self, key: CacheKey, frame: bytes) -> str:
         """Write an immutable snapshot / blob segment (kept as is if it exists already); returns its name."""
@@ -435,10 +439,22 @@ def _lock_body() -> bytes:
 def _dir_lock(root: Path) -> Iterator[None]:
     """An exclusive ``flock`` on the cache directory itself, held for a few file operations: taking a lock over,
     and removing a dead owner's lock and files, are then exclusive between processes (the directory is never
-    removed, unlike a lock file, so every process locks the same inode)."""
+    removed, unlike a lock file, so every process locks the same inode). Taken without blocking, retried every
+    ``DIR_LOCK_RETRY_SEC`` for at most ``DIR_LOCK_TIMEOUT_SEC``; CacheLockedError naming the directory after that
+    (a holder stuck for that long is not one of these short critical sections)."""
     fd = os.open(root, os.O_RDONLY)
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX)
+        deadline = time.monotonic() + DIR_LOCK_TIMEOUT_SEC
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise CacheLockedError(f"weight cache directory {root}: its lock (flock) has been held by another "
+                                           f"process for more than {DIR_LOCK_TIMEOUT_SEC:.0f} s; is a node stuck "
+                                           f"there? (lsof {root})") from None
+                time.sleep(DIR_LOCK_RETRY_SEC)
         yield
     finally:
         os.close(fd)                      # closing the descriptor releases the flock

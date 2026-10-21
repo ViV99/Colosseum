@@ -1,0 +1,1516 @@
+"""The node agent: one per machine (SP5 spec 1, 2.6, 4.1-4.4, 4.6, 4.7, 7.1, 7.7; rulings R3, R10-R13).
+
+``NodeAgent.run`` is one loop on the calling thread (the "main-loop thread"; it alone starts children, because
+``PR_SET_PDEATHSIG`` fires when the creating thread exits). What it does:
+
+1. **Identity.** ``options.local`` (``train``'s node, R12): ``credentials`` = ``(node_id, number, node_secret)`` from
+   the hub, no ``Register``. Otherwise ``NodeIdentity.load_or_create(token.ca_fingerprint, identity_root)``; without
+   a registration: the hub CA (``fetch_hub_ca``, unless ``insecure`` / ``loopback_plain``), ``Register`` with the
+   token secret, ``save_registration``. A refusal (``UNAUTHENTICATED`` / ``PERMISSION_DENIED``) is exit 1.
+2. **Session.** A ``HubSession`` whose ``hello`` carries the hardware, the slots, the live cells, the session's
+   cumulative env steps and the last acked result seq (built from a snapshot the loop refreshes every pass: the
+   session thread never reads the loop's books).
+3. **Welcome** (once per run; a second one after a reconnect starts nothing new): the config, the env spec, the
+   agents, the shared-memory cache (``cleanup_dead``, the node lock once per run, writer and reader), the children's
+   listener (``Acceptor`` with an ``os.urandom(32)`` key), then every ``Welcome.fixed`` blob fetched into the cache;
+   then ``workers`` workers (``worker-<i>``). Learners of ``Welcome.learners`` are T2.4 (b).
+4. **Children** run under ``ChildSupervisor``. Each pass waits on the wake pipe, the children's connections and
+   their sentinels, reads the ready connections first, then the inbox, then the exits (P-PF2-11: an exited child's
+   control connection is read to its end, bounded by ``EXIT_DRAIN_SEC``, before it counts as "reported" or "died").
+   A worker that reported a ``ChildError`` is not restarted (the hub stops the run, A12); one that died without a
+   report is ``proc_died`` and restarts with a new incarnation (new cells, new epochs) within ``WORKER_RESTARTS``,
+   else its slot is ``slot_disabled``.
+5. **Messages from children.** ``WorkerResults`` -> ``ResultBuffer``; ``WorkerProgress`` -> per (worker,
+   incarnation) cumulative env steps (their sum is the session's counter: it never decreases) and counters
+   (``MetricsBatch.workers``); ``ChildError`` -> ``Event(child_error)`` with ``node <n> (<name>), `` prepended to the
+   child's context.
+6. **Lineups (R11).** ``CellTracker.due()`` -> one ``LineupRequest`` per pass; a grant waits until every key of its
+   seats is in the cache (a ``latest`` pointer, a snapshot, a frozen agent's blob), fetching the missing snapshots and
+   blobs in the transfer pool; a failed fetch keeps the old lineup, counts ``lineup_fetch_failed`` per grant and
+   re-requests after ``LINEUP_RETRY_SEC`` (WARNING once per key); a grant waiting longer than
+   ``max(ttl, LINEUP_WAIT_SEC)`` is given up the same way (P-PF2-12). A worker gets its routes and ``WeightsReady``
+   when its control connection opens, before its first ``WorkerLineups``. Snapshots no cell references any more
+   leave the cache after ``CACHE_DROP_DELAY_SEC`` (a worker reads a delivered snapshot only when its loop takes the
+   lineup).
+7. **Announces.** ``evictions`` -> ``WorkerEvict`` to every worker; ``env_steps`` is kept for the learners (b).
+8. **Heartbeat** every ``distributed.heartbeat_sec``: env steps, ``dropped_results``, processes, load, cached keys
+   and the node counters (``lineup_fetch_failed``, ``dropped_results_node_buffer``, ``worker_restarts``: A2).
+   ``MetricsBatch`` every ``METRICS_FLUSH_SEC``; due result batches every pass, unacked ones again after
+   ``RESULT_RESEND_SEC`` on a live session (P-PF2-4) and all of them after every reconnect.
+9. **Commands.** ``stop_run`` stops (item 10); ``start_learner`` / ``stop_learner`` / ``release`` are T2.4 (b) /
+   T6.3, ``set_evaluators`` / ``update_code`` T5.1 / T8.3: logged and ignored here.
+10. **Stop** (``stop_run`` or ``request_stop``): ``Stop`` to every child; the loop keeps reading results until every
+    child exited or the grace passed (``LOCAL_CHILD_GRACE_SEC`` for the local node, ``distributed.shutdown_grace_sec -
+    5`` otherwise); the rest is killed; the result buffer is flushed and its acks awaited until the grace's deadline +
+    ``ACK_WAIT_EXTRA_SEC``; what is still unacked then is counted in ``dropped_results_node_buffer`` (P-PF2-4 b); a
+    last ``Heartbeat``, ``Event(run_stopped)``; the node's cache files and lock are removed; the session closes.
+
+Threads besides the loop: the session reader (``HubSession``), the listener's ``Acceptor`` and the transfer pool;
+they only post into the inbox (a ``SimpleQueue`` plus a non-blocking wake pipe in the loop's ``wait`` list). The
+loop never blocks on the network and reads only connections ``wait`` reported ready.
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import multiprocessing.connection as mpc
+import os
+import queue
+import re
+import shutil
+import socket
+import sys
+import threading
+import time
+import uuid
+from collections import Counter, deque
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from concurrent.futures import Future, ThreadPoolExecutor
+from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
+
+import grpc
+
+from colosseum.net.proto import colosseum_v1_pb2 as pb
+from colosseum.net.security import Token
+from colosseum.node.procs import ChildSpec, ChildSupervisor
+from colosseum.utils.process import SHUTDOWN_GRACE_SEC
+
+logger = logging.getLogger(__name__)
+
+__all__ = [
+    "ACK_WAIT_EXTRA_SEC", "CACHE_DROP_DELAY_SEC", "EXIT_DRAIN_SEC", "LINEUP_RETRY_SEC", "LINEUP_WAIT_SEC",
+    "LOCAL_CHILD_GRACE_SEC", "METRICS_FLUSH_SEC", "RESULT_RESEND_SEC", "CellTracker", "NodeAgent", "NodeOptions",
+    "ResultBuffer", "local_node_target", "main",
+]
+
+LINEUP_RETRY_SEC = 1.0          # a requested cell without an answer, or after a failed fetch, is asked again
+LINEUP_WAIT_SEC = 30.0          # a grant waiting longer than max(ttl, this) for its weights is given up (P-PF2-12)
+RESULT_RESEND_SEC = 10.0        # an unacked result batch is sent again after this long on a live session (P-PF2-4)
+METRICS_FLUSH_SEC = 0.5         # MetricsBatch cadence
+LOCAL_CHILD_GRACE_SEC = SHUTDOWN_GRACE_SEC - 2.0   # children of train's local node: before the hub's 7 s
+REMOTE_GRACE_MARGIN_SEC = 5.0   # remote nodes: distributed.shutdown_grace_sec minus this
+ACK_WAIT_EXTRA_SEC = 1.0        # result acks are awaited until the children's deadline plus this
+CACHE_DROP_DELAY_SEC = 10.0     # an unreferenced snapshot stays this long in the cache before it is removed
+EXIT_DRAIN_SEC = 1.0            # an exited child's control connection is read to its end within this (P-PF2-11)
+FIXED_RETRY_SEC = 2.0           # a failed fetch of a Welcome.fixed blob is retried after this
+TRANSFER_THREADS = 4
+DOWNLOAD_TIMEOUT_SEC = 300.0
+REGISTER_TIMEOUT_SEC = 30.0
+FETCH_CA_TIMEOUT_SEC = 10.0
+CONNECT_RETRY_SEC = (0.5, 10.0)  # registration retries while the hub is unreachable (doubling)
+PENDING_EVENTS_KEPT = 100       # events kept while the hub is away (oldest dropped)
+LOOP_WAIT_SEC = 0.05
+CHILD_MESSAGES_PER_PASS = 256   # messages read from one child connection per pass (others get their turn)
+CACHE_PRUNE_SEC = 1.0
+_CA_UNREACHABLE = "cannot fetch the hub certificate"   # security.fetch_hub_ca: the hub is unreachable, not refused
+_REFUSALS = (grpc.StatusCode.UNAUTHENTICATED, grpc.StatusCode.PERMISSION_DENIED,
+             grpc.StatusCode.FAILED_PRECONDITION)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The books: results and cells
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class ResultBuffer:
+    """The node's unacked result batches (spec 4.3). Results are gathered into batches of at most ``batch`` results or
+    every ``flush_sec`` (``due``), numbered per session from 1; ``make(seq, results)`` builds the message once (a
+    ``ResultBatch``) and ``size_of(message)`` its encoded size. A batch is kept until its ack, also while the hub is
+    away; ``limit_bytes`` bounds the kept bytes: a new batch that does not fit is dropped whole and counted in
+    ``dropped`` (one WARNING; overview deviation: the newest is dropped, the oldest keep being resent).
+    ``unacked()`` lists the kept messages in seq order; ``resend_all()`` the same, marking them sent now (after every
+    reconnect); ``overdue(after_sec)`` the kept batches sent ``after_sec`` ago or earlier, marking them sent again
+    (P-PF2-4 a: a refused or lost batch is resent on a live session too); ``give_up()`` counts every kept and pending
+    result as dropped (the stop, P-PF2-4 b)."""
+
+    def __init__(self, *, batch: int, flush_sec: float, limit_bytes: int, make: Callable[[int, list], Any],
+                 size_of: Callable[[Any], int], clock: Callable[[], float]) -> None:
+        self._batch, self._flush_sec, self._limit = max(1, int(batch)), float(flush_sec), int(limit_bytes)
+        self._make, self._size_of, self._clock = make, size_of, clock
+        self._pending: list = []
+        self._since = clock()
+        self._next_seq = 1
+        self._kept: dict[int, list] = {}          # seq -> [message, size, sent_at, results]
+        self._bytes = 0
+        self.dropped = 0
+        self._warned = False
+
+    def add(self, results: Iterable) -> list[Any]:
+        """Gather ``results``; returns the messages cut now (to send)."""
+        out = []
+        for r in results:
+            if not self._pending:
+                self._since = self._clock()
+            self._pending.append(r)
+            if len(self._pending) >= self._batch:
+                out.extend(self._cut())
+        return out
+
+    def due(self) -> list[Any]:
+        """The pending results as one message once ``flush_sec`` passed since the first of them."""
+        if self._pending and self._clock() - self._since >= self._flush_sec:
+            return self._cut()
+        return []
+
+    def flush(self) -> list[Any]:
+        return self._cut() if self._pending else []
+
+    def _cut(self) -> list[Any]:
+        batch, self._pending = self._pending, []
+        message = self._make(self._next_seq, batch)
+        size = int(self._size_of(message))
+        if self._bytes + size > self._limit:
+            self.dropped += len(batch)
+            if not self._warned:
+                self._warned = True
+                logger.warning(f"node result buffer full ({self._bytes / 2**20:.1f} MB unacked); dropped {len(batch)} "
+                               f"match results (dropped_match_results.node_buffer; further drops are only counted)")
+            return []
+        self._kept[self._next_seq] = [message, size, self._clock(), len(batch)]
+        self._next_seq += 1
+        self._bytes += size
+        return [message]
+
+    def ack(self, seqs: Iterable[int]) -> int:
+        n = 0
+        for seq in seqs:
+            kept = self._kept.pop(int(seq), None)
+            if kept is not None:
+                self._bytes -= kept[1]
+                n += 1
+        return n
+
+    def unacked(self) -> list[Any]:
+        return [self._kept[seq][0] for seq in sorted(self._kept)]
+
+    def resend_all(self) -> list[Any]:
+        now = self._clock()
+        for seq in self._kept:
+            self._kept[seq][2] = now
+        return self.unacked()
+
+    def overdue(self, after_sec: float) -> list[Any]:
+        now = self._clock()
+        out = []
+        for seq in sorted(self._kept):
+            kept = self._kept[seq]
+            if now - kept[2] >= after_sec:
+                kept[2] = now
+                out.append(kept[0])
+        return out
+
+    def give_up(self) -> int:
+        """Count every unacked and pending result as dropped and forget them; returns how many (one WARNING)."""
+        n = sum(k[3] for k in self._kept.values()) + len(self._pending)
+        self._kept.clear()
+        self._pending = []
+        self._bytes = 0
+        if n:
+            self.dropped += n
+            logger.warning(f"node: gave up {n} match results the hub did not acknowledge before the stop "
+                           f"(dropped_match_results.node_buffer)")
+        return n
+
+    @property
+    def pending(self) -> int:
+        """Results gathered but not cut into a batch yet."""
+        return len(self._pending)
+
+    @property
+    def last_acked(self) -> int:
+        """Every seq below the smallest kept one is acked (``Hello.last_acked_seq``)."""
+        return (min(self._kept) if self._kept else self._next_seq) - 1
+
+    @property
+    def kept_bytes(self) -> int:
+        return self._bytes
+
+
+@dataclass
+class _Cell:
+    worker: int
+    env: int
+    incarnation: int
+    epoch: int = 0
+    deadline: float | None = None       # node monotonic; None: no lineup yet / due now; inf: whole run
+    waiting: Any = None                 # a grant waiting for its weights: (lineup, keys)
+    waiting_since: float = 0.0
+    ttl: float = 0.0                    # of the waiting grant
+    keys: dict = field(default_factory=dict)   # seat -> key of the lineup the worker has or has been sent
+    requested: bool = False             # in a LineupRequest without an answer yet
+    retry_at: float = 0.0
+
+
+class CellTracker:
+    """The node's cells (spec 4.2, R11): which need a lineup (new incarnation, TTL expired, refused grant), grants
+    that wait for their weights, and the cache keys every live or waiting lineup references (``referenced``: a key
+    that is not referenced may leave the cache). ``retry_sec``: how long a requested cell without an answer, or one
+    whose fetch failed, waits before it is requested again.
+
+    Grants carry no incarnation, so a cell takes a grant only while it is requested, or a late one of the epoch it
+    has; a worker restarted while its cells were requested asks again only after ``retry_sec`` (the answer to the
+    dead incarnation's request comes first on the ordered stream and is refused), so a new incarnation never plays
+    an old incarnation's epoch (whose match uids it would repeat)."""
+
+    def __init__(self, *, retry_sec: float, clock: Callable[[], float]) -> None:
+        self._cells: dict[tuple[int, int], _Cell] = {}
+        self._retry = float(retry_sec)
+        self._clock = clock
+        self._hold: dict[int, float] = {}       # worker -> no request before (its dead incarnation's was unanswered)
+
+    def add_worker(self, worker: int, envs: int, incarnation: int) -> None:
+        hold = self._hold.pop(worker, 0.0)
+        for e in range(envs):
+            self._cells[(worker, e)] = _Cell(worker, e, incarnation, retry_at=hold)
+
+    def drop_worker(self, worker: int) -> None:
+        keys = [k for k in self._cells if k[0] == worker]
+        if any(self._cells[k].requested for k in keys):
+            self._hold[worker] = self._clock() + self._retry
+        for key in keys:
+            del self._cells[key]
+
+    def due(self) -> list[tuple[int, int, int, int]]:
+        """Cells to request now, as ``(worker, env, epoch, incarnation)``; marks them requested."""
+        now = self._clock()
+        out = []
+        for c in self._cells.values():
+            if c.waiting is not None or now < c.retry_at:
+                continue
+            if c.deadline is None or now >= c.deadline:
+                c.requested = True
+                c.retry_at = now + self._retry
+                out.append((c.worker, c.env, c.epoch, c.incarnation))
+        return sorted(out)
+
+    def granted(self, worker: int, env: int, epoch: int, ttl_sec: float, lineup: Any, keys: Mapping) -> bool:
+        """A grant: kept as waiting until delivered; False for a cell this node no longer has (a dead incarnation)
+        or one that asked for nothing (class docstring)."""
+        c = self._cells.get((worker, env))
+        if c is None or not (c.requested or (c.epoch and int(epoch) == c.epoch)):
+            return False
+        now = self._clock()
+        c.requested = False
+        c.epoch = int(epoch)
+        c.deadline = float("inf") if ttl_sec <= 0 else now + float(ttl_sec)
+        c.waiting = (lineup, dict(keys))
+        c.waiting_since = now
+        c.ttl = float(ttl_sec)
+        return True
+
+    def waiting(self) -> list[tuple[int, int, Any, dict]]:
+        return [(c.worker, c.env, c.waiting[0], c.waiting[1]) for c in self._cells.values() if c.waiting is not None]
+
+    def deliver(self, worker: int, env: int) -> tuple[Any, dict]:
+        """The waiting grant's weights are cached: it goes to the worker now."""
+        c = self._cells[(worker, env)]
+        lineup, keys = c.waiting
+        c.waiting = None
+        c.keys = keys
+        return lineup, keys
+
+    def failed(self, worker: int, env: int) -> None:
+        """Fetching the waiting grant's weights failed: drop it, keep the old lineup, ask again after ``retry_sec``."""
+        c = self._cells.get((worker, env))
+        if c is None:
+            return
+        c.waiting = None
+        c.deadline = None
+        c.retry_at = self._clock() + self._retry
+
+    def stale_waiting(self, wait_sec: float) -> list[tuple[int, int, dict]]:
+        """``(worker, env, keys)`` of the grants waiting ``max(ttl, wait_sec)`` or longer (P-PF2-12)."""
+        now = self._clock()
+        return sorted((c.worker, c.env, c.waiting[1]) for c in self._cells.values()
+                      if c.waiting is not None and now - c.waiting_since >= max(c.ttl, wait_sec))
+
+    def referenced(self) -> set:
+        keys = set()
+        for c in self._cells.values():
+            keys.update(c.keys.values())
+            if c.waiting is not None:
+                keys.update(c.waiting[1].values())
+        return keys
+
+    def live(self) -> list[tuple[int, int, int, int]]:
+        """``(worker, env, epoch, incarnation)`` of the cells with an epoch (``Hello.live_cells``)."""
+        return sorted((c.worker, c.env, c.epoch, c.incarnation) for c in self._cells.values() if c.epoch)
+
+    def epoch(self, worker: int, env: int) -> int:
+        c = self._cells.get((worker, env))
+        return 0 if c is None else c.epoch
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Options, inbox events, per-run state
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class NodeOptions:
+    hub_address: str
+    token: Token
+    insecure: bool = False
+    loopback_plain: bool = False
+    workers: int | None = None
+    evaluators: int | None = None
+    cpu_learners: int | None = None
+    no_learners: bool = False
+    gpus: tuple[int, ...] | None = None
+    name: str | None = None
+    tags: tuple[str, ...] = ()
+    once: bool = False
+    identity_root: Path | None = None
+    log_dir: Path | None = None
+    local: bool = False                # train's local node (R12): unlimited learner slots, no Bootstrap, hub's sys.path
+    data_port: int | None = None       # None: no data port; 0 ephemeral; -1 distributed.data_port (A23; T3.1)
+    credentials: tuple[str, int, str] | None = None   # the local node's (node_id, number, node_secret) from the hub
+    shutdown_grace_sec: float | None = None           # None: LOCAL_CHILD_GRACE_SEC / shutdown_grace_sec - 5
+
+
+@dataclass
+class _Accepted:
+    conn: mpc.Connection
+    hello: Any
+
+
+@dataclass
+class _FetchDone:
+    key: Any
+    error: str | None
+    generation: int                    # the run this fetch belongs to (a fetch of an older run is ignored)
+
+
+@dataclass
+class _StopRequested:
+    reason: str
+
+
+class _Refused(Exception):
+    """The hub refused this node (registration or identity); ``run`` returns 1."""
+
+
+@dataclass
+class _Run:
+    """What the node knows of the run it serves (from the first ``Welcome``)."""
+
+    serial: int
+    run_id: str
+    number: int
+    config: Any
+    spec: Any
+    agent_ids: list[str]
+    agent_roles: dict[str, list[str]]
+    agent_configs: dict[str, Any]
+    role_specs: dict[str, Any]
+    bots: dict[str, Any]
+    fixed_roles: dict[str, tuple[str, ...]]
+    teachers: dict[str, Any]
+    fixed_keys: dict[Any, str]          # every Welcome.fixed blob key -> its kind (kept in the cache for the run)
+    frozen_keys: dict[str, Any]         # frozen agent -> its fixed blob key
+    root: Path
+    prefix: str
+    writer: Any
+    reader: Any
+    lock: Path | None
+    authkey: bytes
+    node_address: str
+    listener: Any
+    acceptor: Any
+    log_dir: Path
+    results: ResultBuffer
+    heartbeat_sec: float
+    envs: int
+    workers: int
+    grace: float
+    started: bool = False
+    fixed_retry_at: dict = field(default_factory=dict)
+
+
+def _hostname_name() -> str:
+    name = re.sub(r"[^A-Za-z0-9_.-]", "-", socket.gethostname())[:63].lstrip("-_.")
+    return name or "node"
+
+
+def _split_address(address: str) -> tuple[str, int]:
+    host, _, port = address.rpartition(":")
+    return host.strip("[]") or "127.0.0.1", int(port)
+
+
+def _rpc_text(e: BaseException) -> str:
+    if isinstance(e, grpc.RpcError) and hasattr(e, "code"):
+        return f"{e.code().name}: {e.details() if hasattr(e, 'details') else ''}".rstrip(": ")
+    return f"{type(e).__name__}: {e}"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The agent
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class NodeAgent:
+    """The node agent (module docstring). ``run`` blocks; ``request_stop`` is thread-safe. ``supervisor``,
+    ``cells`` and ``results`` are the loop's books (tests read them; only the loop changes them)."""
+
+    def __init__(self, options: NodeOptions) -> None:
+        self.options = options
+        self.session_id = uuid.uuid4().hex
+        self.supervisor = ChildSupervisor()
+        self.cells = CellTracker(retry_sec=LINEUP_RETRY_SEC, clock=time.monotonic)
+        self.counters: Counter = Counter(lineup_fetch_failed=0, worker_restarts=0)
+        self._inbox: queue.SimpleQueue = queue.SimpleQueue()
+        self._wake_r, self._wake_w = os.pipe()
+        os.set_blocking(self._wake_r, False)
+        os.set_blocking(self._wake_w, False)
+        self._closed = False
+        self._run: _Run | None = None
+        self._run_serial = 0
+        self._session: Any = None
+        self._channel: grpc.Channel | None = None
+        self._node_id = ""
+        self._node_secret = ""
+        self._number = -1
+        self._name = options.name or ("local" if options.local else _hostname_name())
+        self._max_mb = 64
+        self._hw: Any = None
+        self._connected = False
+        self._pool = ThreadPoolExecutor(max_workers=TRANSFER_THREADS, thread_name_prefix="node-transfer")
+        self._fetching: dict[Any, Future] = {}
+        self._fetch_warned: set = set()
+        self._cached: set = set()                   # snapshot keys this node put into the cache
+        self._unref_since: dict[Any, float] = {}
+        self._control: dict[str, mpc.Connection] = {}
+        self._child_conns: dict[mpc.Connection, str] = {}
+        self._route_conns: set[mpc.Connection] = set()
+        self._reported: set[str] = set()           # children that sent a ChildError
+        self._disabled: set[str] = set()
+        self._progress: dict[tuple[int, int], int] = {}            # (worker, incarnation) -> cumulative env steps
+        self._worker_stats: dict[tuple[int, int], dict[str, int]] = {}
+        self._stats_changed: set[tuple[int, int]] = set()
+        self._learner_routes: dict[str, Any] = {}   # agent -> LearnerRoute sent to every worker (T2.4 b fills it)
+        self._hub_env_steps = 0                     # Announce.env_steps (forwarded to learners in T2.4 b)
+        self._events: deque = deque(maxlen=PENDING_EVENTS_KEPT)
+        self._hello_lock = threading.Lock()
+        self._hello_state: tuple = ("", (), 0, 0, 0)
+        self._next_heartbeat = 0.0
+        self._next_metrics = 0.0
+        self._next_prune = 0.0
+        self._stopping = False
+        self._stop_phase = ""
+        self._children_deadline = 0.0
+        self._ack_deadline = 0.0
+        self._done = False
+        self._exit_code = 0
+
+    # ---- public ---------------------------------------------------------------------------------------------
+
+    def request_stop(self) -> None:
+        self._post(_StopRequested("stop requested"))
+
+    @property
+    def results(self) -> ResultBuffer | None:
+        return None if self._run is None else self._run.results
+
+    @property
+    def run_id(self) -> str | None:
+        return None if self._run is None else self._run.run_id
+
+    @property
+    def number(self) -> int:
+        return self._number
+
+    @property
+    def cache_prefix(self) -> str | None:
+        return None if self._run is None else self._run.prefix
+
+    def run(self) -> int:
+        """The node's loop until its stop; returns the exit code (0 after a stop, 1 after a refusal or a failure)."""
+        try:
+            try:
+                identity = self._identity()
+            except _Refused as e:
+                logger.error(f"node: {e}")
+                return 1
+            if identity is None:
+                return 0
+            self._open_session(*identity)
+            while not self._done:
+                self._pass()
+            return self._exit_code
+        except Exception:  # noqa: BLE001 - a bug in the loop: stop the children, report, exit 1
+            logger.exception("node: the main loop failed")
+            return 1
+        finally:
+            self._close()
+
+    # ---- identity and session -------------------------------------------------------------------------------
+
+    def _post(self, item: object) -> None:
+        self._inbox.put(item)
+        if self._closed:
+            return
+        try:
+            os.write(self._wake_w, b"w")
+        except (BlockingIOError, OSError):        # a wake is pending already, or the node closed
+            pass
+
+    def _plain(self) -> bool:
+        return self.options.insecure or self.options.loopback_plain
+
+    def _identity(self) -> tuple[str, str, grpc.ChannelCredentials | None] | None:
+        """``(node_id, node_secret, channel credentials)``; None when stopped meanwhile; _Refused on a refusal."""
+        from colosseum.net.security import (
+            NodeIdentity,
+            SecurityError,
+            fetch_hub_ca,
+            hub_channel_credentials,
+        )
+
+        opts = self.options
+        self._hw = self._probe_hardware()
+        if opts.local:
+            if opts.credentials is None:
+                raise _Refused("a local node needs the hub's credentials (NodeOptions.credentials)")
+            node_id, number, secret = opts.credentials
+            self._number = int(number)
+            if self._plain():
+                return node_id, secret, None
+            host, port = _split_address(opts.hub_address)
+            try:
+                ca_pem = fetch_hub_ca(host, port, fingerprint=opts.token.ca_fingerprint, timeout=FETCH_CA_TIMEOUT_SEC)
+            except SecurityError as e:
+                raise _Refused(str(e)) from None
+            return node_id, secret, hub_channel_credentials(ca_pem)
+        try:
+            identity = NodeIdentity.load_or_create(opts.token.ca_fingerprint, opts.identity_root)
+        except SecurityError as e:
+            raise _Refused(str(e)) from None
+        if not identity.registered:
+            reply = self._register(identity)
+            if reply is None:
+                return None
+            try:
+                identity.save_registration(reply, hub_addresses=[opts.hub_address])
+            except SecurityError as e:
+                raise _Refused(str(e)) from None
+            logger.info(f"node: registered with the hub as node {identity.number} ({identity.name}, "
+                        f"{identity.node_id[:8]})")
+        self._number = int(identity.number)
+        self._name = opts.name or identity.name or self._name
+        if self._plain():
+            return identity.node_id, identity.secret, None
+        return identity.node_id, identity.secret, hub_channel_credentials((identity.path / "ca.crt").read_bytes())
+
+    def _register(self, identity: Any) -> Any:
+        """``Register`` with the token (retried while the hub is unreachable); None when stopped meanwhile."""
+        from colosseum.net.grpc_util import channel_options, token_metadata
+        from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
+        from colosseum.net.security import HUB_SERVER_NAME, SecurityError, fetch_hub_ca, hub_channel_credentials
+        from colosseum.node.hardware import machine_id
+
+        opts = self.options
+        request = pb.RegisterRequest(public_key_pem=identity.public_key_pem().decode("ascii"), machine_id=machine_id(),
+                                     name=self._name, tags=list(opts.tags), node_id=identity.node_id or "")
+        delay = CONNECT_RETRY_SEC[0]
+        while True:
+            channel = None
+            try:
+                if self._plain():
+                    channel = grpc.insecure_channel(opts.hub_address, options=channel_options(self._max_mb))
+                else:
+                    host, port = _split_address(opts.hub_address)
+                    ca_pem = fetch_hub_ca(host, port, fingerprint=opts.token.ca_fingerprint,
+                                          timeout=FETCH_CA_TIMEOUT_SEC)
+                    channel = grpc.secure_channel(opts.hub_address, hub_channel_credentials(ca_pem),
+                                                  options=channel_options(self._max_mb, server_name=HUB_SERVER_NAME))
+                return pb_grpc.HubStub(channel).Register(request, metadata=token_metadata(opts.token),
+                                                         timeout=REGISTER_TIMEOUT_SEC)
+            except grpc.RpcError as e:
+                code = e.code() if hasattr(e, "code") else None
+                if code in _REFUSALS:
+                    raise _Refused(f"the hub refused the registration ({_rpc_text(e)})") from None
+                logger.warning(f"node: cannot register with the hub at {opts.hub_address} yet ({_rpc_text(e)}); "
+                               f"retrying in {delay:.1f} s")
+            except SecurityError as e:
+                if not str(e).startswith(_CA_UNREACHABLE):
+                    raise _Refused(str(e)) from None
+                logger.warning(f"node: {e}; retrying in {delay:.1f} s")   # the hub is not up (yet)
+            finally:
+                if channel is not None:
+                    channel.close()
+            if self._wait_or_stop(delay):
+                return None
+            delay = min(CONNECT_RETRY_SEC[1], delay * 2)
+
+    def _wait_or_stop(self, delay: float) -> bool:
+        """Sleep ``delay`` unless a stop is requested (True: stop)."""
+        end = time.monotonic() + delay
+        while True:
+            try:
+                item = self._inbox.get(timeout=max(0.0, min(0.1, end - time.monotonic())))
+                if isinstance(item, _StopRequested):
+                    return True
+            except queue.Empty:
+                pass
+            if time.monotonic() >= end:
+                return False
+
+    def _open_session(self, node_id: str, secret: str, credentials: grpc.ChannelCredentials | None) -> None:
+        from colosseum.net.grpc_util import channel_options
+        from colosseum.net.security import HUB_SERVER_NAME
+        from colosseum.node.session import HubSession
+
+        self._node_id, self._node_secret = node_id, secret
+        if credentials is None:
+            self._channel = grpc.insecure_channel(self.options.hub_address, options=channel_options(self._max_mb))
+        else:
+            self._channel = grpc.secure_channel(self.options.hub_address, credentials,
+                                                options=channel_options(self._max_mb, server_name=HUB_SERVER_NAME))
+        self._session = HubSession(self.options.hub_address, credentials=credentials, node_id=node_id,
+                                   node_secret=secret, hello=self._hello, inbox=self._post,
+                                   max_message_mb=self._max_mb)
+        self._session.start()
+
+    def _probe_hardware(self) -> Any:
+        from colosseum.node.hardware import probe
+
+        return probe()
+
+    def _slots(self) -> pb.Slots:
+        from colosseum.node.hardware import default_slots
+
+        opts, envs = self.options, self._hello_state[4]
+        if opts.local:
+            return pb.Slots(workers=int(opts.workers or 0), evaluators=int(opts.evaluators or 0), cpu_learners=-1,
+                            gpus=list(opts.gpus or ()), no_learners=opts.no_learners, envs_per_worker=envs)
+        d = default_slots(self._hw)
+        return pb.Slots(workers=int(opts.workers if opts.workers is not None else d["workers"]),
+                        evaluators=int(opts.evaluators if opts.evaluators is not None else d["evaluators"]),
+                        cpu_learners=int(opts.cpu_learners if opts.cpu_learners is not None else d["cpu_learners"]),
+                        gpus=list(opts.gpus if opts.gpus is not None else d["gpus"]), no_learners=opts.no_learners,
+                        envs_per_worker=envs)
+
+    def _hardware(self) -> pb.Hardware:
+        from colosseum.net.security import cache_home
+        from colosseum.node.weights import shm_dir
+
+        hw = self._hw
+
+        def free(path: Path) -> int:
+            for p in (path, *path.parents):              # the nearest existing ancestor
+                try:
+                    return int(shutil.disk_usage(p).free)
+                except OSError:
+                    continue
+            return 0
+
+        return pb.Hardware(logical_cores=hw.logical_cores, physical_cores=hw.physical_cores,
+                           memory_bytes=hw.memory_bytes,
+                           gpus=[pb.Gpu(index=int(g.get("index", 0)), name=str(g.get("name", "")),
+                                        memory_bytes=int(g.get("memory_bytes", 0)), kind=str(g.get("kind", "")))
+                                 for g in hw.gpus],
+                           os=hw.os, platform=hw.platform, python=hw.python, torch_version=hw.torch_version,
+                           torch_build=hw.torch_build, shm_free_bytes=free(shm_dir()),
+                           cache_free_bytes=free(cache_home()))
+
+    def _hello(self) -> pb.Hello:
+        """Called by the session thread at every (re)connect: built from the loop's snapshot only."""
+        from colosseum.net.messages import PROTOCOL_VERSION
+
+        with self._hello_lock:
+            run_id, live, env_steps, last_acked, _envs = self._hello_state
+        return pb.Hello(node_id=self._node_id, session_id=self.session_id, protocol_major=PROTOCOL_VERSION[0],
+                        protocol_minor=PROTOCOL_VERSION[1], code_hash="", hardware=self._hardware(),
+                        slots=self._slots(), data_addresses=[], run_id=run_id,
+                        live_cells=[pb.LiveCell(worker=w, env=e, epoch=ep, incarnation=i) for w, e, ep, i in live],
+                        env_steps=env_steps, last_acked_seq=last_acked, learners=[], name=self._name,
+                        tags=list(self.options.tags))
+
+    def _update_hello_state(self) -> None:
+        run = self._run
+        state = ("" if run is None else run.run_id, tuple(self.cells.live()), self._env_steps(),
+                 0 if run is None else run.results.last_acked, 0 if run is None else run.envs)
+        with self._hello_lock:
+            self._hello_state = state
+
+    def _send(self, message: pb.NodeMessage) -> bool:
+        return self._session is not None and self._session.send(message)
+
+    def _event(self, kind: str, **fields: Any) -> None:
+        """An ``Event`` to the hub; kept (up to ``PENDING_EVENTS_KEPT``) while the hub is away."""
+        event = pb.Event(kind=kind, **fields)
+        if not (self._connected and self._send(pb.NodeMessage(event=event))):
+            self._events.append(event)
+
+    # ---- the loop ---------------------------------------------------------------------------------------------
+
+    def _pass(self) -> None:
+        conns = list(self._child_conns)
+        try:
+            ready = mpc.wait([self._wake_r, *conns, *self.supervisor.sentinels()], timeout=LOOP_WAIT_SEC)
+        except OSError:
+            ready = []
+        for obj in ready:                           # P-PF2-11: ready connections before the exits
+            if isinstance(obj, mpc.Connection) and obj in self._child_conns:
+                self._read_child(obj)
+        if self._wake_r in ready:
+            self._drain_wake()
+        self._drain_inbox()
+        for name, code in self.supervisor.exited():
+            self._on_exit(name, code)
+        self._tick(time.monotonic())
+        self._update_hello_state()
+
+    def _drain_wake(self) -> None:
+        try:
+            while os.read(self._wake_r, 4096):
+                pass
+        except (BlockingIOError, OSError):
+            pass
+
+    def _drain_inbox(self) -> None:
+        while True:
+            try:
+                item = self._inbox.get_nowait()
+            except queue.Empty:
+                return
+            if isinstance(item, pb.HubMessage):
+                self._on_hub_message(item)
+            elif isinstance(item, _Accepted):
+                self._on_child_hello(item.conn, item.hello)
+            elif isinstance(item, _FetchDone):
+                self._on_fetch_done(item)
+            elif isinstance(item, _StopRequested):
+                self._begin_stop(item.reason)
+            else:
+                self._on_session_event(item)
+
+    def _on_session_event(self, item: object) -> None:
+        from colosseum.node.session import SessionLost, SessionUp
+
+        if isinstance(item, SessionUp):
+            self._connected = True
+            run = self._run
+            if run is not None:
+                resend = run.results.resend_all()
+                for message in resend:
+                    self._send(message)
+                if resend:
+                    logger.info(f"node: resent {len(resend)} unacknowledged result batches after the reconnect")
+            while self._events:
+                if not self._send(pb.NodeMessage(event=self._events[0])):
+                    break
+                self._events.popleft()
+        elif isinstance(item, SessionLost):
+            if self._connected:
+                logger.warning(f"node: the session with the hub ended ({item.reason}); reconnecting")
+            self._connected = False
+
+    def _tick(self, now: float) -> None:
+        run = self._run
+        if self._stopping:
+            self._stop_step(now)
+        elif run is not None:
+            if not run.started:
+                self._maybe_start_workers(run, now)
+            self._request_lineups()
+            self._expire_waiting()
+            self._deliver(run)
+            if now >= self._next_prune:
+                self._next_prune = now + CACHE_PRUNE_SEC
+                self._prune_cache(run, now)
+        if run is None or self._done:
+            return
+        for message in run.results.due():
+            self._send(message)
+        if self._connected:
+            for message in run.results.overdue(RESULT_RESEND_SEC):
+                self._send(message)
+            if now >= self._next_heartbeat:
+                self._next_heartbeat = now + run.heartbeat_sec
+                self._send_heartbeat(run)
+            if now >= self._next_metrics:
+                self._next_metrics = now + METRICS_FLUSH_SEC
+                self._send_metrics()
+
+    # ---- hub messages -----------------------------------------------------------------------------------------
+
+    def _on_hub_message(self, msg: pb.HubMessage) -> None:
+        kind = msg.WhichOneof("m")
+        if kind == "welcome":
+            self._on_welcome(msg.welcome)
+        elif kind == "grants":
+            self._on_grants(msg.grants)
+        elif kind == "ack":
+            if self._run is not None:
+                self._run.results.ack(msg.ack.seqs)
+        elif kind == "command":
+            self._on_command(msg.command)
+        elif kind == "announce":
+            self._on_announce(msg.announce)
+        else:
+            logger.debug(f"node: ignored a {kind} message (not handled by this node yet)")
+
+    def _on_welcome(self, welcome: pb.Welcome) -> None:
+        if self._stopping:
+            return
+        run = self._run
+        if run is None:
+            try:
+                self._start_run(welcome)
+            except Exception as e:  # noqa: BLE001 - a config, env or cache problem: this node cannot serve the run
+                logger.exception(f"node: cannot serve run {welcome.run_id[:8]} ({type(e).__name__}: {e})")
+                self._exit_code = 1
+                self._begin_stop("the run could not start on this node")
+            return
+        if welcome.run_id != run.run_id:
+            logger.warning(f"node: the hub now runs {welcome.run_id[:8]}, this node serves {run.run_id[:8]}; "
+                           f"ignored (switching runs is the join command's, T6.3)")
+            return
+        logger.info(f"node: session resumed for run {run.run_id[:8]} (node {run.number})")
+
+    def _start_run(self, welcome: pb.Welcome) -> None:
+        from colosseum.core.config import ColosseumConfig
+        from colosseum.core.registry import env_spec
+        from colosseum.core.roles import agent_role_spec
+        from colosseum.net.local import Acceptor, address, listener
+        from colosseum.node.logs import node_log_dir
+        from colosseum.node.weights import (
+            WeightCacheReader,
+            WeightCacheWriter,
+            acquire_node_lock,
+            blob_key,
+            cache_prefix,
+            cleanup_dead,
+            release_node_lock,
+            shm_dir,
+        )
+        from colosseum.players.registry import BotSpec, resolve_player_roles
+
+        config = ColosseumConfig.model_validate_json(welcome.config_json)
+        run_id, number = welcome.run_id, int(welcome.node_number)
+        if self.options.local or self._number < 0:
+            self._number = number
+        elif number != self._number:
+            logger.warning(f"node: the hub calls this node {number}, its registration says {self._number}")
+            self._number = number
+        spec = env_spec(config)
+        trainable = config.get_trainable_agent_ids()
+        scripted = [a for a in config.fixed_agent_ids() if config.agent_kind(a) == "scripted"]
+        roles = resolve_player_roles(config, spec, scripted)     # frozen agents' roles come from their blobs
+        bots = {a: BotSpec(config.agent_entry(a).class_path, dict(config.agent_entry(a).kwargs)) for a in scripted}
+        fixed_keys: dict = {}
+        frozen_keys: dict = {}
+        for fb in welcome.fixed:
+            key = blob_key(fb.kind, fb.agent_id, fb.blob_id)
+            fixed_keys[key] = fb.kind
+            if fb.kind == "fixed":
+                frozen_keys[fb.agent_id] = key
+        dist = config.distributed
+        root = shm_dir()
+        prefix = cache_prefix(self.options.token.ca_fingerprint, run_id, number)
+        cleanup_dead(root)
+        lock = acquire_node_lock(root, prefix)                    # once per run (P-PF2 brief note)
+        authkey = os.urandom(32)
+        ca8, run8 = self.options.token.ca_fingerprint[:8], run_id[:8]
+        node_address = address(ca8, run8, number, "node")
+        try:
+            lst = listener(node_address, authkey)
+        except BaseException:
+            release_node_lock(root, prefix)
+            raise
+        acceptor = Acceptor(lst, lambda conn, hello: self._post(_Accepted(conn, hello)), authkey=authkey,
+                            name=f"node-{number}")
+        log_dir = Path(self.options.log_dir) if self.options.log_dir is not None else node_log_dir(ca8, run_id)
+        log_dir.mkdir(parents=True, exist_ok=True)
+        if self.options.shutdown_grace_sec is not None:
+            grace = float(self.options.shutdown_grace_sec)
+        elif self.options.local:
+            grace = LOCAL_CHILD_GRACE_SEC
+        else:
+            grace = max(1.0, float(dist.shutdown_grace_sec) - REMOTE_GRACE_MARGIN_SEC)
+        workers = self.options.workers
+        if workers is None:
+            from colosseum.node.hardware import default_slots
+
+            workers = default_slots(self._hw)["workers"]
+        self._run_serial += 1
+        self._run = _Run(
+            serial=self._run_serial, run_id=run_id, number=number, config=config, spec=spec, agent_ids=trainable,
+            agent_roles={a: list(roles[a]) for a in trainable},
+            agent_configs={a: config.get_agent_config(a) for a in trainable},
+            role_specs={a: agent_role_spec(spec, roles[a]) for a in trainable},
+            bots=bots, fixed_roles={a: tuple(roles[a]) for a in scripted}, teachers=_scripted_teachers(config),
+            fixed_keys=fixed_keys, frozen_keys=frozen_keys, root=root, prefix=prefix,
+            writer=WeightCacheWriter(root, prefix), reader=WeightCacheReader(root, prefix), lock=lock,
+            authkey=authkey, node_address=node_address, listener=lst, acceptor=acceptor, log_dir=log_dir,
+            results=ResultBuffer(batch=dist.results_batch, flush_sec=dist.results_flush_sec,
+                                 limit_bytes=int(dist.node_result_buffer_mb * 2**20), make=_result_batch,
+                                 size_of=lambda m: m.ByteSize(), clock=time.monotonic),
+            heartbeat_sec=float(dist.heartbeat_sec), envs=int(config.rollout.envs_per_worker), workers=int(workers),
+            grace=grace)
+        if welcome.learners:
+            logger.warning(f"node: learner assignments {[la.agent_id for la in welcome.learners]} are not handled "
+                           f"by this node yet (T2.4 b)")
+        logger.info(f"node {number} ({self._name}): serving run {run_id[:8]} with {workers} workers; "
+                    f"{len(fixed_keys)} fixed blobs to fetch; logs in {log_dir}")
+        self._maybe_start_workers(self._run, time.monotonic())
+
+    def _maybe_start_workers(self, run: _Run, now: float) -> None:
+        """Fetch the missing ``Welcome.fixed`` blobs; once all are cached, start the workers."""
+        missing = [k for k in run.fixed_keys if not self._has(run, k)]
+        for key in missing:
+            if key not in self._fetching and now >= run.fixed_retry_at.get(key, 0.0):
+                self._fetch(run, key)
+        if not missing:
+            self._start_workers(run)
+
+    def _start_workers(self, run: _Run) -> None:
+        from colosseum.node.worker_main import worker_target
+
+        for agent, key in run.frozen_keys.items():
+            cached = run.reader.get(key)
+            if cached is None:
+                raise RuntimeError(f"the fixed blob of {agent!r} vanished from the weight cache")
+            run.fixed_roles[agent] = tuple(cached.meta.roles) if cached.meta.roles else tuple(run.spec.roles)
+        daemon = run.config.rollout.vec_env != "subprocess"            # P-PF2-7
+        for i in range(run.workers):
+            kwargs = dict(name=f"worker-{i}", log_dir=str(run.log_dir), node=run.number, worker=i,
+                          node_address=run.node_address, authkey=run.authkey, config=run.config,
+                          agent_ids=list(run.agent_ids), agent_roles=run.agent_roles,
+                          agent_configs=run.agent_configs, role_specs=run.role_specs, bots=run.bots,
+                          frozen_keys=dict(run.frozen_keys), fixed_roles=dict(run.fixed_roles),
+                          teachers=run.teachers, cache_root=str(run.root), cache_prefix=run.prefix,
+                          run_id=run.run_id)
+            incarnation = self.supervisor.start(ChildSpec(f"worker-{i}", "worker", worker_target, kwargs,
+                                                          daemon=daemon))
+            self.cells.add_worker(i, run.envs, incarnation)
+        run.started = True
+        logger.info(f"node: started {run.workers} workers")
+
+    def _on_grants(self, grants: pb.LineupGrants) -> None:
+        from colosseum.net.messages import lineup_from_proto
+
+        run = self._run
+        if run is None or self._stopping:
+            return
+        for grant in grants.grants:
+            try:
+                lineup = lineup_from_proto(grant.lineup)
+                lineup.epoch = int(grant.epoch)
+                keys = self._seat_keys(run, lineup)
+            except ValueError as e:
+                logger.warning(f"node: refused a lineup grant for worker {grant.worker}, env {grant.env}: {e}")
+                continue
+            self.cells.granted(int(grant.worker), int(grant.env), int(grant.epoch), float(grant.ttl_sec), lineup,
+                               keys)
+        self._deliver(run)
+
+    def _seat_keys(self, run: _Run, lineup: Any) -> dict:
+        """The cache key of every seat's weights (none for a scripted seat); ValueError for an unknown player."""
+        from colosseum.arena.entities import snapshot_version
+        from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID
+        from colosseum.node.weights import CacheKey, segment_name
+
+        keys = {}
+        for i, seat in enumerate(lineup.seats):
+            agent, net = seat.agent_id, seat.network_id
+            if net == FIXED_NETWORK_ID:
+                if agent in run.frozen_keys:
+                    keys[i] = run.frozen_keys[agent]
+                elif agent not in run.bots:
+                    raise ValueError(f"seat {i}: {agent!r} is no fixed player of this run")
+            elif agent not in run.agent_ids:
+                raise ValueError(f"seat {i}: {agent!r} is no trainable agent of this run")
+            elif net == LATEST_NETWORK_ID:
+                keys[i] = CacheKey("latest", agent)
+            elif snapshot_version(net) is not None:
+                key = CacheKey("snapshot", agent, net)
+                segment_name(run.prefix, key)                      # ValueError for a malformed id
+                keys[i] = key
+            else:
+                raise ValueError(f"seat {i}: unknown network {net!r}")
+        return keys
+
+    def _on_command(self, cmd: pb.Command) -> None:
+        if cmd.kind == "stop_run":
+            self._begin_stop(f"the hub stopped the run ({cmd.reason or 'stop_run'})")
+        else:
+            logger.info(f"node: command {cmd.kind!r} is not handled by this node yet; ignored")
+
+    def _on_announce(self, announce: pb.Announce) -> None:
+        from colosseum.net.local import WorkerEvict
+        from colosseum.node.weights import CacheKey
+
+        if announce.env_steps:
+            self._hub_env_steps = max(self._hub_env_steps, int(announce.env_steps))
+        keys = [CacheKey("snapshot", ev.agent_id, ev.checkpoint_id) for ev in announce.evictions]
+        if keys and self._run is not None:
+            for name, conn in list(self._control.items()):
+                if self.supervisor.role(name) == "worker":
+                    self._child_send(name, conn, WorkerEvict(keys))
+
+    # ---- lineups and the cache --------------------------------------------------------------------------------
+
+    def _has(self, run: _Run, key: Any) -> bool:
+        if key.kind == "latest":
+            return run.reader.latest_version(key.agent_id) is not None
+        return key in self._cached or run.reader.has(key)
+
+    def _request_lineups(self) -> None:
+        if not self._connected:
+            return
+        due = self.cells.due()
+        if due:
+            self._send(pb.NodeMessage(lineup_request=pb.LineupRequest(cells=[
+                pb.CellRequest(worker=w, env=e, epoch=ep, incarnation=i) for w, e, ep, i in due])))
+
+    def _expire_waiting(self) -> None:
+        for worker, env, keys in self.cells.stale_waiting(LINEUP_WAIT_SEC):
+            self.cells.failed(worker, env)
+            self.counters["lineup_fetch_failed"] += 1
+            run = self._run
+            missing = [k for k in keys.values() if run is None or not self._has(run, k)]
+            for key in missing:
+                self._warn_fetch(key, f"its weights did not arrive within {LINEUP_WAIT_SEC:.0f} s")
+
+    def _deliver(self, run: _Run) -> None:
+        """Send every waiting grant whose weights are all cached to its worker (R11); fetch what is missing."""
+        from colosseum.net.local import CellLineup, WorkerLineups
+
+        ready: dict[int, list] = {}
+        for worker, env, _lineup, keys in self.cells.waiting():
+            missing = [k for k in set(keys.values()) if not self._has(run, k)]
+            for key in missing:
+                if key.kind != "latest" and key not in self._fetching:
+                    self._fetch(run, key)
+            if missing or f"worker-{worker}" not in self._control:
+                continue
+            lineup, keys = self.cells.deliver(worker, env)
+            ready.setdefault(worker, []).append(CellLineup(env, lineup, dict(keys)))
+        for worker, cells in ready.items():
+            name = f"worker-{worker}"
+            self._child_send(name, self._control[name], WorkerLineups(cells))
+
+    def _fetch(self, run: _Run, key: Any) -> None:
+        future = self._pool.submit(self._download, run, key)
+        self._fetching[key] = future
+        serial = run.serial
+
+        def done(f: Future) -> None:
+            error = None
+            if f.cancelled():
+                error = "cancelled"
+            elif f.exception() is not None:
+                error = _rpc_text(f.exception())
+            self._post(_FetchDone(key, error, serial))
+
+        future.add_done_callback(done)
+
+    def _download(self, run: _Run, key: Any) -> None:
+        """A transfer-pool thread: ``Download`` the key's frame, check it, put it into the cache."""
+        from colosseum.net.chunks import decode_weights
+        from colosseum.net.frame import payload_byte_cap
+        from colosseum.net.grpc_util import node_metadata, receive_parts
+        from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
+        from colosseum.node.weights import split_blob_key
+
+        if key.kind == "snapshot":
+            kind, ident = "snapshot", key.ident
+        else:
+            kind, ident = split_blob_key(key)
+        parts = pb_grpc.HubStub(self._channel).Download(
+            pb.BlobRequest(kind=kind, agent_id=key.agent_id, ident=ident),
+            metadata=node_metadata(self._node_id, self._node_secret), timeout=DOWNLOAD_TIMEOUT_SEC)
+        data, _meta = receive_parts(parts, cap=payload_byte_cap(run.config.distributed.max_message_mb))
+        if data is None:
+            raise ValueError("the hub answered not_modified")
+        _state, meta = decode_weights(data, cap=len(data))
+        if meta.agent_id != key.agent_id:
+            raise ValueError(f"the frame holds weights of {meta.agent_id!r}")
+        run.writer.put(key, data)
+
+    def _on_fetch_done(self, done: _FetchDone) -> None:
+        self._fetching.pop(done.key, None)
+        run = self._run
+        if run is None or run.serial != done.generation:
+            return
+        if done.error is None:
+            if done.key not in run.fixed_keys:
+                self._cached.add(done.key)
+            self._fetch_warned.discard(done.key)
+            if not self._stopping:
+                self._deliver(run)
+            return
+        if done.key in run.fixed_keys:
+            run.fixed_retry_at[done.key] = time.monotonic() + FIXED_RETRY_SEC
+            self._warn_fetch(done.key, f"{done.error}; retrying (the workers start once every fixed blob is here)")
+            return
+        failed = [(w, e) for w, e, _lineup, keys in self.cells.waiting() if done.key in keys.values()]
+        for worker, env in failed:
+            self.cells.failed(worker, env)
+            self.counters["lineup_fetch_failed"] += 1
+        self._warn_fetch(done.key, f"{done.error}; {len(failed)} lineups keep their old one")
+
+    def _warn_fetch(self, key: Any, why: str) -> None:
+        if key in self._fetch_warned:
+            return
+        self._fetch_warned.add(key)
+        logger.warning(f"node: fetching {key.kind} {key.agent_id}/{key.ident} failed: {why} (lineup_fetch_failed; "
+                       f"further failures of this key are only counted)")
+
+    def _prune_cache(self, run: _Run, now: float) -> None:
+        """Snapshots no cell references for ``CACHE_DROP_DELAY_SEC`` leave the cache (``Welcome.fixed`` blobs and
+        latest pointers stay)."""
+        referenced = self.cells.referenced()
+        for key in list(self._cached):
+            if key in referenced or key in self._fetching:
+                self._unref_since.pop(key, None)
+                continue
+            since = self._unref_since.setdefault(key, now)
+            if now - since >= CACHE_DROP_DELAY_SEC:
+                try:
+                    run.writer.drop(key)
+                except OSError as e:
+                    logger.warning(f"node: cannot remove {key} from the weight cache: {e}")
+                self._cached.discard(key)
+                self._unref_since.pop(key, None)
+
+    # ---- children ---------------------------------------------------------------------------------------------
+
+    def _on_child_hello(self, conn: mpc.Connection, hello: Any) -> None:
+        from colosseum.net.local import Stop
+
+        name = hello.name
+        proc = self.supervisor.get(name)
+        if (self._run is None or proc is None or proc.exitcode is not None
+                or int(hello.incarnation) != self.supervisor.incarnation(name)):
+            logger.debug(f"node: closed a connection of {name!r} (incarnation {hello.incarnation}): not a live child")
+            conn.close()
+            return
+        if hello.channel == "control":
+            old = self._control.pop(name, None)
+            if old is not None:
+                self._close_conn(old)
+            self._control[name] = conn
+            self._child_conns[conn] = name
+            if self._stopping:
+                self._child_send(name, conn, Stop("the node stops"))
+            elif self.supervisor.role(name) == "worker":
+                self._on_worker_connected(name, conn)
+        elif hello.channel == "route":
+            self._child_conns[conn] = name
+            self._route_conns.add(conn)
+        else:
+            conn.close()
+
+    def _on_worker_connected(self, name: str, conn: mpc.Connection) -> None:
+        from colosseum.net.local import LearnerRoute, WeightsReady
+
+        run = self._run
+        for agent in run.agent_ids:
+            self._child_send(name, conn, self._learner_routes.get(agent, LearnerRoute(agent, None, False, 0)))
+        ready = [a for a in run.agent_ids if run.reader.latest_version(a) is not None]
+        self._child_send(name, conn, WeightsReady(ready))
+        self._deliver(run)
+
+    def _child_send(self, name: str, conn: mpc.Connection, message: Any) -> bool:
+        try:
+            conn.send(message)
+            return True
+        except (OSError, EOFError, ValueError) as e:
+            logger.debug(f"node: cannot send {type(message).__name__} to {name}: {e}")
+            return False
+
+    def _read_child(self, conn: mpc.Connection) -> None:
+        name = self._child_conns.get(conn, "?")
+        for _ in range(CHILD_MESSAGES_PER_PASS):
+            try:
+                if not conn.poll(0):
+                    return
+                if conn in self._route_conns:
+                    conn.recv_bytes()               # frames for other machines: T3.2
+                    continue
+                message = conn.recv()
+            except (EOFError, OSError):
+                self._close_conn(conn)
+                return
+            except Exception:  # noqa: BLE001 - an unreadable message: only this connection closes
+                logger.exception(f"node: unreadable message from {name}; its connection is closed")
+                self._close_conn(conn)
+                return
+            self._on_child_message(name, message)
+
+    def _on_child_message(self, name: str, message: Any) -> None:
+        from colosseum.net.local import ChildError, WorkerProgress, WorkerResults
+
+        run = self._run
+        if isinstance(message, WorkerResults):
+            if run is not None:
+                for batch in run.results.add(message.results):
+                    self._send(batch)
+        elif isinstance(message, WorkerProgress):
+            worker = _slot_index(name)
+            key = (worker, int(message.incarnation))
+            self._progress[key] = max(self._progress.get(key, 0), int(message.env_steps))
+            self._worker_stats[key] = dict(message.counters)
+            self._stats_changed.add(key)
+        elif isinstance(message, ChildError):
+            self._reported.add(name)
+            log_path = "" if run is None else str(run.log_dir / f"{name}.log")
+            logger.error(f"node: {name} failed ({message.kind}): {message.message}")
+            self._event("child_error", proc=name, error_kind=message.kind, message=message.message,
+                        context=f"node {self._number} ({self._name}), {message.context}", log_path=log_path)
+        else:
+            self._on_learner_message(name, message)
+
+    def _on_learner_message(self, name: str, message: Any) -> None:
+        """Learner messages (``VersionPublished``, checkpoints, metrics, intake reports): T2.4 (b)."""
+        logger.warning(f"node: unexpected {type(message).__name__} from {name}")
+
+    def _close_conn(self, conn: mpc.Connection) -> None:
+        name = self._child_conns.pop(conn, None)
+        self._route_conns.discard(conn)
+        if name is not None and self._control.get(name) is conn:
+            del self._control[name]
+        try:
+            conn.close()
+        except OSError:
+            pass
+
+    def _drain_to_eof(self, name: str) -> None:
+        """Read an exited child's control connection to its end, bounded by ``EXIT_DRAIN_SEC`` (P-PF2-11)."""
+        conn = self._control.get(name)
+        deadline = time.monotonic() + EXIT_DRAIN_SEC
+        while conn is not None and self._control.get(name) is conn:
+            remaining = deadline - time.monotonic()
+            try:
+                if remaining <= 0 or not conn.poll(remaining):
+                    break
+            except (EOFError, OSError):
+                break
+            self._read_child(conn)
+        for c in [c for c, n in self._child_conns.items() if n == name]:
+            self._close_conn(c)
+
+    def _on_exit(self, name: str, code: int | None) -> None:
+        self._drain_to_eof(name)
+        if self._stopping:
+            return
+        run = self._run
+        role = self.supervisor.role(name)
+        log_path = "" if run is None else str(run.log_dir / f"{name}.log")
+        if name in self._reported:
+            logger.info(f"node: {name} exited (code {code}) after reporting its error; not restarted")
+            return
+        logger.warning(f"node: {name} died (exit {code}) without reporting an error; see {log_path}")
+        self._event("proc_died", proc=name, exit_code=int(code or 0), log_path=log_path)
+        if role == "worker" and run is not None:
+            worker = _slot_index(name)
+            self.cells.drop_worker(worker)
+            if self.supervisor.may_restart(name):
+                incarnation = self.supervisor.restart(name)
+                self.cells.add_worker(worker, run.envs, incarnation)
+                self.counters["worker_restarts"] += 1
+                logger.info(f"node: restarted {name} (incarnation {incarnation})")
+            else:
+                self._disabled.add(name)
+                logger.error(f"node: {name} died too often; its slot is disabled")
+                self._event("slot_disabled", proc=name, exit_code=int(code or 0), log_path=log_path)
+        elif role == "learner":
+            self._event("learner_failed", proc=name, exit_code=int(code or 0), log_path=log_path)   # T2.4 (b)
+
+    # ---- heartbeats and metrics -------------------------------------------------------------------------------
+
+    def _env_steps(self) -> int:
+        return sum(self._progress.values())
+
+    def _proc_state(self, name: str) -> str:
+        if name in self._disabled:
+            return "disabled"
+        proc = self.supervisor.get(name)
+        return "alive" if proc is not None and proc.exitcode is None else "dead"
+
+    def _node_counters(self, run: _Run) -> dict[str, int]:
+        return {"lineup_fetch_failed": int(self.counters["lineup_fetch_failed"]),
+                "dropped_results_node_buffer": int(run.results.dropped),
+                "worker_restarts": int(self.counters["worker_restarts"])}
+
+    def _send_heartbeat(self, run: _Run) -> None:
+        try:
+            load = float(os.getloadavg()[0])
+        except (AttributeError, OSError):
+            load = 0.0
+        cached = sorted(f"{k.kind}:{k.agent_id}:{k.ident}" for k in (*self._cached, *run.fixed_keys))
+        self._send(pb.NodeMessage(heartbeat=pb.Heartbeat(
+            env_steps=self._env_steps(), dropped_results=int(run.results.dropped),
+            procs=[pb.ProcState(name=n, state=self._proc_state(n), restarts=max(0, self.supervisor.incarnation(n) - 1))
+                   for n in self.supervisor.names()],
+            load=load, cached_keys=cached, counters=self._node_counters(run))))
+
+    def _send_metrics(self) -> None:
+        if not self._stats_changed:
+            return
+        workers = [pb.WorkerStats(worker=w, incarnation=i, counters=self._worker_stats.get((w, i), {}))
+                   for w, i in sorted(self._stats_changed)]
+        if self._send(pb.NodeMessage(metrics=pb.MetricsBatch(workers=workers))):
+            self._stats_changed.clear()
+
+    # ---- the stop ---------------------------------------------------------------------------------------------
+
+    def _begin_stop(self, reason: str) -> None:
+        from colosseum.net.local import Stop
+
+        if self._stopping:
+            return
+        self._stopping = True
+        now = time.monotonic()
+        run = self._run
+        logger.info(f"node: stopping ({reason})")
+        if run is None:
+            self._stop_phase = "acks"
+            self._ack_deadline = now
+            return
+        for name, conn in list(self._control.items()):
+            self._child_send(name, conn, Stop(reason))
+        self._children_deadline = now + run.grace
+        self._stop_phase = "children"
+
+    def _stop_step(self, now: float) -> None:
+        run = self._run
+        if self._stop_phase == "children":
+            if self.supervisor.alive() and now < self._children_deadline:
+                return
+            if self.supervisor.alive():
+                self.supervisor.stop_all(0.0)
+            for name, code in self.supervisor.exited():
+                self._on_exit(name, code)
+            if run is not None:
+                for message in run.results.flush():
+                    self._send(message)
+            self._ack_deadline = max(now, self._children_deadline) + ACK_WAIT_EXTRA_SEC
+            self._stop_phase = "acks"
+            return
+        if self._stop_phase == "acks":
+            if run is not None and run.results.unacked() and time.monotonic() < self._ack_deadline:
+                return
+            if run is not None:
+                run.results.give_up()
+                if self._connected:
+                    self._send_metrics()
+                    self._send_heartbeat(run)
+            if self._connected:
+                self._send(pb.NodeMessage(event=pb.Event(kind="run_stopped")))
+            self._done = True
+
+    def _close(self) -> None:
+        """Children, connections, threads, the cache files and the session (every path out of ``run``)."""
+        from colosseum.node.weights import release_node_lock
+
+        if self.supervisor.alive():
+            self.supervisor.stop_all(0.0)
+        run = self._run
+        if run is not None:
+            run.acceptor.close()
+            try:
+                run.listener.close()
+            except OSError:
+                pass
+        for conn in list(self._child_conns):
+            self._close_conn(conn)
+        self._pool.shutdown(wait=False, cancel_futures=True)
+        if self._session is not None:
+            self._session.close()
+        if self._channel is not None:
+            self._channel.close()
+        if run is not None and run.lock is not None:
+            try:
+                release_node_lock(run.root, run.prefix)
+            except Exception as e:  # noqa: BLE001 - leftovers are removed by the next node's cleanup_dead
+                logger.warning(f"node: cannot remove the weight cache files of {run.prefix}: {e}")
+        self._closed = True
+        for fd in (self._wake_r, self._wake_w):
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Helpers and entry points
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def _slot_index(name: str) -> int:
+    return int(name.rsplit("-", 1)[1])
+
+
+def _result_batch(seq: int, results: list) -> pb.NodeMessage:
+    """One ``ResultBatch`` message; a result that cannot be converted is left out with a WARNING (never raises)."""
+    from colosseum.net.messages import result_to_proto
+
+    protos = []
+    for result in results:
+        try:
+            protos.append(result_to_proto(result))
+        except Exception as e:  # noqa: BLE001 - one malformed result never stops the node
+            logger.warning(f"node: a match result could not be encoded and is left out ({type(e).__name__}: {e})")
+    return pb.NodeMessage(results=pb.ResultBatch(seq=int(seq), results=protos))
+
+
+def _scripted_teachers(config: Any) -> dict[str, Any]:
+    """The scripted kickstart teachers (DAgger) of the trainable agents, as ``BotSpec`` (no file is read)."""
+    from colosseum.players.registry import BotSpec
+
+    out = {}
+    agents = set(config.agent_ids())
+    for agent in config.get_trainable_agent_ids():
+        teacher = config.get_agent_config(agent).kickstart.teacher
+        if teacher in agents and config.agent_kind(teacher) == "scripted":
+            entry = config.agent_entry(teacher)
+            out[agent] = BotSpec(entry.class_path, dict(entry.kwargs))
+    return out
+
+
+def local_node_target(*, options: NodeOptions, log_dir: str) -> None:
+    """The hub's spawn target for ``train``'s local node (R12): process logging, the child signal policy (it dies
+    with the hub), then the node until its stop."""
+    from colosseum.utils.process import run_child
+
+    def body() -> None:
+        code = NodeAgent(options).run()
+        if code:
+            sys.exit(code)
+
+    run_child("node", log_dir, body)
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """``python -m colosseum.node.agent --hub ADDR --token-file F [--insecure] [--workers N] [--name NAME]`` (the
+    loader's target, T6.2; ``join`` defines the full flags in T6.3)."""
+    import signal
+
+    from colosseum.net.security import parse_token
+    from colosseum.utils.logging import setup_process_logging
+
+    parser = argparse.ArgumentParser(prog="python -m colosseum.node.agent")
+    parser.add_argument("--hub", required=True)
+    parser.add_argument("--token-file", required=True)
+    parser.add_argument("--insecure", action="store_true")
+    parser.add_argument("--workers", type=int, default=None)
+    parser.add_argument("--name", default=None)
+    args = parser.parse_args(argv)
+    setup_process_logging(None, "node", console_level=logging.INFO)
+    options = NodeOptions(hub_address=args.hub, token=parse_token(Path(args.token_file).read_text()),
+                          insecure=args.insecure, workers=args.workers, name=args.name)
+    agent = NodeAgent(options)
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda *_: agent.request_stop())
+    return agent.run()
+
+
+if __name__ == "__main__":
+    sys.exit(main())
