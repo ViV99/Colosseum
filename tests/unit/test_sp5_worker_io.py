@@ -141,7 +141,7 @@ def test_a_chunk_of_a_known_generation_passes_a_newer_learners_floor_rule():
     node_end, learner_end = mp.Pipe()
     intake = ConnectionIntake(listener(name, KEY), ControlChannel(learner_end),
                               ChunkValidator(learner_role(), agent_id="a", teacher=False),
-                              agent_id="a", generation=2, version_floor=10, capacity=8, cap_bytes=1 << 24)
+                              authkey=KEY, agent_id="a", generation=2, version_floor=10, capacity=8, cap_bytes=1 << 24)
     cache = FakeCache()
     cache.latest["a"] = (4, 1)
     io, _ = _io(cache, routes={"a": LearnerRoute("a", name, False, 2)})
@@ -213,10 +213,12 @@ def test_results_are_stamped_with_the_node_and_seat_generations_and_batched():
 
 
 def test_progress_is_cumulative_and_carries_the_loop_and_drop_counters():
-    io, node_end = _io()
+    now = [100.0]
+    io, node_end = _io(clock=lambda: now[0])
     io.stats_fn = lambda: {"episodes": 4, "dropped_results": 1}
     io.add_env_steps(10)
-    time.sleep(PROGRESS_INTERVAL_SEC + 0.05)
+    assert not node_end.poll(0.1)                                        # not due yet
+    now[0] += PROGRESS_INTERVAL_SEC
     io.add_env_steps(5)
     (progress, *_) = _messages(node_end, WorkerProgress)
     assert progress.incarnation == 2 and progress.env_steps == 15
@@ -239,3 +241,15 @@ def test_a_closed_node_connection_stops_the_worker():
     io, node_end = _io()
     node_end.close()
     assert _wait(io.stopped)
+
+
+def test_close_stops_every_sender_within_one_shared_deadline():
+    routes = {aid: LearnerRoute(aid, address("abcdef12", secrets.token_hex(4), 3, f"learner-{aid}-i1"), False, 1)
+              for aid in ("a", "b")}
+    io, _ = _io(routes=routes)
+    for aid in ("a", "b"):                    # no listener: both senders stay in their openers (connect retries)
+        io.send_chunk(TrajectoryChunk.from_payload(chunk_v2_payload(agent_id=aid)))
+    start = time.monotonic()
+    io.close(timeout=0.5)
+    assert time.monotonic() - start < 0.9     # one deadline for both, not 0.5 s each
+    assert io.counters()["dropped_chunks_disconnect"] == 2               # the frames left in their slots

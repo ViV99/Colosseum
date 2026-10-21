@@ -2,7 +2,8 @@
 the learner's intake reads every connection, applies backpressure, and drops by reason (invalid, stale generation,
 disconnect) without ever letting one sender's death block another; the control connection carries env steps, stop
 and the intake report; a dead learner never blocks a worker's send; a stuck or dying client never stops later
-connections (P-PF2-6); long agent ids keep socket names short (P-PF2-18)."""
+connections (P-PF2-6) and the challenge always runs; long agent ids keep socket names short (P-PF2-18); a frame cut
+right after its length is counted; an unreadable control message or a reader failure stops the learner."""
 from __future__ import annotations
 
 import math
@@ -12,6 +13,7 @@ import os
 import queue
 import secrets
 import signal
+import struct
 import threading
 import time
 from collections import Counter
@@ -22,6 +24,7 @@ from colosseum.core.types import TrajectoryChunk
 from colosseum.net import local
 from colosseum.net.chunks import ChunkValidator, encode_chunk
 from colosseum.net.local import (
+    Acceptor,
     ChildHello,
     ConnectionIntake,
     ControlChannel,
@@ -77,8 +80,8 @@ class _Learner:
         self.node_end, learner_end = mp.Pipe()
         self.control = ControlChannel(learner_end)
         validator = ChunkValidator(learner_role(), agent_id="a", teacher=False)
-        self.intake = ConnectionIntake(self.lst, self.control, validator, agent_id="a", generation=generation,
-                                       version_floor=floor, capacity=capacity, cap_bytes=cap)
+        self.intake = ConnectionIntake(self.lst, self.control, validator, authkey=KEY, agent_id="a",
+                                       generation=generation, version_floor=floor, capacity=capacity, cap_bytes=cap)
 
     def close(self):
         self.intake.close()
@@ -307,3 +310,76 @@ def test_a_dead_learner_never_blocks_a_worker_send():
     assert time.monotonic() - start < 1.0
     assert dropped["disconnect"] == 6
     sender.close()
+
+
+def test_an_acceptor_needs_a_key_and_a_wrong_key_never_reaches_the_callback():
+    name = _name()
+    lst = listener(name, KEY)
+    for bad in (None, b""):
+        with pytest.raises(ValueError, match="authkey"):
+            Acceptor(lst, lambda conn, hello: None, authkey=bad, name="t")
+    got = []
+    acceptor = Acceptor(lst, lambda conn, hello: got.append(hello), authkey=KEY, name="t")
+    try:
+        with pytest.raises(mpc.AuthenticationError):
+            connect(name, b"z" * 32, timeout=5.0)
+        good = _hello(connect(name, KEY, timeout=5.0))
+        assert _wait(lambda: len(got) == 1) and got[0].channel == "chunks"
+        good.close()
+    finally:
+        acceptor.close()
+        lst.close()
+
+
+def test_a_frame_cut_right_after_its_length_is_counted(learner):
+    lrn = learner(capacity=4)
+    cut = _hello(connect(lrn.name, KEY, timeout=5))
+    os.write(cut.fileno(), struct.pack("!i", 100_000))   # the length of a frame whose body never comes
+    cut.close()
+    assert _wait(lambda: lrn.intake.dropped == {"disconnect": 1})
+    other = _hello(connect(lrn.name, KEY, timeout=5))
+    other.send_bytes(_frame(2))
+    assert lrn.intake.get(timeout=5.0).policy_version == 2
+
+
+def test_an_unreadable_control_message_stops_the_learner(learner, caplog):
+    lrn = learner()
+    lrn.node_end.send_bytes(b"not a pickle")
+    assert lrn.intake.stop_flag.wait(5)
+    assert any(r.levelname == "ERROR" and "control message" in r.getMessage() for r in caplog.records)
+
+
+def test_an_unexpected_error_on_one_chunk_connection_closes_only_that_one(learner, monkeypatch, caplog):
+    real = local._read_frame_bytes
+    calls = []
+
+    def flaky(conn, cap):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("boom")
+        return real(conn, cap)
+    monkeypatch.setattr(local, "_read_frame_bytes", flaky)
+    lrn = learner(capacity=4)
+    first = _hello(connect(lrn.name, KEY, timeout=5))
+    first.send_bytes(_frame(1))
+    assert _wait(lambda: lrn.intake.dropped == {"disconnect": 1})
+    second = _hello(connect(lrn.name, KEY, timeout=5))
+    second.send_bytes(_frame(2))
+    assert lrn.intake.get(timeout=5.0).policy_version == 2
+    assert not lrn.intake.stop_flag.is_set()
+    assert any(r.levelname == "ERROR" and "chunk connection" in r.getMessage() for r in caplog.records)
+
+
+def test_a_failure_of_the_reader_thread_stops_the_learner(learner, monkeypatch, caplog):
+    def broken(self):
+        raise RuntimeError("reader bug")
+    monkeypatch.setattr(ConnectionIntake, "_read_forever", broken)
+    lrn = learner()
+    assert lrn.intake.stop_flag.wait(5)
+    assert any(r.levelname == "ERROR" and "reader failed" in r.getMessage() for r in caplog.records)
+
+
+def test_closing_the_intake_closes_its_wake_pipe(learner):
+    lrn = learner()
+    lrn.intake.close()
+    assert lrn.intake._wake_r.closed and lrn.intake._wake_w.closed

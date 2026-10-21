@@ -74,7 +74,7 @@ def _start(tmp_path, *, version_floor=0, batches=3):
     node_conn, learner_conn = mp.Pipe()
     control = ControlChannel(learner_conn)
     intake = ConnectionIntake(listener(name, KEY), control, ChunkValidator(learner_role(), agent_id="a", teacher=False),
-                              agent_id="a", generation=1, version_floor=version_floor, capacity=8,
+                              authkey=KEY, agent_id="a", generation=1, version_floor=version_floor, capacity=8,
                               cap_bytes=payload_byte_cap(64))
     prefix = cache_prefix("abcdef12" * 8, run8 * 4, 1)
     outputs = NodeOutputs(control, WeightCacheWriter(shm_dir(), prefix), agent_id="a", generation=1)

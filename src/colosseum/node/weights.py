@@ -239,10 +239,11 @@ class WeightCacheWriter:
             (self.root / name).unlink(missing_ok=True)
 
     def publish_latest(self, agent_id: str, frame: bytes, *, version: int, generation: int,
-                       teacher_active: bool) -> str:
+                       teacher_active: bool, digest: str | None = None) -> str:
         """Write version ``version`` of ``agent_id``'s latest weights, point the pointer at it, keep the newest
-        ``KEEP_LATEST`` versions; returns the segment name. If the pointer cannot be written, a segment this call
-        created is removed again and the error is raised."""
+        ``KEEP_LATEST`` versions; returns the segment name. ``digest``: ``frame_digest(frame)`` when the caller has it
+        already (one hash pass per publish). If the pointer cannot be written, a segment this call created is removed
+        again and the error is raised."""
         name = segment_name(self.prefix, CacheKey("latest", agent_id), version)
         _check_plain_frame(frame)
         self._check_space(len(frame))
@@ -250,7 +251,8 @@ class WeightCacheWriter:
         existed = segment.exists()
         _write_file(segment, frame)
         pointer = {"segment": name, "version": int(version), "generation": int(generation), "size": len(frame),
-                   "digest": frame_digest(frame), "teacher_active": bool(teacher_active)}
+                   "digest": digest if digest is not None else frame_digest(frame),
+                   "teacher_active": bool(teacher_active)}
         try:
             _write_file(self.root / pointer_name(self.prefix, agent_id), json.dumps(pointer).encode("utf-8"))
         except BaseException:

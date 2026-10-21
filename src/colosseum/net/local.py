@@ -45,6 +45,7 @@ import logging
 import multiprocessing.connection as mpc
 import os
 import queue
+import struct
 import sys
 import tempfile
 import threading
@@ -154,16 +155,21 @@ class _HandshakeDeadline:
 
 
 class Acceptor:
-    """Accepts ``lst``'s connections in a thread (P-PF2-6). Each accepted connection is authenticated with the
-    listener's ``authkey`` and reads its ``ChildHello`` in a short-lived daemon thread bounded by
-    ``HANDSHAKE_TIMEOUT_SEC``; then ``on_connection(conn, hello)`` runs in that thread. A failure of one connection
-    (a client that dies or stalls in the handshake, a wrong key, no hello, an error in the callback) closes only
-    that connection; the accept thread never stops before ``close``. ``close`` does not close the listener."""
+    """Accepts ``lst``'s connections in a thread (P-PF2-6). Each accepted connection is authenticated with
+    ``authkey`` (the node's key; mandatory: an abstract Unix socket has no file permissions, so the challenge is the
+    only gate in front of the pickled control messages, R3) and reads its ``ChildHello`` in a short-lived daemon
+    thread bounded by ``HANDSHAKE_TIMEOUT_SEC``; then ``on_connection(conn, hello)`` runs in that thread. The
+    challenge always runs here, whatever key ``lst`` was created with (``Listener.accept``, which would run it on the
+    accepting thread, is never called). A failure of one connection (a client that dies or stalls in the handshake,
+    a wrong key, no hello, an error in the callback) closes only that connection; the accept thread never stops
+    before ``close``. ``close`` does not close the listener."""
 
     def __init__(self, lst: mpc.Listener, on_connection: Callable[[mpc.Connection, ChildHello], None], *,
-                 name: str) -> None:
+                 authkey: bytes, name: str) -> None:
+        if not isinstance(authkey, bytes) or not authkey:
+            raise ValueError(f"{name}: an Acceptor needs a non-empty authkey (bytes)")
         self._listener = lst
-        self._authkey: bytes | None = lst._authkey        # the handshake runs here, not in Listener.accept
+        self._authkey = authkey
         self._on_connection = on_connection
         self._name = name
         self._closed = threading.Event()
@@ -189,9 +195,8 @@ class Acceptor:
     def _handshake(self, conn: mpc.Connection) -> None:
         try:
             bounded = _HandshakeDeadline(conn, time.monotonic() + HANDSHAKE_TIMEOUT_SEC)
-            if self._authkey is not None:
-                mpc.deliver_challenge(bounded, self._authkey)
-                mpc.answer_challenge(bounded, self._authkey)
+            mpc.deliver_challenge(bounded, self._authkey)
+            mpc.answer_challenge(bounded, self._authkey)
             bounded.wait()
             hello = conn.recv()                            # authenticated: a pickled control message (R3)
             if not isinstance(hello, ChildHello):
@@ -422,7 +427,8 @@ class FrameSender:
         try:
             conn = self._opener()
         except Exception as e:  # noqa: BLE001 - the learner is gone or never came up
-            self._fail(f"cannot connect ({type(e).__name__}: {e})")
+            if not self._closed:                # after stop() nothing is sent any more: nothing to report
+                self._fail(f"cannot connect ({type(e).__name__}: {e})")
             return
         with self._state:
             if self.broken or self._closed:
@@ -479,6 +485,14 @@ class FrameSender:
 
     def close(self, timeout: float = 1.0) -> None:
         """Stop the thread; a frame still in the slot is counted as dropped."""
+        self.stop()
+        self.join(timeout)
+
+    def join(self, timeout: float) -> None:
+        self._thread.join(max(0.0, timeout))
+
+    def stop(self) -> None:
+        """Tell the thread to stop (without waiting); a frame still in the slot is counted as dropped."""
         with self._state:
             self._closed = True
         try:
@@ -491,7 +505,6 @@ class FrameSender:
             self._slot.put_nowait(None)
         except queue.Full:
             pass
-        self._thread.join(timeout)
 
 
 class _ResultSink:
@@ -719,13 +732,17 @@ class WorkerIO:
         self._last_progress = self._clock()
         self._control.send(WorkerProgress(self.incarnation, self._env_steps, self.counters()))
 
-    def close(self) -> None:
-        """Flush the pending results, send the final progress, stop the sender threads."""
+    def close(self, timeout: float = 1.0) -> None:
+        """Flush the pending results, send the final progress, stop the sender threads (all at once, then joined
+        within one shared ``timeout``)."""
         self._batcher.flush()
         self.send_progress()
-        for sender in self._senders.values():
-            sender.close()
-        self._senders = {}
+        senders, self._senders = list(self._senders.values()), {}
+        for sender in senders:
+            sender.stop()
+        deadline = time.monotonic() + timeout
+        for sender in senders:
+            sender.join(deadline - time.monotonic())
 
     def send_error(self, error: ChildError) -> None:
         self._control.send(error)
@@ -734,6 +751,48 @@ class WorkerIO:
 # ---------------------------------------------------------------------------------------------------------------
 # Learner side
 # ---------------------------------------------------------------------------------------------------------------
+
+
+class _FrameCut(Exception):
+    """The connection ended inside a frame (after its first length byte): the frame is lost."""
+
+
+class _FrameTooLarge(Exception):
+    """A frame whose announced length exceeds the cap (or is malformed)."""
+
+
+_LEN = struct.Struct("!i")       # multiprocessing.connection's message header: signed 32-bit length, or -1 and then
+_LEN64 = struct.Struct("!Q")     # an unsigned 64-bit length (CPython's Connection._send_bytes on Unix)
+
+
+def _read_exact(fd: int, n: int, *, at_start: bool) -> bytearray:
+    """``n`` bytes of ``fd``; EOFError for an end before the first byte of a message (``at_start``), _FrameCut for
+    an end after it (a sender killed mid-frame), OSError for socket errors."""
+    buf = bytearray(n)
+    view = memoryview(buf)
+    pos = 0
+    while pos < n:
+        got = os.readv(fd, [view[pos:]])
+        if got == 0:
+            if at_start and pos == 0:
+                raise EOFError
+            raise _FrameCut(f"end of stream after {pos} of {n} bytes")
+        pos += got
+    return buf
+
+
+def _read_frame_bytes(conn: mpc.Connection, cap: int) -> bytearray:
+    """One ``send_bytes`` message of ``conn`` (Unix), read with explicit outcomes instead of ``recv_bytes``'s, which
+    reports a sender cut between the length and the body as a clean EOF: EOFError only for an end between messages,
+    _FrameCut for an end inside one, _FrameTooLarge for a length above ``cap`` (the body stays unread: the caller
+    closes the connection)."""
+    fd = conn.fileno()
+    (size,) = _LEN.unpack(_read_exact(fd, _LEN.size, at_start=True))
+    if size == -1:
+        (size,) = _LEN64.unpack(_read_exact(fd, _LEN64.size, at_start=False))
+    if size < 0 or size > cap:
+        raise _FrameTooLarge(f"a frame of {size} bytes, the cap is {cap}")
+    return _read_exact(fd, size, at_start=False) if size else bytearray()
 
 
 class ChunkIntake(Protocol):
@@ -765,11 +824,13 @@ class ConnectionIntake:
     ``Stop`` or EOF -> ``stop_flag``); ``capacity``: frames buffered (``learner.queue_size``); ``cap_bytes``: the
     largest frame accepted (``payload_byte_cap``). ``version_floor``: the first version of this generation; a chunk
     of an older generation is kept only below it (R16). Only ``ChildHello(channel="chunks")`` connections are kept
-    (an ``Acceptor`` authenticates them, P-PF2-6). A frame goes through one path (A17): header meta -> misroute
-    and generation rules -> ``decode_chunk(..., validator=)``; every drop is counted by reason."""
+    (an ``Acceptor`` authenticates them with ``authkey``, the node's key, P-PF2-6). A frame goes through one path
+    (A17): header meta -> misroute and generation rules -> ``decode_chunk(..., validator=)``; every drop is counted
+    by reason. An unreadable control message or a failure of the reader thread logs an ERROR and sets ``stop_flag``;
+    an unexpected error on one chunk connection closes only that connection (``disconnect``)."""
 
-    def __init__(self, lst: mpc.Listener, control: ControlChannel, validator: ChunkValidator, *, agent_id: str,
-                 generation: int, version_floor: int, capacity: int, cap_bytes: int) -> None:
+    def __init__(self, lst: mpc.Listener, control: ControlChannel, validator: ChunkValidator, *, authkey: bytes,
+                 agent_id: str, generation: int, version_floor: int, capacity: int, cap_bytes: int) -> None:
         from colosseum.net.chunks import decode_chunk
 
         self._listener = lst
@@ -792,7 +853,7 @@ class ConnectionIntake:
         self.env_steps = 0
         self._read_thread = threading.Thread(target=self._read_loop, name=f"intake-read-{agent_id}", daemon=True)
         self._read_thread.start()
-        self._acceptor = Acceptor(lst, self._on_connection, name=f"intake-{agent_id}")
+        self._acceptor = Acceptor(lst, self._on_connection, authkey=authkey, name=f"intake-{agent_id}")
 
     # ---- ChunkIntake ---------------------------------------------------------------------------------------
 
@@ -879,6 +940,14 @@ class ConnectionIntake:
         self._wake()
 
     def _read_loop(self) -> None:
+        try:
+            self._read_forever()
+        except Exception:  # noqa: BLE001 - a reader bug: the learner must not starve without a stop
+            logger.exception(f"learner {self.agent_id}: the chunk intake's reader failed; stopping the learner")
+            self.stop_flag.set()
+            self._closed.set()
+
+    def _read_forever(self) -> None:
         last_report = time.monotonic()
         control = self._control.conn
         while not self._closed.is_set():
@@ -916,6 +985,11 @@ class ConnectionIntake:
             self.stop_flag.set()                  # the node is gone: stop (final snapshot is best effort)
             self._closed.set()
             return
+        except Exception:  # noqa: BLE001 - a malformed message: the learner's only link to its node is broken
+            logger.exception(f"learner {self.agent_id}: unreadable control message from the node; stopping")
+            self.stop_flag.set()
+            self._closed.set()
+            return
         if isinstance(msg, LearnerEnvSteps):
             self.env_steps = int(msg.env_steps)
         elif isinstance(msg, Stop):
@@ -925,13 +999,22 @@ class ConnectionIntake:
 
     def _read_frame(self, conn: mpc.Connection) -> None:
         try:
-            frame = conn.recv_bytes(self._cap)
+            frame = _read_frame_bytes(conn, self._cap)
         except EOFError:                          # the sender closed between frames: nothing lost
             self._close_conn(conn)
             return
-        except OSError as e:                      # cut mid-frame (killed sender) or larger than the cap
+        except _FrameTooLarge:                    # its body is never read: the connection closes
             self._close_conn(conn)
-            self._drop("invalid" if "bad message length" in str(e) else "disconnect")
+            self._drop("invalid")
+            return
+        except (_FrameCut, OSError):              # cut mid-frame (a killed sender), or a socket error
+            self._close_conn(conn)
+            self._drop("disconnect")
+            return
+        except Exception:  # noqa: BLE001 - only this connection fails
+            logger.exception(f"learner {self.agent_id}: reading a chunk connection failed; it is closed")
+            self._close_conn(conn)
+            self._drop("disconnect")
             return
         with self._cond:
             self._frames.append(frame)
@@ -950,7 +1033,7 @@ class ConnectionIntake:
         self._wake()
         self._acceptor.close(timeout)
         self._read_thread.join(timeout)
-        for conn in self._conns + self._new:
+        for conn in self._conns + self._new + [self._wake_r, self._wake_w]:
             try:
                 conn.close()
             except OSError:
@@ -976,20 +1059,21 @@ class NodeOutputs:
 
     def publish_weights(self, payload: WeightPayload) -> None:
         from colosseum.net.chunks import WeightsMeta, encode_weights
-        from colosseum.node.weights import CacheFullError
+        from colosseum.node.weights import CacheFullError, frame_digest
 
         meta = WeightsMeta(agent_id=self.agent_id, kind="latest", generation=self.generation,
                            policy_version=int(payload.policy_version), teacher_active=bool(payload.teacher_active))
         frame = encode_weights(payload.state_dict, meta)
+        digest = frame_digest(frame)
         try:
             segment = self._cache.publish_latest(self.agent_id, frame, version=meta.policy_version,
-                                                 generation=self.generation, teacher_active=meta.teacher_active)
+                                                 generation=self.generation, teacher_active=meta.teacher_active,
+                                                 digest=digest)
         except CacheFullError as e:
             logger.error(f"learner {self.agent_id}: v{meta.policy_version} not published: {e}",
                          exc_info=not self._cache_error_logged)
             self._cache_error_logged = True
             return
-        digest = hashlib.blake2b(frame, digest_size=16).hexdigest()
         self._control.send(VersionPublished(self.agent_id, self.generation, meta.policy_version, segment,
                                             len(frame), digest, meta.teacher_active))
 
