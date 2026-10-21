@@ -26,6 +26,7 @@ from colosseum.hub.server import (
     SessionClosed,
     SessionOpened,
     UploadIn,
+    blob_file_name,
     blob_ident,
     hello_from_proto,
 )
@@ -376,6 +377,18 @@ def test_blob_paths_are_validated_before_any_path_is_formed(hub):
                                                                                          "state1", ".bin")
 
 
+def test_blob_file_name_is_the_public_rule_every_blob_path_uses(hub):
+    """``blob_file_name`` is the documented rule (``BlobStore`` names its files through it); a kind with ``-``
+    is refused (it would break injectivity)."""
+    assert blob_file_name("fixed", "a-b", "c") == _blob_name("fixed", "a-b", "c")
+    assert blob_file_name("trainer_state", "a", "t1") == _blob_name("trainer_state", "a", "t1", ".bin")
+    assert blob_file_name("snapshot", "agent", "ckpt_v7") == _blob_name("snapshot", "agent", "ckpt_v7")
+    with pytest.raises(ValueError, match="'-'"):
+        blob_file_name("bad-kind", "a", "c")
+    hub.blobs.register_fixed("x1", b"frame", kind="init", agent_id="a")
+    assert hub.blobs.frame_path("init", "a", "x1") == hub.run_dir.root / "blobs" / blob_file_name("init", "a", "x1")
+
+
 def test_agent_ids_follow_the_config_rule_and_never_name_blob_files(hub):
     """Agent ids are checked with ``check_agent_id`` (no length limit of the hub's own: a 200-char config id is
     served), blob file names stay bounded and never contain the agent id, and triples that would join to the same
@@ -510,6 +523,54 @@ def test_server_stop_ends_a_handler_that_waits_for_the_main_loop(tmp_path, monke
     assert not client.is_alive()
     incoming = hub.run_dir.root / ".incoming"
     assert not incoming.exists() or list(incoming.iterdir()) == []
+
+
+class _LoopTimeout(TimeoutError):
+    """A ``TimeoutError`` subclass the main loop may raise."""
+
+
+@pytest.mark.parametrize("method", ["Register", "Upload", "Admin"])
+def test_a_timeout_error_set_by_the_main_loop_maps_like_any_exception_at_once(tmp_path, method):
+    """``concurrent.futures.TimeoutError`` is the builtin ``TimeoutError`` (3.11+): a reply the main loop fails
+    with ``TimeoutError`` (or a subclass) ends the call promptly with the handler's ordinary exception mapping
+    (Register / Admin: INTERNAL, Upload: ``error: <type>``), not with a busy wait until the reply timeout."""
+    hub = serve(tmp_path)
+    node = hub.registered_node() if method != "Register" else hub.node()
+    hub.loop.stop()                                              # this test answers the inbox itself
+    out: dict = {}
+
+    def call():
+        try:
+            if method == "Register":
+                node.register(machine_id="m2")
+            elif method == "Upload":
+                out["reply"] = node.upload(_header(b"payload"), b"payload")
+            else:
+                node.stub().Admin(pb.AdminRequest(command="hub.status"), metadata=token_metadata(hub.identity.token),
+                                  timeout=30)
+        except grpc.RpcError as e:
+            out["code"], out["details"] = e.code(), e.details()
+
+    client = threading.Thread(target=call, daemon=True)
+    try:
+        start = time.monotonic()
+        client.start()
+        expected = {"Register": RegisterIn, "Upload": UploadIn, "Admin": AdminIn}[method]
+        while True:
+            ev = hub.inbox.get(timeout=10)
+            if isinstance(ev, expected):
+                break
+        ev.reply.set_exception(_LoopTimeout("main loop") if method == "Upload" else TimeoutError("main loop"))
+        client.join(10)
+        assert not client.is_alive() and time.monotonic() - start <= 5.0
+    finally:
+        hub.stop()
+    if method == "Upload":
+        assert not out["reply"].accepted and out["reply"].reason == "error: _LoopTimeout"
+        incoming = hub.run_dir.root / ".incoming"
+        assert not incoming.exists() or list(incoming.iterdir()) == []
+    else:
+        assert out["code"] == grpc.StatusCode.INTERNAL and "TimeoutError" in out["details"]
 
 
 # ---- admin, relay ---------------------------------------------------------------------------------------------

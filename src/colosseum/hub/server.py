@@ -15,7 +15,7 @@ Files (pre-flight ruling P-PF2-9 (a, c); every string a node sends is untrusted)
 ids (``core.config.check_agent_id``, the config's own rule) and idents before it forms any path, serves snapshots
 from ``checkpoints/<agent>/ckpt_v<N>/model.pt`` (converted once into a frame under ``blobs/``) and every other kind
 only from the ``(kind, agent, ident)`` triples the main loop registered (``register_fixed``). Blob file names never
-contain the agent id (``BlobStore._file_name``).
+contain the agent id (``blob_file_name``: every blob path goes through it).
 
 Lifecycle: a servicer that waits for the main loop's reply (``Register``, ``Upload``, ``Admin``) waits in
 ``POLL_SEC`` slices while its RPC is active, so ``server.stop`` (which cancels every RPC) ends it at once even when
@@ -38,7 +38,7 @@ import time
 import uuid
 from collections.abc import Callable, Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
-from concurrent.futures import TimeoutError as FutureTimeout
+from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -63,7 +63,7 @@ __all__ = [
     "ADMIN_REPLY_TIMEOUT_SEC", "CLOSE_GRACE_SEC", "LOOPBACK_KEY", "OUTBOUND_QUEUE_SIZE", "REGISTER_REPLY_TIMEOUT_SEC",
     "SERVER_THREADS", "UPLOAD_KINDS", "UPLOAD_REPLY_TIMEOUT_SEC", "AdminIn", "BlobStore", "HubServicer",
     "NodeMessageIn", "RegisterIn", "SessionClosed", "SessionHandle", "SessionOpened", "StopRequested", "UploadIn",
-    "blob_ident", "build_server", "hello_from_proto",
+    "blob_file_name", "blob_ident", "build_server", "hello_from_proto",
 ]
 
 log = logging.getLogger(__name__)
@@ -101,20 +101,25 @@ class _Cancelled(Exception):
     """The RPC whose reply a servicer waited for was cancelled (``server.stop``, or the client went away)."""
 
 
+class _NoReply(Exception):
+    """The main loop did not resolve the reply within the servicer's reply timeout. Its own class: since Python
+    3.11 ``concurrent.futures.TimeoutError`` is the builtin ``TimeoutError``, which the main loop may also set as the
+    reply's exception (that one is mapped like any other exception of the main loop)."""
+
+
 def _await_reply(reply: Future, context: grpc.ServicerContext, timeout: float) -> Any:
-    """``reply.result(timeout)`` in ``POLL_SEC`` slices while the RPC is active: FutureTimeout after ``timeout``,
-    ``_Cancelled`` as soon as the RPC is not active, else the result (or the main loop's exception)."""
+    """Wait for ``reply`` in ``POLL_SEC`` slices while the RPC is active: ``_NoReply`` after ``timeout``,
+    ``_Cancelled`` as soon as the RPC is not active, else the result (or the main loop's exception, raised once:
+    ``reply.result()`` is called only when the reply is done)."""
     deadline = time.monotonic() + timeout
     while True:
         if not context.is_active():
             raise _Cancelled
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            raise FutureTimeout
-        try:
-            return reply.result(timeout=min(POLL_SEC, remaining))
-        except FutureTimeout:
-            continue
+            raise _NoReply
+        if wait_futures([reply], timeout=min(POLL_SEC, remaining)).done:
+            return reply.result()
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -294,7 +299,7 @@ class HubServicer(pb_grpc.HubServicer):
             return _await_reply(reply, context, REGISTER_REPLY_TIMEOUT_SEC)
         except _Cancelled:                             # nobody reads the reply (the hub stops or the node left)
             return pb.RegisterReply()
-        except FutureTimeout:
+        except _NoReply:
             context.abort(grpc.StatusCode.UNAVAILABLE, "the hub did not answer the registration in time; retry")
         except SecurityError as e:
             context.abort(grpc.StatusCode.PERMISSION_DENIED, str(e))
@@ -405,7 +410,7 @@ class HubServicer(pb_grpc.HubServicer):
             except _Cancelled:                         # the hub stops or the node left: nobody reads the reply
                 spool.unlink(missing_ok=True)
                 return refuse("cut")
-            except FutureTimeout:
+            except _NoReply:
                 spool.unlink(missing_ok=True)
                 return refuse("timeout")
             except Exception as e:  # noqa: BLE001 - the main loop failed this upload
@@ -459,7 +464,7 @@ class HubServicer(pb_grpc.HubServicer):
             return _await_reply(reply, context, ADMIN_REPLY_TIMEOUT_SEC)
         except _Cancelled:                             # nobody reads the reply (the hub stops or the caller left)
             return pb.AdminReply()
-        except FutureTimeout:
+        except _NoReply:
             context.abort(grpc.StatusCode.UNAVAILABLE, "the hub did not answer in time")
         except Exception as e:  # noqa: BLE001 - the main loop failed this command
             context.abort(grpc.StatusCode.INTERNAL, f"{request.command[:64]}: {type(e).__name__}: {e}")
@@ -493,6 +498,20 @@ def blob_ident(kind: str, agent_id: str, data: bytes | str) -> str:
     return h.hexdigest()[:16]
 
 
+def blob_file_name(kind: str, agent_id: str, ident: str) -> str:
+    """The file name of a blob under ``runs/<name>/blobs/``: ``<kind>-<agent digest>-<ident>.frame``
+    (``trainer_state``: ``.bin``), the agent digest being the 32-hex-char blake2b of the agent id (UTF-8). Every blob
+    path of the hub goes through this function (``BlobStore`` here; the latest, start and eval blobs of later tasks
+    too), so the rule lives in one place. Kinds never contain ``-`` (ValueError otherwise) and the digest has a fixed
+    length, so the name is injective: it splits back into (kind, digest, ident) although agent ids and idents may
+    contain ``-``. Bounded: the agent id never reaches the name (the config sets no limit on its length), so the name
+    is at most len(kind) + 1 + 32 + 1 + len(ident) + 6 chars. The caller validates ``agent_id`` and ``ident``."""
+    if "-" in kind:
+        raise ValueError(f"blob kinds never contain '-', got {kind!r}")
+    agent = hashlib.blake2b(agent_id.encode("utf-8"), digest_size=_AGENT_DIGEST_SIZE).hexdigest()
+    return f"{kind}-{agent}-{ident}" + (".bin" if kind == "trainer_state" else ".frame")
+
+
 def _is_file(path: Path) -> bool:
     """``path.is_file()`` that is False for any OSError (Python 3.12's raises e.g. ENAMETOOLONG for a very long
     agent id)."""
@@ -515,7 +534,7 @@ def _write_atomic(path: Path, data: bytes) -> None:
 class BlobStore:
     """Read-only file serving and lazy snapshot conversion for ``Download`` (servicer threads) plus the registered
     blobs of the main loop (module docstring). Files: ``runs/<name>/blobs/<kind>-<agent digest>-<ident>.frame``
-    (``trainer_state``: ``.bin``; ``_file_name``). It never deletes snapshot frames itself (T3.1 removes those of
+    (``trainer_state``: ``.bin``; ``blob_file_name``). It never deletes snapshot frames itself (T3.1 removes those of
     evicted snapshots after their hold). Agent ids follow the config's rule (``check_agent_id``); the snapshot source
     ``checkpoints/<agent>/ckpt_v<N>/model.pt`` keeps the agent's directory."""
 
@@ -534,15 +553,6 @@ class BlobStore:
         """``runs/<name>/.incoming/``: upload spool files."""
         return self.run_dir.root / ".incoming"
 
-    @staticmethod
-    def _file_name(kind: str, agent_id: str, ident: str) -> str:
-        """``<kind>-<agent digest>-<ident>.frame`` (``trainer_state``: ``.bin``), the agent digest being 32 hex chars
-        of a blake2b of the agent id. Injective: kinds contain no ``-`` and the digest has a fixed length, so the name
-        splits back into (kind, digest, ident) although agent ids and idents may contain ``-``. Bounded: at most
-        13 + 1 + 32 + 1 + 160 + 6 chars whatever the agent id's length (the config sets no limit on it)."""
-        agent = hashlib.blake2b(agent_id.encode("utf-8"), digest_size=_AGENT_DIGEST_SIZE).hexdigest()
-        return f"{kind}-{agent}-{ident}" + (".bin" if kind == "trainer_state" else ".frame")
-
     def frame_path(self, kind: str, agent_id: str, ident: str) -> Path | None:
         """The file to serve for a ``BlobRequest``, or None (unknown, invalid or unreadable). Ids are checked before
         any path is formed (P-PF2-9 (c))."""
@@ -558,11 +568,11 @@ class BlobStore:
         with self._lock:
             if (kind, agent_id, ident) not in self._registered:
                 return None
-        path = self.dir / self._file_name(kind, agent_id, ident)
+        path = self.dir / blob_file_name(kind, agent_id, ident)
         return path if _is_file(path) else None
 
     def _snapshot(self, agent_id: str, ident: str, version: int) -> Path | None:
-        path = self.dir / self._file_name("snapshot", agent_id, ident)
+        path = self.dir / blob_file_name("snapshot", agent_id, ident)
         if _is_file(path):
             return path
         model = self.run_dir.checkpoints / agent_id / ident / "model.pt"
@@ -596,7 +606,7 @@ class BlobStore:
         if not isinstance(blob_id, str) or not BLOB_IDENT_RE.fullmatch(blob_id):
             raise ValueError(f"invalid blob id {blob_id!r}")
         self.dir.mkdir(parents=True, exist_ok=True)
-        _write_atomic(self.dir / self._file_name(kind, agent_id, blob_id), bytes(frame))
+        _write_atomic(self.dir / blob_file_name(kind, agent_id, blob_id), bytes(frame))
         with self._lock:
             self._registered.add((kind, agent_id, blob_id))
 
