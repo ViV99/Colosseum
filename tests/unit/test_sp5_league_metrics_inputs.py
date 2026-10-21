@@ -83,6 +83,7 @@ def test_worker_stats_are_keyed_by_node_worker_and_incarnation():
     stats.on_worker_stats({"node": 1, "worker_id": 0, "incarnation": 1, "dropped_results": 2})   # a restart
     stats.on_worker_stats({"node": 1, "worker_id": 0, "incarnation": 0, "dropped_results": 1})   # never lowers
     stats.on_worker_stats({"worker_id": 0, "incarnation": 0, "dropped_results": 6})               # (None, 0, 0)
+    stats.on_worker_stats({"node": None, "worker_id": 0, "incarnation": None, "dropped_results": 5})  # likewise
     assert stats.cumulative("dropped_results") == 6 + 3 + 5 + 2
     snap = stats.snapshot(0, {})
     assert snap["workers_reporting"] == 4 and snap["dropped_match_results"] == 16

@@ -91,3 +91,79 @@ def test_call_and_stream_reach_the_hubs_main_loop(tmp_path, insecure):
             {"code": 0, "text": "ok tournament.submit", "data": {"name": "t"}, "done": True}]
     finally:
         hub.stop()
+
+
+def test_an_insecure_hub_gets_the_local_token_only_on_loopback_or_as_a_running_local_hub(tmp_path, monkeypatch):
+    """Review round 1: without TLS nothing proves who listens on ADDR, so the machine's owner token is sent in clear
+    only to a loopback address or to an address of a hub running here with this identity."""
+    monkeypatch.delenv("COLOSSEUM_TOKEN", raising=False)
+    identity = HubIdentity.load_or_create(hub_identity_dir())
+    for loopback in ("127.0.0.1:47100", "localhost:47100", "[::1]:47100"):
+        assert resolve_hub(hub=loopback, insecure=True).token == identity.token
+    with pytest.raises(SecurityError, match="no token for the insecure hub at 10.1.2.3:47100"):
+        resolve_hub(hub="10.1.2.3:47100", insecure=True)
+    run = tmp_path / "run"
+    register_running(identity.path, _info(identity, run, mode="hub", addresses=("10.1.2.3:47100",), loopback=None))
+    assert resolve_hub(hub="10.1.2.3:47100", insecure=True).token == identity.token
+    register_running(identity.path, _info(identity, run, run_id="S", mode="hub", ca_fingerprint="0" * 64,
+                                          addresses=("10.9.9.9:47100",), loopback=None))
+    with pytest.raises(SecurityError, match="no token for the insecure hub"):        # another identity's hub
+        resolve_hub(hub="10.9.9.9:47100", insecure=True)
+    assert resolve_hub(hub="10.9.9.9:47100", token=str(identity.token), insecure=True).token == identity.token
+
+
+def test_resolve_hub_errors_name_what_is_missing(tmp_path, monkeypatch):
+    """No local identity and no token; a malformed address; a hub.json whose identity is not here (a given token
+    then works with a fetched CA) or was rotated since; an unreadable identity directory."""
+    monkeypatch.delenv("COLOSSEUM_TOKEN", raising=False)
+    monkeypatch.setattr(admin, "fetch_hub_ca", lambda host, port, *, fingerprint, timeout: b"FETCHED")
+    with pytest.raises(SecurityError, match="no token"):
+        resolve_hub(hub="10.0.0.5:47100")
+    with pytest.raises(SecurityError, match="malformed hub address"):
+        resolve_hub(hub="10.0.0.5", token=str(HubIdentity.load_or_create(tmp_path / "x").token))
+    elsewhere = HubIdentity.load_or_create(tmp_path / "elsewhere")
+    run = tmp_path / "run"
+    run.mkdir()
+    write_hub_json(run, HubInfo(**{**_info(elsewhere, run).__dict__, "identity_dir": str(tmp_path / "gone"),
+                                   "mode": "hub", "tls": True}))
+    with pytest.raises(SecurityError, match="is not on this machine"):
+        resolve_hub(run=str(run))
+    target = resolve_hub(run=str(run), token=str(elsewhere.token))
+    assert (target.address, target.tls, target.ca_pem, target.token) == ("127.0.0.1:41234", True, b"FETCHED",
+                                                                         elsewhere.token)
+    write_hub_json(run, _info(elsewhere, run, ca_fingerprint="0" * 64))
+    with pytest.raises(SecurityError, match="rotated"):
+        resolve_hub(run=str(run))
+
+    def unreadable(path=None):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(HubIdentity, "load_or_create", unreadable)
+    with pytest.raises(SecurityError, match=f"cannot read the hub identity {elsewhere.path}"):
+        resolve_hub(run=str(run))
+
+
+def test_leaving_a_stream_early_closes_its_channel(tmp_path, monkeypatch):
+    closed = []
+
+    class RecordingChannel:
+        def __init__(self, channel):
+            self._channel = channel
+
+        def __getattr__(self, name):
+            return getattr(self._channel, name)
+
+        def close(self):
+            closed.append(True)
+            self._channel.close()
+
+    real = admin._channel
+    monkeypatch.setattr(admin, "_channel", lambda target: RecordingChannel(real(target)))
+    hub = serve(tmp_path, insecure=True)
+    try:
+        replies = stream(resolve_hub(hub=hub.address, token=str(hub.identity.token), insecure=True), "x.y")
+        assert next(replies)["text"] == "progress" and not closed
+        replies.close()
+        assert closed == [True]
+    finally:
+        hub.stop()

@@ -10,6 +10,7 @@ token secret as metadata; a gRPC failure propagates as ``grpc.RpcError`` (the CL
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import os
 from collections.abc import Iterator, Mapping
@@ -63,8 +64,39 @@ def _split(address: str) -> tuple[str, int]:
 
 
 def _local_identity(path: Path) -> HubIdentity | None:
-    """The hub identity at ``path`` if one exists there (never created here)."""
-    return HubIdentity.load_or_create(path) if (path / "ca.crt").is_file() else None
+    """The hub identity at ``path`` if one exists there (never created here); SecurityError naming ``path`` when it
+    cannot be read (e.g. another user's directory)."""
+    try:
+        return HubIdentity.load_or_create(path) if (path / "ca.crt").is_file() else None
+    except OSError as e:
+        raise SecurityError(f"cannot read the hub identity {path} ({type(e).__name__}: {e}); pass --token or "
+                            f"--token-file") from None
+
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def _local_token_for(address: str, host: str, *, insecure: bool) -> Token:
+    """The token for ``--hub ADDR`` when none is given: the local hub identity's (spec 3.3: on the hub machine).
+    With TLS the pinned certificate fetch proves ADDR is that hub. Without TLS nothing would, so the owner's token
+    is sent in clear only to a loopback address or to an address of a running hub of this machine with this
+    identity; otherwise the "no token" SecurityError."""
+    identity = _local_identity(hub_identity_dir())
+    if identity is None:
+        return resolve_token(None, None)               # raises "no token"
+    if insecure and not _is_loopback(host) and not any(
+            info.ca_fingerprint == identity.fingerprint and address in (info.loopback, *info.addresses)
+            for info in running_hubs(identity.path)):
+        raise SecurityError(f"no token for the insecure hub at {address}: this machine's hub token is sent in clear "
+                            f"only to a loopback address or to a hub running here; pass --token, --token-file or "
+                            f"set {TOKEN_ENV}")
+    return identity.token
 
 
 def _given_token(token: str | None, token_file: str | None) -> Token | None:
@@ -87,8 +119,11 @@ def _from_info(info: HubInfo, token: Token | None, where: str) -> HubTarget:
     if identity is not None and identity.fingerprint == info.ca_fingerprint:
         return HubTarget(address, tls, identity.ca_pem if tls else None, identity.token)
     if token is None:
-        raise SecurityError(f"{where}: the hub's identity {info.identity_dir} is not readable here; pass --token or "
-                            f"--token-file (print it with `colosseum hub token` on the hub machine)")
+        why = (f"the hub's identity {info.identity_dir} is not on this machine" if identity is None else
+               f"the identity {info.identity_dir} now has fingerprint {identity.fingerprint[:16]}..., the hub "
+               f"recorded {info.ca_fingerprint[:16]}... (rotated since the hub started?)")
+        raise SecurityError(f"{where}: {why}; pass --token or --token-file (print it with `colosseum hub token` on "
+                            f"the hub machine)")
     if not tls:
         return HubTarget(address, False, None, token)
     host, port = _split(address)
@@ -105,8 +140,7 @@ def resolve_hub(*, hub: str | None = None, run: str | None = None, token: str | 
     if hub:
         host, port = _split(hub)
         if given is None:                              # on the hub machine: the local identity's token
-            identity = _local_identity(hub_identity_dir())
-            given = identity.token if identity is not None else resolve_token(None, None)   # raises "no token"
+            given = _local_token_for(hub, host, insecure=insecure)
         if insecure:
             return HubTarget(hub, False, None, given)
         return HubTarget(hub, True, fetch_hub_ca(host, port, fingerprint=given.ca_fingerprint,

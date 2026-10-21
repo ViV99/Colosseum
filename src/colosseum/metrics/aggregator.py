@@ -210,9 +210,10 @@ WorkerKey = tuple[int | None, int, int]
 
 def worker_key(stats: Mapping[str, Any]) -> WorkerKey:
     """The key of a worker stats dict: ``(node, worker_id, incarnation)``; SP4's dicts (no ``node``, no
-    ``incarnation``) key ``(None, worker_id, 0)``."""
-    node = stats.get("node")
-    return (None if node is None else int(node), int(stats["worker_id"]), int(stats.get("incarnation", 0)))
+    ``incarnation``, or None for either) key ``(None, worker_id, 0)``."""
+    node, incarnation = stats.get("node"), stats.get("incarnation")
+    return (None if node is None else int(node), int(stats["worker_id"]),
+            0 if incarnation is None else int(incarnation))
 
 
 class SystemStats:

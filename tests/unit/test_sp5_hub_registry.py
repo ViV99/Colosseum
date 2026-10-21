@@ -42,8 +42,20 @@ def test_the_running_registry_lists_live_hubs_and_removes_stale_entries(tmp_path
     proc.join()
     dead = HubInfo(**{**json.loads(_info().to_json()), "addresses": (), "pid": proc.pid, "proc_start": None})
     register_running(tmp_path, dead)
-    (tmp_path / "running" / "999999999.json").write_text("not json")
+    (tmp_path / "running" / "999999999-R.json").write_text("not json")
     assert [h.pid for h in running_hubs(tmp_path)] == [_info().pid]
-    assert sorted(p.name for p in (tmp_path / "running").iterdir()) == [f"{_info().pid}.json"]
-    unregister_running(tmp_path, _info().pid)
+    assert sorted(p.name for p in (tmp_path / "running").iterdir()) == [f"{_info().pid}-R.json"]
+    unregister_running(tmp_path, _info())
     assert running_hubs(tmp_path) == []
+
+
+def test_two_hubs_of_one_process_have_their_own_entries(tmp_path):
+    """Ruling R25 (A14): hubs of one process (in-process clusters) register side by side; removing one keeps the
+    other; a run id that is no plain file-name token still gives one entry of its own."""
+    first, second, odd = _info(run_id="R1"), _info(run_id="R2", run_dir="/runs/y"), _info(run_id="../x y")
+    for info in (first, second, odd):
+        register_running(tmp_path, info)
+    assert sorted(h.run_id for h in running_hubs(tmp_path)) == ["../x y", "R1", "R2"]
+    assert all(p.parent == tmp_path / "running" for p in (tmp_path / "running").iterdir())
+    unregister_running(tmp_path, first)
+    assert sorted(h.run_id for h in running_hubs(tmp_path)) == ["../x y", "R2"]

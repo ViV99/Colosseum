@@ -1088,7 +1088,8 @@ class WriterStats:
     Every submitted result ends up in exactly one of ``written``, ``duplicates``, ``dropped`` and ``pending``,
     except the results of a tokened submit (SP5) that was refused or got a failed ``Commit``: those are in none (their
     sender resends them). One exception, in the journal and not in these counters: a batch that an abandoned thread
-    was writing (``stop``) is counted as dropped and may still be committed, at most ``WRITE_BATCH`` results."""
+    was writing (``stop``) is counted as dropped and may still be committed: at most ``WRITE_BATCH`` results, or one
+    larger tokened group (``MatchLogWriter``)."""
 
     written: int = 0            # journaled results (detailed or counted)
     dropped: int = 0            # lost: writer queue full, write errors, not written at stop, journal unusable
@@ -1143,30 +1144,34 @@ class MatchLogWriter:
     entities and the commits (all under its lock) and ``table`` (internally locked). ``submit``, ``take_commits``,
     ``note_evicted`` and ``stop`` are called from one thread (the main loop).
 
-    Submits are groups: a tokened ``submit`` is written in one transaction (with the batch it is part of; a batch
-    takes whole groups up to ``WRITE_BATCH`` results, or one larger group); an untokened one is cut into groups of
-    ``WRITE_BATCH``. ``queue_size`` bounds the queued results.
+    Submits are groups: a tokened ``submit`` is written in one transaction (with the batch it is part of); an
+    untokened one is cut into groups of ``WRITE_BATCH``. A batch (one transaction) takes whole groups in queue order
+    while their total stays within ``WRITE_BATCH`` results (the group that would exceed it waits for the next
+    batch); a tokened group larger than ``WRITE_BATCH`` is a batch alone. ``queue_size`` bounds the queued results.
 
     - Without a token (SP4): what does not fit is dropped and counted (``dropped``, one WARNING); no ``Commit``.
     - With a token (SP5, R8): all or nothing: a submit that does not fit, or reaches a stopped or dead writer, is
       refused whole (the return value is its size) and NOT counted as dropped (the caller resends it later or
-      accounts it otherwise); after the thread wrote its group, ``take_commits`` returns a ``Commit`` for the token.
+      accounts it otherwise); a group larger than ``queue_size`` is taken whole when nothing else is queued (ruling
+      R23: it would never fit otherwise). After the thread wrote its group, ``take_commits`` returns a ``Commit``
+      for the token.
       A write error (or the thread's death) gives a failed ``Commit`` (``write_errors`` counts the error; the results
       are not counted as dropped: the sender resends them).
 
     Accounting: a batch the thread took from the queue is "in flight" (``pending``) until its append returns.
     When ``stop`` gives up waiting for the thread, the in-flight and queued results are counted as dropped and the
     writer is abandoned: whatever the thread does afterwards no longer changes the stats or the commits. The thread's
-    append of the in-flight batch may still commit, so the journal can then hold up to ``WRITE_BATCH`` results that
-    are also counted as dropped (an over-count, never a loss). When the journal cannot be opened or the thread dies,
-    the writer is ``dead``: queued untokened results are counted as dropped, queued tokened groups get failed
-    commits, later submits are refused."""
+    append of the in-flight batch may still commit, so the journal can then hold that batch's results (at most
+    ``WRITE_BATCH``, or one larger tokened group) also counted as dropped (an over-count, never a loss). When the
+    journal cannot be opened or the thread dies, the writer is ``dead``: queued untokened results are counted as
+    dropped, queued tokened groups get failed commits, later submits are refused."""
 
     def __init__(self, log_factory: Callable[[], MatchLog], *, queue_size: int = WRITER_QUEUE_SIZE,
                  compact_interval_sec: float, window_bytes: int, table: ComparisonTable | None = None,
                  clock: Callable[[], float] = time.monotonic) -> None:
         self._factory = log_factory
         self._groups: queue.Queue[_Group] = queue.Queue()
+        self._carry: _Group | None = None    # the oldest queued group, taken out but left for the next batch
         self._capacity = int(queue_size)
         self._queued = 0                 # results in queued groups (under the lock)
         self._interval = float(compact_interval_sec)
@@ -1205,8 +1210,9 @@ class MatchLogWriter:
         self._stats = replace(self._stats, **{k: getattr(self._stats, k) + v for k, v in delta.items()})
 
     def _drain_locked(self) -> list[_Group]:
-        """Remove every queued group."""
-        out = []
+        """Remove every queued group (the carried one first)."""
+        out = [] if self._carry is None else [self._carry]
+        self._carry = None
         while True:
             try:
                 out.append(self._groups.get_nowait())
@@ -1254,8 +1260,8 @@ class MatchLogWriter:
                 reason = "is stopped" if self._stop.is_set() else "is not running (the journal is unusable)"
                 taken = 0
             elif token is not None:
-                if self._queued + len(results) > self._capacity:
-                    return len(results)
+                if self._queued and self._queued + len(results) > self._capacity:
+                    return len(results)                 # R23: an empty queue takes any group whole
                 taken = len(results)
             else:
                 reason = f"queue is full ({self._capacity} results)"
@@ -1291,8 +1297,9 @@ class MatchLogWriter:
         written in time (queued, or in flight when the thread does not stop in time) is counted as dropped (one
         WARNING; tokened groups too: the run is over); the returned stats are final. A thread that does not stop in
         time is abandoned; the WARNING names what it was doing. Its in-flight batch may still be committed (an
-        over-count of at most ``WRITE_BATCH`` in ``dropped``); stuck in compaction or another journal operation, it
-        has no results in flight. Idempotent; harmless without ``start``."""
+        over-count in ``dropped`` of at most that batch: ``WRITE_BATCH`` results, or one larger tokened group); stuck
+        in compaction or another journal operation, it has no results in flight. Idempotent; harmless without
+        ``start``."""
         timeout = max(0.0, float(timeout))
         self._deadline = self._clock() + max(0.0, timeout - _STOP_MARGIN_SEC)
         self._stop.set()
@@ -1313,7 +1320,7 @@ class MatchLogWriter:
             if in_flight:
                 logger.warning(f"Match log writer did not stop within {timeout:.1f} s (it was writing a batch of "
                                f"{in_flight} results); they are counted as dropped (dropped_match_results), but the "
-                               f"thread may still commit them: an over-count of at most {WRITE_BATCH} results; the "
+                               f"thread may still commit them: an over-count of at most {in_flight} results; the "
                                f"journal stays open until the process exits")
             else:
                 logger.warning(f"Match log writer did not stop within {timeout:.1f} s (it was {self._activity}; no "
@@ -1327,29 +1334,34 @@ class MatchLogWriter:
     # ---- the thread --------------------------------------------------------------------------------------------
 
     def _take(self, timeout: float) -> list[_Group]:
-        """Whole groups up to ``WRITE_BATCH`` results (at least one group), now in flight; waits up to ``timeout``
-        for the first."""
-        groups: list[_Group] = []
-        if timeout > 0:
+        """The next batch, now in flight: whole groups in queue order within ``WRITE_BATCH`` results, or one larger
+        group alone (class docstring); waits up to ``timeout`` for the first group."""
+        with self._lock:
+            first, self._carry = self._carry, None
+        if first is None and timeout > 0:
             try:
-                groups.append(self._groups.get(timeout=timeout))
+                first = self._groups.get(timeout=timeout)
             except queue.Empty:
                 return []
         with self._lock:
             if self._abandoned:
-                if groups:
-                    self._bump_locked(dropped=len(groups[0].results))
+                if first is not None:
+                    self._bump_locked(dropped=len(first.results))
                 return []
-            if not groups:
+            if first is None:
                 try:
-                    groups.append(self._groups.get_nowait())
+                    first = self._groups.get_nowait()
                 except queue.Empty:
                     return []
-            total = len(groups[0].results)
+            groups = [first]
+            total = len(first.results)
             while total < WRITE_BATCH:
                 try:
                     group = self._groups.get_nowait()
                 except queue.Empty:
+                    break
+                if total + len(group.results) > WRITE_BATCH:
+                    self._carry = group                 # still queued: it opens the next batch
                     break
                 groups.append(group)
                 total += len(group.results)
