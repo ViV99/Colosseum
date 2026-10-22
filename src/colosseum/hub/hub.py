@@ -415,7 +415,8 @@ class Hub(RunSinks):
         for agent_id, checkpoint_id in released:
             manager.release_held(agent_id, checkpoint_id)
             self._blobs.forget("snapshot", agent_id, checkpoint_id)
-        if now is None:
+        if now is None:                              # the stop: snapshots evicted from now on are never held
+            manager.set_eviction_hold(None)
             manager.clear_held()
 
     def _register_blobs(self, setup: RunSetup, resume_states: Mapping[str, dict | None]) -> None:
@@ -860,6 +861,10 @@ class Hub(RunSinks):
             self._count_drop(entry.number, "node_messages", "invalid", "requested cells outside its slots", bad)
         if not requested:
             return
+        for key, _epoch, incarnation in requested:   # a new incarnation: the dead one's lineups name nothing any more
+            known = self._cells.get(key)
+            if known is not None and known.incarnation != incarnation:
+                self._holds.drop_cell(key)
         cells = self._cells.request(entry.number, requested, now)
         keys = [c.key for c in cells]
         owners = self._rotation.assign(keys, collecting=collecting, owners=self._cells.owners(exclude=keys),
@@ -967,6 +972,9 @@ class Hub(RunSinks):
                            f"restarts it; see {event.log_path}")
         elif kind == "slot_disabled":
             logger.warning(f"{where}: {event.proc} died too often; its slot is disabled; see {event.log_path}")
+            name, _, index = event.proc.rpartition("-")
+            if name == "worker" and index.isdigit():   # it never asks again: its lineups name nothing any more
+                self._holds.drop_worker(entry.number, int(index))
         elif kind == "run_stopped":
             self._run_stopped.add(entry.node_id)
             logger.info(f"{where} stopped its processes")

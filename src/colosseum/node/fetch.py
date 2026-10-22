@@ -27,9 +27,10 @@ Rules (``FetchPlanner.due``):
 
 A fetched frame of the announced version must carry the digest the hub announced: the authenticity anchor of a
 direct fetch covers the announced version only (a peer at a data-port address cannot substitute other weights for
-it). A newer version that the hub has not announced yet carries no hub digest; it is anchored by the per-node
-identity check of the data port's certificate (T3.2; ruling R32). Every frame's header must agree with the reply's
-metadata (``dataport.check_fetched``). Refusals count as failed fetches.
+it). A newer version that the hub has not announced yet carries no hub digest: until T3.2 such a frame is accepted
+without an anchor; T3.2's per-node identity check of the data port's certificate closes that (ruling R32). Every
+frame's header must agree with the reply's metadata (``dataport.check_fetched``). Refusals count as failed
+fetches.
 
 ``NodeFetcher`` runs the transfers in the node's transfer pool; its threads touch no main-loop state: they post
 ``BlobFetched`` / ``LatestFetched`` / ``LatestFetchFailed`` into the node inbox, and the main loop decides what the

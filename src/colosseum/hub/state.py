@@ -375,6 +375,11 @@ class SnapshotHolds:
         for cell in [c for c in self._cells if c.node == node]:
             self.drop_cell(cell)
 
+    def drop_worker(self, node: int, worker: int) -> None:
+        """A worker slot that will not ask again (disabled): its cells' references go."""
+        for cell in [c for c in self._cells if c.node == node and c.worker == worker]:
+            self.drop_cell(cell)
+
     def referenced(self, agent_id: str, checkpoint_id: str) -> bool:
         """Does a granted lineup name this snapshot (and is a hold possible at all: ``max_hold_sec > 0``)?"""
         return self.max_hold_sec > 0 and self._counts[(agent_id, checkpoint_id)] > 0

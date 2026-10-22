@@ -640,6 +640,12 @@ class CheckpointManager:
         delete it."""
         victim = self._ckpt_dir(agent_id, checkpoint_id)
         doomed = self._agent_dir(agent_id) / f"{_TMP_PREFIX}evict-{checkpoint_id}-{uuid.uuid4().hex[:8]}"
+        # The held copy is linked from the stored snapshot before it leaves its place: a download that reads it
+        # meanwhile always finds it in one of the two (the hub's BlobStore tries the held copy next).
+        if victim.is_dir() and self._wants_hold(agent_id, checkpoint_id):
+            self._keep_copy(agent_id, checkpoint_id, victim)
+        elif self._hold is not None:                  # a held copy of an earlier snapshot with this id is stale now
+            shutil.rmtree(self.held_dir(agent_id, checkpoint_id), ignore_errors=True)
         try:
             os.replace(victim, doomed)
         except FileNotFoundError:
@@ -647,10 +653,6 @@ class CheckpointManager:
         except OSError as e:  # like the plain rmtree before: an eviction failure never fails the save
             logger.warning(f"Could not evict {victim}: {e}")
             return
-        if self._wants_hold(agent_id, checkpoint_id):
-            self._keep_copy(agent_id, checkpoint_id, doomed)
-        elif self._hold is not None:                  # a held copy of an earlier snapshot with this id is stale now
-            shutil.rmtree(self.held_dir(agent_id, checkpoint_id), ignore_errors=True)
         shutil.rmtree(doomed, ignore_errors=True)
 
     def load_model(self, agent_id: str, checkpoint_id: str) -> dict[str, np.ndarray]:

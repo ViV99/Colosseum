@@ -145,8 +145,8 @@ def _pipes_alive():
 
 def test_a_pipe_blocked_in_sendall_ends_when_the_other_direction_ends():
     """The target half-closes without reading while the client's bytes are stuck in the proxy's ``sendall``: the
-    reverse pipe ends at the EOF and shuts both sockets down, which wakes the blocked ``sendall`` (``close`` alone
-    does not on Linux)."""
+    reverse pipe ends at the EOF, and both pipe threads end (none stays blocked in ``sendall``; the proxy shuts both
+    sockets down before closing them)."""
     server = socket.create_server(("127.0.0.1", 0))
     accepted = []
 

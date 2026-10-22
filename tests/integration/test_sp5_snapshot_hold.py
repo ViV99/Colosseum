@@ -12,6 +12,7 @@ from colosseum.coordinator.checkpoint_manager import EVICTED_DIR
 from colosseum.hub.server import BlobStore
 
 DOWNLOAD_DELAY_SEC = 0.5      # each snapshot download starts this late: newer snapshots evict it meanwhile
+REFRESH_SEC = 2.0             # holds last up to 2 x this: far above the injected delay
 
 
 def test_snapshots_evicted_while_referenced_stay_downloadable(tmp_path, monkeypatch):
@@ -27,7 +28,7 @@ def test_snapshots_evicted_while_referenced_stay_downloadable(tmp_path, monkeypa
                                        "checkpoint.keep_every": 0,
                                        "matchmaking.opponents": {"latest": 0.0, "snapshots": 1.0, "rivals": 0.0,
                                                                  "anchors": 0.0},
-                                       "rollout.match_refresh_interval_sec": 0.5,
+                                       "rollout.match_refresh_interval_sec": REFRESH_SEC,
                                        "training.total_timesteps": 10**9})
     with cluster(tmp_path, config, [dict(name="a", cpu_learners=1, workers=1)]) as (hub, (a,)):
         assert wait_until(lambda: hub_counter(hub, "snapshot_holds") >= 3, 90), hub_counter(hub, "snapshot_holds")

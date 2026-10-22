@@ -4,6 +4,7 @@ never fails a save and is invisible to the pool, rescans, run-dir listings and i
 from __future__ import annotations
 
 import logging
+from pathlib import Path
 
 import numpy as np
 import pytest
@@ -70,3 +71,24 @@ def test_a_run_dir_import_skips_the_evicted_dir(tmp_path):
 def test_bad_ids_are_refused(tmp_path):
     with pytest.raises(ConfigError):
         _manager(tmp_path).held_dir("main", "../x")
+
+
+def test_the_held_copy_exists_before_the_snapshot_leaves_its_place(tmp_path, monkeypatch):
+    """Review round 1: no moment in which an evicted, held snapshot is in neither place (a download reading the
+    stored one finds the held copy next)."""
+    import colosseum.coordinator.checkpoint_manager as cm
+
+    m = _manager(tmp_path)
+    m.set_eviction_hold(lambda a, c: c == "ckpt_v10")
+    m.save("main", 10, STATE)
+    seen = []
+    replace = cm.os.replace
+
+    def watching_replace(src, dst):
+        if Path(src).name == "ckpt_v10" and ".tmp-evict-" in Path(dst).name:
+            seen.append(m.held_dir("main", "ckpt_v10").is_dir())
+        return replace(src, dst)
+
+    monkeypatch.setattr(cm.os, "replace", watching_replace)
+    m.save("main", 20, STATE)
+    assert seen == [True]

@@ -610,10 +610,19 @@ class BlobStore:
             model = self._snapshot_source(agent_id, ident)
             if model is None:
                 return None
-            try:
-                state = read_weights_file(model)
-            except ValueError as e:
-                log.warning("snapshot %s/%s cannot be served: %s", agent_id, ident, e)
+            state, error = None, ""
+            for _attempt in range(2):                 # evicted while it was read: the held copy is the next source
+                try:
+                    state = read_weights_file(model)
+                    break
+                except ValueError as e:
+                    error = str(e)
+                retry = self._snapshot_source(agent_id, ident)
+                if retry is None or retry == model:
+                    break
+                model = retry
+            if state is None:
+                log.warning("snapshot %s/%s cannot be served: %s", agent_id, ident, error)
                 return None
             frame = encode_weights(state, WeightsMeta(agent_id=agent_id, kind="snapshot", generation=0,
                                                       policy_version=version, checkpoint_id=ident))

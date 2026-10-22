@@ -71,3 +71,27 @@ def test_a_re_saved_id_is_served_again_after_forget(tmp_path):
     store.forget("snapshot", "main", "ckpt_v10")
     m.save("main", 10, STATE)                                  # the id exists again (e.g. after a resume)
     assert store.frame_path("snapshot", "main", "ckpt_v10") is not None
+
+
+def test_a_snapshot_evicted_while_it_is_read_is_served_from_its_held_copy(tmp_path, monkeypatch):
+    """Review round 1: a conversion that chose the stored ``model.pt`` and finds it gone (evicted meanwhile) reads the
+    held copy instead of answering NOT_FOUND."""
+    run_dir = RunDir(tmp_path / "run")
+    m = CheckpointManager(run_dir.checkpoints, keep_last=1)
+    m.set_eviction_hold(lambda agent, ckpt: True)
+    m.save("main", 10, STATE)
+    store = BlobStore(run_dir)
+    read = server.read_weights_file
+    calls = []
+
+    def read_after_eviction(path):                             # the main loop evicts v10 just as it is read
+        calls.append(path)
+        if len(calls) == 1:
+            m.save("main", 20, STATE)
+        return read(path)
+
+    monkeypatch.setattr(server, "read_weights_file", read_after_eviction)
+    path = store.frame_path("snapshot", "main", "ckpt_v10")
+    assert path is not None and len(calls) == 2 and ".evicted" in str(calls[1])
+    _state, meta = decode_weights(path.read_bytes(), cap=1 << 20)
+    assert meta.checkpoint_id == "ckpt_v10"
