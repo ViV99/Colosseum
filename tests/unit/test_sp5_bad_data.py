@@ -51,6 +51,10 @@ class _Sink:
     def set_system_value(self, *args) -> None:
         pass
 
+    def system_state(self, local_nodes=()) -> dict:
+        """``MetricsHub.system_state`` (T4.3: ``hub_state.json`` ``counters.system_stats``): no worker totals here."""
+        return {}
+
 
 @pytest.fixture
 def setup(tmp_path):

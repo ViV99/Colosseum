@@ -471,16 +471,18 @@ def run_node_main(options_json: str) -> int:
 
 def start_node_main(options: NodeOptions, stderr: Path) -> Any:
     """``run_node_main`` in its own process and session (``python -c``; ``tests/`` on its path); its stderr goes to
-    ``stderr``. Returns the ``Popen``; the caller signals / waits / kills it (process group)."""
+    ``stderr``. Returns the ``Popen``; the caller signals / waits / kills it (process group). Its cwd is the repo root,
+    as for every CLI child (``cli_runner``): ``python -c`` puts the cwd on ``sys.path``, so configs may name
+    ``examples.*`` (the test's own cwd is its ``tmp_path``, ``conftest._isolate_filesystem``)."""
     import subprocess
     import sys
 
-    from cli_runner import child_env
+    from cli_runner import REPO_ROOT, child_env
 
     code = "import sys, node_kit; sys.exit(node_kit.run_node_main(sys.argv[1]))"
     with open(stderr, "wb") as err:
-        return subprocess.Popen([sys.executable, "-c", code, node_options_json(options)], env=child_env(),
-                                stdout=subprocess.DEVNULL, stderr=err, start_new_session=True)
+        return subprocess.Popen([sys.executable, "-c", code, node_options_json(options)], cwd=REPO_ROOT,
+                                env=child_env(), stdout=subprocess.DEVNULL, stderr=err, start_new_session=True)
 
 
 def start_node_process(options: NodeOptions, log_dir: Path) -> Any:
