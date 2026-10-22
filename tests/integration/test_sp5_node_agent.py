@@ -664,38 +664,37 @@ def test_a_learner_that_fails_to_start_reports_why_and_is_never_routed_to(hub_fa
     assert node.stop() == 0
 
 
-def _recovery_blobs(hub, config, version):
-    """A ``recovery`` weights frame and ``trainer_state`` bytes of ``a`` at policy version ``version`` (A28)."""
+def _start_point(hub, config, version):
+    """The start point ``start:resume`` of ``a`` at policy version ``version`` (A28: one checkpoint frame with the
+    weights and the trainer-state bytes)."""
     from colosseum.core.registry import env_spec
     from colosseum.core.roles import agent_role_spec, resolve_agent_roles
     from colosseum.learner.factory import build_algorithm
     from colosseum.learner.learner import make_checkpoint_payload, set_policy_version
-    from colosseum.net.chunks import WeightsMeta, encode_weights
+    from colosseum.net.chunks import encode_checkpoint
 
     spec = env_spec(config)
     role = agent_role_spec(spec, resolve_agent_roles(config, spec)["a"])
     algo = build_algorithm(config.get_agent_config("a"), role, spec, device="cpu", teacher=None)
     set_policy_version(algo, version)
-    payload = make_checkpoint_payload("a", algo)
-    hub.serve_blob("recovery", "a", "rec7", encode_weights(payload["model_state"], WeightsMeta(
-        agent_id="a", kind="recovery", generation=1, policy_version=version)))
-    hub.serve_blob("trainer_state", "a", "ts7", payload["trainer_state_bytes"])
+    hub.serve_blob("start", "a", "resume", encode_checkpoint(make_checkpoint_payload("a", algo), kind="recovery",
+                                                             generation=0))
 
 
 def test_a_learner_resumes_from_its_start_blobs_and_takes_its_version_floor(hub_factory, node_factory):
     hub = hub_factory(_learner_config())
-    _recovery_blobs(hub, hub.config, 7)
+    _start_point(hub, hub.config, 7)
     hub.welcome(learners=[pb.LearnerAssignment(agent_id="a", generation=1, version_floor=0, device="cpu",
-                                               weights_blob="rec7", trainer_state_blob="ts7")])
+                                               weights_blob="start:resume")])
     hub.grant(lambda worker, env: SELF_PLAY if hub.versions("a") else None)
     node = node_factory(hub)
     assert wait_for(lambda: hub.versions("a"), timeout=60)[0].version == 7      # the resumed version
-    assert {("recovery", "a", "rec7"), ("trainer_state", "a", "ts7")} <= set(hub.blobs.requests())
+    assert ("start", "a", "resume") in set(hub.blobs.requests())
     hub.send_command("stop_learner", learner=pb.LearnerAssignment(agent_id="a", generation=1), reason="test")
     wait_for(lambda: node.agent.supervisor.get("learner-a").exitcode is not None and not node.agent.learners.agents())
     announced = len(hub.versions("a"))
     hub.send_command("start_learner", learner=pb.LearnerAssignment(
-        agent_id="a", generation=1, version_floor=12, device="cpu", weights_blob="rec7", trainer_state_blob="ts7"))
+        agent_id="a", generation=1, version_floor=12, device="cpu", weights_blob="start:resume"))
     wait_for(lambda: len(hub.versions("a")) > announced, timeout=60)
     assert hub.versions("a")[announced].version == 12                         # the floor lifts the resumed 7
     assert node.stop() == 0
@@ -703,7 +702,8 @@ def test_a_learner_resumes_from_its_start_blobs_and_takes_its_version_floor(hub_
 
 def test_a_start_state_that_cannot_be_fetched_fails_the_learner(hub_factory, node_factory):
     hub = hub_factory(_learner_config())
-    hub.welcome(learners=[pb.LearnerAssignment(agent_id="a", generation=1, device="cpu", weights_blob="missing")])
+    hub.welcome(learners=[pb.LearnerAssignment(agent_id="a", generation=1, device="cpu",
+                                               weights_blob="start:recovery")])                # never served
     node = node_factory(hub)
     failed = wait_for(lambda: hub.node_events("learner_failed"))[0]
     assert failed.proc == "learner-a" and "start state not fetched" in failed.message and "NOT_FOUND" in failed.message

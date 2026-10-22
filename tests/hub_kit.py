@@ -105,6 +105,9 @@ class FakeNode:
         self.ended = threading.Event()
         self.code: grpc.StatusCode | None = None
         self.details: str = ""
+        self.env_steps = 0                       # the cumulative env steps its heartbeats report
+        self._beating = threading.Event()        # heartbeats are sent while set (T4.1: pause / resume)
+        self._beat_stop: threading.Event | None = None
 
     # ---- channel ------------------------------------------------------------------------------------------------
 
@@ -142,20 +145,40 @@ class FakeNode:
         return reply
 
     def hello(self, session_id: str, *, live_cells: Sequence[tuple[int, int, int, int]] = (),
-              last_acked: int = 0) -> pb.Hello:
-        return pb.Hello(node_id=self.node_id, session_id=session_id, protocol_major=PROTOCOL_VERSION[0],
-                        protocol_minor=PROTOCOL_VERSION[1], env_steps=0, last_acked_seq=last_acked,
-                        live_cells=[pb.LiveCell(worker=w, env=e, epoch=ep, incarnation=i)
-                                    for w, e, ep, i in live_cells])
+              last_acked: int = 0, fields: dict | None = None) -> pb.Hello:
+        """``fields``: more ``pb.Hello`` fields (T4.1: ``slots``, ``hardware``, ``learners``, ``data_addresses``,
+        ``name``, ``tags``)."""
+        kw: dict[str, Any] = dict(node_id=self.node_id, session_id=session_id, protocol_major=PROTOCOL_VERSION[0],
+                                  protocol_minor=PROTOCOL_VERSION[1], env_steps=self.env_steps,
+                                  last_acked_seq=last_acked,
+                                  live_cells=[pb.LiveCell(worker=w, env=e, epoch=ep, incarnation=i)
+                                              for w, e, ep, i in live_cells])
+        kw.update(fields or {})
+        return pb.Hello(**kw)
 
     def open(self, session_id: str, *, live_cells: Sequence[tuple[int, int, int, int]] = (), last_acked: int = 0,
-             first: pb.NodeMessage | None = None, read: bool = True) -> FakeNode:
+             first: pb.NodeMessage | None = None, read: bool = True, hello_fields: dict | None = None,
+             heartbeat_sec: float | None = None) -> FakeNode:
         """Open a session stream whose requests come from a queue: ``Hello`` first (``first``: another first
-        message instead); responses are collected into ``received`` by a thread (``read=False``: never read)."""
+        message instead; ``hello_fields``: more ``Hello`` fields); responses are collected into ``received`` by a
+        thread (``read=False``: never read). ``heartbeat_sec``: a thread sends a ``Heartbeat`` (``env_steps``) at that
+        cadence until the stream ends (``pause_heartbeats`` / ``resume_heartbeats``)."""
+        if self._beat_stop is not None:
+            self._beat_stop.set()
         self._requests = requests = queue.Queue()
         requests.put(first if first is not None else pb.NodeMessage(
-            hello=self.hello(session_id, live_cells=live_cells, last_acked=last_acked)))
+            hello=self.hello(session_id, live_cells=live_cells, last_acked=last_acked, fields=hello_fields)))
         self.received, self.ended, self.code, self.details = [], threading.Event(), None, ""
+        if heartbeat_sec is not None:
+            stop = self._beat_stop = threading.Event()
+            self._beating.set()
+
+            def beat() -> None:
+                while not stop.wait(heartbeat_sec):
+                    if self._beating.is_set():
+                        requests.put(pb.NodeMessage(heartbeat=pb.Heartbeat(env_steps=self.env_steps)))
+
+            threading.Thread(target=beat, name="fake-node-heartbeat", daemon=True).start()
 
         def gen():
             while True:
@@ -189,8 +212,21 @@ class FakeNode:
         """Send one ``NodeMessage`` (``send(heartbeat=pb.Heartbeat(env_steps=10))``)."""
         self._requests.put(pb.NodeMessage(**oneof))
 
+    def pause_heartbeats(self) -> None:
+        self._beating.clear()
+
+    def resume_heartbeats(self) -> None:
+        self._beating.set()
+
+    @staticmethod
+    def wait_until(predicate: Callable[[], Any], timeout: float = 10.0) -> Any:
+        """``poll_until(predicate, timeout)`` (A4's name)."""
+        return poll_until(predicate, timeout)
+
     def cut(self) -> None:
         """Close the channel abruptly (the hub sees a cut stream)."""
+        if self._beat_stop is not None:
+            self._beat_stop.set()
         if self._requests is not None:
             self._requests.put(_END)
         if self._channel is not None:
@@ -199,6 +235,8 @@ class FakeNode:
 
     def close(self) -> None:
         """End the request stream (half-close), wait briefly for the hub to end it, close the channel."""
+        if self._beat_stop is not None:
+            self._beat_stop.set()
         if self._requests is not None:
             self._requests.put(_END)
         self.ended.wait(5)
@@ -218,8 +256,10 @@ class FakeNode:
             raise AssertionError(f"the session stream did not end within {timeout} s")
         return self.code
 
-    def download(self, kind: str, agent: str, ident: str, *, cap: int = 1 << 30) -> tuple[bytes | None, str]:
-        parts = self.stub().Download(pb.BlobRequest(kind=kind, agent_id=agent, ident=ident),
+    def download(self, kind: str, agent: str, ident: str, *, cap: int = 1 << 30,
+                 since_version: int = 0) -> tuple[bytes | None, str]:
+        parts = self.stub().Download(pb.BlobRequest(kind=kind, agent_id=agent, ident=ident,
+                                                    since_version=since_version),
                                      metadata=self._node_md(), timeout=30)
         return receive_parts(parts, cap=cap)
 
@@ -591,24 +631,33 @@ def lineup_hub(config, tmp_path: Path, *, mode: str = "hub", sinks: bool = False
     return hub
 
 
-def open_node(hub, *, name: str = "n", workers: int = 2, envs: int | None = None, cpu_learners: int = 1,
+def open_node(hub, *, name: str = "n", workers: int = 2, envs: int | None = None, cpu_learners: int = 8,
               no_learners: bool = False, session_id: str | None = None, last_acked: int = 0,
-              node_id: str | None = None, data_addresses: Sequence[str] = ()) -> RecordingHandle:
+              node_id: str | None = None, data_addresses: Sequence[str] = (), gpus: Sequence[int] = (),
+              gpu_kind: str = "cuda", tags: Sequence[str] = (),
+              learners: Sequence[tuple[str, int, int]] = ()) -> RecordingHandle:
     """Register a node in the hub's node book (unless ``node_id`` names one) and open a session on the real
-    ``Hub._on_session_opened``; returns its recording handle."""
+    ``Hub._on_session_opened``; returns its recording handle. Its ``Hello`` offers ``cpu_learners`` CPU learner slots
+    (default 8: a node that takes every learner of a small test config, as before T4.1's placement) and the GPU slots
+    ``gpus`` (hardware GPUs of kind ``gpu_kind``), and names its running ``learners`` (``(agent, generation,
+    version)``)."""
     import uuid
 
     from colosseum.hub.server import SessionOpened
 
     if node_id is None:
-        record, _secret = hub.identity.nodes.register(machine_id=uuid.uuid4().hex, name=name, tags=[], node_id=None)
+        record, _secret = hub.identity.nodes.register(machine_id=uuid.uuid4().hex, name=name, tags=list(tags),
+                                                      node_id=None)
         node_id = record.node_id
     handle = RecordingHandle(node_id, session_id or uuid.uuid4().hex)
     envs = hub._config.rollout.envs_per_worker if envs is None else envs
     hello = pb.Hello(node_id=node_id, session_id=handle.session_id, protocol_major=PROTOCOL_VERSION[0],
                      protocol_minor=PROTOCOL_VERSION[1], last_acked_seq=last_acked,
                      slots=pb.Slots(workers=workers, cpu_learners=cpu_learners, no_learners=no_learners,
-                                    envs_per_worker=envs), data_addresses=list(data_addresses))
+                                    envs_per_worker=envs, gpus=list(gpus)), data_addresses=list(data_addresses),
+                     hardware=pb.Hardware(gpus=[pb.Gpu(index=int(i), kind=gpu_kind) for i in gpus]),
+                     learners=[pb.RunningLearner(agent_id=a, generation=g, version=v) for a, g, v in learners],
+                     name=name, tags=list(tags))
     hub._on_session_opened(SessionOpened(handle, hello))
     return handle
 
@@ -617,7 +666,7 @@ def accept_version(hub, agent: str, version: int = 0) -> str:
     """An accepted ``VersionAnnounce`` of ``agent``'s learner (from its node): the agent can collect."""
     from colosseum.net.messages import VersionInfo
 
-    number = hub._learner_node[agent]
+    number = hub._learner_node_of(agent)
     info = VersionInfo(agent_id=agent, generation=hub._versions.generation(agent), version=version, size=10,
                        digest="d" * 32, node=number)
     return hub._versions.announce(info)
@@ -709,7 +758,7 @@ def upload_event(hub, payload: dict, kind: str = "checkpoint", *, node_id: str |
     agent = str(payload["agent_id"])
     generation = int(hub._versions.generation(agent))
     if node_id is None:
-        number = hub._learner_node[agent]
+        number = hub._learner_node_of(agent)
         node_id = next(e.node_id for e in hub._registry.all() if e.number == number)
     data = encode_checkpoint(payload, kind="final" if kind == "final" else "periodic", generation=generation)
     hub._blobs.incoming.mkdir(parents=True, exist_ok=True)

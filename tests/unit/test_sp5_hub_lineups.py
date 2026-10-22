@@ -97,7 +97,7 @@ def test_no_lineup_is_granted_while_no_agent_can_collect(tmp_path, caplog):
     alive learner is enough, before any first version."""
     hub = lineup_hub(_config(("a",)), tmp_path)
     workers_only = open_node(hub, name="worker-node", workers=1, cpu_learners=0, no_learners=True)
-    assert hub._learner_node == {}
+    assert hub._learners.current() == {} and hub._learners.to_place() == ["a"]
     with caplog.at_level(logging.DEBUG, logger="colosseum.hub.hub"):
         assert request_cells(hub, workers_only, [(0, e, 0, 0) for e in range(4)]) == []
     assert hub._cells.live() == [] and hub._epochs.reserved_until == 0    # P-PF2-3: no epoch allocated
@@ -111,7 +111,8 @@ def test_no_lineup_is_granted_while_no_agent_can_collect(tmp_path, caplog):
 
 def test_agents_collect_from_their_learners_placement_without_a_first_version(tmp_path):
     """Ruling R36: with both learners placed and alive and only ``a``'s first version accepted, ``b``'s seats collect
-    too (the node holds a lineup until ``b``'s latest weights are cached); once ``b``'s learner failed they do not."""
+    too (the node holds a lineup until ``b``'s latest weights are cached); once ``b``'s learner failed they do not, and
+    (T4.1) ``b`` without any weights is not seated at all: with rivals only, no lineup is granted (counted)."""
     mm = {"opponents": {"latest": 0.0, "snapshots": 0.0, "rivals": 1.0, "anchors": 0.0}}
     hub = lineup_hub(_config(("a", "b"), matchmaking=mm), tmp_path)
     node = open_node(hub, workers=2)
@@ -123,13 +124,9 @@ def test_agents_collect_from_their_learners_placement_without_a_first_version(tm
     assert all(_collecting(lineup_from_proto(g.lineup)) == {"a", "b"} for g in grants)
 
     hub._on_message(node_message(node, event=pb.Event(kind="learner_failed", proc="learner-b", exit_code=1)))
-    assert hub._learner_alive == {"a": True, "b": False}
-    grants = request_cells(hub, node, [(g.worker, g.env, g.epoch, 0) for g in grants])
-    assert len(grants) == 8
-    for grant in grants:
-        lineup = lineup_from_proto(grant.lineup)
-        assert _owner(lineup) == "a" and _collecting(lineup) == {"a"}
-        assert any(s.agent_id == "b" for s in lineup.seats)
+    assert (hub._learners["a"].status, hub._learners["b"].status) == ("starting", "failed")
+    assert request_cells(hub, node, [(g.worker, g.env, g.epoch, 0) for g in grants]) == []
+    assert hub._book.totals()["lineup_redraw_failed"] == 8
 
 
 def test_a_node_without_a_path_to_the_learner_plays_without_collecting(tmp_path):
@@ -139,7 +136,7 @@ def test_a_node_without_a_path_to_the_learner_plays_without_collecting(tmp_path)
     hub = lineup_hub(_config(("a",), distributed={"relay": False}), tmp_path)
     first = open_node(hub, name="learner-node", workers=1)
     second = open_node(hub, name="worker-node", workers=1, cpu_learners=0, no_learners=True)
-    assert hub._learner_node == {"a": first.of("welcome")[0].node_number}
+    assert hub._learner_node_of("a") == first.of("welcome")[0].node_number
     assert [la.agent_id for la in first.of("welcome")[0].learners] == ["a"] and not second.of("welcome")[0].learners
     accept_version(hub, "a")
     hub._newest_snapshot = lambda agent: "ckpt_v4"                        # R37: snapshot seats there

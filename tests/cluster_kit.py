@@ -131,8 +131,8 @@ def cluster(tmp_path: Path, config: ColosseumConfig, nodes: Sequence[Mapping[str
             insecure: bool = False, learner_first: str | None = None,
             timeout: float = 120.0) -> Iterator[tuple[HubThread, list[NodeThread]]]:
     """A hub and ``nodes`` (``start_node`` keywords + ``name``). With ``learner_first=<agent>``, every node after the
-    first starts only once the hub accepted a version of that agent (its learner runs on the first node: until T4.1
-    the hub places learners on the first node with a learner slot)."""
+    first starts only once the hub accepted a version of that agent (its learner runs on the first node: the hub
+    places learners on the first node with a free slot of the right device, T4.1)."""
     hub = start_hub(tmp_path, config, insecure=insecure)
     started: list[NodeThread] = []
     try:

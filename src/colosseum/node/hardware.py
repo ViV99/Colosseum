@@ -3,9 +3,13 @@
 Cores honour the process's CPU affinity and a cgroup v2 / v1 CPU quota (containers); physical cores come from
 ``/proc/cpuinfo`` (pairs of ``physical id`` / ``core id``), else ``sysctl hw.physicalcpu`` (macOS), else the logical
 count; both are capped by the quota. GPUs come from ``nvidia-smi`` (also ``/usr/lib/wsl/lib/nvidia-smi`` on WSL2),
-without initializing CUDA in the node process; MPS from ``torch.backends.mps``. The torch version and build are
-``bootstrap.torch_select.torch_identity()``'s (amendment A24: hub and node compare the same strings). Every probe is
-a module-level function, so tests replace them."""
+without initializing CUDA in the node process; MPS from ``torch.backends.mps``. Learner GPU slots (pre-flight ruling
+P-PF3-4) are the devices torch in this environment can use (``torch.cuda.is_available()``, indices
+``0..torch.cuda.device_count()-1``, no CUDA context), not ``nvidia-smi``'s list (which stays for the hub's display and
+the wheel choice): a CPU-only torch, a ``CUDA_VISIBLE_DEVICES`` subset or a driver torch cannot use offers no CUDA
+learner slot, so ``learner.device: auto`` falls back to the CPU as ``resolve_device("auto")`` does. The torch version
+and build are ``bootstrap.torch_select.torch_identity()``'s (amendment A24: hub and node compare the same strings).
+Every probe is a module-level function, so tests replace them."""
 
 from __future__ import annotations
 
@@ -20,8 +24,8 @@ import sys
 from dataclasses import dataclass
 from pathlib import Path
 
-__all__ = ["Hardware", "affinity_cores", "cgroup_quota_cores", "default_slots", "machine_id", "memory_bytes",
-           "nvidia_gpus", "physical_cores_raw", "probe", "torch_versions"]
+__all__ = ["Hardware", "affinity_cores", "cgroup_quota_cores", "default_slots", "learner_gpus", "machine_id",
+           "memory_bytes", "nvidia_gpus", "physical_cores_raw", "probe", "torch_cuda_devices", "torch_versions"]
 
 _NVIDIA_SMI = ("nvidia-smi", "/usr/lib/wsl/lib/nvidia-smi")
 _CGROUP_ROOT = Path("/sys/fs/cgroup")
@@ -39,6 +43,7 @@ class Hardware:
     python: str
     torch_version: str
     torch_build: str
+    learner_gpus: tuple[int, ...] | None = None    # GPU indices a learner can use (P-PF3-4); None: not probed
 
 
 def affinity_cores() -> int:
@@ -129,6 +134,17 @@ def mps_available() -> bool:
         return False
 
 
+def torch_cuda_devices() -> int:
+    """How many CUDA devices torch in this environment can use (0 without a CUDA build, a usable driver or a visible
+    device); no CUDA context is created (P-PF3-4)."""
+    try:
+        import torch
+
+        return int(torch.cuda.device_count()) if torch.cuda.is_available() else 0
+    except Exception:  # noqa: BLE001 - no (working) torch: no CUDA learner slot
+        return 0
+
+
 def torch_versions() -> tuple[str, str]:
     """``(version, build)`` of this interpreter's torch as ``bootstrap.torch_select.torch_identity`` names them
     (A24); ``("", "")`` without torch."""
@@ -151,17 +167,27 @@ def probe() -> Hardware:
     if not gpus and sys.platform == "darwin" and mps_available():
         gpus = [{"index": 0, "name": "mps", "memory_bytes": 0, "kind": "mps"}]
     version, build = torch_versions()
+    cuda = torch_cuda_devices()
+    usable = tuple(range(cuda)) if cuda else tuple(int(g["index"]) for g in gpus if g.get("kind") == "mps")
     return Hardware(logical_cores=logical, physical_cores=physical, memory_bytes=memory_bytes(), gpus=tuple(gpus),
                     os=sys.platform, platform=platform.platform(), python=platform.python_version(),
-                    torch_version=version, torch_build=build)
+                    torch_version=version, torch_build=build, learner_gpus=usable)
+
+
+def learner_gpus(hw: Hardware) -> list[int]:
+    """The GPU indices a learner on this machine can use (P-PF3-4): ``hw.learner_gpus`` from ``probe``; a
+    ``Hardware`` built without the probe falls back to its listed GPUs."""
+    if hw.learner_gpus is not None:
+        return [int(i) for i in hw.learner_gpus]
+    return [int(g["index"]) for g in hw.gpus]
 
 
 def default_slots(hw: Hardware) -> dict:
     """Spec 2.6: workers = physical cores - 1 (at least 1); one evaluator and one CPU learner on >= 4 physical
-    cores; one learner slot per GPU."""
+    cores; one learner slot per GPU a learner can use (``learner_gpus``, P-PF3-4)."""
     big = hw.physical_cores >= 4
     return {"workers": max(1, hw.physical_cores - 1), "evaluators": 1 if big else 0,
-            "cpu_learners": 1 if big else 0, "gpus": [int(g["index"]) for g in hw.gpus]}
+            "cpu_learners": 1 if big else 0, "gpus": learner_gpus(hw)}
 
 
 def machine_id() -> str:

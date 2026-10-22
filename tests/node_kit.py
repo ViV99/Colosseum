@@ -77,6 +77,17 @@ class GatedBlobs(BlobStore):
             gate.wait(60)
         return super().frame_path(kind, agent_id, ident)
 
+    def start_path(self, agent_id: str, ident: str) -> Path | None:
+        """``Download(kind="start")`` (T4.1, A28) under the same controls as ``frame_path``."""
+        triple = ("start", agent_id, ident)
+        self.timeline.append(("download", triple))
+        if triple in self.missing:
+            return None
+        gate = self.gates.get(triple)
+        if gate is not None:
+            gate.wait(60)
+        return super().start_path(agent_id, ident)
+
     def requests(self) -> list[tuple[str, str, str]]:
         return [t for k, t in list(self.timeline) if k == "download"]
 
@@ -209,11 +220,13 @@ class FakeHub:
 
     def serve_blob(self, kind: str, agent: str, ident: str, data: bytes, *,
                    gate: threading.Event | None = None) -> None:
-        """Serve ``data`` for ``Download(kind, agent, ident)`` (a snapshot frame, or a registered fixed / teacher /
-        init blob); ``gate``: held until it is set."""
+        """Serve ``data`` for ``Download(kind, agent, ident)`` (a snapshot frame, a learner start point of kind
+        ``start`` (A28), or a registered fixed / teacher / init blob); ``gate``: held until it is set."""
         if kind == "snapshot":
             self.blobs.dir.mkdir(parents=True, exist_ok=True)
             (self.blobs.dir / blob_file_name("snapshot", agent, ident)).write_bytes(data)
+        elif kind == "start":
+            self.blobs.write_start(agent, ident, data)
         else:
             self.blobs.register_fixed(ident, data, kind=kind, agent_id=agent)
         if gate is not None:

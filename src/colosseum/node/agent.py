@@ -297,6 +297,7 @@ class NodeAgent:
         self._name = options.name or ("local" if options.local else _hostname_name())
         self._max_mb = 64
         self._hw: Any = None
+        self._gpus_warned = False                  # an unusable --gpus index was named once (P-PF3-4)
         self._connected = False
         self._pool = ThreadPoolExecutor(max_workers=TRANSFER_THREADS, thread_name_prefix="node-transfer")
         self.fetches = NodeFetcher(submit=self._pool.submit, post=self._post)   # downloads (node.fetch, A25)
@@ -552,18 +553,30 @@ class NodeAgent:
         return probe()
 
     def _slots(self) -> pb.Slots:
-        from colosseum.node.hardware import default_slots
+        """``Hello.slots``. GPU learner slots are only devices torch here can use (P-PF3-4; ``hardware.learner_gpus``):
+        the default, and an explicit ``--gpus`` list filtered by it (one WARNING naming the dropped indices); train's
+        local node (R18) offers every such GPU and unlimited CPU learners (``cpu_learners = -1``)."""
+        from colosseum.node.hardware import default_slots, learner_gpus
 
         opts, envs = self.options, self._hello_state[4]
+        usable = learner_gpus(self._hw)
+        if opts.gpus is None:
+            gpus = usable
+        else:
+            gpus = [int(g) for g in opts.gpus if int(g) in usable]
+            dropped = [int(g) for g in opts.gpus if int(g) not in usable]
+            if dropped and not self._gpus_warned:
+                self._gpus_warned = True
+                logger.warning(f"node: --gpus {dropped} are not usable by torch in this environment (usable: "
+                               f"{usable or 'none'}); no learner slot on them")
         if opts.local:
             return pb.Slots(workers=int(opts.workers or 0), evaluators=int(opts.evaluators or 0), cpu_learners=-1,
-                            gpus=list(opts.gpus or ()), no_learners=opts.no_learners, envs_per_worker=envs)
+                            gpus=gpus, no_learners=opts.no_learners, envs_per_worker=envs)
         d = default_slots(self._hw)
         return pb.Slots(workers=int(opts.workers if opts.workers is not None else d["workers"]),
                         evaluators=int(opts.evaluators if opts.evaluators is not None else d["evaluators"]),
                         cpu_learners=int(opts.cpu_learners if opts.cpu_learners is not None else d["cpu_learners"]),
-                        gpus=list(opts.gpus if opts.gpus is not None else d["gpus"]), no_learners=opts.no_learners,
-                        envs_per_worker=envs)
+                        gpus=gpus, no_learners=opts.no_learners, envs_per_worker=envs)
 
     def _hardware(self) -> pb.Hardware:
         from colosseum.net.security import cache_home

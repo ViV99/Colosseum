@@ -120,7 +120,7 @@ def test_a_periodic_replaces_an_earlier_runs_final_of_the_same_version(tmp_path)
 
 @pytest.mark.parametrize("case, expected", [
     ("unknown agent", "invalid"), ("frozen agent", "invalid"), ("scripted agent", "invalid"),
-    ("generation 0", "invalid"), ("learner elsewhere", "invalid"), ("frame agent", "invalid: agent"),
+    ("generation 0", "invalid"), ("learner elsewhere", "stale_generation"), ("frame agent", "invalid: agent"),
     ("frame generation", "invalid: generation"), ("frame version", "invalid: version"),
     ("frame kind", "invalid: kind"), ("stale generation", "stale_generation"), ("upload kind", "kind"),
     ("garbage", "invalid")])
@@ -194,7 +194,7 @@ def test_a_crashed_learners_error_pair_is_logged_once_and_the_first_message_wins
                                                           log_path="/logs/learner-a.log", generation=1)))
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1 and "learner-a failed (crash): RuntimeError: boom" in errors[0]
-    assert "RuntimeError: boom" in hub._failure and hub._learner_alive["a"] is False
+    assert "RuntimeError: boom" in hub._failure and hub._learners["a"].status == "failed"
 
 
 @pytest.mark.parametrize("kind", ["child_error", "learner_failed"])

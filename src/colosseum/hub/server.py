@@ -96,7 +96,9 @@ POLL_SEC = 0.5
 UPLOAD_KINDS = ("checkpoint", "final", "recovery")              # agent_file: T8.2
 RELAY_UPLOAD_KIND = "relay_latest"                               # T3.2: handled in the servicer (LatestRelay)
 RELAY_ITEM_POLL_SEC = 0.25
-REGISTERED_KINDS = ("fixed", "teacher", "init", "recovery", "trainer_state")
+REGISTERED_KINDS = ("fixed", "teacher", "init")
+START_IDENT_RE = re.compile(r"resume|recovery|ckpt_v[0-9]{1,18}")   # Download(kind="start") idents (T4.1, A28)
+PARKED_IDENT = "parked"
 BLOB_IDENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,159}")  # A18's blob id
 SNAPSHOT_IDENT_RE = re.compile(r"ckpt_v([0-9]{1,18})")
 SESSION_ID_RE = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
@@ -454,10 +456,14 @@ class HubServicer(pb_grpc.HubServicer):
     # ---- Download -----------------------------------------------------------------------------------------------
 
     def Download(self, request: pb.BlobRequest, context: grpc.ServicerContext):
-        if request.kind == "latest" and self._latest is not None:
+        if request.kind == "latest":
             yield from self._download_latest(request, context)
             return
-        path = self._blobs.frame_path(request.kind, request.agent_id, request.ident)
+        if request.kind == "start":
+            path = self._blobs.start_path(request.agent_id, request.ident)
+            path = path if path is not None and _is_file(path) else None
+        else:
+            path = self._blobs.frame_path(request.kind, request.agent_id, request.ident)
         if path is None:
             context.abort(grpc.StatusCode.NOT_FOUND,
                           f"no {request.kind[:32]!r} blob {request.agent_id[:64]!r} / {request.ident[:64]!r}")
@@ -532,13 +538,24 @@ class HubServicer(pb_grpc.HubServicer):
             self._relay.detach(handle)
 
     def _download_latest(self, request: pb.BlobRequest, context: grpc.ServicerContext):
-        """``Download(kind="latest")``: the newest relayed weights above ``since_version`` (the same metadata as
-        ``NodeData.GetLatest``), ``not_modified`` when none is newer, ``UNAVAILABLE`` while the hub has none yet. The
-        wait for a pull ends as soon as the RPC does (module lifecycle rule)."""
+        """``Download(kind="latest")``: an agent's parked (hub-held) weights when the hub parks them (SP5 T4.1, A27,
+        P-PF3-13: whatever ``distributed.relay`` says), else the newest relayed weights above ``since_version`` (the
+        same metadata as ``NodeData.GetLatest``), ``not_modified`` when none is newer, ``UNAVAILABLE`` while the hub
+        has none yet (``NOT_FOUND`` without a relay). The wait for a pull ends as soon as the RPC does (module
+        lifecycle rule)."""
         latest = self._latest
         if not _valid_agent_id(request.agent_id):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "invalid agent id")
         since = int(request.since_version)
+        parked = self._blobs.parked_path(request.agent_id)
+        if parked is not None and _is_file(parked):
+            try:
+                yield from _serve_parked(parked, request.agent_id, since)
+                return
+            except FileNotFoundError:                  # unparked meanwhile: the relayed path below
+                pass
+        if latest is None:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"no latest weights of {request.agent_id[:64]!r} on the hub")
         got = latest.open_newer(request.agent_id, since, should_stop=lambda: not context.is_active())
         if got is None:
             info = latest.latest(request.agent_id)
@@ -649,7 +666,7 @@ def blob_ident(kind: str, agent_id: str, data: bytes | str) -> str:
 
 def blob_file_name(kind: str, agent_id: str, ident: str) -> str:
     """The file name of a blob under ``runs/<name>/blobs/``: ``<kind>-<agent digest>-<ident>.frame``
-    (``trainer_state``: ``.bin``), the agent digest being the 32-hex-char blake2b of the agent id (UTF-8). Every blob
+    the agent digest being the 32-hex-char blake2b of the agent id (UTF-8). Every blob
     path of the hub goes through this function (``BlobStore`` here; the latest, start and eval blobs of later tasks
     too), so the rule lives in one place. Kinds never contain ``-`` (ValueError otherwise) and the digest has a fixed
     length, so the name is injective: it splits back into (kind, digest, ident) although agent ids and idents may
@@ -658,7 +675,7 @@ def blob_file_name(kind: str, agent_id: str, ident: str) -> str:
     if "-" in kind:
         raise ValueError(f"blob kinds never contain '-', got {kind!r}")
     agent = hashlib.blake2b(agent_id.encode("utf-8"), digest_size=_AGENT_DIGEST_SIZE).hexdigest()
-    return f"{kind}-{agent}-{ident}" + (".bin" if kind == "trainer_state" else ".frame")
+    return f"{kind}-{agent}-{ident}.frame"
 
 
 def _is_file(path: Path) -> bool:
@@ -680,11 +697,46 @@ def _write_atomic(path: Path, data: bytes) -> None:
         tmp.unlink(missing_ok=True)
 
 
+def _serve_parked(path: Path, agent_id: str, since: int):
+    """The parts of a parked weights file (SP5 T4.1): its metadata comes from the file itself (frame header, digest of
+    its bytes), so a file the main loop replaces meanwhile is never served with another version's metadata;
+    ``not_modified`` when its version is not above ``since``. FileNotFoundError when it vanished before it was
+    opened or is not a weights frame (then the caller's next path answers)."""
+    with open(path, "rb") as f:
+        try:
+            mapping = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+        except ValueError as e:                        # an empty file
+            raise FileNotFoundError(path) from e
+        try:
+            try:
+                kind, header = peek_meta(mapping)
+            except FrameError:
+                kind, header = "", {}
+            version = header.get("policy_version") if isinstance(header, dict) else None
+            if kind != "weights" or type(version) is not int:
+                log.warning("parked weights of %s are not a weights frame; not served", agent_id)
+                raise FileNotFoundError(path)
+            if version <= since:
+                yield not_modified_part(json.dumps({"agent_id": agent_id, "version": version}))
+                return
+            digest = hashlib.blake2b(mapping, digest_size=BLOB_DIGEST_SIZE).hexdigest()
+            meta = json.dumps({"agent_id": agent_id, "version": version,
+                               "generation": int(header.get("generation", 0)), "size": len(mapping),
+                               "digest": digest, "teacher_active": bool(header.get("teacher_active", False))})
+            yield from send_parts(mapping, meta_json=meta, digest=digest)
+        finally:
+            try:
+                mapping.close()
+            except BufferError:              # a part view still alive (a cancelled stream): freed with it
+                pass
+
+
 class BlobStore:
     """Read-only file serving and lazy snapshot conversion for ``Download`` (servicer threads) plus the registered
     blobs of the main loop (module docstring). Files: ``runs/<name>/blobs/<kind>-<agent digest>-<ident>.frame``
-    (``trainer_state``: ``.bin``; ``blob_file_name``). Agent ids follow the config's rule (``check_agent_id``); the
-    snapshot source is ``checkpoints/<agent>/ckpt_v<N>/model.pt``, else the held copy of an evicted one in
+    (``blob_file_name``; parked weights and learner start points: ``parked_path`` / ``start_path``, SP5 T4.1). Agent
+    ids follow the config's rule (``check_agent_id``); the snapshot source is
+    ``checkpoints/<agent>/ckpt_v<N>/model.pt``, else the held copy of an evicted one in
     ``checkpoints/.evicted/<agent>/ckpt_v<N>/`` (SP5 T3.1, spec 4.2). ``forget`` (main loop) removes the converted
     frame of an evicted snapshot that is not (or no longer) held; a conversion that started before ``forget`` writes
     nothing (a per-key forget count is compared under the lock before the frame is put in place)."""
@@ -787,9 +839,47 @@ class BlobStore:
                 tmp.unlink(missing_ok=True)
             return path
 
+    def parked_path(self, agent_id: str) -> Path | None:
+        """``blobs/latest-<agent digest>-parked.frame``: the agent's parked (hub-held) weights frame (SP5 T4.1); None
+        for an invalid agent id. The main loop writes it (``write_parked``) and removes it (``drop_parked``)."""
+        if not _valid_agent_id(agent_id):
+            return None
+        return self.dir / blob_file_name("latest", agent_id, PARKED_IDENT)
+
+    def write_parked(self, agent_id: str, frame: bytes) -> Path:
+        """Write the agent's parked weights frame atomically (a servicer reading the old file keeps reading it)."""
+        path = self.parked_path(agent_id)
+        if path is None:
+            raise ValueError(f"invalid agent id {agent_id!r} for a blob")
+        self.dir.mkdir(parents=True, exist_ok=True)
+        _write_atomic(path, bytes(frame))
+        return path
+
+    def drop_parked(self, agent_id: str) -> None:
+        path = self.parked_path(agent_id)
+        if path is not None:
+            path.unlink(missing_ok=True)
+
+    def start_path(self, agent_id: str, ident: str) -> Path | None:
+        """``blobs/start-<agent digest>-<ident>.frame``: a learner start point (one checkpoint frame; A28) for
+        ``Download(kind="start")``; ``ident`` is ``resume``, ``recovery`` or ``ckpt_v<N>``. None for an invalid
+        agent id or ident (checked before any path is formed)."""
+        if not _valid_agent_id(agent_id) or not isinstance(ident, str) or not START_IDENT_RE.fullmatch(ident):
+            return None
+        return self.dir / blob_file_name("start", agent_id, ident)
+
+    def write_start(self, agent_id: str, ident: str, frame: bytes) -> Path:
+        """Write a start point atomically (main loop)."""
+        path = self.start_path(agent_id, ident)
+        if path is None:
+            raise ValueError(f"invalid start blob {agent_id!r} / {ident!r}")
+        self.dir.mkdir(parents=True, exist_ok=True)
+        _write_atomic(path, bytes(frame))
+        return path
+
     def register_fixed(self, blob_id: str, frame: bytes, *, kind: str, agent_id: str) -> None:
-        """Register (and write atomically) a blob the main loop serves: a frozen agent's or a teacher's weights, an
-        ``init`` state, a recovery frame or trainer state (``kind``). ValueError for an invalid kind or id."""
+        """Register (and write atomically) a blob the main loop serves: a frozen agent's or a teacher's weights or an
+        ``init`` state (``kind``). ValueError for an invalid kind or id."""
         if kind not in REGISTERED_KINDS:
             raise ValueError(f"blob kind must be one of {REGISTERED_KINDS}, got {kind!r}")
         if not _valid_agent_id(agent_id):

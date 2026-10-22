@@ -522,8 +522,8 @@ def test_hub_state_counters_are_saved_and_loaded_whole(tmp_path):
     assert CounterBook.from_state(back.counters["intake_book"]).get("dropped_chunks.invalid") == 3
     assert VersionRegistry.from_state(back.versions).latest("a") == _info(4, 1)
     on_disk = json.loads(path.read_text())
-    assert sorted(on_disk) == ["counters", "env_steps", "epoch_reserved_until", "nodes_lost", "run_id", "sessions",
-                               "version", "versions"]
+    assert sorted(on_disk) == ["counters", "env_steps", "epoch_reserved_until", "learners", "nodes_lost", "run_id",
+                               "sessions", "version", "versions"]                  # learners: T4.1 (A3)
 
 
 def test_a_missing_hub_state_is_none_and_a_malformed_one_a_value_error(tmp_path):

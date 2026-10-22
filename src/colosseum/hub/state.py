@@ -518,10 +518,12 @@ class _AgentVersions:
 
 
 class VersionRegistry:
-    """Agent -> generation -> versions (spec 4.5, 7.2; R16)."""
+    """Agent -> generation -> versions (spec 4.5, 7.2; R16). Parked weights (SP5 T4.1, amendment A27): hub-held
+    weights of an agent without a running learner, served as its latest (``park``); never saved in ``state()``."""
 
     def __init__(self) -> None:
         self._agents: dict[str, _AgentVersions] = {}
+        self._parked: dict[str, VersionInfo] = {}
 
     def _get(self, agent_id: str) -> _AgentVersions:
         return self._agents.setdefault(agent_id, _AgentVersions())
@@ -553,11 +555,38 @@ class VersionRegistry:
             return "not_newer"
         a.max_version = a.gen_max = info.version
         a.latest = info
+        self._parked.pop(info.agent_id, None)        # a learner version again: the hub-held weights go
         return "accepted"
 
     def latest(self, agent_id: str) -> VersionInfo | None:
+        """The agent's parked weights while parked, else its newest accepted announcement."""
+        parked = self._parked.get(agent_id)
+        if parked is not None:
+            return parked
+        return self.accepted(agent_id)
+
+    def accepted(self, agent_id: str) -> VersionInfo | None:
+        """The newest accepted learner announcement (parked weights ignored)."""
         a = self._agents.get(agent_id)
         return None if a is None else a.latest
+
+    def park(self, info: VersionInfo) -> None:
+        """Serve ``info`` as ``info.agent_id``'s latest until a learner version of the agent is accepted again
+        (``announce``) or ``unpark``: hub-held weights of an agent without a running learner (``node == -1``: node 0
+        is ``train``'s local node, amendment A27; ``generation == 0``; SP5 T4.1). ``max_version``, the floor and the
+        caps are unchanged; not saved."""
+        if info.node != -1:
+            raise ValueError(f"parked weights of {info.agent_id!r} are hub-held: node -1, not {info.node}")
+        if info.generation != 0:
+            raise ValueError(f"parked weights of {info.agent_id!r} carry generation 0, not {info.generation}")
+        self._parked[info.agent_id] = info
+
+    def unpark(self, agent_id: str) -> VersionInfo | None:
+        """Stop serving the parked weights (the agent's learner runs again); returns them."""
+        return self._parked.pop(agent_id, None)
+
+    def parked(self, agent_id: str) -> VersionInfo | None:
+        return self._parked.get(agent_id)
 
     def replace_latest(self, info: VersionInfo) -> bool:
         """Replace the stored latest announcement by ``info`` of the same agent, generation and version (where to
@@ -803,7 +832,8 @@ class HubStateData:
     ``BudgetCounter.state()``, ``versions`` is ``VersionRegistry.state()``, ``counters`` is ``{"book":
     Hub._book.state(), "intake_book": MetricsHub.intake_book.state()}`` (two ``CounterBook`` states; T4.3 restores
     them with ``CounterBook.from_state``). ``counters`` is saved and loaded whole, so keys this version does not know
-    survive a resume (D16). T4.1 adds ``learners``."""
+    survive a resume (D16). ``learners`` is ``hub.placement.LearnerTable.state(...)`` (SP5 T4.1; ``{}`` in a file
+    written before it)."""
 
     version: int
     run_id: str
@@ -813,6 +843,7 @@ class HubStateData:
     versions: dict
     counters: dict[str, Any]
     nodes_lost: int
+    learners: dict = field(default_factory=dict)
 
 
 def save_hub_state(path: str | Path, data: HubStateData, *, fsync: bool) -> None:
@@ -851,6 +882,7 @@ def load_hub_state(path: str | Path) -> HubStateData | None:
         return HubStateData(version=int(d["version"]), run_id=str(d["run_id"]), env_steps=int(d["env_steps"]),
                             sessions={str(k): int(v) for k, v in d["sessions"].items()},
                             epoch_reserved_until=int(d["epoch_reserved_until"]), versions=dict(d["versions"]),
-                            counters=dict(d["counters"]), nodes_lost=int(d["nodes_lost"]))
+                            counters=dict(d["counters"]), nodes_lost=int(d["nodes_lost"]),
+                            learners=dict(d.get("learners") or {}))
     except (OSError, ValueError, KeyError, TypeError, AttributeError) as e:
         raise ValueError(f"malformed {path}: {type(e).__name__}: {e}") from e

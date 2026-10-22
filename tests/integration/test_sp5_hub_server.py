@@ -372,16 +372,21 @@ def test_blob_paths_are_validated_before_any_path_is_formed(hub):
     with pytest.raises(ValueError):
         blobs.register_fixed("x", b"f", kind="snapshot", agent_id="bot")
     assert not (root / "blobs").exists() or list((root / "blobs").iterdir()) == []
-    blobs.register_fixed("state1", b"raw", kind="trainer_state", agent_id="a")
-    assert blobs.frame_path("trainer_state", "a", "state1") == root / "blobs" / _blob_name("trainer_state", "a",
-                                                                                         "state1", ".bin")
+    with pytest.raises(ValueError):                    # A28: no trainer_state / recovery blobs any more (T4.1)
+        blobs.register_fixed("state1", b"raw", kind="trainer_state", agent_id="a")
+    for agent, ident in (("../a", "resume"), ("a", "../resume"), ("a", "ckpt_v1/../x"), ("a", "latest"),
+                         ("", "resume")):
+        assert blobs.start_path(agent, ident) is None
+    assert blobs.start_path("a", "ckpt_v3") == root / "blobs" / _blob_name("start", "a", "ckpt_v3")
+    assert blobs.parked_path("a") == root / "blobs" / _blob_name("latest", "a", "parked")
+    assert blobs.parked_path("../a") is None
 
 
 def test_blob_file_name_is_the_public_rule_every_blob_path_uses(hub):
     """``blob_file_name`` is the documented rule (``BlobStore`` names its files through it); a kind with ``-``
     is refused (it would break injectivity)."""
     assert blob_file_name("fixed", "a-b", "c") == _blob_name("fixed", "a-b", "c")
-    assert blob_file_name("trainer_state", "a", "t1") == _blob_name("trainer_state", "a", "t1", ".bin")
+    assert blob_file_name("start", "a", "resume") == _blob_name("start", "a", "resume")
     assert blob_file_name("snapshot", "agent", "ckpt_v7") == _blob_name("snapshot", "agent", "ckpt_v7")
     with pytest.raises(ValueError, match="'-'"):
         blob_file_name("bad-kind", "a", "c")

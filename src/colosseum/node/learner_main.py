@@ -25,7 +25,7 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CONNECT_TIMEOUT_SEC", "init_from_cached", "learner_target", "resume_state_from_blobs",
+__all__ = ["CONNECT_TIMEOUT_SEC", "init_from_cached", "learner_target", "resume_state_from_frame",
            "teacher_for"]
 
 CONNECT_TIMEOUT_SEC = 10.0
@@ -129,16 +129,18 @@ class _ProgressFloor:
 # ---------------------------------------------------------------------------------------------------------------
 
 
-def resume_state_from_blobs(weights_frame: bytes, trainer_state: bytes | None, *, env_steps: int,
-                            source: str) -> dict:
-    """``learner_process``'s ``resume_state`` from a ``recovery`` weights frame and ``trainer_state`` bytes (A28);
-    ValueError for a frame that is not one."""
-    from colosseum.net.chunks import decode_weights
+def resume_state_from_frame(frame: bytes | bytearray, *, agent_id: str, cap: int, env_steps: int, source: str) -> dict:
+    """``learner_process``'s ``resume_state`` from a learner start point (A28: one checkpoint frame of the hub's
+    ``Download(kind="start")``, weights plus trainer-state bytes; ``trainer_state`` None = weights only).
+    ``FrameError`` (a ValueError) for a frame that is not one, ValueError for another agent's."""
+    from colosseum.net.chunks import decode_checkpoint
 
-    state, meta = decode_weights(weights_frame, cap=len(weights_frame))
-    return {"model_state": {k: np.array(v) for k, v in state.items()},
-            "trainer_state": None if trainer_state is None else bytes(trainer_state),
-            "policy_version": int(meta.policy_version), "env_steps": int(env_steps), "source": source}
+    payload, _meta = decode_checkpoint(bytearray(frame), cap=cap)
+    if payload["agent_id"] != agent_id:
+        raise ValueError(f"the start point of {agent_id!r} is a frame of {payload['agent_id']!r}")
+    return {"model_state": {k: np.array(v) for k, v in payload["model_state"].items()},
+            "trainer_state": payload["trainer_state_bytes"], "policy_version": int(payload["policy_version"]),
+            "env_steps": int(env_steps), "source": source}
 
 
 def teacher_for(config: Any, agent_id: str, *, cached: Any = None, bot: Any = None) -> Any:

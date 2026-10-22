@@ -62,3 +62,23 @@ def test_the_torch_identity_is_the_bootstrap_rule():
     from colosseum.bootstrap.torch_select import torch_identity
 
     assert hardware.torch_versions() == torch_identity()                       # A24
+
+
+def test_learner_gpu_slots_are_the_devices_torch_can_use(monkeypatch):
+    """P-PF3-4: a GPU nvidia-smi lists but torch here cannot use (a CPU-only torch, a hidden device) offers no learner
+    slot, so ``learner.device: auto`` takes the CPU; nvidia-smi's list stays in the reported hardware."""
+    from colosseum.hub.placement import capacity_from_hello, requested_slot
+
+    smi = [{"index": 0, "name": "x", "memory_bytes": 1, "kind": "cuda"},
+           {"index": 1, "name": "y", "memory_bytes": 1, "kind": "cuda"}]
+    monkeypatch.setattr(hardware, "nvidia_gpus", lambda: smi)
+    monkeypatch.setattr(hardware, "physical_cores_raw", lambda: 8)
+    monkeypatch.setattr(hardware, "torch_cuda_devices", lambda: 0)
+    hw = hardware.probe()
+    assert [g["index"] for g in hw.gpus] == [0, 1] and hardware.learner_gpus(hw) == []
+    assert default_slots(hw)["gpus"] == []
+    node = capacity_from_hello(1, "pc", (), default_slots(hw), {0: "cuda", 1: "cuda"}, unlimited=True)
+    assert requested_slot("auto", [node]) == ("cpu", None)
+    monkeypatch.setattr(hardware, "torch_cuda_devices", lambda: 1)          # e.g. CUDA_VISIBLE_DEVICES=1
+    hw = hardware.probe()
+    assert hardware.learner_gpus(hw) == [0] and default_slots(hw)["gpus"] == [0]

@@ -52,8 +52,20 @@ results are accounted in commit order and the batch acked only then. A batch the
 accounted nor acked (the node resends it); without the journal, or with a dead writer, results are accounted at
 intake. Drops are counted in ``Hub._book`` (``dropped_match_results_by_reason.*``, amendment A2).
 
-Until T4.1 every learner is generation 1 and is placed on the local node (``train``) or on the first node with
-learner capacity (``hub``); until T4.2 a failed learner stops the run (A12).
+Learners (spec block 1, 2.6, 7.2; T4.1; ``hub.placement``): the ``LearnerTable`` is the one authority on where each
+trainable agent's learner runs and with which generation. A placement pass (``_place_learners``: at every session
+open, after a node loss) puts every agent without a learner on a free slot of the right device on an online node
+(``train``'s local node takes every learner, R18) with a new generation (persisted with fsync before the
+``start_learner`` command, P-PF3-2), a version floor above every version ever used (``_version_floor``) and its start
+point (A28: ``start:resume`` / ``init`` / factory weights); a learner never moves while its node lives. A reconnecting
+node is reconciled (``LearnerTable.reconcile``: its learners of the current generation are adopted, anything else is
+told to stop); ``Welcome.learners`` is the node's desired learner set. An agent without a slot is ``pending``: its
+seats do not collect, it owns no cells, and it plays with hub-held ("parked") weights when it has any (its newest
+stored snapshot, its ``init`` or ``training.resume_from`` weights: a ``VersionInfo`` with node -1 served by
+``Download(kind="latest")``, A27); lineups naming an agent without any weights are drawn again (``LINEUP_REDRAWS``).
+Announcements, snapshots and train metrics of a superseded generation are fenced (R16; results by
+``ResultIntake.check``'s version cap). ``train`` without ``--listen`` stops at once when an agent cannot be placed on
+its machine (W04-26). Until T4.2 a failed learner stops the run (A12).
 """
 
 from __future__ import annotations
@@ -77,6 +89,8 @@ from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.ipc import QueueReader
 from colosseum.core.run_dir import RunDir
+from colosseum.core.types import LATEST_NETWORK_ID
+from colosseum.hub.placement import LearnerSlot, LearnerTable, capacity_from_hello, place
 from colosseum.hub.run_sinks import RunSinks
 from colosseum.hub.server import (
     LOOPBACK_KEY,
@@ -125,7 +139,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "INBOX_POLL_SEC", "LOCAL_SHUTDOWN_GRACE_SEC", "Hub", "HubOptions", "LocalNodeOptions", "RunSetup",
+    "INBOX_POLL_SEC", "LINEUP_REDRAWS", "LOCAL_SHUTDOWN_GRACE_SEC", "Hub", "HubOptions", "LocalNodeOptions", "RunSetup",
     "run_hub", "run_training", "setup_run", "validate_run_config", "warn_static_ownership_skew",
 ]
 
@@ -141,7 +155,8 @@ _CHECKPOINT_KIND = {"checkpoint": "periodic", "final": "final"}   # UploadHeader
 _LOOPBACK_OF = {"[::]": "[::1]", "0.0.0.0": "127.0.0.1", "127.0.0.1": "127.0.0.1", "localhost": "localhost",
                 "[::1]": "[::1]"}
 PENDING_EVICTIONS_MAX = 10_000            # evictions kept per node while its stream is down (oldest dropped)
-UNREACHABLE_REDRAWS = 16                  # R37: draws for a lineup without unreachable agents' latest seats
+LINEUP_REDRAWS = 16                       # draws for a lineup whose latest seats this node can play (W04-4, R37)
+JOURNAL_FLOOR_MATCHES = 1000              # newest journaled matches per agent read for the version floor (P-PF3-3)
 
 
 @dataclass(frozen=True)
@@ -219,7 +234,6 @@ class Hub(RunSinks):
         self._blobs = None
         self._holds: SnapshotHolds | None = None   # evicted snapshots granted lineups still name (spec 4.2, T3.1)
         self._fixed_blobs: list = []              # pb.FixedBlob of Welcome.fixed
-        self._start_blobs: dict[str, tuple[str, str]] = {}   # agent -> (recovery blob id, trainer_state blob id)
         # Pure hub state (built by _prepare).
         self._registry = None
         self._epochs = None
@@ -228,8 +242,18 @@ class Hub(RunSinks):
         self._versions = None
         self._intake = None
         self._sessions: dict[str, Any] = {}       # node id -> its current SessionHandle
-        self._learner_node: dict[str, int] = {}   # agent -> node number of its learner
-        self._learner_alive: dict[str, bool] = {}
+        # Learners (T4.1; module docstring): placement, generations, parked weights, start points, version floors.
+        self._learners: LearnerTable | None = None
+        self._assignments: dict[str, Any] = {}    # agent -> its current pb.LearnerAssignment
+        self._parked: dict[str, int] = {}         # agent -> version of its parked (hub-held) weights
+        self._unplayable: set[str] = set()        # pending agents without any weights (not drawn into lineups)
+        self._pending_reasons: dict[str, str] = {}
+        self._start_sources: dict[str, tuple[str, int, str]] = {}   # agent -> (weights_blob, version, description)
+        self._hello_floors: dict[str, int] = {}   # agent -> RunningLearner.version + 1 seen in a Hello (P-PF3-3)
+        self._journal_floors: dict[str, int] | None = None   # P-PF3-3: read once per hub start
+        self._stops_sent: set[tuple[int, str, int]] = set()  # (stream serial, agent, generation) told to stop
+        self._welcoming: int | None = None        # the node whose Welcome is being built (its commands wait)
+        self._deferred: list[Any] = []            # start_learner commands for that node, sent after its Welcome
         self._paths: dict[int, dict[int, str]] = {}   # node number -> {learner node: path} (Heartbeat.paths, T3.2)
         self._machines: dict[str, str] = {}       # node id -> machine id (loopback addresses, T3.2)
         self._relay = None                        # hub.relay.RelayHub (built by _prepare; T3.2)
@@ -403,13 +427,15 @@ class Hub(RunSinks):
         shutil.rmtree(self._blobs.incoming, ignore_errors=True)    # upload spools of a crashed hub
         self._build_relay()
         self._wire_snapshot_holds(coordinator)
-        self._register_blobs(setup, self._resume_states)
+        self._register_blobs(setup)
+        self._start_sources = self._resume_start_sources()
         self._pulse_setup()
         self._registry = NodeRegistry()
         self._epochs = EpochAllocator(0, self._reserve_epochs)
         self._cells = CellTable(self._epochs)
         self._rotation = OwnerRotation(trainable)
         self._versions = VersionRegistry()
+        self._learners = LearnerTable(trainable)
         self._intake = ResultIntake(journal=bool(cfg.match_log.enabled))
 
     def _build_relay(self) -> None:
@@ -433,7 +459,8 @@ class Hub(RunSinks):
     def _publish_latest(self) -> None:
         """The relay's view of every agent's latest version (after every accepted or re-sourced one)."""
         if self._latest is not None:
-            self._latest.publish_versions({a: v for a in self._agent_ids if (v := self._versions.latest(a))})
+            self._latest.publish_versions({a: v for a in self._agent_ids
+                                           if (v := self._versions.latest(a)) is not None and v.node >= 0})
 
     def _report_relay(self) -> None:
         """The relay's cumulative counters into ``Hub._book`` under ``hub/<incarnation>`` (A2)."""
@@ -476,10 +503,9 @@ class Hub(RunSinks):
             manager.set_eviction_hold(None)
             manager.clear_held()
 
-    def _register_blobs(self, setup: RunSetup, resume_states: Mapping[str, dict | None]) -> None:
-        """What nodes download from the hub: frozen agents' weights, neural kickstart teachers and ``init`` weights
-        (``Welcome.fixed``), and every resumed agent's start state (A28 until T4.1: a ``recovery`` weights frame and
-        its ``trainer_state`` bytes, named by the agent's ``LearnerAssignment``)."""
+    def _register_blobs(self, setup: RunSetup) -> None:
+        """What nodes download from the hub (``Welcome.fixed``): frozen agents' weights, neural kickstart teachers and
+        ``init`` weights. Learner start points are ``_resume_start_sources``'s (A28)."""
         from colosseum.net.chunks import WeightsMeta, encode_weights
 
         def register(kind: str, agent_id: str, data: bytes) -> str:
@@ -506,15 +532,33 @@ class Hub(RunSinks):
             frame = encode_weights(init.model_state, WeightsMeta(agent_id, "init", 0, 0))
             self._fixed_blobs.append(pb.FixedBlob(agent_id=agent_id, blob_id=register("init", agent_id, frame),
                                                   kind="init"))
-        for agent_id, state in resume_states.items():
-            if state is None:
-                continue
-            frame = encode_weights(state["model_state"], WeightsMeta(
-                agent_id, "recovery", 0, int(state["policy_version"])))
-            trainer = state.get("trainer_state")
-            self._start_blobs[agent_id] = (register("recovery", agent_id, frame),
-                                           "" if trainer is None else register("trainer_state", agent_id,
-                                                                               bytes(trainer)))
+
+    def _resume_start_sources(self) -> dict[str, tuple[str, int, str]]:
+        """The hub-start source of every trainable agent's learner (A28; T4.3 replaces it for an in-place resume):
+        ``(weights_blob, version, description)``. A ``training.resume_from`` state becomes the start point
+        ``start:resume`` (one checkpoint frame: weights plus trainer-state bytes, none = weights only, as SP3's
+        ``.pt`` resume) written once to ``BlobStore.start_path(agent, "resume")``; else ``init`` (the ``Welcome.fixed``
+        blob); else factory weights."""
+        from colosseum.net.chunks import encode_checkpoint
+
+        out: dict[str, tuple[str, int, str]] = {}
+        for agent in self._agent_ids:
+            state = self._resume_states.get(agent)
+            init = self._init_states.get(agent)
+            if state is not None:
+                version = int(state["policy_version"])
+                trainer = state.get("trainer_state")
+                frame = encode_checkpoint({"agent_id": agent, "policy_version": version,
+                                           "model_state": state["model_state"],
+                                           "trainer_state_bytes": None if trainer is None else bytes(trainer),
+                                           "final": False}, kind="recovery", generation=0)
+                self._blobs.write_start(agent, "resume", frame)
+                out[agent] = ("start:resume", version, f"{state['source']} (policy_version {version})")
+            elif init is not None:
+                out[agent] = ("init", 0, f"init {init.source}")
+            else:
+                out[agent] = ("", 0, "factory weights")
+        return out
 
     def _pulse_setup(self) -> None:
         """R6: the pulse plan, its feeder and the two queues (with ``evaluation.enabled``)."""
@@ -535,6 +579,7 @@ class Hub(RunSinks):
         self._open_match_log(self._coordinator)
         self._open_live_ratings()
         self._wire_retention()
+        self._update_pending_value()
 
     def _start_server(self) -> None:
         """The hub's gRPC server (``hub.server.build_server``), ``hub.json`` and the running-hubs registry entry.
@@ -688,6 +733,7 @@ class Hub(RunSinks):
             if self._hub.maybe_tick(env_steps=env_steps, ratings=self._coordinator.ratings_snapshot,
                                     queue_depths=self._hub.intake_queue_depths(), match_log=self._match_log_stats(),
                                     bt=self._live_snapshot()):
+                self._place_learners()               # cheap and idempotent (T4.1); T4.2's relocations go here too
                 self._save_league_state()
                 self._save_hub_state(fsync=False)
             if self._failure is not None:
@@ -754,7 +800,11 @@ class Hub(RunSinks):
     def _on_session_opened(self, ev: Any) -> None:
         """A node's ``Hello`` (P-PF2-1 (c)): an older live stream of the node is closed as superseded; the node is
         connected (``new`` / ``resumed`` / ``returned``: a returned node's cells are dropped), its batch bookkeeping
-        opened with ``Hello.last_acked_seq``, its learners placed, and a ``Welcome`` sent."""
+        opened with ``Hello.last_acked_seq``, its running learners reconciled (``LearnerTable.reconcile``: the current
+        generation's are adopted, the rest told to stop after the ``Welcome``), the learners placed (a start on this
+        node is listed in its ``Welcome`` and its command sent right after it), and a ``Welcome`` sent whose
+        ``learners`` are the node's desired learner set. ``train`` without ``--listen``: an agent its local node
+        cannot run stops the run before the ``Welcome`` (nothing starts there)."""
 
         handle, hello = ev.handle, ev.hello
         record = self._identity.nodes.get(handle.node_id)
@@ -782,49 +832,330 @@ class Hub(RunSinks):
         self._publish_online()
         self._intake.open(handle.node_id, hello.session_id, int(hello.last_acked_seq))
         self._budget.report(handle.node_id, hello.session_id, int(hello.env_steps))
-        placed = self._place_learners(record.number, node_hello)
+        stops = self._reconcile_learners(record.number, hello.learners)
+        failed_before = self._failure is not None
+        self._welcoming, self._deferred = record.number, []
+        try:
+            self._place_learners()
+        finally:
+            self._welcoming = None
+        deferred, self._deferred = self._deferred, []
+        if self._failure is not None and not failed_before:
+            return                                   # W04-26: the run stops; this node starts nothing
         cfg = self._config
-        agents = [pb.AgentState(agent_id=aid, kind=cfg.agent_kind(aid), status="active", start_env_steps=0)
-                  for aid in cfg.agent_ids()]
         versions = self._versions_for(handle.node_id, [v for aid in self._agent_ids
                                                        if (v := self._versions.latest(aid)) is not None])
+        here = self._learners_on(record.number)
         handle.send(pb.HubMessage(welcome=pb.Welcome(
             node_number=record.number, run_id=self._run_id, config_json=cfg.model_dump_json(by_alias=True),
-            agents=agents, versions=versions, evictions=self._take_evictions(handle.node_id),
-            learners=[self._assignment(a) for a in placed], evaluators=0, env_steps=self._budget.value,
+            agents=self._agent_states(), versions=versions, evictions=self._take_evictions(handle.node_id),
+            learners=[self._assignment_for(a) for a in here], evaluators=0, env_steps=self._budget.value,
             fixed=list(self._fixed_blobs), collect_allowed=True)))
-        logger.info(f"node {record.number} ({record.name}) connected ({kind}); learners here: {placed or 'none'}")
+        for command in deferred:
+            handle.send(command)
+        for agent, generation in stops:
+            self._stop_learner(record.number, agent, generation, "superseded")
+        logger.info(f"node {record.number} ({record.name}) connected ({kind}); learners here: {here or 'none'}")
         if self._shutting_down:
             self._send_stop_run(handle)
 
-    def _place_learners(self, number: int, hello: Any) -> list[str]:
-        """The trainable agents whose learner runs on node ``number``. Until T4.1 (A11): ``train`` places every
-        learner on its local node (number 0); ``hub`` on the first node that connects with learner capacity (not
-        ``--no-learners``, CPU learner slots or GPUs). Every placed learner is generation 1."""
-        if not self._learner_node:
-            slots = hello.slots or {}
-            if self._options.mode == "train":
-                capable = number == 0
-            else:
-                capable = (not slots.get("no_learners", False)
-                           and (int(slots.get("cpu_learners", 0) or 0) != 0 or bool(slots.get("gpus"))))
-            if capable:
-                for agent in self._agent_ids:
-                    self._versions.new_generation(agent)
-                    self._learner_node[agent] = number
-                    self._learner_alive[agent] = True
-                logger.info(f"Learners of {self._agent_ids} placed on node {number}")
-        return [a for a in self._agent_ids if self._learner_node.get(a) == number]
+    def _train_only(self) -> bool:
+        """``train`` without ``--listen``: its local node is the only node that can ever exist (W04-26)."""
+        return self._options.mode == "train" and self._options.listen is None
 
-    def _assignment(self, agent: str) -> Any:
-        """The ``LearnerAssignment`` of ``agent`` (A28: a resumed agent names its ``recovery`` / ``trainer_state``
-        blobs)."""
+    # ---- learners (T4.1) --------------------------------------------------------------------------------------
 
-        weights, trainer = self._start_blobs.get(agent, ("", ""))
-        return pb.LearnerAssignment(agent_id=agent, generation=self._versions.generation(agent),
-                                    version_floor=self._versions.version_floor(agent),
-                                    device=str(self._setup.agent_configs[agent].learner.device),
-                                    weights_blob=weights, trainer_state_blob=trainer, env_steps=self._budget.value)
+    def _reconcile_learners(self, number: int, running: Any) -> list[tuple[str, int]]:
+        """``Hello.learners`` of node ``number`` against the learner table (``LearnerTable.reconcile``): adopted
+        learners stop being parked; returns the ``(agent, generation)`` learners the node must stop. Every reported
+        version raises that agent's version floor (P-PF3-3)."""
+        reported: dict[str, int] = {}
+        for learner in running:
+            agent = str(learner.agent_id)
+            reported[agent] = int(learner.generation)
+            if agent in self._learners:
+                self._hello_floors[agent] = max(self._hello_floors.get(agent, 0), int(learner.version) + 1)
+        announced = {a: info.generation for a in self._agent_ids if (info := self._versions.accepted(a)) is not None}
+        out = self._learners.reconcile(number, reported, announced=announced)
+        for agent in out.adopted:
+            entry = self._learners[agent]
+            self._drop_parked(agent)
+            logger.info(f"Learner of {agent}: generation {entry.generation} on node {number} adopted ({entry.status})")
+        for agent, generation in out.stop:
+            logger.info(f"Learner of {agent}: generation {generation} on node {number} is not the current one; "
+                        f"it is told to stop")
+        for agent in out.gone:
+            logger.info(f"Learner of {agent}: node {number} came back without it; it is placed again")
+        return list(out.stop)
+
+    def _learners_on(self, number: int) -> list[str]:
+        """Agents whose learner starts or runs on node ``number`` (the node's desired learner set)."""
+        return [a for a in self._learners.on_node(number) if self._learners[a].status in ("starting", "running")]
+
+    def _learner_node_of(self, agent: str) -> int | None:
+        """The node of ``agent``'s learner while it starts or runs (the collect rule's ``learner_node``), else None."""
+        if self._learners is None or agent not in self._learners or not self._learners.can_collect(agent):
+            return None
+        slot = self._learners[agent].slot
+        return None if slot is None else slot.node
+
+    def _node_capacities(self) -> list:
+        """The learner slots of every online node (``hub.placement.capacity_from_hello``); train's local node
+        (``data_path == "local"``) is unlimited (R18)."""
+        out = []
+        for entry in self._registry.online():
+            kinds = {int(g.get("index", 0)): str(g.get("kind", "")) for g in (entry.hardware or {}).get("gpus", ())}
+            out.append(capacity_from_hello(entry.number, entry.name, entry.tags, entry.slots or {}, kinds,
+                                           unlimited=entry.data_path == "local"))
+        return out
+
+    def _place_learners(self) -> None:
+        """One placement pass (main loop only; cheap, idempotent; module docstring): every agent without a learner
+        gets a free slot (``_start_learner``), the rest are ``pending`` (an INFO when the reason changes; parked
+        weights when they have any). No pass runs while no node is online. ``train`` without ``--listen`` fails the
+        run when an agent stays pending with its local node online (W04-26)."""
+        if self._learners is None or not self._agent_ids or not self._registry.online():
+            return                                   # before any node: nothing to place, nobody to play parked weights
+        configs = self._setup.agent_configs
+        agents = {a: configs[a].learner for a in self._agent_ids if self._learners[a].status != "failed"}
+        current = self._learners.current()
+        plan = place(agents, self._node_capacities(), current=current)
+        for agent, slot in plan.new(current).items():
+            self._start_learner(agent, slot)
+        for agent in plan.pending:
+            reason = plan.reasons[agent]
+            self._learners.set_pending(agent, reason)
+            if self._pending_reasons.get(agent) != reason:
+                self._pending_reasons[agent] = reason
+                logger.info(f"Learner of {agent}: pending ({reason})")
+            self._park(agent)
+        for agent in plan.assigned:
+            self._pending_reasons.pop(agent, None)
+        self._update_pending_value()
+        local_online = any(e.data_path == "local" for e in self._registry.online())
+        if plan.pending and local_online and self._train_only():
+            agent = plan.pending[0]
+            self._fail_run(f"Learner of {agent} cannot run on this machine: {plan.reasons[agent]}")
+
+    def _start_learner(self, agent: str, slot: LearnerSlot) -> None:
+        """A new assignment of ``agent``'s learner to ``slot``: a new generation (``hub_state.json`` written with
+        fsync before the command leaves, P-PF3-2), the version floor, the start point (A28), the ``start_learner``
+        command (deferred until after the ``Welcome`` of a node being welcomed) and an immediate ``Announce`` of the
+        agents' states."""
+        generation = self._versions.new_generation(agent)
+        self._learners.assign(agent, slot, generation)
+        try:
+            self._save_hub_state(fsync=True)
+        except Exception:
+            self._learners.set_pending(agent, "hub_state.json could not be written")
+            raise
+        blob, version, what = self._learner_start_source(agent)
+        floor = self._version_floor(agent, start=(blob, version))
+        assignment = pb.LearnerAssignment(agent_id=agent, generation=generation, version_floor=floor,
+                                          device=slot.device, weights_blob=blob, trainer_state_blob="",
+                                          env_steps=self._budget.value)
+        self._assignments[agent] = assignment
+        command = pb.HubMessage(command=pb.Command(kind="start_learner", learner=assignment))
+        entry = self._registry.get(slot.node)
+        if slot.node == self._welcoming:
+            self._deferred.append(command)
+        elif entry is not None and (handle := self._sessions.get(entry.node_id)) is not None:
+            handle.send(command)
+        name = "?" if entry is None else entry.name
+        logger.info(f"Learner of {agent}: generation {generation} on node {slot.node} ({name}), device {slot.device}, "
+                    f"from {what}, versions from {floor}")
+        self._announce_agents()
+
+    def _learner_start_source(self, agent: str) -> tuple[str, int, str]:
+        """``(weights_blob, version, description)`` of ``agent``'s next learner start (A28): the hub-start source
+        (``_resume_start_sources``; T4.2 puts the newest recovery point in front)."""
+        return self._start_sources.get(agent, ("", 0, "factory weights"))
+
+    def _version_floor(self, agent: str, *, start: tuple[str, int] | None = None) -> int:
+        """The first version a new learner of ``agent`` may publish (R9, W04-7, P-PF3-3): above every version the
+        registry accepted, the newest stored snapshot, the journal's newest seats of the agent (read once per hub
+        start) and every learner version a node reported in a ``Hello``. T4.2 adds the recovery point.
+
+        ``start`` = the start point ``(weights_blob, version)``: a start point that IS the newest stored snapshot (a
+        run-dir ``training.resume_from`` resumes the parent's newest snapshot, which the pool import stored here; an
+        in-place resume's ``start:ckpt_v<N>``, T4.3) may publish its own version again (the same weights), so the
+        stored snapshot then bounds the floor at its version, not above it (SP2's "versions continue from the
+        resumed ``ckpt_v<N>``")."""
+        floors = [self._versions.version_floor(agent), self._hello_floors.get(agent, 0),
+                  self._journal_version_floors().get(agent, 0)]
+        latest = self._coordinator.checkpoint_manager.latest(agent) if self._coordinator is not None else None
+        if latest is not None:
+            stored = int(latest.policy_version)
+            same = start is not None and int(start[1]) == stored and start[0] in ("start:resume",
+                                                                                  f"start:ckpt_v{stored}")
+            floors.append(stored if same else stored + 1)
+        return max(floors)
+
+    def _journal_version_floors(self) -> dict[str, int]:
+        """P-PF3-3: per trainable agent, 1 + the highest ``version_start`` / ``version_end`` of its latest seats in
+        the newest ``JOURNAL_FLOOR_MATCHES`` journaled training matches (versions that reached a result survive a
+        crash of the hub even when ``hub_state.json`` is older); read once per hub start, {} without a journal."""
+        if self._journal_floors is not None:
+            return self._journal_floors
+        from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLogReader
+
+        floors: dict[str, int] = {}
+        path = self._run_dir.root / MATCH_LOG_FILE
+        if self._config.match_log.enabled and path.exists():
+            try:
+                with MatchLogReader(path) as reader:
+                    for agent in self._agent_ids:
+                        for match in reader.matches(agent=agent, source="train", limit=JOURNAL_FLOOR_MATCHES):
+                            for seat in match.seats:
+                                if seat.agent_id == agent and seat.network_id == LATEST_NETWORK_ID:
+                                    top = max(v for v in (seat.version_start, seat.version_end, -1) if v is not None)
+                                    floors[agent] = max(floors.get(agent, 0), int(top) + 1)
+            except Exception as e:  # noqa: BLE001 - the other floors still apply
+                logger.warning(f"the journal's versions could not be read for the version floor "
+                               f"({type(e).__name__}: {e})")
+        self._journal_floors = floors
+        return floors
+
+    def _stop_learner(self, node: int, agent: str, generation: int, reason: str) -> None:
+        """``stop_learner`` of ``agent``'s learner ``generation`` on ``node`` (reason ``superseded``: no final upload;
+        T4.4 adds ``stop_run``), at most once per stream of that node; nothing while the node has no stream (its next
+        ``Hello`` is reconciled)."""
+        entry = self._registry.get(node)
+        handle = None if entry is None else self._sessions.get(entry.node_id)
+        if handle is None:
+            return
+        key = (int(handle.serial), agent, int(generation))
+        if key in self._stops_sent:
+            return
+        self._stops_sent.add(key)
+        handle.send(pb.HubMessage(command=pb.Command(
+            kind="stop_learner", learner=pb.LearnerAssignment(agent_id=agent, generation=int(generation)),
+            reason=reason)))
+        logger.info(f"Learner of {agent}: generation {generation} on node {node} told to stop ({reason})")
+
+    def _assignment_for(self, agent: str) -> Any:
+        """The ``LearnerAssignment`` of ``agent``'s current learner (the one it was started with; an adopted learner
+        of an earlier hub process gets one built from the table)."""
+        entry = self._learners[agent]
+        known = self._assignments.get(agent)
+        if known is not None and int(known.generation) == entry.generation:
+            return known
+        blob, _version, _what = self._learner_start_source(agent)
+        return pb.LearnerAssignment(agent_id=agent, generation=entry.generation,
+                                    version_floor=self._version_floor(agent),
+                                    device="" if entry.slot is None else entry.slot.device, weights_blob=blob,
+                                    trainer_state_blob="", env_steps=self._budget.value)
+
+    def _agent_states(self) -> list:
+        """``AgentState`` of every agent: a trainable one ``active`` while its learner starts or runs, ``pending``
+        while it waits for a slot or its node, ``failed``; fixed agents ``active``."""
+        cfg = self._config
+        out = []
+        for aid in cfg.agent_ids():
+            status = "active"
+            if self._learners is not None and aid in self._learners:
+                learner = self._learners[aid].status
+                status = {"pending": "pending", "relocating": "pending", "failed": "failed"}.get(learner, "active")
+            out.append(pb.AgentState(agent_id=aid, kind=cfg.agent_kind(aid), status=status, start_env_steps=0))
+        return out
+
+    def _announce_agents(self) -> None:
+        """An immediate ``Announce`` (the periodic one's content plus every agent's state, A6)."""
+        if self._sessions and self._coordinator is not None:
+            self._broadcast_announce(agents=True)
+
+    def _update_pending_value(self) -> None:
+        """``system`` value ``pending_agents``: trainable agents waiting for a slot or for their node (A26)."""
+        if self._hub is None or self._learners is None:
+            return
+        self._hub.set_system_value("pending_agents", [e.agent_id for e in self._learners.entries()
+                                                      if e.status in ("pending", "relocating")])
+
+    # ---- parked weights (T4.1; A27) ---------------------------------------------------------------------------
+
+    def _playable(self, agent: str) -> bool:
+        """A fixed agent, or a trainable one whose learner starts or runs or that has parked weights."""
+        if self._learners is None or agent not in self._learners:
+            return True
+        return self._learners.can_collect(agent) or self._versions.parked(agent) is not None
+
+    def _park_source(self, agent: str) -> tuple[int, dict, str] | None:
+        """The newest hub-held weights of ``agent`` (``(version, numpy state_dict, description)``): its newest stored
+        snapshot, its ``training.resume_from`` state, its ``init`` weights (version 0; a partial ``init`` completed on
+        a freshly built model); None without any. T4.2 adds the recovery point."""
+        candidates: list[tuple[int, int, Callable[[], dict], str]] = []
+        latest = self._coordinator.checkpoint_manager.latest(agent)
+        if latest is not None:
+            candidates.append((int(latest.policy_version), 2, lambda: self._coordinator.checkpoint_manager.load_model(
+                agent, latest.checkpoint_id), f"snapshot {latest.checkpoint_id}"))
+        state = self._resume_states.get(agent)
+        if state is not None:
+            candidates.append((int(state["policy_version"]), 1, lambda: dict(state["model_state"]),
+                               f"{state['source']}"))
+        init = self._init_states.get(agent)
+        if init is not None:
+            candidates.append((0, 0, lambda: self._full_init_state(agent, init), f"init {init.source}"))
+        if not candidates:
+            return None
+        version, _rank, load, what = max(candidates, key=lambda c: (c[0], c[1]))
+        return version, load(), what
+
+    def _full_init_state(self, agent: str, init: Any) -> dict:
+        """``init`` weights as a full state_dict (a partial ``init`` is loaded onto a freshly built model)."""
+        import numpy as np
+
+        if init.strict:
+            return dict(init.model_state)
+        import torch
+
+        from colosseum.core.registry import build_model
+
+        model = build_model(self._setup.agent_configs[agent], self._setup.role_specs[agent])
+        model.load_state_dict({k: torch.as_tensor(np.asarray(v)) for k, v in init.model_state.items()}, strict=False)
+        return {k: v.detach().cpu().numpy() for k, v in model.state_dict().items()}
+
+    def _park(self, agent: str) -> None:
+        """Serve ``agent``'s newest hub-held weights as its latest while it has no learner (``_park_source``): the
+        frame ``BlobStore.parked_path`` (written atomically), a ``VersionInfo`` with node -1, generation 0,
+        ``relay_only`` (A27) in the registry and the next ``Announce``. No-op while it can collect or is parked; an
+        agent without any weights is not drawn into lineups (one INFO)."""
+        from colosseum.net.chunks import WeightsMeta, encode_weights
+        from colosseum.net.grpc_util import blob_digest
+        from colosseum.net.messages import VersionInfo
+
+        if self._learners.can_collect(agent) or agent in self._parked or agent in self._unplayable:
+            return
+        try:
+            source = self._park_source(agent)
+            if source is not None:
+                version, state_dict, what = source
+                frame = encode_weights(state_dict, WeightsMeta(agent, "latest", generation=0,
+                                                               policy_version=int(version)))
+                self._blobs.write_parked(agent, frame)
+        except Exception as e:  # noqa: BLE001 - a session open or a placement pass must go on
+            logger.error(f"{agent}: its hub-held weights could not be prepared ({type(e).__name__}: {e}); it is not "
+                         f"drawn into lineups until its learner runs", exc_info=True)
+            self._unplayable.add(agent)
+            return
+        if source is None:
+            self._unplayable.add(agent)
+            logger.info(f"{agent} has no weights yet: it is not drawn into lineups until its learner runs")
+            return
+        info = VersionInfo(agent_id=agent, generation=0, version=int(version), size=len(frame),
+                           digest=blob_digest(frame), node=-1, relay_only=True)
+        self._versions.park(info)
+        self._parked[agent] = int(version)
+        self._new_versions[agent] = info
+        logger.info(f"{agent}: plays with hub-held weights v{version} ({what}) while it has no learner")
+        self._announce_agents()
+
+    def _drop_parked(self, agent: str) -> None:
+        """Stop serving ``agent``'s parked weights (its learner was adopted or published a version): the registry
+        entry and the file go (a servicer that has it open keeps reading, POSIX)."""
+        self._versions.unpark(agent)
+        self._unplayable.discard(agent)
+        if self._parked.pop(agent, None) is not None:
+            self._blobs.drop_parked(agent)
 
     def _on_session_closed(self, ev: Any) -> None:
         """Only the node's current stream counts (P-PF2-1 (c)); the node stays online until ``node_lost_after_sec``
@@ -837,7 +1168,12 @@ class Hub(RunSinks):
 
     def _on_node_lost(self, entry: Any, *, reason: str = "lost", relocate_now: bool = False) -> None:
         """A node silent for ``node_lost_after_sec`` (or removed: ``reason``): its cells go (their unfinished
-        matches are never reported), its stream is closed. T4.2 adds the relocation of its learners."""
+        matches are never reported), its stream is closed, its learners wait for it (``relocating``: they do not
+        collect and play with parked weights; T4.2 relocates them after ``learner_relocate_after_sec``)."""
+        if self._learners is not None:
+            for agent in self._learners.node_lost(entry.number, entry.last_heartbeat):
+                self._park(agent)
+            self._update_pending_value()
         self._cells.drop_node(entry.number)
         self._holds.drop_node(entry.number)
         self._paths.pop(entry.number, None)
@@ -919,7 +1255,7 @@ class Hub(RunSinks):
         if self._relay_on():
             return
         for target, path in paths.items():
-            agents = sorted(a for a, n in self._learner_node.items() if n == target)
+            agents = sorted(a for a in self._agent_ids if self._learner_node_of(a) == target)
             if path == "down" and agents:
                 self._warn_once(("path_down", entry.number, target),
                                 f"node {entry.number} ({entry.name}) cannot reach the data port of node {target} and "
@@ -933,9 +1269,10 @@ class Hub(RunSinks):
         return self._relay is not None and bool(getattr(self._relay, "enabled", False))
 
     def _collecting_any(self) -> list[str]:
-        """Agents that can collect anywhere: a placed, alive learner (spec 4.2, 4.7; ruling R36: no first version
-        needed, a lineup naming the agent waits on the node until its latest weights are cached)."""
-        return [a for a in self._agent_ids if self._learner_alive.get(a)]
+        """Agents that can collect anywhere: a learner that starts or runs (``LearnerTable.can_collect``; spec 4.2,
+        4.7; ruling R36: no first version needed, a lineup naming the agent waits on the node until its latest
+        weights are cached)."""
+        return [] if self._learners is None else self._learners.collecting()
 
     def _collecting_on(self, number: int) -> list[str]:
         """Agents that can collect on node ``number`` (``hub.state.collect_allowed``): their learner runs there, or
@@ -943,7 +1280,7 @@ class Hub(RunSinks):
         relay, paths = self._relay_on(), self._paths.get(number, {})
         out = []
         for agent in self._collecting_any():
-            learner = self._learner_node.get(agent)
+            learner = self._learner_node_of(agent)
             if collect_allowed(number, learner, relay=relay, path=paths.get(learner)):
                 out.append(agent)
         return out
@@ -1003,8 +1340,8 @@ class Hub(RunSinks):
         for cell in cells:
             owner = owners[cell.key]
             drawer = owner if owner is not None else playable[cell.epoch % len(playable)]
-            lineup = self._lineup_on_node(drawer, here, snapshots)
-            if lineup is None:                       # R37: no playable lineup there yet; the cell asks again
+            lineup = self._lineup_for_cell(drawer, here, snapshots)
+            if lineup is None:                       # no playable lineup there yet; the cell asks again
                 continue
             lineup = dataclasses.replace(lineup, epoch=cell.epoch)
             self._cells.grant(cell.key, owner, ttl, now)
@@ -1017,14 +1354,31 @@ class Hub(RunSinks):
             logger.debug(f"node {entry.number}: no lineup without {unreachable} (no stored snapshot yet); its cells "
                          f"ask again")
 
-    def _lineup_on_node(self, owner: str, here: list[str], snapshots: Mapping[str, str | None]) -> Any:
+    def _lineup_for_cell(self, owner: str, here: list[str], snapshots: Mapping[str, str | None]) -> Any:
         """The matchmaker's lineup for ``owner`` as a node sees it: seats of agents it cannot collect for do not
-        collect; with ``snapshots`` (R37) those agents' latest seats play their newest stored snapshot. A draw that
-        seats such an agent without a snapshot is drawn again, up to ``UNREACHABLE_REDRAWS`` times (None then)."""
-        for _ in range(UNREACHABLE_REDRAWS if snapshots else 1):
-            lineup = seat_snapshots(strip_collect(self._coordinator.lineup_for(owner), here), snapshots)
+        collect (a pending agent's latest seats play its parked weights); with ``snapshots`` (R37) those agents' latest
+        seats play their newest stored snapshot. A draw whose latest seats name an agent without any weights (a
+        pending agent with nothing parked, W04-4) or, under R37, an unreachable agent without a snapshot, is drawn
+        again (rejection sampling: the matchmaker's distribution conditioned on playable agents), up to
+        ``LINEUP_REDRAWS`` times; then None (the cell asks again at its next request). Agents without weights named
+        by every draw are counted (``lineup_redraw_failed``) with one WARNING per owner."""
+        unplayable = {a for a in self._agent_ids if not self._playable(a)}
+        named: set[str] = set()
+        for _ in range(LINEUP_REDRAWS if (snapshots or unplayable) else 1):
+            lineup = self._coordinator.lineup_for(owner)
+            bad = {s.agent_id for s in lineup.seats if s.network_id == LATEST_NETWORK_ID and s.agent_id in unplayable}
+            if bad:
+                named |= bad
+                continue
+            lineup = seat_snapshots(strip_collect(lineup, here), snapshots)
             if lineup is not None:
                 return lineup
+        if named:
+            self._book.add("lineup_redraw_failed", 1)
+            self._warn_once(("lineup_redraw", owner),
+                            f"matchmaking for {owner}: {LINEUP_REDRAWS} draws in a row named agents without weights "
+                            f"({', '.join(sorted(named))}); no lineup this pass — give them init weights or a learner "
+                            f"slot")
         return None
 
     def _newest_snapshot(self, agent: str) -> str | None:
@@ -1039,8 +1393,14 @@ class Hub(RunSinks):
             if train.agent_id not in self._agent_ids:
                 self._count_drop(entry.number, "dropped_metrics", "invalid", "train records of unknown agents")
                 continue
+            learner = self._learners[train.agent_id]
+            if int(train.generation) != learner.generation or learner.slot is None:
+                logger.debug(f"node {entry.number}: train record of {train.agent_id} generation {train.generation} "
+                             f"dropped (current generation {learner.generation})")
+                continue                             # a superseded learner's numbers never mix into the curves
             self._hub.on_train_metrics({"agent_id": train.agent_id, "train_step": int(train.train_step),
-                                        **{str(k): float(v) for k, v in train.values.items()}})
+                                        **{str(k): float(v) for k, v in train.values.items()},
+                                        "learner_node": int(learner.slot.node), "generation": learner.generation})
         for stats in metrics.workers:
             self._hub.on_worker_stats({"node": entry.number, "worker_id": int(stats.worker),
                                        "incarnation": int(stats.incarnation),
@@ -1053,16 +1413,32 @@ class Hub(RunSinks):
                                       {str(k): int(v) for k, v in intake.dropped.items()})
 
     def _on_version(self, entry: Any, info_proto: Any) -> None:
-        """A learner's ``VersionAnnounce``: accepted only from the agent's learner node and generation (spec 4.5);
+        """A learner's ``VersionAnnounce``: accepted only from the agent's learner node and current generation (spec
+        4.5); the first accepted one of a generation makes its learner ``running`` and ends the agent's parked weights;
         an accepted version goes out with the next ``Announce`` (the agent collects from its learner's placement on,
-        R36)."""
+        R36). An announcement of a superseded generation is fenced (counted ``dropped_announcements.stale_generation``)
+        and its learner is told to stop (spec 7.2, W04-23)."""
 
         info = version_from_proto(info_proto)
-        if self._learner_node.get(info.agent_id) != entry.number or info.node != entry.number:
+        agent = info.agent_id
+        known = self._learners is not None and agent in self._learners
+        slot = self._learners[agent].slot if known else None
+        if not known or info.node != entry.number:
+            outcome = "invalid"
+        elif 1 <= info.generation < self._versions.generation(agent):
+            outcome = "stale_generation"
+        elif slot is None or slot.node != entry.number:
             outcome = "invalid"
         else:
             outcome = self._versions.announce(info)
+        if outcome == "stale_generation":
+            self._stop_learner(entry.number, agent, info.generation, "superseded")
         if outcome == "accepted":
+            if self._learners.announced(agent, info.generation):
+                logger.info(f"Learner of {agent}: running on node {entry.number} ({entry.name}) (generation "
+                            f"{info.generation})")
+                self._announce_agents()
+            self._drop_parked(agent)
             sourced = version_source(info, entry)          # where the other nodes fetch it (spec 4.5, T3.1)
             self._versions.replace_latest(sourced)
             self._new_versions[info.agent_id] = sourced
@@ -1115,9 +1491,11 @@ class Hub(RunSinks):
             code = f" (exit {event.exit_code})" if event.exit_code else ""
             why = f": {event.message}" if event.message else ""
             log = f"; see {event.log_path}" if event.log_path else ""
-            for agent, number in self._learner_node.items():
-                if number == entry.number and event.proc == f"learner-{agent}":
-                    self._learner_alive[agent] = False
+            agent = event.proc.removeprefix("learner-")
+            if (agent in self._learners and self._learner_node_of(agent) == entry.number
+                    and int(event.generation) in (0, self._learners[agent].generation)):
+                self._learners.fail(agent, f"{event.proc} ended{code}{why}")
+                self._update_pending_value()
             self._fail_run(f"{event.proc} on {where} ended{code}{why}{log}")
         elif kind == "proc_died":
             logger.warning(f"{where}: {event.proc} died (exit {event.exit_code}) without reporting an error; the node "
@@ -1271,11 +1649,13 @@ class Hub(RunSinks):
                 reply(False, "kind")
                 return
             agent, generation = header.agent_id, int(header.generation)
-            if agent not in self._agent_ids or self._learner_node.get(agent) != number or generation < 1:
+            if agent not in self._agent_ids or generation < 1:
                 self._count_drop(number, "dropped_uploads", "invalid", f"uploads of {agent!r}")
                 reply(False, "invalid")
                 return
-            if generation != self._versions.generation(agent):
+            slot = self._learners[agent].slot
+            if generation != self._versions.generation(agent) or slot is None or slot.node != number:
+                # R16 / spec 7.2: a superseded generation, or a learner the hub did not place on this node
                 self._count_drop(number, "dropped_uploads", "stale_generation", f"uploads of {agent!r}")
                 reply(False, "stale_generation")
                 return
@@ -1380,11 +1760,12 @@ class Hub(RunSinks):
 
     # ---- periodic ---------------------------------------------------------------------------------------------
 
-    def _broadcast_announce(self) -> None:
+    def _broadcast_announce(self, *, agents: bool = False) -> None:
         """The periodic ``Announce`` to every live session: the hub's env steps (the learners' LR progress), the
         versions accepted (or re-sourced, T3.1) since the last one, with where to fetch them, and the snapshots
         evicted since the node's last ``Announce`` or ``Welcome`` (kept per online or lost node while its stream is
-        down, at most ``PENDING_EVICTIONS_MAX``: a lost node that comes back gets them with its ``Welcome``)."""
+        down, at most ``PENDING_EVICTIONS_MAX``: a lost node that comes back gets them with its ``Welcome``);
+        ``agents``: every agent's state too (``_announce_agents``)."""
         new = [(a, c) for a, ids in sorted(self._coordinator.take_evictions().items()) for c in ids]
         if new:
             for entry in self._registry.all():
@@ -1394,10 +1775,17 @@ class Hub(RunSinks):
                     del pending[:-PENDING_EVICTIONS_MAX]
         new_versions = list(self._new_versions.values())
         self._new_versions = {}
+        states = self._agent_states() if agents else []
         for node_id, handle in list(self._sessions.items()):
+            if self._welcoming is not None and self._number_of(node_id) == self._welcoming:
+                continue                             # its Welcome (sent next) carries all of it
             handle.send(pb.HubMessage(announce=pb.Announce(
                 versions=self._versions_for(node_id, new_versions), evictions=self._take_evictions(node_id),
-                env_steps=self._budget.value, collect_allowed=True)))
+                env_steps=self._budget.value, collect_allowed=True, agents=states)))
+
+    def _number_of(self, node_id: str) -> int | None:
+        entry = self._registry.by_id(node_id)
+        return None if entry is None else entry.number
 
     def _versions_for(self, node_id: str, infos: list) -> list:
         """``infos`` as node ``node_id`` sees them (``pb.VersionInfo``): the learner node's loopback data addresses
@@ -1433,7 +1821,9 @@ class Hub(RunSinks):
                             versions=self._versions.state() if self._versions is not None else {},
                             counters={"book": self._book.state(),
                                       "intake_book": self._hub.intake_book.state() if self._hub is not None else {}},
-                            nodes_lost=int(self._nodes_lost))
+                            nodes_lost=int(self._nodes_lost),
+                            learners={} if self._learners is None else self._learners.state(
+                                local_nodes={e.number for e in self._registry.all() if e.data_path == "local"}))
         path = self._run_dir.root / HUB_STATE_FILE
         if fsync:
             save_hub_state(path, data, fsync=True)

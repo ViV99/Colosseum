@@ -36,7 +36,7 @@ def test_a_remote_learners_seats_collect_only_where_a_direct_path_was_reported(t
     first = open_node(hub, name="learner-node", workers=1)
     second = open_node(hub, name="worker-node", workers=1, cpu_learners=0, no_learners=True)
     a, b = (h.of("welcome")[0].node_number for h in (first, second))
-    assert hub._learner_node == {"a": a}
+    assert hub._learner_node_of("a") == a
     accept_version(hub, "a")
     cells = [(0, e, 0, 0) for e in range(4)]
     assert request_cells(hub, second, cells) == []                            # R37: no path, no snapshot: nothing
@@ -161,9 +161,9 @@ def test_relay_off_an_unreachable_learner_never_owns_a_cell_and_its_seats_need_a
     config = make_test_config("turns", agents={"a": {}, "b": {}}, matchmaking=rivals, rollout={"envs_per_worker": 4},
                               distributed={"relay": False})
     hub = lineup_hub(config, tmp_path)
-    open_node(hub, name="learner-node", workers=1)
-    second = open_node(hub, name="worker-node", workers=1, cpu_learners=0, no_learners=True)
-    hub._learner_node["b"] = second.of("welcome")[0].node_number            # b's learner runs on node 2
+    open_node(hub, name="learner-node", workers=1, cpu_learners=1)           # a's learner; b waits for a slot
+    second = open_node(hub, name="worker-node", workers=1, cpu_learners=1)    # b's learner runs on node 2
+    assert hub._learner_node_of("b") == second.of("welcome")[0].node_number
     cells = [(0, e, 0, 0) for e in range(4)]
     assert request_cells(hub, second, cells) == []                            # a has no snapshot: no lineup
     epochs = sorted(c.epoch for c in hub._cells.live())

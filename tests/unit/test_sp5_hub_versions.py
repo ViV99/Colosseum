@@ -3,6 +3,7 @@ node's data addresses (``Announce``, ``Welcome``); new addresses re-announce the
 addresses are dropped and counted; evictions wait for a node marked lost and reach it with its next ``Welcome``."""
 from __future__ import annotations
 
+import itertools
 import logging
 import time
 
@@ -34,7 +35,7 @@ def test_an_accepted_version_reaches_every_node_with_the_learner_nodes_addresses
     hub = _hub(tmp_path)
     learner = open_node(hub, name="learner")
     other = open_node(hub, name="other", cpu_learners=0, no_learners=True)
-    number = hub._learner_node["a"]
+    number = hub._learner_node_of("a")
     _addresses(hub, learner, "10.0.0.2:47102", "192.168.1.2:47102")
     hub._broadcast_announce()
     _announce(hub, learner, 3, number)
@@ -53,7 +54,7 @@ def test_a_learner_node_without_addresses_is_relay_only_until_it_announces_them(
     hub = _hub(tmp_path)
     learner = open_node(hub, name="learner")
     other = open_node(hub, name="other", cpu_learners=0, no_learners=True)
-    number = hub._learner_node["a"]
+    number = hub._learner_node_of("a")
     _announce(hub, learner, 0, number)
     hub._broadcast_announce()
     _addresses(hub, learner, "10.0.0.2:47199")                          # its data port was bound after Welcome
@@ -83,7 +84,7 @@ def test_evictions_wait_for_a_lost_node_and_reach_it_with_its_welcome(tmp_path):
     for entry in hub._registry.lost(time.monotonic() + 3600.0, 10.0):  # silent too long: marked lost
         hub._on_node_lost(entry)
     assert hub._registry.by_id(node.node_id).state == "lost"
-    evictions = iter([{"a": ["ckpt_v5"]}, {}])
+    evictions = itertools.chain([{"a": ["ckpt_v5"]}], itertools.repeat({}))   # T4.1's placement announces too
     hub._coordinator.take_evictions = lambda: next(evictions)
     hub._broadcast_announce()
     back = open_node(hub, node_id=node.node_id, session_id=node.session_id)
@@ -96,7 +97,7 @@ def test_hello_data_addresses_have_the_same_bounds(tmp_path, caplog):
     hub = _hub(tmp_path)
     learner = open_node(hub, name="learner", data_addresses=["10.0.0.2:47102"])
     other = open_node(hub, name="other", cpu_learners=0, no_learners=True)
-    number = hub._learner_node["a"]
+    number = hub._learner_node_of("a")
     _announce(hub, learner, 0, number)
     hub._broadcast_announce()
     assert _announced(other)[-1].addresses == ("10.0.0.2:47102",)

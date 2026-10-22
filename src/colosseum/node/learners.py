@@ -1,8 +1,9 @@
 """The learners a node runs (SP5 spec 4.4, 4.5, 4.7; A28; controller ruling R24): their lifecycle and their
 messages, owned by the node agent's main loop (``colosseum.node.agent``).
 
-A learner assignment (``Welcome.learners`` or ``Command(start_learner)``) downloads its start blobs first (A28: a
-``recovery`` weights frame and ``trainer_state`` bytes), then waits until every ``Welcome.fixed`` blob is cached
+A learner assignment (``Welcome.learners`` or ``Command(start_learner)``) downloads its start point first (A28:
+``weights_blob`` ``start:<ident>`` is one checkpoint frame of ``Download(kind="start")``; ``init`` and ``""`` need no
+download), then waits until every ``Welcome.fixed`` blob is cached
 (teacher and ``init`` weights come from there) and is spawned from the main-loop thread (PDEATHSIG). At its first
 ``VersionPublished`` (after its intake runs) the workers are routed to its listener; every ``VersionPublished``
 becomes a ``VersionAnnounce`` (the latest one kept while the hub is away), ``LearnerMetrics`` / ``IntakeReport``
@@ -178,7 +179,7 @@ class NodeLearners:
         assignment = pb.LearnerAssignment()
         assignment.CopyFrom(la)
         entry = self._entries[agent] = LearnerEntry(agent, int(la.generation), assignment, f"learner-{agent}")
-        if not la.weights_blob:
+        if la.weights_blob in ("", "init"):          # factory weights / the init blob of Welcome.fixed
             entry.state = "ready"
             return
         serial, generation = run.serial, entry.generation
@@ -192,15 +193,18 @@ class NodeLearners:
         future.add_done_callback(done)
 
     def _fetch_blobs(self, run: Any, la: pb.LearnerAssignment) -> dict:
-        """A transfer-pool thread: the start state of an assignment (A28: a ``recovery`` weights frame and the
-        ``trainer_state`` bytes)."""
-        from colosseum.node.learner_main import resume_state_from_blobs
+        """A transfer-pool thread: the start state of an assignment (A28: ``start:<ident>`` names one checkpoint
+        frame the hub serves as ``Download(kind="start", ident=<ident>)``)."""
+        from colosseum.net.frame import payload_byte_cap
+        from colosseum.node.learner_main import resume_state_from_frame
 
-        weights = self._host.download_bytes(run, "recovery", la.agent_id, la.weights_blob)
-        trainer = (self._host.download_bytes(run, "trainer_state", la.agent_id, la.trainer_state_blob)
-                   if la.trainer_state_blob else None)
-        return resume_state_from_blobs(weights, trainer, env_steps=int(la.env_steps),
-                                       source=f"hub recovery blob {la.weights_blob}")
+        kind, _, ident = la.weights_blob.partition(":")
+        if kind != "start" or not ident:
+            raise ValueError(f"unknown learner start point {la.weights_blob!r}")
+        frame = self._host.download_bytes(run, "start", la.agent_id, ident)
+        cap = payload_byte_cap(run.config.distributed.max_message_mb)
+        return resume_state_from_frame(frame, agent_id=la.agent_id, cap=cap, env_steps=int(la.env_steps),
+                                       source=f"{ident} of the hub")
 
     def on_blobs(self, done: LearnerBlobsDone) -> None:
         run = self._host.current_run()

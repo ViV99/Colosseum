@@ -37,7 +37,7 @@ def test_hub_trains_with_a_node_that_connects_in_process(tmp_path):
             pass
         proc.wait()
     main = (root / "logs" / "main.log").read_text()
-    assert "Learners of ['agent_0'] placed on node 1" in main and "Training budget reached" in main
+    assert "Learner of agent_0: generation 1 on node 1" in main and "Training budget reached" in main
     assert (tmp_path / "node-logs" / "learner-agent_0.log").exists()
     with MatchLogReader(root / MATCH_LOG_FILE) as reader:
         uids = [r.uid for r in reader.matches(source="train", limit=None)]
