@@ -166,6 +166,10 @@ def test_relay_off_an_unreachable_learner_never_owns_a_cell_and_its_seats_need_a
     hub._learner_node["b"] = second.of("welcome")[0].node_number            # b's learner runs on node 2
     cells = [(0, e, 0, 0) for e in range(4)]
     assert request_cells(hub, second, cells) == []                            # a has no snapshot: no lineup
+    epochs = sorted(c.epoch for c in hub._cells.live())
+    for _ in range(3):                                                        # the node asks again with epoch 0
+        assert request_cells(hub, second, cells) == []
+    assert sorted(c.epoch for c in hub._cells.live()) == epochs               # no epoch consumed (review round 2)
     hub._newest_snapshot = lambda agent: {"a": "ckpt_v7"}.get(agent)
     grants = request_cells(hub, second, cells)
     assert len(grants) == 4
@@ -174,3 +178,4 @@ def test_relay_off_an_unreachable_learner_never_owns_a_cell_and_its_seats_need_a
         assert {(s.agent_id, s.network_id, s.collect) for s in seats} == {("b", "latest", True),
                                                                            ("a", "ckpt_v7", False)}
     assert set(hub._cells.owners().values()) == {"b"}
+    assert sorted(g.epoch for g in grants) == epochs                          # the grants use the kept epochs

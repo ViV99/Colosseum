@@ -284,12 +284,13 @@ class CellTable:
     def __init__(self, epochs: EpochAllocator) -> None:
         self._epochs = epochs
         self._cells: dict[CellKey, CellEntry] = {}
-        self._granted: set[int] = set()        # epochs this hub process handed out
+        self._granted: set[int] = set()        # epochs this hub process granted (handed out with a lineup)
 
     def request(self, node: int, cells: Sequence[tuple[CellKey, int, int]], now: float) -> list[CellEntry]:
         """``cells``: ``(key, epoch, incarnation)`` the node asks a lineup for (epoch 0: none yet). Returns the
         entries in request order: the epoch stays for the same incarnation and an epoch this hub process granted to
-        that cell; otherwise a new epoch. Every key must be of ``node`` (ValueError)."""
+        that cell, and also while the cell's epoch was never granted (the node never learned it: an ungranted request,
+        R37, consumes no further epoch); otherwise a new epoch. Every key must be of ``node`` (ValueError)."""
         cells = list(cells)
         for key, _epoch, _incarnation in cells:           # every key first: a refused request allocates no epoch
             if key.node != node:
@@ -297,11 +298,10 @@ class CellTable:
         out = []
         for key, epoch, incarnation in cells:
             entry = self._cells.get(key)
-            keep = (entry is not None and entry.incarnation == incarnation and entry.epoch == epoch
-                    and epoch in self._granted)
+            keep = (entry is not None and entry.incarnation == incarnation
+                    and ((entry.epoch == epoch and epoch in self._granted) or entry.granted_at is None))
             if not keep:
                 new_epoch = self._epochs.next()
-                self._granted.add(new_epoch)
                 previous = None if entry is None else (entry.owner or entry.previous)
                 entry = CellEntry(key=key, epoch=new_epoch, incarnation=int(incarnation), owner=None,
                                   previous=previous)
@@ -313,6 +313,7 @@ class CellTable:
         """Record the lineup just granted: ``owner`` becomes the owner (the old one the previous owner); None: a cell
         outside the owner rotation (R37: a node that plays only stored snapshots of learners it cannot reach)."""
         entry = self._cells[key]
+        self._granted.add(entry.epoch)
         if entry.owner is not None:
             entry.previous = entry.owner
         entry.owner = owner

@@ -138,12 +138,31 @@ def _table(reserved_until: int = 0) -> CellTable:
 def test_a_cell_keeps_its_epoch_within_an_incarnation_and_gets_a_new_one_otherwise():
     table, key = _table(), CellKey(1, 0, 2)
     (first,) = table.request(1, [(key, 0, 1)], now=0.0)
+    table.grant(key, "a", 1.0, now=0.0)
     (again,) = table.request(1, [(key, first.epoch, 1)], now=1.0)
     assert again.epoch == first.epoch
     (restarted,) = table.request(1, [(key, first.epoch, 2)], now=2.0)       # a new worker incarnation
     assert restarted.epoch > first.epoch and restarted.incarnation == 2
+    table.grant(key, "a", 1.0, now=2.0)
     (unknown,) = table.request(1, [(key, 999, 2)], now=3.0)                 # an epoch this table never granted
     assert unknown.epoch > restarted.epoch
+
+
+def test_an_ungranted_request_consumes_no_further_epoch():
+    """Review round 2 of T3.2(b): a cell that got no lineup (R37) asks again with its old epoch (it never learned the
+    new one); it keeps the one it was given, and only a grant marks an epoch granted."""
+    table, key = _table(), CellKey(1, 0, 2)
+    (first,) = table.request(1, [(key, 0, 1)], now=0.0)
+    for k in range(9):                                                      # never granted: the node sends 0
+        (again,) = table.request(1, [(key, 0, 1)], now=float(k))
+        assert again.epoch == first.epoch
+    assert table._granted == set()
+    table.grant(key, "a", 1.0, now=10.0)
+    assert table._granted == {first.epoch}
+    (refreshed,) = table.request(1, [(key, first.epoch, 1)], now=11.0)     # the TTL refresh keeps it
+    assert refreshed.epoch == first.epoch
+    (other,) = table.request(1, [(CellKey(1, 0, 3), 0, 1)], now=12.0)
+    assert other.epoch == first.epoch + 1                                   # one epoch per granted cell, no gaps
 
 
 def test_a_new_hub_process_never_keeps_an_epoch_of_the_old_one():
