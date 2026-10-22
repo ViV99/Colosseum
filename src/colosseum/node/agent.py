@@ -41,7 +41,7 @@
    re-requests after ``LINEUP_RETRY_SEC`` (WARNING once per key); a grant waiting longer than
    ``max(ttl, LINEUP_WAIT_SEC)`` is given up the same way (P-PF2-12). A worker gets its routes and ``WeightsReady``
    when its control connection opens, before its first ``WorkerLineups``. Snapshots no cell references any more
-   leave the cache after ``CACHE_DROP_DELAY_SEC`` (safe by an ordering invariant, see ``_prune_cache``).
+   leave the cache after ``CACHE_DROP_DELAY_SEC`` (safe by an ordering invariant, see ``node.lineups``).
 7. **Announces.** ``evictions`` -> ``WorkerEvict`` to every worker; ``env_steps`` (plus this node's own env steps
    since, refreshed at every ``WorkerProgress``; ruling R28) -> ``LearnerEnvSteps`` to every
    learner (LR progress); ``versions`` (where each agent's newest weights are) -> the fetch planner (item 11);
@@ -112,6 +112,7 @@ from colosseum.net.security import Token
 from colosseum.node.books import CellTracker, ResultBuffer
 from colosseum.node.fetch import BlobFetched, LatestFetched, LatestFetchFailed, NodeFetcher, rpc_text
 from colosseum.node.learners import LearnerBlobsDone, NodeLearners
+from colosseum.node.lineups import CACHE_DROP_DELAY_SEC, FIXED_RETRY_SEC, LINEUP_WAIT_SEC, NodeLineups  # noqa: F401
 from colosseum.node.procs import ChildSpec, ChildSupervisor
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC
 
@@ -124,15 +125,12 @@ __all__ = [
 ]
 
 LINEUP_RETRY_SEC = 1.0          # a requested cell without an answer, or after a failed fetch, is asked again
-LINEUP_WAIT_SEC = 30.0          # a grant waiting longer than max(ttl, this) for its weights is given up (P-PF2-12)
 RESULT_RESEND_SEC = 10.0        # an unacked result batch is sent again after this long on a live session (P-PF2-4)
 METRICS_FLUSH_SEC = 0.5         # MetricsBatch cadence
 LOCAL_CHILD_GRACE_SEC = SHUTDOWN_GRACE_SEC - 2.0   # children of train's local node: before the hub's 7 s
 REMOTE_GRACE_MARGIN_SEC = 5.0   # remote nodes: distributed.shutdown_grace_sec minus this
 ACK_WAIT_EXTRA_SEC = 1.0        # result acks are awaited until the children's deadline plus this
-CACHE_DROP_DELAY_SEC = 10.0     # an unreferenced snapshot stays this long in the cache before it is removed
 EXIT_DRAIN_SEC = 1.0            # an exited child's control connection is read to its end within this (P-PF2-11)
-FIXED_RETRY_SEC = 2.0           # a failed fetch of a Welcome.fixed blob is retried after this
 TRANSFER_THREADS = 4
 TRANSFER_JOIN_SEC = 1.0         # at the end, cancelled transfers are waited for this long before the cache cleanup
 FETCH_PUMP_SEC = 0.1            # the fetch planner is asked for due latest transfers at most this often
@@ -196,14 +194,6 @@ class _UploadDone:
     version: int
     reply: Any                         # pb.UploadReply, or None after a transfer error
     error: str | None
-
-
-class _BadSeat(ValueError):
-    """A grant names a player this node cannot seat; ``player`` = (agent, network) (one WARNING per player)."""
-
-    def __init__(self, message: str, agent: str, network: str) -> None:
-        super().__init__(message)
-        self.player = (agent, network)
 
 
 class _Refused(Exception):
@@ -296,10 +286,7 @@ class NodeAgent:
         self._connected = False
         self._pool = ThreadPoolExecutor(max_workers=TRANSFER_THREADS, thread_name_prefix="node-transfer")
         self.fetches = NodeFetcher(submit=self._pool.submit, post=self._post)   # downloads (node.fetch, A25)
-        self._fetch_warned: set = set()
-        self._refused_players: set = set()        # (agent, network) of refused grants (warned once)
-        self._cached: set = set()                   # snapshot keys this node put into the cache
-        self._unref_since: dict[Any, float] = {}
+        self.lineups = NodeLineups(_LineupHost(self), self.fetches)   # lineups and the cache (node.lineups, R31)
         self._control: dict[str, mpc.Connection] = {}
         self._child_conns: dict[mpc.Connection, str] = {}
         self._route_conns: set[mpc.Connection] = set()
@@ -656,11 +643,11 @@ class NodeAgent:
             elif isinstance(item, _Accepted):
                 self._on_child_hello(item.conn, item.hello)
             elif isinstance(item, BlobFetched):
-                self._on_fetch_done(item)
+                self.lineups.on_fetch_done(item)
             elif isinstance(item, LatestFetched):
-                self._on_latest_fetched(item)
+                self.lineups.on_latest_fetched(item)
             elif isinstance(item, LatestFetchFailed):
-                self._on_latest_fetch_failed(item)
+                self.lineups.on_latest_fetch_failed(item)
             elif isinstance(item, _StopRequested):
                 self._begin_stop(item.reason)
             elif isinstance(item, LearnerBlobsDone):
@@ -699,19 +686,19 @@ class NodeAgent:
             if self._run is not run:                 # released in this pass: nothing of the old run is sent
                 return
         elif run is not None:
-            self._fetch_fixed(run, now)
+            self.lineups.fetch_fixed(run, now)
             if not run.started:
                 self._maybe_start_workers(run)
             self.learners.start_pending(run)
-            self._request_lineups()
-            self._expire_waiting()
-            self._deliver(run)
+            self.lineups.request_lineups()
+            self.lineups.expire_waiting()
+            self.lineups.deliver(run)
             if now >= self._next_fetch_pump:
                 self._next_fetch_pump = now + FETCH_PUMP_SEC
-                self._pump_fetches(run, now)
+                self.lineups.pump_fetches(run, now)
             if now >= self._next_prune:
                 self._next_prune = now + CACHE_PRUNE_SEC
-                self._prune_cache(run, now)
+                self.lineups.prune_cache(run, now)
         if self._done:
             return
         if run is None:                              # released (or no Welcome yet): heartbeats keep the session
@@ -740,7 +727,7 @@ class NodeAgent:
         if kind == "welcome":
             self._on_welcome(msg.welcome)
         elif kind == "grants":
-            self._on_grants(msg.grants)
+            self.lineups.on_grants(msg.grants)
         elif kind == "ack":
             if self._run is not None:
                 self._run.results.ack(msg.ack.seqs)
@@ -901,7 +888,7 @@ class NodeAgent:
             self.learners.assign(run, la)
         logger.info(f"node {number} ({self._name}): serving run {run_id[:8]} with {workers} workers; "
                     f"{len(fixed_keys)} fixed blobs; logs in {log_dir}")
-        self._fetch_fixed(run, time.monotonic())
+        self.lineups.fetch_fixed(run, time.monotonic())
         self._maybe_start_workers(run)
 
     def _start_data_port(self, run: _Run) -> None:
@@ -931,23 +918,6 @@ class NodeAgent:
             self._data_addresses = addresses
         self._send(pb.NodeMessage(addresses=pb.DataAddresses(data_addresses=list(addresses))))
 
-    def _needed_fixed(self, run: _Run) -> list:
-        """The ``Welcome.fixed`` blobs this node needs: frozen and teacher weights always, an agent's ``init`` weights
-        only while its learner runs (or is about to run) here (spec 4.6: "или назначенному лёрнеру")."""
-        learners = set(self.learners.agents())
-        return [k for k, kind in run.fixed_keys.items() if kind != "init" or k.agent_id in learners]
-
-    def _fetch_fixed(self, run: _Run, now: float) -> None:
-        """Fetch the needed ``Welcome.fixed`` blobs that are not cached (a failed one again after
-        ``FIXED_RETRY_SEC``)."""
-        for key in self._needed_fixed(run):
-            if key in run.fixed_done or self.fetches.blob_in_flight(key) or now < run.fixed_retry_at.get(key, 0.0):
-                continue
-            if run.reader.has(key):
-                run.fixed_done.add(key)
-                continue
-            self.fetches.fetch_blob(run, key)
-
     def _maybe_start_workers(self, run: _Run) -> None:
         """Start the workers once every frozen and teacher blob is cached (``init`` blobs are the learners')."""
         if all(k in run.fixed_done for k, kind in run.fixed_keys.items() if kind != "init"):
@@ -976,57 +946,6 @@ class NodeAgent:
         run.started = True
         logger.info(f"node: started {run.workers} workers")
 
-    def _on_grants(self, grants: pb.LineupGrants) -> None:
-        from colosseum.net.messages import lineup_from_proto
-
-        run = self._run
-        if run is None or self._stopping:
-            return
-        for grant in grants.grants:
-            try:
-                lineup = lineup_from_proto(grant.lineup)
-                lineup.epoch = int(grant.epoch)
-                keys = self._seat_keys(run, lineup)
-            except ValueError as e:                  # the cell asks again after LINEUP_RETRY_SEC: warn once
-                player = getattr(e, "player", None) or ("", str(e))
-                if player not in self._refused_players:
-                    self._refused_players.add(player)
-                    logger.warning(f"node: refused a lineup grant for worker {grant.worker}, env {grant.env}: {e} "
-                                   f"(further grants naming it are refused silently)")
-                continue
-            self.cells.granted(int(grant.worker), int(grant.env), int(grant.epoch), float(grant.ttl_sec), lineup,
-                               keys)
-        self._deliver(run)
-
-    def _seat_keys(self, run: _Run, lineup: Any) -> dict:
-        """The cache key of every seat's weights (none for a scripted seat); ValueError for an unknown player."""
-        from colosseum.arena.entities import snapshot_version
-        from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID
-        from colosseum.node.weights import CacheKey, segment_name
-
-        keys = {}
-        for i, seat in enumerate(lineup.seats):
-            agent, net = seat.agent_id, seat.network_id
-            if net == FIXED_NETWORK_ID:
-                if agent in run.frozen_keys:
-                    keys[i] = run.frozen_keys[agent]
-                elif agent not in run.bots:
-                    raise _BadSeat(f"seat {i}: {agent!r} is no fixed player of this run", agent, net)
-            elif agent not in run.agent_ids:
-                raise _BadSeat(f"seat {i}: {agent!r} is no trainable agent of this run", agent, net)
-            elif net == LATEST_NETWORK_ID:
-                keys[i] = CacheKey("latest", agent)
-            elif snapshot_version(net) is not None:
-                key = CacheKey("snapshot", agent, net)
-                try:
-                    segment_name(run.prefix, key)
-                except ValueError as e:
-                    raise _BadSeat(f"seat {i}: {e}", agent, net) from None
-                keys[i] = key
-            else:
-                raise _BadSeat(f"seat {i}: unknown network {net!r}", agent, net)
-        return keys
-
     def _on_command(self, cmd: pb.Command) -> None:
         if cmd.kind == "stop_run":
             self._begin_stop(f"the hub stopped the run ({cmd.reason or 'stop_run'})")
@@ -1045,138 +964,6 @@ class NodeAgent:
         self._absorb(announce.versions, announce.agents, announce.evictions, announce.banned_node_ids, welcome=False)
 
     # ---- lineups and the cache --------------------------------------------------------------------------------
-
-    def _has(self, run: _Run, key: Any) -> bool:
-        if key.kind == "latest":
-            return run.reader.latest_version(key.agent_id) is not None
-        return key in run.fixed_done or key in self._cached or run.reader.has(key)
-
-    def _request_lineups(self) -> None:
-        if not self._connected:
-            return
-        due = self.cells.due()
-        if due:
-            self._send(pb.NodeMessage(lineup_request=pb.LineupRequest(cells=[
-                pb.CellRequest(worker=w, env=e, epoch=ep, incarnation=i) for w, e, ep, i in due])))
-
-    def _expire_waiting(self) -> None:
-        for worker, env, keys in self.cells.stale_waiting(LINEUP_WAIT_SEC):
-            self.cells.failed(worker, env)
-            self._counters["lineup_fetch_failed"] += 1
-            run = self._run
-            missing = [k for k in keys.values() if run is None or not self._has(run, k)]
-            for key in missing:
-                self._warn_fetch(key, f"its weights did not arrive within {LINEUP_WAIT_SEC:.0f} s")
-
-    def _deliver(self, run: _Run) -> None:
-        """Send every waiting grant whose weights are all cached to its worker (R11); fetch what is missing."""
-        from colosseum.net.local import CellLineup, WorkerLineups
-
-        ready: dict[int, list] = {}
-        for worker, env, _lineup, keys in self.cells.waiting():
-            missing = [k for k in set(keys.values()) if not self._has(run, k)]
-            for key in missing:
-                if key.kind != "latest" and not self.fetches.blob_in_flight(key):
-                    self.fetches.fetch_blob(run, key)     # latest weights: _pump_fetches (item 11)
-            if missing or f"worker-{worker}" not in self._control:
-                continue
-            lineup, keys = self.cells.deliver(worker, env)
-            ready.setdefault(worker, []).append(CellLineup(env, lineup, dict(keys)))
-        for worker, cells in ready.items():
-            name = f"worker-{worker}"
-            self._child_send(name, self._control[name], WorkerLineups(cells))
-
-    def _on_fetch_done(self, done: BlobFetched) -> None:
-        self.fetches.blob_done(done)
-        run = self._run
-        if run is None or run.serial != done.serial:
-            return
-        if done.error is None:
-            if done.key in run.fixed_keys:
-                run.fixed_done.add(done.key)
-            else:
-                self._cached.add(done.key)
-            self._fetch_warned.discard(done.key)
-            if not self._stopping:
-                self._deliver(run)
-            return
-        if done.key in run.fixed_keys:
-            run.fixed_retry_at[done.key] = time.monotonic() + FIXED_RETRY_SEC
-            self._warn_fetch(done.key, f"{done.error}; retrying (the workers start once every fixed blob is here)")
-            return
-        failed = [(w, e) for w, e, _lineup, keys in self.cells.waiting() if done.key in keys.values()]
-        for worker, env in failed:
-            self.cells.failed(worker, env)
-            self._counters["lineup_fetch_failed"] += 1
-        self._warn_fetch(done.key, f"{done.error}; {len(failed)} lineups keep their old one")
-
-    def _pump_fetches(self, run: _Run, now: float) -> None:
-        """Item 11: the latest transfers the planner wants now (the agents named by latest seats of this node's live
-        and waiting lineups are refreshed; never the agents whose learner runs here)."""
-        referenced = {k.agent_id for k in self.cells.referenced() if k.kind == "latest"}
-        self.fetches.pump(run, now, referenced=referenced, local=self.learners.agents(), hub_online=self._connected)
-
-    def _on_latest_fetched(self, ev: LatestFetched) -> None:
-        run = self._run
-        if run is None or run.serial != ev.serial or run.closed:
-            return
-        outcome = self.fetches.latest_done(run, ev)
-        if outcome == "published":
-            if not self._stopping:
-                self._deliver(run)
-        elif outcome == "failed":
-            self._fail_latest_grants(run, ev.agent_id)
-
-    def _on_latest_fetch_failed(self, ev: LatestFetchFailed) -> None:
-        run = self._run
-        if run is None or run.serial != ev.serial:
-            return
-        self.fetches.latest_failed(ev)
-        self._fail_latest_grants(run, ev.agent_id)
-
-    def _fail_latest_grants(self, run: _Run, agent: str) -> None:
-        """A latest transfer of ``agent`` failed and nothing of it is cached: the grants waiting for it keep their old
-        lineups, count ``lineup_fetch_failed`` and are requested again (spec 4.2; R11)."""
-        from colosseum.node.weights import CacheKey
-
-        key = CacheKey("latest", agent)
-        if self._has(run, key):
-            return
-        for worker, env, _lineup, keys in self.cells.waiting():
-            if key in keys.values():
-                self.cells.failed(worker, env)
-                self._counters["lineup_fetch_failed"] += 1
-
-    def _warn_fetch(self, key: Any, why: str) -> None:
-        if key in self._fetch_warned:
-            return
-        self._fetch_warned.add(key)
-        logger.warning(f"node: fetching {key.kind} {key.agent_id}/{key.ident} failed: {why} (lineup_fetch_failed; "
-                       f"further failures of this key are only counted)")
-
-    def _prune_cache(self, run: _Run, now: float) -> None:
-        """Snapshots no cell references for ``CACHE_DROP_DELAY_SEC`` leave the cache (``Welcome.fixed`` blobs and
-        latest pointers stay).
-
-        Invariant (a worker never misses a delivered snapshot): a key stops being referenced only when ``deliver``
-        replaces its cell's lineup, and ``_deliver`` sends the replacing ``WorkerLineups`` on the same ordered control
-        connection at once; a worker pumps every pending control message before each cache read
-        (``WorkerIO.poll_command``), so it never reads a lineup that was replaced, and the snapshot of the lineup it
-        does read is still referenced. Any new delivery path must keep this (replace a cell's keys only together
-        with sending the replacing lineup). The delay is a margin, not what makes it safe."""
-        referenced = self.cells.referenced()
-        for key in list(self._cached):
-            if key in referenced or self.fetches.blob_in_flight(key):
-                self._unref_since.pop(key, None)
-                continue
-            since = self._unref_since.setdefault(key, now)
-            if now - since >= CACHE_DROP_DELAY_SEC:
-                try:
-                    run.writer.drop(key)
-                except OSError as e:
-                    logger.warning(f"node: cannot remove {key} from the weight cache: {e}")
-                self._cached.discard(key)
-                self._unref_since.pop(key, None)
 
     # ---- children ---------------------------------------------------------------------------------------------
 
@@ -1216,7 +1003,7 @@ class NodeAgent:
             self._child_send(name, conn, self._learner_routes.get(agent, LearnerRoute(agent, None, False, 0)))
         ready = [a for a in run.agent_ids if run.reader.latest_version(a) is not None]
         self._child_send(name, conn, WeightsReady(ready))
-        self._deliver(run)
+        self.lineups.deliver(run)
 
     def _child_send(self, name: str, conn: mpc.Connection, message: Any) -> bool:
         try:
@@ -1442,7 +1229,7 @@ class NodeAgent:
         except (AttributeError, OSError):
             load = 0.0
         cached = sorted(f"{k.kind}:{k.agent_id}:{k.ident}"
-                        for k in (*self._cached, *(k for k in run.fixed_keys if self._has(run, k))))
+                        for k in (*self.lineups.cached, *(k for k in run.fixed_keys if self.lineups.has(run, k))))
         self._send(pb.NodeMessage(heartbeat=pb.Heartbeat(
             env_steps=self._env_steps(), dropped_results=self._dropped_carry + int(run.results.dropped),
             procs=[pb.ProcState(name=n, state=self._proc_state(n), restarts=max(0, self.supervisor.incarnation(n) - 1))
@@ -1536,9 +1323,10 @@ class NodeAgent:
         self.cells = CellTracker(retry_sec=LINEUP_RETRY_SEC, clock=time.monotonic)
         self.learners.clear()
         self.fetches.clear_run()
-        for book in (self._learner_routes, self._uploads, self._unref_since, self._control, self._child_conns):
+        self.lineups.clear()
+        for book in (self._learner_routes, self._uploads, self._control, self._child_conns):
             book.clear()
-        for book in (self._cached, self._route_conns, self._reported, self._disabled):
+        for book in (self._route_conns, self._reported, self._disabled):
             book.clear()
         self._stopping, self._releasing, self._stop_phase = False, False, ""
         logger.info(f"node: released run {run.run_id[:8]}; the session stays open")
@@ -1596,6 +1384,45 @@ class NodeAgent:
                 logger.warning(f"node: cannot remove the weight cache files of {run.prefix}: {e}")
 
 
+class _LineupHost:
+    """``node.lineups.LineupHost`` over the agent: the narrow interface ``NodeLineups`` uses."""
+
+    def __init__(self, agent: NodeAgent) -> None:
+        self._agent = agent
+
+    @property
+    def cells(self) -> CellTracker:
+        return self._agent.cells
+
+    @property
+    def stopping(self) -> bool:
+        return self._agent._stopping
+
+    @property
+    def connected(self) -> bool:
+        return self._agent._connected
+
+    def current_run(self) -> Any:
+        return self._agent._run
+
+    def send(self, message: pb.NodeMessage) -> bool:
+        return self._agent._send(message)
+
+    def count(self, name: str, n: int = 1) -> None:
+        self._agent._counters[name] += n
+
+    def learner_agents(self) -> list[str]:
+        return self._agent.learners.agents()
+
+    def worker_connected(self, worker: int) -> bool:
+        return f"worker-{worker}" in self._agent._control
+
+    def send_worker(self, worker: int, message: Any) -> bool:
+        name = f"worker-{worker}"
+        conn = self._agent._control.get(name)
+        return conn is not None and self._agent._child_send(name, conn, message)
+
+
 class _LearnerHost:
     """``node.learners.LearnerHost`` over the agent: the narrow interface ``NodeLearners`` uses."""
 
@@ -1643,7 +1470,7 @@ class _LearnerHost:
         return self._agent.fetches.download_bytes(run, kind, agent_id, ident)
 
     def fixed_cached(self, run: Any) -> bool:
-        return all(self._agent._has(run, k) for k in self._agent._needed_fixed(run))
+        return all(self._agent.lineups.has(run, k) for k in self._agent.lineups.needed_fixed(run))
 
     def rpc_text(self, error: BaseException) -> str:
         return _rpc_text(error)

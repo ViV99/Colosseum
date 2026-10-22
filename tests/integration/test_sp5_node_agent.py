@@ -21,6 +21,7 @@ from colosseum.hub.server import SessionOpened
 from colosseum.net.proto import colosseum_v1_pb2 as pb
 from colosseum.net.security import NodeIdentity, Token, new_secret
 from colosseum.node import agent as agent_mod
+from colosseum.node import lineups as lineups_mod
 from colosseum.node import procs
 from colosseum.node import session as node_session
 from colosseum.node.weights import shm_dir
@@ -385,7 +386,7 @@ def test_a_lineup_waits_for_its_snapshot_and_a_failed_fetch_keeps_the_old_one(hu
 
 
 def test_evictions_reach_the_workers_and_leave_the_cache(hub_factory, node_factory, monkeypatch, tmp_path):
-    monkeypatch.setattr(agent_mod, "CACHE_DROP_DELAY_SEC", 0.5)
+    monkeypatch.setattr(lineups_mod, "CACHE_DROP_DELAY_SEC", 0.5)
     config = _config()
     hub = hub_factory(config)
     _serve_snapshot(hub, config, 5)
