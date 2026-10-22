@@ -10,8 +10,18 @@ becomes a ``VersionAnnounce`` (the latest one kept while the hub is away), ``Lea
 feed ``MetricsBatch``, the global env steps are forwarded (``LearnerEnvSteps``; ruling R28: the hub's last announced
 count plus this node's own env steps since its receipt, a lower bound of the global count that never decreases; the
 run's ``Welcome`` is the first such count, FX3).
-``stop_learner`` sends ``Stop`` (the final snapshot is uploaded by the agent); a learner that ends without being
-stopped is ``learner_failed`` (until T4.2: the hub stops the run).
+``stop_learner`` sends ``Stop`` (the final snapshot is uploaded by the agent; ``superseded`` sends none); a learner
+that ends without being stopped is ``learner_failed`` (until T4.2: the hub stops the run).
+
+Generations (SP5 T4.1, spec 7.2): at most one learner per agent; the same assignment twice (``Welcome.learners`` and
+the hub's deferred ``start_learner``) is one start; a newer generation replaces the running one (``superseded``: it
+exits without a final, then the new one starts as a new incarnation with a new intake address); an older one is
+ignored; ``stop_learner`` stops only the generation it names. ``Welcome.learners`` is the node's desired learner set
+(``NodeAgent._on_welcome`` stops the others as superseded). A learner starts at ``max(assignment floor, the
+machine's cached latest + 1, every version a learner of the agent published here + 1)`` (R9: no version names two
+weights) with the seed ``learner_seed(training.seed, agent index, generation)``. When an agent's learner here ends
+for good, the node removes the agent's latest weights from the cache (``WeightCacheWriter.release_latest``): it
+becomes their writer again (fetched from the agent's next learner) and is never held back by the dead learner's pointer.
 
 ``NodeLearners`` talks to the agent only through ``LearnerHost`` (the agent's ``_LearnerHost`` adapter): the
 supervisor, posting into the inbox, sending to a child, setting a worker route, events, a connected-only send, the
@@ -63,6 +73,7 @@ class LearnerEntry:
     stop_reason: str = ""
     failure: str = ""                  # why the node gave up on it (its learner_failed message)
     routed: bool = False               # the workers were routed to its listener
+    successor: Any = None              # a newer pb.LearnerAssignment that starts once this one exited (T4.1)
 
 
 class LearnerHost(Protocol):
@@ -101,6 +112,7 @@ class NodeLearners:
         self._announced = 0                                  # the hub's last Announce.env_steps
         self._own_at_announce = 0                            # this node's own env steps when it arrived
         self._based = False                                  # a count arrived this run (the Welcome's at the latest)
+        self._published: dict[str, int] = {}                 # agent -> highest version a learner published here
 
     # ---- books --------------------------------------------------------------------------------------------------
 
@@ -121,6 +133,10 @@ class NodeLearners:
         the node opens its own chunk connection to it for frames from other machines (T3.2)."""
         return {e.agent_id: e.listener_name for e in self._entries.values() if e.state == "running" and e.routed}
 
+    def generations(self) -> dict[str, int]:
+        """Agent -> generation of every learner this node has (fetching, starting, running or stopping)."""
+        return {a: e.generation for a, e in self._entries.items()}
+
     def hello_entries(self) -> tuple:
         """``(agent, generation, version)`` of the running learners (``Hello.learners``)."""
         return tuple((e.agent_id, e.generation, max(e.version, 0)) for e in self._entries.values()
@@ -129,6 +145,7 @@ class NodeLearners:
     def clear(self) -> None:
         self._entries.clear()
         self._pending_versions.clear()
+        self._published.clear()
         self.intake_stats.clear()
         self.hub_env_steps = self._announced = self._own_at_announce = 0   # the next run's counter starts anew
         self._based = False
@@ -164,20 +181,35 @@ class NodeLearners:
     # ---- lifecycle ----------------------------------------------------------------------------------------------
 
     def assign(self, run: Any, la: pb.LearnerAssignment) -> None:
-        """A learner assignment (``Welcome.learners`` or ``start_learner``): its start blobs are downloaded first;
-        an agent whose learner runs here already keeps it (generations change only from T4.1 on)."""
+        """A learner assignment (``Welcome.learners`` or ``start_learner``; module docstring): the same generation
+        again is one start, an older one is ignored, a newer one supersedes the agent's learner here (a learner not
+        spawned yet is replaced at once; a spawned one is stopped and the new one starts when it exited). The start
+        point is downloaded first (A28)."""
         agent = la.agent_id
         if agent not in run.agent_ids:
             logger.warning(f"node: refused a learner assignment for {agent!r}: no trainable agent of this run")
             return
-        current = self._entries.get(agent)
-        if current is not None:
-            if current.generation != int(la.generation):
-                logger.warning(f"node: learner {agent} generation {la.generation} assigned while generation "
-                               f"{current.generation} runs here; ignored")
-            return
+        generation = int(la.generation)
         assignment = pb.LearnerAssignment()
         assignment.CopyFrom(la)
+        current = self._entries.get(agent)
+        if current is not None:
+            queued = 0 if current.successor is None else int(current.successor.generation)
+            if generation in (current.generation, queued):
+                return                               # the same assignment again (Welcome + start_learner): one start
+            if generation < max(current.generation, queued):
+                logger.info(f"node: learner {agent} generation {generation} is older than generation "
+                            f"{max(current.generation, queued)} here; ignored")
+                return
+            if current.state in ("fetching", "ready"):
+                del self._entries[agent]             # never spawned: replaced at once (a late fetch is ignored)
+            else:
+                current.successor = assignment
+                logger.info(f"node: learner {agent} generation {generation} supersedes generation "
+                            f"{current.generation}; it starts once that one exited")
+                if current.state != "stopping":
+                    self.stop(agent, "superseded", current.generation)
+                return
         entry = self._entries[agent] = LearnerEntry(agent, int(la.generation), assignment, f"learner-{agent}")
         if la.weights_blob in ("", "init"):          # factory weights / the init blob of Welcome.fixed
             entry.state = "ready"
@@ -234,6 +266,13 @@ class NodeLearners:
                 self._host.event("learner_failed", proc=entry.name, message=f"{type(e).__name__}: {e}",
                                  generation=entry.generation)
 
+    def floor(self, run: Any, agent: str, assigned: int) -> int:
+        """The version floor of a learner of ``agent`` starting here (R9, W04-7): the assignment's, above the
+        machine's cached latest pointer (also one a dead incarnation published without announcing it) and above every
+        version a learner of the agent published here."""
+        cached = run.reader.latest_version(agent)
+        return max(int(assigned), -1 if cached is None else int(cached[0]) + 1, self._published.get(agent, -1) + 1)
+
     def _start(self, run: Any, entry: LearnerEntry) -> None:
         """Spawn ``entry``'s learner (from the main-loop thread only: PDEATHSIG)."""
         from colosseum.net.frame import payload_byte_cap
@@ -261,13 +300,15 @@ class NodeLearners:
 
         teacher = teacher_for(run.config, agent, cached=cached("teacher"), bot=run.teachers.get(agent))
         init = cached("init")
+        floor = self.floor(run, agent, int(la.version_floor))
+        start = la.weights_blob or "factory"
         kwargs = dict(name=entry.name, log_dir=str(run.log_dir), node=run.number, agent_id=agent,
                       generation=entry.generation, listener_name=entry.listener_name,
                       node_address=run.node_address, authkey=run.authkey, config=config,
                       role_spec=run.role_specs[agent], spec=run.spec,
-                      seed=learner_seed(run.config.training.seed, run.agent_ids.index(agent)), teacher=teacher,
-                      init_state=None if init is None else init_from_cached(run.config, agent, init),
-                      resume_state=entry.resume_state, version_floor=int(la.version_floor),
+                      seed=learner_seed(run.config.training.seed, run.agent_ids.index(agent), entry.generation),
+                      teacher=teacher, init_state=None if init is None else init_from_cached(run.config, agent, init),
+                      resume_state=entry.resume_state, version_floor=floor, start_point=start,
                       env_steps=max(int(la.env_steps), self.hub_env_steps), num_learners=len(self._entries),
                       cache_root=str(run.root), cache_prefix=run.prefix,
                       checkpoint_interval=int(run.config.checkpoint.interval),
@@ -275,8 +316,8 @@ class NodeLearners:
                       cap_bytes=payload_byte_cap(run.config.distributed.max_message_mb))
         supervisor.start(ChildSpec(entry.name, "learner", learner_target, kwargs))
         entry.state, entry.resume_state = "starting", None
-        logger.info(f"node: started learner {agent} (generation {entry.generation}, version floor "
-                    f"{la.version_floor})")
+        logger.info(f"node: started learner {agent} (generation {entry.generation}, device {la.device or 'config'}, "
+                    f"versions from {floor}, start {start}, listener {entry.listener_name})")
 
     def on_connected(self, name: str) -> None:
         """The learner's control hello. Workers are routed to its listener only at its first ``VersionPublished``
@@ -294,13 +335,24 @@ class NodeLearners:
         if self.hub_env_steps:
             self._host.send_child(name, LearnerEnvSteps(self.hub_env_steps))
 
-    def stop(self, agent: str, reason: str) -> None:
-        """``stop_learner``: ``Stop`` to the learner (it sends its final snapshot, which is uploaded); workers no
-        longer send it chunks."""
+    def stop(self, agent: str, reason: str, generation: int | None = None) -> None:
+        """``stop_learner``: ``Stop`` to the learner of ``generation`` (None: whichever runs; another generation is
+        ignored, a queued successor of that generation is dropped); it sends its final snapshot (none for
+        ``superseded``); workers no longer send it chunks."""
         from colosseum.net.local import LearnerRoute, Stop
 
         entry = self._entries.get(agent)
         if entry is None:
+            return
+        if generation is not None and int(generation) != entry.generation:
+            if entry.successor is not None and int(entry.successor.generation) == int(generation):
+                entry.successor = None
+                logger.info(f"node: the queued learner {agent} generation {generation} is cancelled ({reason})")
+            else:
+                logger.debug(f"node: stop_learner {agent} generation {generation} ignored (generation "
+                             f"{entry.generation} here)")
+            return
+        if entry.state == "stopping":
             return
         if entry.state in ("fetching", "ready"):
             del self._entries[agent]                 # never started (a fetch still running is ignored on arrival)
@@ -321,6 +373,14 @@ class NodeLearners:
         route = routes.get(entry.agent_id)
         if route is not None and route.address is not None:
             self._host.set_route(LearnerRoute(entry.agent_id, None, False, 0))
+        run = self._host.current_run()
+        if entry.successor is not None and run is not None:
+            logger.info(f"node: learner {entry.agent_id} generation {entry.generation} ended (exit {code}); "
+                        f"generation {entry.successor.generation} starts")
+            self.assign(run, entry.successor)        # the next writer of the agent's latest: its floor is above
+            return
+        if run is not None:
+            self._release_latest(run, entry.agent_id)
         if entry.state == "stopping" and code == 0 and not entry.failure:
             logger.info(f"node: learner {entry.agent_id} stopped")
             return
@@ -328,6 +388,17 @@ class NodeLearners:
         logger.error(f"node: learner {entry.agent_id} ended (exit {code}): {why}; see {log_path}")
         self._host.event("learner_failed", proc=name, exit_code=int(code or 0), log_path=log_path,
                          generation=entry.generation, message=entry.failure)
+
+    def _release_latest(self, run: Any, agent: str) -> None:
+        """The agent's learner here ended for good: remember its versions for a later floor, then the node gives the
+        agent's latest weights up (``WeightCacheWriter.release_latest``; module docstring)."""
+        cached = run.reader.latest_version(agent)
+        if cached is not None:
+            self._published[agent] = max(self._published.get(agent, -1), int(cached[0]))
+        try:
+            run.writer.release_latest(agent)
+        except OSError as e:
+            logger.warning(f"node: the cached latest weights of {agent} could not be removed ({e})")
 
     # ---- messages -----------------------------------------------------------------------------------------------
 
@@ -343,6 +414,7 @@ class NodeLearners:
             from colosseum.net.local import LearnerRoute
 
             entry.version = max(entry.version, int(message.version))
+            self._published[entry.agent_id] = max(self._published.get(entry.agent_id, -1), entry.version)
             # The route goes to the workers before the VersionAnnounce below goes to the hub, and the hub grants
             # collecting seats for an agent only once it accepted a version: on a first start no lineup collects for
             # this learner before every worker of this node has its route (T3.2, carried item of T2.4 (b)).

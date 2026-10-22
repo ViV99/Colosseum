@@ -163,6 +163,7 @@ def learner_process(
     weight_sync_interval: float = 5.0,
     version_floor: int = 0,
     recovery_interval_sec: float | None = None,
+    send_final: Callable[[], bool] | None = None,
 ) -> None:
     """Main learner process function (see module docstring).
 
@@ -184,6 +185,8 @@ def learner_process(
         version_floor: the first version this learner may publish (R9: the hub's max announced + 1); the
             policy version is raised to it before the first publish
         recovery_interval_sec: recovery points (T4.2); None: none
+        send_final: asked after the loop: the final snapshot is sent only when it is None or returns True (SP5
+            T4.1: a superseded learner generation uploads no final)
     """
     logger.info(f"Learner [{agent_id}]: starting on device={resolve_device(config.device)}")
 
@@ -281,7 +284,9 @@ def learner_process(
 
     # Final snapshot on every stop (R3-07); the outputs deliver it (a node: header + frame on the control
     # connection; SP4: a blocking put, flushed while the main process reads it).
-    if outputs.checkpoints and outputs.send_checkpoint(
+    if send_final is not None and not send_final():
+        logger.info(f"Learner [{agent_id}]: no final checkpoint (this learner generation was superseded)")
+    elif outputs.checkpoints and outputs.send_checkpoint(
             make_checkpoint_payload(agent_id, algorithm, final=True, progress_env_steps=recorded()),
             kind="final", block=True):
         logger.info(f"Learner [{agent_id}]: sent final checkpoint v{algorithm.policy_version}")

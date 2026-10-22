@@ -9,7 +9,8 @@ checkpoints as ``CheckpointHeader`` + frame, metrics as ``LearnerMetrics`` (``No
 intake exist before the first ``VersionPublished``: the node routes workers to the learner only at that message.
 
 Start state (built by the node, numpy only; no file is read on the node): a ``resume_state`` from the assignment's
-blobs (A28 until T4.1: a ``recovery`` weights frame plus ``trainer_state`` bytes), a teacher (a ``teacher`` blob of
+start point (A28: one checkpoint frame, ``resume_state_from_frame``; its trainer state carries R29's
+``progress_env_steps``), a teacher (a ``teacher`` blob of
 ``Welcome.fixed`` -> ``teacher_from_frozen``; a scripted teacher from the config), ``init`` weights (an ``init``
 blob -> ``init_from_blob``)."""
 
@@ -25,10 +26,11 @@ import numpy as np
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["CONNECT_TIMEOUT_SEC", "init_from_cached", "learner_target", "resume_state_from_frame",
+__all__ = ["CONNECT_TIMEOUT_SEC", "NO_FINAL_REASONS", "init_from_cached", "learner_target", "resume_state_from_frame",
            "teacher_for"]
 
 CONNECT_TIMEOUT_SEC = 10.0
+NO_FINAL_REASONS = ("superseded", "hub_lost")   # Stop reasons without a final snapshot (T4.1, P-PF3-19)
 
 
 def learner_target(*, name: str, log_dir: str, incarnation: int, **kwargs: Any) -> None:
@@ -42,7 +44,11 @@ def _learner_main(*, name: str, incarnation: int, node: int, agent_id: str, gene
                   node_address: str, authkey: bytes, config: Any, role_spec: Any, spec: Any, seed: int | None,
                   teacher: Any, init_state: Any, resume_state: dict | None, version_floor: int, env_steps: int,
                   num_learners: int, cache_root: str, cache_prefix: str, checkpoint_interval: int,
-                  total_timesteps: int, cap_bytes: int) -> None:
+                  total_timesteps: int, cap_bytes: int, start_point: str = "factory") -> None:
+    """The assignment (SP5 T4.1): ``config.learner.device`` is the assigned device (the node replaced it),
+    ``generation`` / ``version_floor`` / ``seed`` (``learner_seed(..., generation)``) are this incarnation's;
+    ``start_point`` names the start for the log. A ``Stop`` with reason ``superseded`` or ``hub_lost`` ends the
+    learner without a final snapshot (P-PF3-19)."""
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
     from colosseum.learner.factory import apply_init, build_algorithm
     from colosseum.learner.learner import learner_process, resolve_device
@@ -55,6 +61,8 @@ def _learner_main(*, name: str, incarnation: int, node: int, agent_id: str, gene
 
     apply_global_seed(seed)
     device = resolve_device(config.learner.device)
+    logger.info(f"learner-{agent_id}: generation {generation}, device {device}, versions from {version_floor}, "
+                f"start {start_point}")
     configure_torch_threads(resolve_learner_threads(config.learner.torch_threads, device, config.rollout.num_workers,
                                                     config.rollout.torch_threads, num_learners))
     channel = None
@@ -90,7 +98,8 @@ def _learner_main(*, name: str, incarnation: int, node: int, agent_id: str, gene
                         config=config.learner, stop_event=intake.stop_flag, checkpoint_interval=checkpoint_interval,
                         resume_state=resume_state, progress_counter=_ProgressFloor(intake, env_steps),
                         total_timesteps=total_timesteps,
-                        weight_sync_interval=config.rollout.weight_sync_interval_sec, version_floor=version_floor)
+                        weight_sync_interval=config.rollout.weight_sync_interval_sec, version_floor=version_floor,
+                        send_final=lambda: intake.stop_reason not in NO_FINAL_REASONS)
     except Exception as e:
         error = ChildError("crash", f"{type(e).__name__}: {e}", f"learner {agent_id} (generation {generation})")
         try:

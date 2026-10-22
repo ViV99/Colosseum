@@ -951,6 +951,7 @@ class ConnectionIntake:
         self.agent_id = agent_id
         self.generation = int(generation)
         self.version_floor = int(version_floor)
+        self.stop_reason: str | None = None       # the reason of the first Stop the node sent (T4.1)
         self._capacity = max(1, int(capacity))
         self._cap = int(cap_bytes)
         self._max_lag = None if max_policy_lag is None else int(max_policy_lag)
@@ -1162,6 +1163,8 @@ class ConnectionIntake:
         if isinstance(msg, LearnerEnvSteps):
             self.env_steps = int(msg.env_steps)
         elif isinstance(msg, Stop):
+            if self.stop_reason is None:
+                self.stop_reason = str(msg.reason)    # SP5 T4.1: superseded / hub_lost send no final snapshot
             self.stop_flag.set()
         else:
             logger.warning(f"learner {self.agent_id}: unexpected control message {type(msg).__name__}")

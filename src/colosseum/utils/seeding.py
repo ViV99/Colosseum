@@ -32,9 +32,14 @@ def derive_seed(seed: int, role: str, index: int) -> int:
     return int.from_bytes(digest[:4], "little")
 
 
-def learner_seed(seed: int | None, agent_index: int) -> int | None:
-    """Seed of the learner of the ``agent_index``-th trainable agent (None if unseeded)."""
-    return None if seed is None else derive_seed(seed, "learner", agent_index)
+def learner_seed(seed: int | None, agent_index: int, generation: int = 1) -> int | None:
+    """Seed of the learner of the ``agent_index``-th trainable agent (None if unseeded). Generation 1 keeps the
+    SP4 stream; every later generation (a restart, a relocation, a resumed hub) gets its own (SP5 T4.1, W04-21)."""
+    if seed is None:
+        return None
+    if generation <= 1:
+        return derive_seed(seed, "learner", agent_index)
+    return derive_seed(seed, f"learner-g{int(generation)}", agent_index)
 
 
 def cell_seed(seed: int | None, epoch: int, node: int, worker: int, env: int) -> int | None:

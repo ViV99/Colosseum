@@ -140,13 +140,16 @@ def test_connection_intake_drops_stale_frames_before_decoding():
 
 
 def test_metrics_hub_sums_learner_side_chunk_drops_over_incarnations(tmp_path):
-    hub = MetricsHub(writer=MetricsWriter(tmp_path / "metrics.jsonl"), ratings_path=tmp_path / "ratings.json",
-                     agent_ids=["main"], total_timesteps=1000, log_interval=1, console_interval_sec=60.0,
-                     clock=lambda: 0.0)
-    hub.on_intake_stats("main", 1, 3, {"stale": 3})
-    hub.on_intake_stats("main", 1, 0, {"stale": 5, "invalid": 1})     # cumulative per incarnation
-    hub.on_intake_stats("main", 2, 0, {"stale": 1})                   # a new generation counts from zero
-    assert hub.chunk_drops() == {"stale": 6, "invalid": 1}
-    back = CounterBook.from_state(hub.intake_book.state())
-    assert back.totals() == hub.intake_book.totals()
-    assert hub.intake_queue_depths() == {"main": 0}
+    writer = MetricsWriter(tmp_path / "metrics.jsonl")
+    try:
+        hub = MetricsHub(writer=writer, ratings_path=tmp_path / "ratings.json", agent_ids=["main"],
+                         total_timesteps=1000, log_interval=1, console_interval_sec=60.0, clock=lambda: 0.0)
+        hub.on_intake_stats("main", 1, 3, {"stale": 3})
+        hub.on_intake_stats("main", 1, 0, {"stale": 5, "invalid": 1})     # cumulative per incarnation
+        hub.on_intake_stats("main", 2, 0, {"stale": 1})                   # a new generation counts from zero
+        assert hub.chunk_drops() == {"stale": 6, "invalid": 1}
+        back = CounterBook.from_state(hub.intake_book.state())
+        assert back.totals() == hub.intake_book.totals()
+        assert hub.intake_queue_depths() == {"main": 0}
+    finally:
+        writer.close()                       # never left to the GC (a ResourceWarning in a later test under -W error)

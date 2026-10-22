@@ -218,9 +218,13 @@ def _check_plain_frame(frame: bytes | memoryview) -> None:
 
 
 class WeightCacheWriter:
-    """Writes segments and pointers of one prefix (one process writes a given agent's latest at a time; when that
-    writer changes, e.g. the node while the learner is remote and the learner once it runs here, the next writer
-    prunes what the previous one left, because every publish rescans the agent's segments on disk)."""
+    """Writes segments and pointers of one prefix (one process writes a given agent's latest at a time). When that
+    writer changes (the node while the learner is remote or its weights are parked on the hub, the learner once it
+    runs here) the next writer prunes what the previous one left, because every publish rescans the agent's segments
+    on disk; a new learner here starts above the cached pointer (its version floor), so its versions always win.
+    When the learner here ends for good (SP5 T4.1: the agent's learner moves away), the node removes the pointer
+    and every latest segment of the agent (``release_latest``): a fetched version is never held back by a dead
+    learner's higher, possibly unannounced one."""
 
     def __init__(self, root: Path, prefix: str) -> None:
         self.root = Path(root)
@@ -237,12 +241,23 @@ class WeightCacheWriter:
             raise CacheFullError(f"{size / 2**20:.1f} MiB segment, {free / 2**20:.1f} MiB free: "
                                  + FULL_HINT.format(root=self.root))
 
+    def _latest_segments(self, agent_id: str, exclude: str = "") -> list[tuple[int, str]]:
+        """``(version, name)`` of ``agent_id``'s latest segments on disk, newest first."""
+        pattern = re.compile(re.escape(f"{self.prefix}-{agent_id}-v") + r"([0-9]+)")
+        return sorted(((int(m.group(1)), name) for name in os.listdir(self.root)
+                       if name != exclude and (m := pattern.fullmatch(name))), reverse=True)
+
     def _prune(self, agent_id: str, keep: str) -> None:
         """Delete ``agent_id``'s latest segments on disk except ``keep`` and the newest ``KEEP_LATEST - 1`` others."""
-        pattern = re.compile(re.escape(f"{self.prefix}-{agent_id}-v") + r"([0-9]+)")
-        others = sorted(((int(m.group(1)), name) for name in os.listdir(self.root)
-                         if name != keep and (m := pattern.fullmatch(name))), reverse=True)
-        for _, name in others[KEEP_LATEST - 1:]:
+        for _, name in self._latest_segments(agent_id, keep)[KEEP_LATEST - 1:]:
+            (self.root / name).unlink(missing_ok=True)
+
+    def release_latest(self, agent_id: str) -> None:
+        """Remove ``agent_id``'s latest weights (T4.1: its learner here ended for good): the pointer goes first
+        (readers then see none; one that mapped a segment keeps its views), then every latest segment of the agent;
+        the next writer starts afresh."""
+        (self.root / pointer_name(self.prefix, agent_id)).unlink(missing_ok=True)
+        for _, name in self._latest_segments(agent_id):
             (self.root / name).unlink(missing_ok=True)
 
     def publish_latest(self, agent_id: str, frame: bytes, *, version: int, generation: int,

@@ -141,6 +141,10 @@ class FetchPlanner:
     def set_local_agents(self, agents: Iterable[str]) -> None:
         self._local = set(agents)
 
+    def is_local(self, agent_id: str) -> bool:
+        """Whether ``agent_id``'s learner runs on this node (``set_local_agents``)."""
+        return agent_id in self._local
+
     def set_referenced(self, agents: Iterable[str]) -> None:
         self._referenced = set(agents)
 
@@ -544,6 +548,8 @@ class NodeFetcher:
         cached = run.reader.latest_version(ev.agent_id)
         have = -1 if cached is None else int(cached[0])
         fetched = ev.fetched
+        if fetched is not None and planner.is_local(ev.agent_id):
+            fetched = None                           # its learner runs here now: it alone writes the agent's latest
         if fetched is None or int(fetched.version) <= have:
             planner.finished(ev.agent_id, None if fetched is None else int(fetched.version), cached=have)
             return "kept"

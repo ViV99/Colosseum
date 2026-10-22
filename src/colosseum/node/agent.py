@@ -811,9 +811,12 @@ class NodeAgent:
                            f"ignored (switching runs is the join command's, T6.3)")
             return
         logger.info(f"node: session resumed for run {run.run_id[:8]} (node {run.number})")
-        listed = {la.agent_id for la in welcome.learners}
-        for agent in [a for a in self.learners.agents() if a not in listed]:
-            self.learners.stop(agent, "the hub no longer assigns it here")
+        # Welcome.learners is the node's desired learner set (T4.1): a learner not listed with its generation is
+        # superseded (no final); a listed one this node does not run starts; the same generation keeps running.
+        listed = {la.agent_id: int(la.generation) for la in welcome.learners}
+        for agent, generation in self.learners.generations().items():
+            if listed.get(agent) != generation:
+                self.learners.stop(agent, "superseded", generation)
         for la in welcome.learners:
             self.learners.assign(run, la)
         self.learners.forward_env_steps(int(welcome.env_steps), self._env_steps())
@@ -1011,8 +1014,8 @@ class NodeAgent:
         elif cmd.kind == "start_learner":
             if self._run is not None and not self._stopping:
                 self.learners.assign(self._run, cmd.learner)
-        elif cmd.kind == "stop_learner":
-            self.learners.stop(cmd.learner.agent_id, cmd.reason or "stop_learner")
+        elif cmd.kind == "stop_learner":                # only the generation it names (T4.1)
+            self.learners.stop(cmd.learner.agent_id, cmd.reason or "stop_learner", int(cmd.learner.generation))
         else:
             logger.info(f"node: command {cmd.kind!r} is not handled by this node yet; ignored")
 
