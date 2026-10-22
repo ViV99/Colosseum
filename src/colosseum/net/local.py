@@ -971,7 +971,10 @@ class ConnectionIntake:
                 elif obj is control:
                     self._read_control()
                 else:
-                    self._read_frame(obj)
+                    with self._cond:                  # full again since the wait: leave the frame to its sender
+                        full = len(self._frames) >= self._capacity
+                    if not full:
+                        self._read_frame(obj)
             if time.monotonic() - last_report >= INTAKE_REPORT_SEC:
                 last_report = time.monotonic()
                 self._control.send(IntakeReport(self.depth, self.dropped))

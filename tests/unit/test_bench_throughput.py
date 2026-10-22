@@ -193,3 +193,22 @@ def test_benchmark_runs_the_hub_with_quarter_second_heartbeats(tmp_path):
     runner, stop = bench._runner(cfg, RunDir.create(cfg))
     assert isinstance(runner, Hub) and stop == runner.request_stop and runner.env_steps_done == 0
     assert runner._options.mode == "train" and runner._options.local_node.workers == 1
+
+
+def test_the_launcher_fallback_is_only_for_a_tree_without_the_hub(tmp_path, monkeypatch):
+    """``--tree`` of a checkout without ``colosseum.hub.hub`` measures the SP4 Launcher; a hub that exists but fails
+    to import is an error, never a silent switch to the SP4 path."""
+    import sys
+
+    from colosseum.core.run_dir import RunDir
+    from colosseum.launcher import Launcher
+
+    cfg = bench._make_config(1, str(tmp_path))
+    run_dir = RunDir.create(cfg)
+    monkeypatch.setitem(sys.modules, "colosseum.hub.hub", None)          # "no such module" (ModuleNotFoundError)
+    runner, stop = bench._runner(cfg, run_dir)
+    assert isinstance(runner, Launcher) and stop == runner._stop_event.set
+    monkeypatch.delitem(sys.modules, "colosseum.hub.hub")
+    monkeypatch.setitem(sys.modules, "colosseum.hub.run_sinks", None)    # the hub's own import fails
+    with pytest.raises(ModuleNotFoundError, match="colosseum.hub.run_sinks"):
+        bench._runner(cfg, run_dir)

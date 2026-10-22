@@ -5,9 +5,11 @@ from cli_runner import TTT_CONFIG, run_train
 
 
 def test_tic_tac_toe_trains_to_the_budget(tmp_path):
-    # The tiny run trains for only ~2 s after start-up: checkpoints every 5 train steps and
-    # lineups redrawn every 0.25 s, so matches against past checkpoints are played and rated.
-    overrides = {"training.total_timesteps": "6000", "checkpoint.interval": "5",
+    # The tiny run trains for a few seconds after start-up: checkpoints every 5 train steps and
+    # lineups redrawn every 0.25 s, so matches against past checkpoints are played and rated. SP5: a snapshot game
+    # takes more hops (the snapshot's upload and save, a lineup refresh, its download into the node's cache, the
+    # match, two result flushes), so the budget is 16 000 env steps (was 6 000, about 2 s: past_games 0 under load).
+    overrides = {"training.total_timesteps": "16000", "checkpoint.interval": "5",
                  "rollout.match_refresh_interval_sec": "0.25"}
     run = run_train(TTT_CONFIG, tmp_path, name="ttt", overrides=overrides)
     assert run.returncode == 0, run.stderr[-3000:]

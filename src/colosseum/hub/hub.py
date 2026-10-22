@@ -19,8 +19,9 @@ replies through futures or a session's outbound queue. The main loop (``_main_lo
 3. reruns retention after a live refit, feeds the pulse, marks silent nodes lost, broadcasts the periodic
    ``Announce`` (env steps for the learners' LR progress, new versions, evicted snapshots), ticks the metrics (and
    writes ``league_state.json`` / ``hub_state.json``);
-4. stops at a failure (``_fail_run``: a node's reported child error, a failed learner, a dead local node or pulse),
-   a signal, ``request_stop`` or the budget (the hub is the only budget authority, spec 4.4).
+4. stops at a failure (``_fail_run``: a node's reported child error or a failed learner, also when reported during
+   the shutdown; the supervisor: a dead local node or pulse child), a signal, ``request_stop`` or the budget (the
+   hub is the only budget authority, spec 4.4).
 
 Lineups (spec 4.2): a node asks for cells; every cell gets an epoch (``CellTable``, epochs reserved in blocks with an
 fsync'd ``hub_state.json``, R7), an owner by the deficit rotation over the agents that can collect anywhere (an
@@ -60,6 +61,21 @@ from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.ipc import QueueReader
 from colosseum.core.run_dir import RunDir
 from colosseum.hub.run_sinks import RunSinks
+from colosseum.hub.server import (
+    LOOPBACK_KEY,
+    AdminIn,
+    BlobStore,
+    NodeMessageIn,
+    RegisterIn,
+    SessionClosed,
+    SessionOpened,
+    StopRequested,
+    UploadIn,
+    blob_ident,
+    build_server,
+    hello_from_proto,
+)
+from colosseum.hub.state import CellKey, restrict_collecting
 from colosseum.launcher import (  # one definition until T2.5(b) moves them here
     RunSetup,
     _record_run_state,
@@ -69,6 +85,8 @@ from colosseum.launcher import (  # one definition until T2.5(b) moves them here
 )
 from colosseum.metrics.counters import CounterBook
 from colosseum.metrics.wandb_logger import WandBLogger
+from colosseum.net.messages import lineup_to_proto, version_from_proto, version_to_proto
+from colosseum.net.proto import colosseum_v1_pb2 as pb
 from colosseum.players.registry import FixedPlayers
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, start_process
@@ -89,6 +107,12 @@ LOCAL_SHUTDOWN_GRACE_SEC = SHUTDOWN_GRACE_SEC   # train: the local node's stop (
 # Pulse results (SP4 T6.1): one message per evaluated snapshot; the pulse process puts with a blocking put.
 _PULSE_RESULTS_QUEUE_SIZE = 64
 RESULT_DROP_GROUP = "dropped_match_results_by_reason"
+_CHECKPOINT_KIND = {"checkpoint": "periodic", "final": "final"}   # UploadHeader.kind -> the frame's meta kind (A16)
+# A local client of a hub listening on all interfaces (or on loopback) connects to the loopback address of the
+# family the hub bound: "[::1]" for "[::]" (also under net.ipv6.bindv6only=1), "127.0.0.1" for IPv4.
+_LOOPBACK_OF = {"[::]": "[::1]", "0.0.0.0": "127.0.0.1", "127.0.0.1": "127.0.0.1", "localhost": "localhost",
+                "[::1]": "[::1]"}
+PENDING_EVICTIONS_MAX = 10_000            # evictions kept per node while its stream is down (oldest dropped)
 
 
 @dataclass(frozen=True)
@@ -178,7 +202,12 @@ class Hub(RunSinks):
         self._learner_alive: dict[str, bool] = {}
         self._journal_row: int | None = None
         self._admin_handlers: dict[str, Callable[[dict], dict]] = {"hub.status": self._admin_status}
+        self._handlers: dict[type, Callable[[Any], None]] = {
+            NodeMessageIn: self._on_message, SessionOpened: self._on_session_opened,
+            SessionClosed: self._on_session_closed, UploadIn: self._on_upload, RegisterIn: self._on_register,
+            AdminIn: self._on_admin, StopRequested: self._on_stop_requested}
         self._new_versions: dict[str, Any] = {}   # accepted since the last Announce, by agent
+        self._pending_evictions: dict[str, list[tuple[str, str]]] = {}   # node id -> evictions not delivered yet
         self._announced_once: set[str] = set()    # agents with an accepted version (logged once)
         self._run_stopped: set[str] = set()      # node ids that finished stop_run
         self._nodes_lost = 0
@@ -233,7 +262,6 @@ class Hub(RunSinks):
 
     def request_stop(self) -> None:
         """Stop the run (exit code 0); thread-safe."""
-        from colosseum.hub.server import StopRequested
 
         self._stop_requested.set()
         self._inbox.put(StopRequested())
@@ -271,6 +299,8 @@ class Hub(RunSinks):
                 raise
             killed = self._shutdown()
             code = self._exit_code_after_shutdown(code, killed)
+            if code == 0 and self._failure is not None:      # reported during the shutdown (SP4 R3-08)
+                code = 1
         finally:
             try:
                 self._finish_metrics()
@@ -291,7 +321,6 @@ class Hub(RunSinks):
         identity, the registered blobs, the pulse plan and the pure hub state. Raises ConfigError / EnvContractError
         for a bad config or resume source."""
         from colosseum.core.config import config_hash
-        from colosseum.hub.server import BlobStore
         from colosseum.hub.state import (
             CellTable,
             EpochAllocator,
@@ -351,9 +380,7 @@ class Hub(RunSinks):
         """What nodes download from the hub: frozen agents' weights, neural kickstart teachers and ``init`` weights
         (``Welcome.fixed``), and every resumed agent's start state (A28 until T4.1: a ``recovery`` weights frame and
         its ``trainer_state`` bytes, named by the agent's ``LearnerAssignment``)."""
-        from colosseum.hub.server import blob_ident
         from colosseum.net.chunks import WeightsMeta, encode_weights
-        from colosseum.net.proto import colosseum_v1_pb2 as pb
 
         def register(kind: str, agent_id: str, data: bytes) -> str:
             ident = blob_ident(kind, agent_id, data)
@@ -415,7 +442,6 @@ class Hub(RunSinks):
         ``ADDR:distributed.port`` too; ``hub``: TLS on all interfaces (``--listen`` narrows) at ``--port`` /
         ``distributed.port``; ``--insecure`` / ``distributed.insecure``: plain everywhere."""
         from colosseum.hub.registry import register_running, this_process_info, write_hub_json
-        from colosseum.hub.server import LOOPBACK_KEY, build_server
 
         opts, dist = self._options, self._dist
         insecure = bool(opts.insecure or dist.insecure)
@@ -451,8 +477,8 @@ class Hub(RunSinks):
         addresses = tuple(f"{h}:{ports[f'{h}:{port}']}" for h in hosts)
         if LOOPBACK_KEY in ports:
             loopback = f"127.0.0.1:{ports[LOOPBACK_KEY]}"
-        elif hosts and hosts[0] in ("[::]", "0.0.0.0", "127.0.0.1", "localhost"):
-            loopback = f"127.0.0.1:{ports[f'{hosts[0]}:{port}']}"
+        elif hosts and hosts[0] in _LOOPBACK_OF:          # the same address family as the bound socket (M8)
+            loopback = f"{_LOOPBACK_OF[hosts[0]]}:{ports[f'{hosts[0]}:{port}']}"
         else:
             loopback = None
         info = this_process_info(run_id=self._run_id, run_dir=str(self._run_dir.root), addresses=addresses,
@@ -490,7 +516,6 @@ class Hub(RunSinks):
         local = self._options.local_node
         if local is None:
             return
-        from colosseum.hub.server import LOOPBACK_KEY
         from colosseum.node.agent import NodeOptions, local_node_target
         from colosseum.node.hardware import machine_id
 
@@ -589,25 +614,15 @@ class Hub(RunSinks):
                 return handled
 
     def _dispatch(self, event: object) -> None:
-        from colosseum.hub.server import (
-            AdminIn,
-            NodeMessageIn,
-            RegisterIn,
-            SessionClosed,
-            SessionOpened,
-            StopRequested,
-            UploadIn,
-        )
+        """The handler of ``event``'s type (one dict lookup per event: the result path's cost, criterion 2)."""
+        handler = self._handlers.get(type(event))
+        if handler is None:
+            logger.warning(f"Hub: ignored an unknown inbox event {type(event).__name__}")
+            return
+        self._guarded(handler, event)
 
-        handlers: tuple[tuple[type, Callable[[Any], None]], ...] = (
-            (NodeMessageIn, self._on_message), (SessionOpened, self._on_session_opened),
-            (SessionClosed, self._on_session_closed), (UploadIn, self._on_upload), (RegisterIn, self._on_register),
-            (AdminIn, self._on_admin), (StopRequested, lambda _ev: self._stop_requested.set()))
-        for cls, handler in handlers:
-            if isinstance(event, cls):
-                self._guarded(handler, event)
-                return
-        logger.warning(f"Hub: ignored an unknown inbox event {type(event).__name__}")
+    def _on_stop_requested(self, _event: Any) -> None:
+        self._stop_requested.set()
 
     def _guarded(self, handler: Callable[[Any], None], event: object) -> None:
         """Run one handler; its exception is one ERROR per handler (with the traceback the first time): nothing a
@@ -627,9 +642,6 @@ class Hub(RunSinks):
         """A node's ``Hello`` (P-PF2-1 (c)): an older live stream of the node is closed as superseded; the node is
         connected (``new`` / ``resumed`` / ``returned``: a returned node's cells are dropped), its batch bookkeeping
         opened with ``Hello.last_acked_seq``, its learners placed, and a ``Welcome`` sent."""
-        from colosseum.hub.server import hello_from_proto
-        from colosseum.net.messages import version_to_proto
-        from colosseum.net.proto import colosseum_v1_pb2 as pb
 
         handle, hello = ev.handle, ev.hello
         record = self._identity.nodes.get(handle.node_id)
@@ -656,8 +668,9 @@ class Hub(RunSinks):
         versions = [version_to_proto(v) for aid in self._agent_ids if (v := self._versions.latest(aid)) is not None]
         handle.send(pb.HubMessage(welcome=pb.Welcome(
             node_number=record.number, run_id=self._run_id, config_json=cfg.model_dump_json(by_alias=True),
-            agents=agents, versions=versions, evictions=[], learners=[self._assignment(a) for a in placed],
-            evaluators=0, env_steps=self._budget.value, fixed=list(self._fixed_blobs), collect_allowed=True)))
+            agents=agents, versions=versions, evictions=self._take_evictions(handle.node_id),
+            learners=[self._assignment(a) for a in placed], evaluators=0, env_steps=self._budget.value,
+            fixed=list(self._fixed_blobs), collect_allowed=True)))
         logger.info(f"node {record.number} ({record.name}) connected ({kind}); learners here: {placed or 'none'}")
         if self._shutting_down:
             self._send_stop_run(handle)
@@ -684,7 +697,6 @@ class Hub(RunSinks):
     def _assignment(self, agent: str) -> Any:
         """The ``LearnerAssignment`` of ``agent`` (A28: a resumed agent names its ``recovery`` / ``trainer_state``
         blobs)."""
-        from colosseum.net.proto import colosseum_v1_pb2 as pb
 
         weights, trainer = self._start_blobs.get(agent, ("", ""))
         return pb.LearnerAssignment(agent_id=agent, generation=self._versions.generation(agent),
@@ -709,8 +721,13 @@ class Hub(RunSinks):
         if handle is not None:
             handle.close(reason)
         self._nodes_lost += 1
-        logger.warning(f"node {entry.number} ({entry.name}) {reason}: no heartbeat for more than "
-                       f"{self._dist.node_lost_after_sec:g} s; its cells are dropped")
+        why = ""
+        if reason == "lost":                          # it may come back and resend its unacked batches
+            why = f": no heartbeat for more than {self._dist.node_lost_after_sec:g} s"
+        else:                                         # gone for good (nodes remove, T6.3; ResultIntake contract)
+            self._intake.forget_node(entry.node_id)
+            self._pending_evictions.pop(entry.node_id, None)
+        logger.warning(f"node {entry.number} ({entry.name}) {reason}{why}; its cells are dropped")
 
     def _node_label(self, node_id: str) -> str:
         entry = self._registry.by_id(node_id)
@@ -766,9 +783,6 @@ class Hub(RunSinks):
 
     def _on_lineup_request(self, node_id: str, session_id: str, req: Any) -> None:
         """Answer a node's ``LineupRequest`` in this pass (spec 4.2; P-PF2-2, P-PF2-3, P-PF2-17; A11)."""
-        from colosseum.hub.state import CellKey, restrict_collecting
-        from colosseum.net.messages import lineup_to_proto
-        from colosseum.net.proto import colosseum_v1_pb2 as pb
 
         entry = self._registry.by_id(node_id)
         handle = self._sessions.get(node_id)
@@ -834,7 +848,6 @@ class Hub(RunSinks):
     def _on_version(self, entry: Any, info_proto: Any) -> None:
         """A learner's ``VersionAnnounce``: accepted only from the agent's learner node and generation (spec 4.5);
         an accepted version makes the agent collect and goes out with the next ``Announce``."""
-        from colosseum.net.messages import version_from_proto
 
         info = version_from_proto(info_proto)
         if self._learner_node.get(info.agent_id) != entry.number or info.node != entry.number:
@@ -957,7 +970,6 @@ class Hub(RunSinks):
         self._ack(node_id, seq)
 
     def _ack(self, node_id: str, seq: int) -> None:
-        from colosseum.net.proto import colosseum_v1_pb2 as pb
 
         handle = self._sessions.get(node_id)
         if handle is not None:
@@ -994,7 +1006,6 @@ class Hub(RunSinks):
         and told the node so): then nothing is saved (carried item of T2.3)."""
         from colosseum.net.chunks import decode_checkpoint
         from colosseum.net.frame import payload_byte_cap
-        from colosseum.net.proto import colosseum_v1_pb2 as pb
 
         header = ev.header
         record = self._identity.nodes.get(ev.node_id)
@@ -1012,7 +1023,7 @@ class Hub(RunSinks):
                 logger.info(f"node {number}: an upload of {header.agent_id!r} v{header.version} was given up "
                             f"before the hub read it")
                 return
-            if header.kind not in ("checkpoint", "final"):
+            if header.kind not in _CHECKPOINT_KIND:
                 self._count_drop(number, "dropped_uploads", "invalid", f"{header.kind!r} uploads")
                 reply(False, "kind")
                 return
@@ -1027,10 +1038,20 @@ class Hub(RunSinks):
                 return
             with open(claimed, "rb") as f:
                 data = bytearray(f.read())            # writable: the saved arrays are views of it
-            payload, meta = decode_checkpoint(data, cap=payload_byte_cap(int(self._dist.max_message_mb)))
-            if payload["agent_id"] != agent or int(meta["generation"]) != generation:
-                self._count_drop(number, "dropped_uploads", "invalid", f"uploads of {agent!r}")
+            try:
+                payload, meta = decode_checkpoint(data, cap=payload_byte_cap(int(self._dist.max_message_mb)))
+            except ValueError as e:                   # FrameError: a malformed frame
+                self._count_drop(number, "dropped_uploads", "invalid", f"undecodable uploads ({e})")
                 reply(False, "invalid")
+                return
+            mismatch = [what for what, ok in (
+                ("agent", payload["agent_id"] == agent), ("generation", int(meta["generation"]) == generation),
+                ("version", int(payload["policy_version"]) == int(header.version)),
+                ("kind", meta["kind"] == _CHECKPOINT_KIND[header.kind])) if not ok]
+            if mismatch:                              # the frame says something else than its header (M6)
+                self._count_drop(number, "dropped_uploads", "invalid", f"uploads of {agent!r} whose frame does not "
+                                 f"match the header ({', '.join(mismatch)})")
+                reply(False, f"invalid: {', '.join(mismatch)}")
                 return
             checkpoint_id = self._save_checkpoint(payload)
             reply(True, checkpoint_id=checkpoint_id)
@@ -1044,7 +1065,6 @@ class Hub(RunSinks):
 
     def _on_register(self, ev: Any) -> None:
         """``Register`` with the token (T6.3 adds the version / platform checks before it)."""
-        from colosseum.net.proto import colosseum_v1_pb2 as pb
 
         req = ev.request
         try:
@@ -1065,7 +1085,6 @@ class Hub(RunSinks):
         1 when the handler fails."""
         from concurrent.futures import Future
 
-        from colosseum.net.proto import colosseum_v1_pb2 as pb
 
         handler = self._admin_handlers.get(ev.command)
         if handler is None:
@@ -1091,20 +1110,25 @@ class Hub(RunSinks):
 
     def _broadcast_announce(self) -> None:
         """The periodic ``Announce`` to every live session: the hub's env steps (the learners' LR progress), the
-        versions accepted since the last one and the snapshots evicted since then."""
-        from colosseum.net.messages import version_to_proto
-        from colosseum.net.proto import colosseum_v1_pb2 as pb
-
-        evictions = [pb.Eviction(agent_id=a, checkpoint_id=c)
-                     for a, ids in sorted(self._coordinator.take_evictions().items()) for c in ids]
+        versions accepted since the last one and the snapshots evicted since the node's last ``Announce`` or
+        ``Welcome`` (kept per online node while its stream is down, at most ``PENDING_EVICTIONS_MAX``)."""
+        new = [(a, c) for a, ids in sorted(self._coordinator.take_evictions().items()) for c in ids]
+        if new:
+            for entry in self._registry.all():
+                if entry.state == "online":
+                    pending = self._pending_evictions.setdefault(entry.node_id, [])
+                    pending.extend(new)
+                    del pending[:-PENDING_EVICTIONS_MAX]
         versions = [version_to_proto(v) for v in self._new_versions.values()]
         self._new_versions = {}
-        if not self._sessions:
-            return
-        message = pb.HubMessage(announce=pb.Announce(versions=versions, evictions=evictions,
-                                                     env_steps=self._budget.value, collect_allowed=True))
-        for handle in list(self._sessions.values()):
-            handle.send(message)
+        for node_id, handle in list(self._sessions.items()):
+            handle.send(pb.HubMessage(announce=pb.Announce(
+                versions=versions, evictions=self._take_evictions(node_id), env_steps=self._budget.value,
+                collect_allowed=True)))
+
+    def _take_evictions(self, node_id: str) -> list:
+        """The evictions not yet delivered to ``node_id`` (``pb.Eviction``), now handed out."""
+        return [pb.Eviction(agent_id=a, checkpoint_id=c) for a, c in self._pending_evictions.pop(node_id, [])]
 
     def _reserve_epochs(self, until: int) -> None:
         """R7: ``hub_state.json`` with fsync before an epoch above ``until``'s block start is handed out."""
@@ -1137,7 +1161,6 @@ class Hub(RunSinks):
     # ---- stop -------------------------------------------------------------------------------------------------
 
     def _send_stop_run(self, handle: Any) -> None:
-        from colosseum.net.proto import colosseum_v1_pb2 as pb
 
         handle.send(pb.HubMessage(command=pb.Command(kind="stop_run", reason=f"grace={self._grace():g}")))
 

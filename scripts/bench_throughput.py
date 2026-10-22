@@ -342,7 +342,9 @@ def _runner(config, run_dir):
     stop event). Both expose ``env_steps_done`` (the global budget counter) and ``launch()``."""
     try:
         from colosseum.hub.hub import Hub, HubOptions, LocalNodeOptions
-    except ImportError:                       # documented --tree fallback: the measured checkout predates the hub
+    except ModuleNotFoundError as e:          # documented --tree fallback: the measured checkout predates the hub
+        if e.name not in ("colosseum.hub.hub", "colosseum.hub"):
+            raise                             # the hub exists but one of its imports fails: never measure the SP4 path
         from colosseum.launcher import Launcher
 
         launcher = Launcher(config, run_dir)
