@@ -195,8 +195,9 @@ def _worker_target(*, worker_id: int, log_dir: str | None = None, **kwargs: Any)
     run_child(f"tournament-worker-{worker_id}", log_dir, _worker_main, worker_id=worker_id, **kwargs)
 
 
-class _Placement:
-    """``MatchObserver`` that knows which lineup every env plays (the match an error happened in)."""
+class MatchPlacement:
+    """``MatchObserver`` that knows which lineup every env plays (the match an error happened in); also used by the
+    node evaluators (SP5 T5.1)."""
 
     def __init__(self, lineups: Sequence[Lineup], num_envs: int) -> None:
         self.current = dict(enumerate(lineups[:min(num_envs, len(lineups))]))
@@ -216,18 +217,18 @@ class _Placement:
     def on_episode_end(self, env, end) -> None:
         pass
 
-    def where(self, message: str, context: str, blocks: Sequence[Block]) -> str:
+    def where(self, message: str, context: str, block_ids: Sequence[str]) -> str:
         """``match <uid> of block <id>`` for an error message that starts with ``<context>env <E>``; else the
-        task's blocks."""
+        task's blocks (``block_ids``)."""
         found = re.match(re.escape(context) + r"env (\d+)", message)
         lineup = self.current.get(int(found.group(1))) if found is not None else None
         if lineup is not None:
             return f"match {lineup.uid} of block {lineup.block}"
-        ids = [b.id for b in blocks]
+        ids = list(block_ids)
         return f"one of blocks {ids[0]} .. {ids[-1]}" if len(ids) > 1 else f"block {ids[0]}"
 
 
-def _error_kind(error: Exception) -> str:
+def error_kind(error: Exception) -> str:
     """The name of the nearest class of ``_ERRORS`` in the error's MRO (a ``DataError`` is a ``ConfigError``)."""
     return next(cls.__name__ for cls in type(error).__mro__ if _ERRORS.get(cls.__name__) is cls)
 
@@ -251,7 +252,7 @@ def _worker_main(*, worker_id: int, config: ColosseumConfig, players: list[Tourn
             return
         index, blocks = item
         lineups = [lu for b in blocks for lu in b.lineups]
-        placement = _Placement(lineups, num_envs)
+        placement = MatchPlacement(lineups, num_envs)
         try:
             pool.reserve({(s.agent_id, s.network_id) for lu in lineups for s in lu.seats})
             played = play_lineups(env_fn=lambda: make_env(config), pool=pool, lineups=lineups, num_envs=num_envs,
@@ -259,8 +260,8 @@ def _worker_main(*, worker_id: int, config: ColosseumConfig, players: list[Tourn
                                   max_idle_steps=config.env.max_idle_steps, observer=placement, source=source,
                                   context=context, match_id_prefix=source)
         except (ConfigError, EnvContractError, PlayerError) as e:
-            put_until_stop(results, ("error", index, worker_id, _error_kind(e), str(e),
-                           placement.where(str(e), context, blocks)), stop_event)
+            put_until_stop(results, ("error", index, worker_id, error_kind(e), str(e),
+                           placement.where(str(e), context, [b.id for b in blocks])), stop_event)
             raise
         by_block: dict[str, list[MatchResult]] = {}
         for result in played:

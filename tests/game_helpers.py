@@ -1651,14 +1651,16 @@ def write_fake_run(root, game: str = "turns", *, agent: str = "main", versions=(
 
 
 class PulseFailBot(ScriptedBot):
-    """Random legal play, except in the process named ``pulse`` (``COLOSSEUM_PROCESS_NAME``), where ``act`` raises:
-    ``validate`` and the rollout workers play it normally, the pulse process crashes on it."""
+    """Random legal play, except in the pulse process (SP4, named ``pulse``) or an evaluator process (SP5,
+    ``evaluator-<i>``) (``COLOSSEUM_PROCESS_NAME``), where ``act`` raises: ``validate`` and the rollout workers play
+    it normally, the pulse / evaluator fails on it."""
 
     def reset(self, *, role, seat, layout, rng) -> None:
         self._role, self._rng = self.game_spec.roles[role], rng
 
     def act(self, obs, mask, info):
-        if os.environ.get(ENV_PROCESS_NAME) == "pulse":
+        name = str(os.environ.get(ENV_PROCESS_NAME, ""))
+        if name == "pulse" or name.startswith("evaluator"):
             raise RuntimeError("pulse failure on purpose")
         return random_legal_action(self._role, mask, self._rng)
 

@@ -7,6 +7,14 @@ types that the SP3 / SP4 code keeps as dataclasses are converted here:
 - ``Lineup`` / ``SeatAssignment`` <-> ``LineupProto`` (``seed`` / ``block`` / ``uid`` / ``epoch`` optional);
 - :class:`VersionInfo` (the hub's version registry entry, spec 4.5) <-> ``VersionInfo``.
 
+Evaluation (T5.1, spec 5.3). :class:`PlayerRef` (one player of an evaluation block as an evaluator builds it) and
+:class:`BlockTask` (one evaluation block as the hub queues it) live here because the hub, the node and the evaluator
+all need them; ``player_ref_to_proto`` / ``player_ref_from_proto``, ``block_task_to_proto`` /
+``block_task_from_proto`` and ``lease_to_proto`` convert them. A neural player's weights are the eval blob
+``blob_key("eval", agent_id, blob_id)`` of the machine cache (A18): the wire carries the raw ``blob_id``
+(``BlobRequest(kind="eval")``), ``player_ref_from_proto`` rebuilds the key and raises ValueError for a malformed id
+(the node's untrusted input check). Bot kwargs and networks travel as JSON (ValueError for values JSON cannot hold).
+
 The converters copy values verbatim and never raise on a well-formed protobuf: a result from a node is checked by
 the hub's intake (``colosseum.hub.state.ResultIntake.check``), not here. ``to_proto`` raises ValueError for values a
 field cannot hold (an int beyond int64).
@@ -17,14 +25,20 @@ field cannot hold (an int beyond int64).
 
 from __future__ import annotations
 
-from collections.abc import Iterable, Mapping
+import json
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import asdict, dataclass
-from typing import Any
+from typing import Any, Literal
 
 from colosseum.core.types import Lineup, MatchResult, SeatAssignment, SeatResult, TeamResult
 from colosseum.net.proto import colosseum_v1_pb2 as pb
+from colosseum.node.weights import CacheKey, blob_key, split_blob_key
+from colosseum.players.registry import BotSpec
 
 PROTOCOL_VERSION = (1, 0)
+
+TOURNAMENT_PRIORITY = 0      # spec 5.3: tournament blocks go before pulse blocks
+PULSE_PRIORITY = 1
 
 # Every value of ``Event.kind`` (amendment A1): the one validity list of node events.
 EVENT_KINDS = ("proc_died", "child_error", "slot_disabled", "learner_failed", "warning", "run_stopped",
@@ -148,3 +162,109 @@ def version_from_proto(p: pb.VersionInfo) -> VersionInfo:
     return VersionInfo(agent_id=p.agent_id, generation=p.generation, version=p.version, size=p.size,
                        digest=p.digest, node=p.node, addresses=tuple(p.addresses), relay_only=p.relay_only,
                        teacher_active=p.teacher_active)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Evaluation (T5.1)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True)
+class PlayerRef:
+    """One player of an evaluation block as an evaluator builds it (spec 5.3): a neural player's weights are the
+    machine-cache blob ``blob`` (``blob_key("eval", agent_id, blob_id)``, fetched from the hub with
+    ``BlobRequest(kind="eval")``) built with ``networks`` (a ``NetworkConfig`` dump) for ``roles``; a scripted player
+    is ``bot``. ``(agent_id, network_id)`` is how the block's seats name it; ``name`` is the entity name used in
+    messages."""
+
+    name: str
+    agent_id: str
+    network_id: str
+    roles: tuple[str, ...]
+    kind: Literal["neural", "scripted"]
+    blob: CacheKey | None = None
+    networks: dict | None = None
+    bot: BotSpec | None = None
+
+    def __post_init__(self) -> None:
+        if self.kind not in ("neural", "scripted"):
+            raise ValueError(f"player {self.name!r}: kind must be neural or scripted, got {self.kind!r}")
+        if self.kind == "neural" and not _is_eval_key(self.blob):
+            raise ValueError(f"player {self.name!r}: a neural player needs an eval blob cache key "
+                             f"(blob_key('eval', ...)), got {self.blob!r}")
+        if self.kind == "scripted" and self.bot is None:
+            raise ValueError(f"player {self.name!r}: a scripted player needs a bot")
+
+
+def _is_eval_key(key: CacheKey | None) -> bool:
+    if key is None:
+        return False
+    try:
+        return split_blob_key(key)[0] == "eval"
+    except ValueError:
+        return False
+
+
+@dataclass(frozen=True)
+class BlockTask:
+    """One evaluation block (an SP4 schedule block: one seed, one composition, every rotation) as the hub queues
+    it: ``lineups`` carry the block's seed, id and uids; ``players`` every player its seats name; ``owner`` the pulse
+    snapshot (``pulse:<agent>:<checkpoint id>``) or tournament (``tournament:<name>``) it belongs to; ``priority``
+    ``TOURNAMENT_PRIORITY`` runs before ``PULSE_PRIORITY``; ``num_envs`` the envs an evaluator plays its lease
+    with. On a node (``block_task_from_proto``) ``owner`` is "" and ``priority`` 0."""
+
+    block_id: str
+    source: Literal["pulse", "tournament"]
+    owner: str
+    lineups: tuple[Lineup, ...]
+    players: tuple[PlayerRef, ...]
+    priority: int
+    deterministic: bool
+    num_envs: int = 8
+
+    @property
+    def matches(self) -> int:
+        return len(self.lineups)
+
+
+def _json(value: Any, what: str) -> str:
+    try:
+        return json.dumps(value, sort_keys=True, allow_nan=False)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"{what} is not JSON ({e}); hub-run evaluation sends it to nodes as JSON") from e
+
+
+def player_ref_to_proto(ref: PlayerRef) -> pb.PlayerRefProto:
+    return pb.PlayerRefProto(
+        name=ref.name, agent_id=ref.agent_id, network_id=ref.network_id, roles=list(ref.roles), kind=ref.kind,
+        blob_id="" if ref.blob is None else split_blob_key(ref.blob)[1],
+        networks_json="" if ref.networks is None else _json(ref.networks, f"the networks of {ref.name}"),
+        bot_class="" if ref.bot is None else ref.bot.class_path,
+        bot_kwargs_json="" if ref.bot is None else _json(dict(ref.bot.kwargs), f"the bot kwargs of {ref.name}"))
+
+
+def player_ref_from_proto(p: pb.PlayerRefProto) -> PlayerRef:
+    """ValueError for a malformed blob id, kind or JSON (node-side input check)."""
+    return PlayerRef(
+        name=p.name, agent_id=p.agent_id, network_id=p.network_id, roles=tuple(p.roles), kind=p.kind,  # type: ignore[arg-type]
+        blob=blob_key("eval", p.agent_id, p.blob_id) if p.blob_id else None,
+        networks=json.loads(p.networks_json) if p.networks_json else None,
+        bot=BotSpec(p.bot_class, json.loads(p.bot_kwargs_json) if p.bot_kwargs_json else {}) if p.bot_class else None)
+
+
+def block_task_to_proto(task: BlockTask) -> pb.BlockSpec:
+    return pb.BlockSpec(block_id=task.block_id, source=task.source,
+                        lineups=[lineup_to_proto(lu) for lu in task.lineups],
+                        players=[player_ref_to_proto(p) for p in task.players], deterministic=task.deterministic)
+
+
+def block_task_from_proto(p: pb.BlockSpec, *, num_envs: int) -> BlockTask:
+    return BlockTask(block_id=p.block_id, source=p.source, owner="",  # type: ignore[arg-type]
+                     lineups=tuple(lineup_from_proto(x) for x in p.lineups),
+                     players=tuple(player_ref_from_proto(x) for x in p.players), priority=0,
+                     deterministic=p.deterministic, num_envs=int(num_envs))
+
+
+def lease_to_proto(lease_id: str, lease_sec: float, tasks: Sequence[BlockTask]) -> pb.BlockLease:
+    return pb.BlockLease(lease_id=lease_id, lease_sec=float(lease_sec), blocks=[block_task_to_proto(t) for t in tasks],
+                         num_envs=tasks[0].num_envs if tasks else 0)

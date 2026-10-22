@@ -107,7 +107,7 @@ def test_blocks_need_a_lineup_of_their_own_per_episode(tmp_path):
 
 
 def test_seats_must_be_tournament_players_and_errors_keep_their_base_class(tmp_path):
-    from colosseum.arena.tournament.engine import _drain, _error_kind
+    from colosseum.arena.tournament.engine import _drain, error_kind
     from colosseum.core.errors import ConfigError, DataError
 
     cfg, spec, players = _setup(tmp_path)
@@ -115,7 +115,7 @@ def test_seats_must_be_tournament_players_and_errors_keep_their_base_class(tmp_p
         play_blocks(cfg, spec, players, [_block(0, ("main", "ckpt_v7"), ("rnd", "fixed"))], num_workers=1,
                     num_envs=1, deterministic=True, on_block=lambda *_: None)
     assert _no_workers_left()
-    assert _error_kind(DataError("bad data")) == "ConfigError" and _error_kind(PlayerError("x")) == "PlayerError"
+    assert error_kind(DataError("bad data")) == "ConfigError" and error_kind(PlayerError("x")) == "PlayerError"
     assert issubclass(DataError, ConfigError)
     q = mp.get_context("spawn").Queue()
     for item in ("a", "b"):

@@ -38,6 +38,13 @@ frame holds back only itself, and after ``FRAME_STALL_SEC`` without a byte its c
 An EOF closes only that connection; a frame cut by a dying sender closes it and counts ``disconnect``.
 ``NodeOutputs`` publishes weights into the shared-memory cache and reports them, sends checkpoints and metrics to the
 node. ``QueueIntake`` / ``QueueOutputs`` keep SP4's queue path for the distributed roles (until T7.2).
+
+Evaluator side (T5.1, spec 5.3): one ``control`` connection per evaluator;
+- node -> evaluator: ``EvalTask`` (play a lease's whole blocks; their weights are in the machine cache),
+  ``EvalCancel`` (the hub withdrew the lease), ``Stop``;
+- evaluator -> node: ``EvalDone`` (the lease's results by block, or ``cancelled``), ``EvalFailed`` (a typed error of
+  the lease: ``contract`` / ``player`` / ``config`` / ``missing_weights``; the evaluator keeps running). A typed
+  evaluator error is never a ``ChildError``: it travels to the hub as a failed ``BlockResult``.
 """
 
 from __future__ import annotations
@@ -63,6 +70,7 @@ from colosseum.core.types import Lineup, MatchResult, TrajectoryChunk, WeightPay
 
 if TYPE_CHECKING:
     from colosseum.net.chunks import ChunkValidator
+    from colosseum.net.messages import BlockTask
     from colosseum.node.weights import CacheKey, WeightCacheReader, WeightCacheWriter
 
 logger = logging.getLogger(__name__)
@@ -339,6 +347,45 @@ class LearnerMetrics:
 class IntakeReport:
     depth: int
     dropped: dict[str, int]
+
+
+# node -> evaluator (T5.1)
+@dataclass
+class EvalTask:
+    """Play these whole blocks (every cache key of their players is in the machine cache) and report them."""
+
+    lease_id: str
+    source: str
+    blocks: list[BlockTask]
+    num_envs: int
+    deterministic: bool
+
+
+@dataclass
+class EvalCancel:
+    """The hub withdrew the lease: stop playing it (the evaluator answers ``EvalDone(cancelled=True)``)."""
+
+    lease_id: str
+
+
+# evaluator -> node (T5.1)
+@dataclass
+class EvalDone:
+    """The lease's results by block id (all its blocks), or ``cancelled`` (nothing to report)."""
+
+    lease_id: str
+    results: dict[str, list[MatchResult]] = field(default_factory=dict)
+    cancelled: bool = False
+
+
+@dataclass
+class EvalFailed:
+    """The lease failed with a typed error; the evaluator keeps running (a crash is the process exit instead)."""
+
+    lease_id: str
+    kind: Literal["contract", "player", "config", "missing_weights"]
+    message: str
+    where: str
 
 
 class ControlChannel:
