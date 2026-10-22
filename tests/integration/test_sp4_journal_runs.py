@@ -9,7 +9,7 @@ import json
 import re
 import sqlite3
 
-from cli_runner import TTT_CONFIG, run_train
+from cli_runner import TTT_CONFIG, newest_checkpoint, run_train
 from colosseum.arena.matchlog import MATCH_LOG_FILE, MatchLogReader
 from colosseum.core.config import load_config
 
@@ -86,9 +86,15 @@ def test_a_run_dir_resume_continues_the_journal(tmp_path):
     parent = MatchLogReader(first.root / MATCH_LOG_FILE)
     parent_total = sum(s.n for _, _, s in parent.comparison_table().pairs("2p", ["train"]))
     parent.close()
+    # The hub counts env steps from node heartbeats (every distributed.heartbeat_sec), so the first run stops about
+    # one heartbeat of env steps past its budget (tic-tac-toe: 4000 more or so); the resume continues from the final
+    # checkpoint's env_steps, so the second budget counts from there or the resumed run would start past it
+    resumed = json.loads((newest_checkpoint(first.root, "agent_0") / "meta.json").read_text())["env_steps"]
     second = run_train(TTT_CONFIG, tmp_path, name="second",
-                       overrides={"training.resume_from": str(first.root), "training.total_timesteps": "8000"})
+                       overrides={"training.resume_from": str(first.root),
+                                  "training.total_timesteps": str(resumed + 4000)})
     assert second.returncode == 0, second.stderr[-3000:]
+    assert f"env-step counter continues from {resumed}" in second.log("main")
     assert f"Match log: imported {first.root / MATCH_LOG_FILE}" in second.log("main")
     child = MatchLogReader(second.root / MATCH_LOG_FILE)
     runs = child.runs()
