@@ -16,7 +16,7 @@ import pytest
 
 from colosseum.core.types import Lineup, SeatAssignment, TrajectoryChunk
 from colosseum.net import local
-from colosseum.net.chunks import ChunkValidator, WeightsMeta, decode_chunk
+from colosseum.net.chunks import ChunkValidator, WeightsMeta, decode_chunk, encode_weights
 from colosseum.net.local import (
     PROGRESS_INTERVAL_SEC,
     CellLineup,
@@ -60,10 +60,12 @@ class FakeCache:
         self.blobs: dict = {}
         self.reads: list = []
 
-    def read_latest(self, agent_id, *, newer_than=-1):
-        if agent_id not in self.latest or self.latest[agent_id][0] <= newer_than:
+    def read_latest(self, agent_id, *, newer_than=-1, loaded_generation=None):
+        if agent_id not in self.latest:
             return None
         version, generation = self.latest[agent_id]
+        if version <= newer_than and (loaded_generation is None or generation == loaded_generation):
+            return None                               # WeightCacheReader's rule (R40)
         return Cached({"w": np.full(2, version, np.float32)},
                       WeightsMeta(agent_id=agent_id, kind="latest", generation=generation, policy_version=version))
 
@@ -397,3 +399,33 @@ def test_frames_for_another_machine_go_on_the_route_connection_lz4_probed_per_ag
     assert decode_chunk(node_side.recv_bytes(), cap=1 << 24)[1].agent_id == "a"
     io.close()
     control_node.close()
+
+
+def test_a_lower_version_of_another_generation_is_loaded_but_not_of_the_same(tmp_path):
+    """Controller ruling R40 (T4.1): after a relocation the agent's next learner generation may publish below the
+    versions a dead generation left on this machine; a worker takes the pointer of another generation at any
+    version, and within one generation only a newer version (R9)."""
+    from colosseum.node.weights import WeightCacheReader, WeightCacheWriter, cache_prefix
+
+    prefix = cache_prefix("ab" * 16, "01" * 16, 3)
+    writer, reader = WeightCacheWriter(tmp_path, prefix), WeightCacheReader(tmp_path, prefix)
+
+    def publish(version, generation):
+        frame = encode_weights({"w": np.full(2, float(version), np.float32)},
+                               WeightsMeta("a", "latest", generation=generation, policy_version=version))
+        writer.publish_latest("a", frame, version=version, generation=generation, teacher_active=False)
+
+    io, _node_end = _io(cache=reader)
+    try:
+        publish(18, 2)                                                    # the dead generation's last version
+        assert (io.poll_weights("a").policy_version, io.poll_weights("a")) == (18, None)
+        writer.release_latest("a")                                        # the agent's learner left (R40)
+        publish(6, 3)                                                     # the new generation starts at cap + 1
+        payload = io.poll_weights("a")
+        assert (payload.policy_version, payload.generation) == (6, 3)
+        publish(5, 3)                                                     # never happens: same generation, lower
+        assert io.poll_weights("a") is None
+        publish(7, 3)
+        assert io.poll_weights("a").policy_version == 7
+    finally:
+        io.close()

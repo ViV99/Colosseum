@@ -224,7 +224,8 @@ class WeightCacheWriter:
     on disk; a new learner here starts above the cached pointer (its version floor), so its versions always win.
     When the learner here ends for good (SP5 T4.1: the agent's learner moves away), the node removes the pointer
     and every latest segment of the agent (``release_latest``): a fetched version is never held back by a dead
-    learner's higher, possibly unannounced one."""
+    learner's higher, possibly unannounced one; readers that hold such a version take the next generation's pointer
+    at any version (``WeightCacheReader.read_latest(loaded_generation=)``, controller ruling R40)."""
 
     def __init__(self, root: Path, prefix: str) -> None:
         self.root = Path(root)
@@ -378,11 +379,19 @@ class WeightCacheReader:
             return None
         return CachedWeights(key, state_dict, meta, len(mapping))
 
-    def read_latest(self, agent_id: str, *, newer_than: int = -1) -> CachedWeights | None:
-        """The pointer's version if it is newer than ``newer_than``, else None (also when nothing is published)."""
+    def read_latest(self, agent_id: str, *, newer_than: int = -1,
+                    loaded_generation: int | None = None) -> CachedWeights | None:
+        """The pointer's weights if its version is newer than ``newer_than``, or (controller ruling R40) if its
+        generation differs from ``loaded_generation`` (the generation of the weights the caller holds): the pointer's
+        generation changes only when its writer changes (a new learner generation, parked weights, a relocation after
+        ``WeightCacheWriter.release_latest``), whose versions may lie below a dead generation's; within one
+        generation versions never go back (R9). None otherwise (also when nothing is published)."""
         for _ in range(READ_RETRIES):
             pointer = self._pointer(agent_id)
-            if pointer is None or pointer["version"] <= newer_than:
+            if pointer is None:
+                return None
+            same_generation = loaded_generation is None or int(pointer.get("generation", 0)) == loaded_generation
+            if pointer["version"] <= newer_than and same_generation:
                 return None
             name = pointer["segment"]
             mapping = self._map(name)

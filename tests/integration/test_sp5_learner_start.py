@@ -6,12 +6,16 @@ A ``NodeAgent`` in a thread (``node_kit.NodeThread``) against ``node_kit.FakeHub
 toy game ``turns``: one worker and one learner child (2 loaded processes)."""
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import pytest
 
 from colosseum.core.types import Lineup, SeatAssignment
 from colosseum.hub.server import SessionOpened
+from colosseum.net.local import Stop
 from colosseum.net.proto import colosseum_v1_pb2 as pb
+from colosseum.node import learners as node_learners
 from colosseum.node import session as node_session
 from colosseum.node.weights import WeightCacheReader, WeightCacheWriter
 from game_helpers import agent_role_of, make_test_config, scripted_agent
@@ -24,7 +28,7 @@ def _config():
     return make_test_config("turns", agents={"a": {}, "random": scripted_agent()},
                             rollout={"envs_per_worker": 2, "chunk_length": 8},
                             learner={"batch_chunks": 2, "weight_push_interval": 1}, checkpoint={"interval": 3},
-                            distributed={"heartbeat_sec": 0.25})
+                            distributed={"heartbeat_sec": 0.25, "shutdown_grace_sec": 2.0})
 
 
 @pytest.fixture
@@ -71,6 +75,24 @@ def _learner_pid(node):
 
 def _gone(node):
     return not node.agent.learners.agents()
+
+
+def _after_heartbeats(hub, n=2):
+    """Wait until the node sent ``n`` more heartbeats: its loop handled what the hub sent before."""
+    beats = len(hub.heartbeats())
+    wait_for(lambda: len(hub.heartbeats()) >= beats + n)
+
+
+def _state(node):
+    entry = node.agent.learners.of("learner-a")
+    return None if entry is None else entry.state
+
+
+def _drop_stops(node):
+    """The learner never receives a ``Stop`` (it keeps running as one that ignores it would)."""
+    host = node.agent.learners._host
+    send = host.send_child
+    host.send_child = lambda name, message: False if isinstance(message, Stop) else send(name, message)
 
 
 def _weights(config, version):
@@ -135,10 +157,11 @@ def test_stop_learner_of_another_generation_is_ignored(setup):
     wait_for(lambda: _of(hub, 3), timeout=60)
     pid = _learner_pid(node)
     _start(hub, 3)                                                       # the same assignment again: one start
+    _start(hub, 2)                                                       # an older generation: ignored
     _stop(hub, 2)
-    beats = len(hub.heartbeats())
-    wait_for(lambda: len(hub.heartbeats()) >= beats + 2)                # the node's loop handled both commands
+    _after_heartbeats(hub)                                               # the node's loop handled the commands
     assert _learner_pid(node) == pid and node.agent.learners.generations() == {"a": 3}
+    assert _state(node) == "running"
     _stop(hub, 3)
     wait_for(lambda: _gone(node), timeout=30)
     hub.close_session()
@@ -182,5 +205,72 @@ def test_welcome_is_the_desired_learner_set(setup):
     sessions = len(_hellos(hub))
     hub.close_session()                                                  # the same generation listed again
     wait_for(lambda: len(_hellos(hub)) > sessions, timeout=30)
-    hub.sync()
+    _after_heartbeats(hub)                                               # the Welcome was handled
     assert _learner_pid(node) == pid and node.agent.learners.generations() == {"a": 5}
+    assert _state(node) == "running"
+
+
+def test_a_learner_that_ignores_its_stop_is_terminated_and_its_successor_starts(setup):
+    """Step 7.2: a stopped learner still alive after ``distributed.shutdown_grace_sec`` is terminated; a
+    deliberately stopped learner's non-zero exit is no learner_failed; the queued generation starts."""
+    hub, start, _logs = setup
+    node = start()
+    _start(hub, 3)
+    wait_for(lambda: _of(hub, 3), timeout=60)
+    pid = _learner_pid(node)
+    _drop_stops(node)
+    _start(hub, 4)
+    wait_for(lambda: _of(hub, 4), timeout=60)
+    assert pid != _learner_pid(node) and node.agent.learners.generations() == {"a": 4}
+    hub.sync()
+    assert hub.node_events("learner_failed") == [] and hub.uploads_of("final") == []
+
+
+def test_a_start_point_that_cannot_be_fetched_is_fetched_again(setup, monkeypatch, caplog):
+    """Step 7.1: a failed start-point fetch is retried at a later pass (one WARNING); the learner starts only with
+    its start point; no learner_failed."""
+    from colosseum.core.registry import env_spec
+    from colosseum.learner.factory import build_algorithm
+    from colosseum.learner.learner import make_checkpoint_payload, set_policy_version
+    from colosseum.net.chunks import encode_checkpoint
+
+    monkeypatch.setattr(node_learners, "START_RETRY_SEC", 0.2)
+    hub, start, _logs = setup
+    config = hub.config
+    algo = build_algorithm(config.get_agent_config("a"), agent_role_of(config, "a")[1], env_spec(config),
+                           device="cpu", teacher=None)
+    set_policy_version(algo, 9)
+    hub.serve_blob("start", "a", "resume", encode_checkpoint(make_checkpoint_payload("a", algo), kind="recovery",
+                                                             generation=0))
+    triple = ("start", "a", "resume")
+    hub.not_found(*triple)
+    node = start()
+    with caplog.at_level(logging.WARNING, logger="colosseum.node.learners"):
+        _start(hub, 1, blob="start:resume")
+        wait_for(lambda: hub.blobs.requests().count(triple) >= 2, timeout=30)
+        assert _learner_pid(node) is None and _state(node) == "fetching"
+        hub.blobs.missing.discard(triple)
+        assert wait_for(lambda: _of(hub, 1), timeout=60)[0].version == 9
+    assert caplog.text.count("could not be fetched") == 1
+    hub.sync()
+    assert hub.node_events("learner_failed") == []
+
+
+def test_a_welcome_without_the_agent_cancels_its_queued_successor(setup):
+    hub, start, _logs = setup
+    node = start()
+    _start(hub, 3)
+    wait_for(lambda: _of(hub, 3), timeout=60)
+    _drop_stops(node)
+    _start(hub, 4)
+    wait_for(lambda: node.agent.learners.queued() == {"a": 4})
+    entry = node.agent.learners.of("learner-a")
+    entry.stop_deadline = float("inf")                                   # it stays alive past the Welcome
+    hub.welcome(learners=[])
+    hub.close_session()
+    wait_for(lambda: node.agent.learners.queued() == {}, timeout=30)
+    entry.stop_deadline = 0.0                                            # now its grace is over
+    wait_for(lambda: _gone(node), timeout=30)
+    _after_heartbeats(hub)
+    assert node.agent.learners.generations() == {} and _of(hub, 4) == []
+    assert hub.node_events("learner_failed") == []

@@ -21,7 +21,12 @@ ignored; ``stop_learner`` stops only the generation it names. ``Welcome.learners
 machine's cached latest + 1, every version a learner of the agent published here + 1)`` (R9: no version names two
 weights) with the seed ``learner_seed(training.seed, agent index, generation)``. When an agent's learner here ends
 for good, the node removes the agent's latest weights from the cache (``WeightCacheWriter.release_latest``): it
-becomes their writer again (fetched from the agent's next learner) and is never held back by the dead learner's pointer.
+becomes their writer again (fetched from the agent's next learner) and is never held back by the dead learner's pointer;
+the workers take the next learner's weights although their versions may lie below the dead one's, because they accept
+a pointer of another generation at any version (controller ruling R40, ``WeightCacheReader.read_latest``). A learner
+that does not exit within ``distributed.shutdown_grace_sec`` after its ``Stop`` is terminated; a deliberately stopped
+learner is never ``learner_failed``. A start point that cannot be fetched is fetched again every
+``START_RETRY_SEC`` (one WARNING); the learner never starts without it.
 
 ``NodeLearners`` talks to the agent only through ``LearnerHost`` (the agent's ``_LearnerHost`` adapter): the
 supervisor, posting into the inbox, sending to a child, setting a worker route, events, a connected-only send, the
@@ -31,6 +36,7 @@ stay with the agent (T4.2's ``node.uploads``), downloads too (T3.1's ``node.fetc
 from __future__ import annotations
 
 import logging
+import time
 from collections import deque
 from collections.abc import Callable
 from concurrent.futures import Future
@@ -45,6 +51,8 @@ logger = logging.getLogger(__name__)
 __all__ = ["TRAIN_METRICS_KEPT", "LearnerBlobsDone", "LearnerEntry", "LearnerHost", "NodeLearners"]
 
 TRAIN_METRICS_KEPT = 1000       # learner train records kept while the hub is away (oldest dropped)
+START_RETRY_SEC = 5.0           # a start point that could not be fetched is fetched again after this (T4.1)
+KILL_AFTER_TERMINATE_SEC = 2.0  # a stopped learner still alive this long after SIGTERM is killed
 
 
 @dataclass
@@ -74,6 +82,10 @@ class LearnerEntry:
     failure: str = ""                  # why the node gave up on it (its learner_failed message)
     routed: bool = False               # the workers were routed to its listener
     successor: Any = None              # a newer pb.LearnerAssignment that starts once this one exited (T4.1)
+    stop_deadline: float | None = None  # monotonic: a stopping learner still alive then is terminated (T4.1)
+    terminated_at: float | None = None
+    retry_at: float | None = None      # fetching: its start point is fetched again then (None: a fetch in flight)
+    fetch_warned: bool = False
 
 
 class LearnerHost(Protocol):
@@ -136,6 +148,10 @@ class NodeLearners:
     def generations(self) -> dict[str, int]:
         """Agent -> generation of every learner this node has (fetching, starting, running or stopping)."""
         return {a: e.generation for a, e in self._entries.items()}
+
+    def queued(self) -> dict[str, int]:
+        """Agent -> generation of a successor queued behind a learner that is stopping."""
+        return {a: int(e.successor.generation) for a, e in self._entries.items() if e.successor is not None}
 
     def hello_entries(self) -> tuple:
         """``(agent, generation, version)`` of the running learners (``Hello.learners``)."""
@@ -214,7 +230,13 @@ class NodeLearners:
         if la.weights_blob in ("", "init"):          # factory weights / the init blob of Welcome.fixed
             entry.state = "ready"
             return
+        self._submit_fetch(run, entry)
+
+    def _submit_fetch(self, run: Any, entry: LearnerEntry) -> None:
+        """Download ``entry``'s start point in the transfer pool; the result comes back as ``LearnerBlobsDone``."""
+        agent, assignment = entry.agent_id, entry.assignment
         serial, generation = run.serial, entry.generation
+        entry.retry_at = None
         future = self._host.submit(self._fetch_blobs, run, assignment)
 
         def done(f: Future) -> None:
@@ -244,16 +266,26 @@ class NodeLearners:
         if (run is None or run.serial != done.serial or entry is None or entry.state != "fetching"
                 or entry.generation != done.generation):
             return
-        if done.error is not None:
-            del self._entries[done.agent_id]
-            logger.error(f"node: the start state of learner {done.agent_id} could not be fetched: {done.error}")
-            self._host.event("learner_failed", proc=entry.name, message=f"start state not fetched: {done.error}",
-                             generation=entry.generation)
+        if done.error is not None:                   # retried at a later pass; never started without its start point
+            entry.retry_at = time.monotonic() + START_RETRY_SEC
+            if not entry.fetch_warned:
+                entry.fetch_warned = True
+                logger.warning(f"node: the start point of learner {done.agent_id} (generation {entry.generation}, "
+                               f"{entry.assignment.weights_blob}) could not be fetched: {done.error}; retried every "
+                               f"{START_RETRY_SEC:g} s")
             return
         entry.resume_state = done.resume_state
         entry.state = "ready"
 
     def start_pending(self, run: Any) -> None:
+        """Main loop, every pass: fetch start points again that are due, spawn the learners that are ready, and
+        terminate a stopping learner past its grace (``stop``)."""
+        now = time.monotonic()
+        for entry in list(self._entries.values()):
+            if entry.state == "fetching" and entry.retry_at is not None and now >= entry.retry_at:
+                self._submit_fetch(run, entry)
+            elif entry.state == "stopping":
+                self._enforce_stop(entry, now)
         ready = [e for e in self._entries.values() if e.state == "ready"]
         if not ready or not self._host.fixed_cached(run):
             return                                   # teacher / init weights come from the fixed blobs
@@ -358,9 +390,29 @@ class NodeLearners:
             del self._entries[agent]                 # never started (a fetch still running is ignored on arrival)
             return
         entry.state, entry.stop_reason = "stopping", reason
+        run = self._host.current_run()
+        grace = 0.0 if run is None else float(run.config.distributed.shutdown_grace_sec)
+        entry.stop_deadline = time.monotonic() + grace
         self._host.send_child(entry.name, Stop(reason))
         self._host.set_route(LearnerRoute(agent, None, False, 0))
         logger.info(f"node: stopping learner {agent} ({reason})")
+
+    def _enforce_stop(self, entry: LearnerEntry, now: float) -> None:
+        """A stopping learner still alive after ``distributed.shutdown_grace_sec`` is terminated (spec 7.2 / Step
+        7.2), and killed ``KILL_AFTER_TERMINATE_SEC`` later; its exit then reaches ``on_exit``."""
+        if entry.stop_deadline is None or now < entry.stop_deadline:
+            return
+        proc = self._host.supervisor.get(entry.name)
+        if proc is None or proc.exitcode is not None:
+            return
+        if entry.terminated_at is None:
+            entry.terminated_at = now
+            logger.warning(f"node: learner {entry.agent_id} generation {entry.generation} did not stop within the "
+                           f"grace ({entry.stop_reason}); terminated")
+            proc.terminate()
+        elif now - entry.terminated_at >= KILL_AFTER_TERMINATE_SEC:
+            entry.terminated_at = float("inf")       # killed once
+            proc.kill()
 
     def on_exit(self, name: str, code: int | None, log_path: str, routes: dict) -> None:
         """A learner process ended (not during the node's stop); ``routes``: the agent's current worker routes."""
@@ -374,6 +426,11 @@ class NodeLearners:
         if route is not None and route.address is not None:
             self._host.set_route(LearnerRoute(entry.agent_id, None, False, 0))
         run = self._host.current_run()
+        stopped = entry.state == "stopping"         # a deliberate stop: never learner_failed, whatever the exit
+        if stopped and (code != 0 or entry.failure):
+            logger.warning(f"node: learner {entry.agent_id} generation {entry.generation} ended after its stop "
+                           f"({entry.stop_reason}) with exit {code}{': ' + entry.failure if entry.failure else ''}; "
+                           f"see {log_path}")
         if entry.successor is not None and run is not None:
             logger.info(f"node: learner {entry.agent_id} generation {entry.generation} ended (exit {code}); "
                         f"generation {entry.successor.generation} starts")
@@ -381,7 +438,7 @@ class NodeLearners:
             return
         if run is not None:
             self._release_latest(run, entry.agent_id)
-        if entry.state == "stopping" and code == 0 and not entry.failure:
+        if stopped:
             logger.info(f"node: learner {entry.agent_id} stopped")
             return
         why = entry.failure or "without being stopped"

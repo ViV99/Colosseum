@@ -570,6 +570,7 @@ class WorkerIO:
         self._evict: list[CacheKey] = []
         self._given: set[tuple[str, str]] = set()        # (agent, checkpoint id) handed to the loop
         self._loaded: dict[str, int] = {}                # agent -> version loaded in the loop
+        self._loaded_generation: dict[str, int] = {}     # agent -> generation of those weights (R40)
         self._generations: dict[str, collections.OrderedDict[int, int]] = {}
         self._ready = False
         self._stopped = False
@@ -712,11 +713,16 @@ class WorkerIO:
         return sender
 
     def poll_weights(self, agent_id: str) -> WeightPayload | None:
-        cached = self._cache.read_latest(agent_id, newer_than=self._loaded.get(agent_id, -1))
+        """The agent's latest weights if they are newer than the loaded ones, or of another generation (controller
+        ruling R40: after a relocation the new learner generation may publish below a dead one's versions; within
+        one generation versions only go up, R9)."""
+        cached = self._cache.read_latest(agent_id, newer_than=self._loaded.get(agent_id, -1),
+                                         loaded_generation=self._loaded_generation.get(agent_id))
         if cached is None:
             return None
         meta = cached.meta
         self._loaded[agent_id] = int(meta.policy_version)
+        self._loaded_generation[agent_id] = int(meta.generation)
         gens = self._generations.setdefault(agent_id, collections.OrderedDict())
         gens[int(meta.policy_version)] = int(meta.generation)
         while len(gens) > _GENERATIONS_KEPT:

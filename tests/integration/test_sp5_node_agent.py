@@ -700,14 +700,19 @@ def test_a_learner_resumes_from_its_start_blobs_and_takes_its_version_floor(hub_
     assert node.stop() == 0
 
 
-def test_a_start_state_that_cannot_be_fetched_fails_the_learner(hub_factory, node_factory):
+def test_a_start_state_that_cannot_be_fetched_is_retried_and_never_started(hub_factory, node_factory, monkeypatch):
+    """T4.1 (Step 7.1): a start point the hub does not serve is fetched again at later passes; the learner never
+    starts without it and no learner_failed is reported."""
+    from colosseum.node import learners as node_learners
+
+    monkeypatch.setattr(node_learners, "START_RETRY_SEC", 0.1)
     hub = hub_factory(_learner_config())
     hub.welcome(learners=[pb.LearnerAssignment(agent_id="a", generation=1, device="cpu",
                                                weights_blob="start:recovery")])                # never served
     node = node_factory(hub)
-    failed = wait_for(lambda: hub.node_events("learner_failed"))[0]
-    assert failed.proc == "learner-a" and "start state not fetched" in failed.message and "NOT_FOUND" in failed.message
+    wait_for(lambda: hub.blobs.requests().count(("start", "a", "recovery")) >= 3)
     assert node.agent.supervisor.get("learner-a") is None                     # never spawned
+    assert hub.node_events("learner_failed") == []
     assert node.stop() == 0
 
 

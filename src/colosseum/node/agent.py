@@ -814,6 +814,9 @@ class NodeAgent:
         # Welcome.learners is the node's desired learner set (T4.1): a learner not listed with its generation is
         # superseded (no final); a listed one this node does not run starts; the same generation keeps running.
         listed = {la.agent_id: int(la.generation) for la in welcome.learners}
+        for agent, generation in self.learners.queued().items():      # a queued successor not listed is cancelled
+            if listed.get(agent) != generation:
+                self.learners.stop(agent, "superseded", generation)
         for agent, generation in self.learners.generations().items():
             if listed.get(agent) != generation:
                 self.learners.stop(agent, "superseded", generation)
