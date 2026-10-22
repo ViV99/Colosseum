@@ -133,9 +133,10 @@ def test_agents_collect_from_their_learners_placement_without_a_first_version(tm
 
 
 def test_a_node_without_a_path_to_the_learner_plays_without_collecting(tmp_path):
-    """T3.2 (spec 4.7, 4.8): without the hub relay a remote learner's seats collect only on a node that reported a
-    direct path to it (``test_sp5_hub_paths.py``); before that the node still gets lineups, none collecting."""
-    hub = lineup_hub(_config(("a",)), tmp_path)
+    """T3.2 (spec 4.7, 4.8): with ``distributed.relay: false`` a remote learner's seats collect only on a node that
+    reported a direct path to it (``test_sp5_hub_paths.py``); before that the node still gets lineups, none
+    collecting."""
+    hub = lineup_hub(_config(("a",), distributed={"relay": False}), tmp_path)
     first = open_node(hub, name="learner-node", workers=1)
     second = open_node(hub, name="worker-node", workers=1, cpu_learners=0, no_learners=True)
     assert hub._learner_node == {"a": first.of("welcome")[0].node_number}

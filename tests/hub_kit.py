@@ -512,16 +512,18 @@ class ServedHub:
 
 
 def serve(tmp_path: Path, *, insecure: bool = False, max_message_mb: int = MAX_MB, identity: HubIdentity | None = None,
-          **loop_kwargs) -> ServedHub:
+          relay: Any = None, latest: Any = None, **loop_kwargs) -> ServedHub:
     """A started hub server on ``127.0.0.1:0`` with a ``MiniHubLoop`` (``loop_kwargs`` go to it); the run dir is
-    ``tmp_path / "run"`` and the hub identity ``tmp_path / "hub-identity"``."""
+    ``tmp_path / "run"`` and the hub identity ``tmp_path / "hub-identity"``; ``relay`` / ``latest``: the hub relay's
+    ``RelayHub`` / ``LatestRelay`` (T3.2; the test publishes the online nodes and versions itself)."""
     identity = identity or HubIdentity.load_or_create(Path(tmp_path) / "hub-identity")
     run_dir = RunDir(Path(tmp_path) / "run")
     (run_dir.root / "checkpoints").mkdir(parents=True, exist_ok=True)
     blobs = BlobStore(run_dir)
     inbox: queue.SimpleQueue = queue.SimpleQueue()
     server, ports = build_server(inbox=inbox, identity=identity, insecure=insecure, listen=["127.0.0.1:0"],
-                                 loopback_plain=False, blobs=blobs, max_message_mb=max_message_mb)
+                                 loopback_plain=False, blobs=blobs, max_message_mb=max_message_mb, relay=relay,
+                                 latest=latest)
     server.start()
     loop = MiniHubLoop(inbox, identity=identity, **loop_kwargs)
     port = ports["127.0.0.1:0"]

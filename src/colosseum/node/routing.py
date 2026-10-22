@@ -1,22 +1,29 @@
 """The node's routing section (SP5 spec 4.7, 4.8; T3.2): chunks between machines, owned by the node agent's main loop
 (``colosseum.node.agent``, item 12).
 
-Each run has a ``node.router.ChunkRouter`` (``start``), created before the data port (a new data port takes the
-router's ``LocalDelivery`` at creation, the process's existing one through ``DataServer.set_delivery``; the router is
-per run, the port per process). Every pass at the fetch cadence (``update_routes``): every trainable agent whose newest
-known version comes from another node (not parked: node -1 is no route, pre-flight ruling P-PF3-13) and whose learner
-does not run here is a ``RemoteRoute`` (its node, generation, data addresses); the router starts a ``TargetSender``
-per target node at once, which probes the path (``direct`` within ``distributed.connect_timeout_sec``, else the hub
-relay (T3.2 (b)), else ``down``) and reports it (``PathChanged`` into the inbox; ``Heartbeat.paths``), so the hub
-grants collecting seats only where the learner is reachable (P-PF3-1). Workers get ``LearnerRoute(agent, None,
-via_node=True)`` for such agents while the path is not ``down`` (``via_node=False`` otherwise: the worker drops and
-counts ``no_learner``): their frames come on the workers' ``route`` connections (``add_worker``: one ``RouteReader``
-each; nothing is decoded) and leave in one gRPC stream per target. A path change to ``relay`` / ``down`` is one WARNING
-per target per node process and one ``Event(warning)`` to the hub.
+Each run has a ``node.router.ChunkRouter`` (``start``), created before the data port (a new data port takes the router's
+``LocalDelivery`` at creation, the process's existing one through ``DataServer.set_delivery``; the router is per run,
+the port per process). Every pass at the fetch cadence (``update_routes``): every trainable agent whose newest known
+version comes from another node (not parked: node -1 is no route, pre-flight ruling P-PF3-13) and whose learner does not
+run here is a ``RemoteRoute`` (its node, generation, data addresses); the router starts a ``TargetSender`` per target
+node at once, which probes the path (``direct`` within ``distributed.connect_timeout_sec``, else the hub relay
+(``Hub.RelaySend``), else ``down`` with ``distributed.relay: false``) and reports it (``PathChanged`` into the inbox;
+``Heartbeat.paths``), so the hub grants collecting seats only where the learner is reachable (P-PF3-1). Workers get
+``LearnerRoute(agent, None, via_node=True)`` for such agents while the path is not ``down`` (``via_node=False``
+otherwise: the worker drops and counts ``no_learner``): their frames come on the workers' ``route`` connections
+(``add_worker``: one ``RouteReader`` each; nothing is decoded) and leave in one gRPC stream per target. A path change to
+``relay`` / ``down`` is one WARNING per target per node process and one ``Event(warning)`` to the hub.
 
-Frames from other machines arrive at the data port's ``Chunks`` (T3.2 (b): also through the hub relay) and go to the
-local learner over the node's own ``chunks`` connection to that learner incarnation (``sync_delivery``: opened by a
-short thread off the loop, ``LearnerConnOpened``; reopened at most every ``DELIVERY_RETRY_SEC`` after a failure).
+Frames from other machines arrive at the data port's ``Chunks`` or through the hub relay and go to the local learner
+over the node's own ``chunks`` connection to that learner incarnation (``sync_delivery``: opened by a short thread off
+the loop, ``LearnerConnOpened``; reopened at most every ``DELIVERY_RETRY_SEC`` after a failure).
+
+The hub relay (spec 4.8): while this node runs a learner and ``distributed.relay`` is on, a ``router.RelayReceiver``
+keeps the node's ``Hub.RelayInbox`` stream open (``sync_relay_inbox``): relayed frames go to the same delivery, and a
+weights pull (the hub needs the newest weights of a learner here for nodes that cannot reach this data port) becomes
+``RelayPull`` on the main loop, which uploads the cache's newest frame of that agent with ``Hub.Upload(kind=
+"relay_latest")`` in the transfer pool (``on_relay_pull``; at most one upload in flight per agent: a pull meanwhile is
+ignored, the running upload sends the newest anyway).
 
 The router's counters (``chunks_*``, ``dropped_chunks.*``) are cumulative per node process: a stopped router's values
 are carried (``counters``). ``stop`` (before the node kills its children, at a release and at the end) stops every
@@ -37,11 +44,12 @@ from colosseum.net.proto import colosseum_v1_pb2 as pb
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["DELIVERY_RETRY_SEC", "LEARNER_CONNECT_SEC", "LearnerConnOpened", "NodeRouting", "PathChanged",
-           "RoutingHost"]
+__all__ = ["DELIVERY_RETRY_SEC", "LEARNER_CONNECT_SEC", "RELAY_UPLOAD_TIMEOUT_SEC", "LearnerConnOpened", "NodeRouting",
+           "PathChanged", "RelayPull", "RelayUploadDone", "RoutingHost"]
 
 DELIVERY_RETRY_SEC = 1.0        # the node's chunk connection to a local learner is (re)opened at most this often
 LEARNER_CONNECT_SEC = 5.0
+RELAY_UPLOAD_TIMEOUT_SEC = 300.0
 
 
 @dataclass
@@ -61,6 +69,22 @@ class LearnerConnOpened:
     agent_id: str
     listener: str
     conn: Any
+    error: str
+
+
+@dataclass
+class RelayPull:
+    """The hub asked (``RelayItem.pull``) for the newest weights of a learner here (posted by the relay inbox)."""
+
+    serial: int
+    request: Any                       # pb.LatestRequest
+
+
+@dataclass
+class RelayUploadDone:
+    serial: int
+    agent_id: str
+    reply: Any                         # pb.UploadReply, None: nothing to send or a transfer error
     error: str
 
 
@@ -88,6 +112,11 @@ class RoutingHost(Protocol):
     def set_route(self, route: Any) -> None: ...
     def event(self, kind: str, **fields: Any) -> None: ...
     def set_delivery(self, delivery: Any) -> None: ...   # the data port's (when it exists)
+    @property
+    def node_id(self) -> str: ...
+    def hub_channel(self) -> Any: ...                 # grpc.Channel to the hub (None before the session)
+    def hub_metadata(self) -> tuple: ...              # the node's R1 credentials
+    def submit(self, fn: Any, *args: Any) -> Any: ... # the transfer pool
 
 
 class NodeRouting:
@@ -101,6 +130,9 @@ class NodeRouting:
         self._paths: dict[int, str] = {}            # target node -> path (from PathChanged)
         self._warned: set[tuple[int, str]] = set()
         self._links: dict[str, _DeliveryLink] = {}  # agent -> the node's chunk connection to its local learner
+        self._receiver: Any = None                  # router.RelayReceiver (relay inbox) of the run
+        self._relay = False                         # distributed.relay of the run
+        self._uploading: set[str] = set()           # agents with a relay upload in flight
 
     @property
     def delivery(self) -> Any:
@@ -110,7 +142,7 @@ class NodeRouting:
 
     def start(self, run: Any) -> None:
         """The run's router: direct channels through the run's data-port link (a TLS channel names its target node),
-        no relay until T3.2 (b)."""
+        the hub relay as the fallback unless ``distributed.relay: false``."""
         from functools import partial
 
         from colosseum.net.frame import payload_byte_cap
@@ -122,12 +154,18 @@ class NodeRouting:
         metadata = () if link is None else tuple(link.metadata)
         serial, post = run.serial, self._host.post
         dist = run.config.distributed
+        self._relay = bool(dist.relay)
+        hub_channel, hub_md = self._host.hub_channel(), tuple(self._host.hub_metadata())
+        relay_call = None
+        if self._relay and hub_channel is not None:
+            def relay_call() -> Any:
+                return partial(pb_grpc.HubStub(hub_channel).RelaySend, metadata=hub_md)
         self.router = ChunkRouter(
             make_frame=lambda agent, gen, frame, target: pb.ChunkFrame(agent_id=agent, target_node=int(target),
                                                                        generation=int(gen), frame=frame),
             make_channel=make_channel,
             direct_stub=lambda channel: partial(pb_grpc.NodeDataStub(channel).Chunks, metadata=metadata),
-            relay_call=None,                             # the hub relay: T3.2 (b)
+            relay_call=relay_call,                       # None: distributed.relay is false
             connect_timeout_sec=float(dist.connect_timeout_sec),
             on_path=lambda target, path: post(PathChanged(serial, int(target), str(path))),
             max_frame_bytes=payload_byte_cap(int(dist.max_message_mb)))
@@ -138,6 +176,7 @@ class NodeRouting:
         router, self.router = self.router, None
         if router is None:
             return
+        self._stop_receiver()
         router.stop()
         self._carry.update(router.counters())
         self._host.set_delivery(None)
@@ -214,7 +253,7 @@ class NodeRouting:
             timeout = float(run.config.distributed.connect_timeout_sec)
             text = f"the data port of node {ev.target} is unreachable ({where}) within {timeout:g} s; "
             text += ("chunks go through the hub" if ev.path == "relay"
-                     else f"the relay is off: this node stops collecting for {agents}")
+                     else f"the hub relay is off (distributed.relay: false): this node stops collecting for {agents}")
             logger.warning(f"node: {text}")
             self._host.event("warning", proc="node", message=text)
         elif ev.path == "direct":
@@ -267,3 +306,96 @@ class NodeRouting:
             ev.conn.close()
             return
         self.router.delivery.set_learner(ev.agent_id, ev.conn)
+
+    # ---- the hub relay: inbox and weight pulls ---------------------------------------------------------------------
+
+    def sync_relay_inbox(self, run: Any) -> None:
+        """The relay inbox runs while this node runs a learner and the relay is on (pre-flight-accepted W03-7)."""
+        from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
+        from colosseum.node.router import RelayReceiver
+
+        want = (self.router is not None and self._relay and not self._host.stopping
+                and bool(self._host.local_learners()) and self._host.hub_channel() is not None)
+        if not want:
+            self._stop_receiver()
+            return
+        if self._receiver is not None:
+            return
+        channel, md, serial, post = self._host.hub_channel(), tuple(self._host.hub_metadata()), run.serial, \
+            self._host.post
+        self._receiver = RelayReceiver(
+            node_id=self._host.node_id,
+            open_inbox=lambda requests: pb_grpc.HubStub(channel).RelayInbox(requests, metadata=md),
+            make_credit=lambda n, node_id: pb.RelayCredit(frames=int(n), node_id=node_id),
+            delivery=self.router.delivery,
+            chunk_of=lambda item: ((item.chunk.agent_id, item.chunk.frame) if item.WhichOneof("i") == "chunk"
+                                   else None),
+            on_pull=lambda item: post(RelayPull(serial, item.pull)),
+            counters=self.router.counters_obj)
+        self._receiver.start()
+
+    def _stop_receiver(self) -> None:
+        receiver, self._receiver = self._receiver, None
+        if receiver is not None:
+            receiver.stop()
+
+    def relay_connected(self) -> bool:
+        return self._receiver is not None and self._receiver.connected.is_set()
+
+    def on_relay_pull(self, ev: RelayPull) -> None:
+        """The hub wants the newest weights of a learner here: one upload in the transfer pool (at most one in flight
+        per agent)."""
+        run = self._host.current_run()
+        agent = str(ev.request.agent_id)
+        if (run is None or run.serial != ev.serial or self._host.stopping or agent in self._uploading
+                or agent not in self._host.local_learners()):
+            return
+        self._uploading.add(agent)
+        future = self._host.submit(self._upload_latest, run, agent, str(ev.request.request_id))
+        post, serial = self._host.post, run.serial
+
+        def done(f: Any) -> None:
+            if f.cancelled():
+                post(RelayUploadDone(serial, agent, None, "cancelled"))
+            elif f.exception() is not None:
+                e = f.exception()
+                post(RelayUploadDone(serial, agent, None, f"{type(e).__name__}: {e}"))
+            else:
+                post(RelayUploadDone(serial, agent, f.result(), ""))
+
+        future.add_done_callback(done)
+
+    def _upload_latest(self, run: Any, agent: str, request_id: str) -> Any:
+        """A transfer-pool thread: the cache's newest frame of ``agent`` as ``Upload(kind="relay_latest")`` (parts
+        straight from the shared-memory segment). None when the cache holds none."""
+        import mmap
+
+        from colosseum.net.grpc_util import send_parts
+        from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
+
+        opened = run.reader.open_latest(agent)
+        if opened is None:
+            return None
+        f, pointer = opened
+        with f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapping:
+            header = pb.UploadHeader(kind="relay_latest", agent_id=agent, generation=int(pointer["generation"]),
+                                     version=int(pointer["version"]), total_size=len(mapping),
+                                     digest=str(pointer["digest"]), request_id=request_id)
+
+            def parts() -> Any:
+                yield pb.UploadPart(header=header)
+                for part in send_parts(mapping, digest=str(pointer["digest"])):
+                    if part.data:
+                        yield pb.UploadPart(data=part.data)
+
+            return pb_grpc.HubStub(self._host.hub_channel()).Upload(
+                parts(), metadata=tuple(self._host.hub_metadata()), timeout=RELAY_UPLOAD_TIMEOUT_SEC)
+
+    def on_relay_upload_done(self, ev: RelayUploadDone) -> None:
+        self._uploading.discard(ev.agent_id)
+        if ev.error:
+            logger.info(f"node: the relayed weights of {ev.agent_id} were not uploaded ({ev.error}); the hub asks "
+                        f"again")
+        elif ev.reply is not None and not ev.reply.accepted:
+            level = logging.DEBUG if ev.reply.reason == "not_newer" else logging.INFO
+            logger.log(level, f"node: the hub did not take the relayed weights of {ev.agent_id} ({ev.reply.reason})")

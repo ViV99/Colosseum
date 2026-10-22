@@ -21,7 +21,13 @@ Lifecycle: a servicer that waits for the main loop's reply (``Register``, ``Uplo
 ``POLL_SEC`` slices while its RPC is active, so ``server.stop`` (which cancels every RPC) ends it at once even when
 the main loop no longer drains the inbox.
 
-``RelaySend`` / ``RelayInbox`` answer ``UNIMPLEMENTED`` until T3.2; ``Bootstrap`` (T6.2): ``add_bootstrap``.
+Relay (T3.2, spec 4.8; ``colosseum.hub.relay``): ``RelaySend`` puts a sender node's ``ChunkFrame``s into the
+``RelayHub`` pair buffer of their target (undecoded); ``RelayInbox`` streams them to the target node against the
+credits it grants, weight pulls first. ``Download(kind="latest")`` serves a relay-only learner's newest weights through
+``LatestRelay`` (one pull down the learner node's inbox, one upload per version) and ``Upload(kind="relay_latest")``
+completes such a pull in the servicer (no ``UploadIn``: no hub state is touched). The caller of a relay call is the node
+the ``AuthInterceptor`` verified. Without a ``RelayHub`` (``build_server(relay=None)``) the relay methods answer
+``UNIMPLEMENTED``; with ``distributed.relay: false`` ``FAILED_PRECONDITION``. ``Bootstrap`` (T6.2): ``add_bootstrap``.
 """
 
 from __future__ import annotations
@@ -30,6 +36,7 @@ import hashlib
 import itertools
 import json
 import logging
+import mmap
 import os
 import queue
 import re
@@ -51,10 +58,18 @@ from colosseum.core.config import check_agent_id
 from colosseum.core.errors import ConfigError
 from colosseum.core.run_dir import RunDir
 from colosseum.core.types import MatchResult
+from colosseum.hub.relay import LatestRelay, RelayHub
 from colosseum.hub.state import NodeHello
 from colosseum.net.chunks import WeightsMeta, encode_weights
-from colosseum.net.frame import payload_byte_cap
-from colosseum.net.grpc_util import BLOB_DIGEST_SIZE, AuthInterceptor, node_id_of, send_parts, server_options
+from colosseum.net.frame import FrameError, payload_byte_cap, peek_meta
+from colosseum.net.grpc_util import (
+    BLOB_DIGEST_SIZE,
+    AuthInterceptor,
+    node_id_of,
+    not_modified_part,
+    send_parts,
+    server_options,
+)
 from colosseum.net.messages import PROTOCOL_VERSION, results_from_batch
 from colosseum.net.proto import colosseum_v1_pb2 as pb
 from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
@@ -78,7 +93,9 @@ CLOSE_GRACE_SEC = 5.0                # a closed session whose writer is stuck (a
 LOOPBACK_KEY = "loopback"            # the plain loopback port in build_server's port map
 POLL_SEC = 0.5
 
-UPLOAD_KINDS = ("checkpoint", "final", "recovery")              # relay_latest: T3.2; agent_file: T8.2
+UPLOAD_KINDS = ("checkpoint", "final", "recovery")              # agent_file: T8.2
+RELAY_UPLOAD_KIND = "relay_latest"                               # T3.2: handled in the servicer (LatestRelay)
+RELAY_ITEM_POLL_SEC = 0.25
 REGISTERED_KINDS = ("fixed", "teacher", "init", "recovery", "trainer_state")
 BLOB_IDENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,159}")  # A18's blob id
 SNAPSHOT_IDENT_RE = re.compile(r"ckpt_v([0-9]{1,18})")
@@ -286,10 +303,13 @@ def _rpc_reason(e: grpc.RpcError) -> str:
 class HubServicer(pb_grpc.HubServicer):
     """The ``colosseum.v1.Hub`` methods (module docstring)."""
 
-    def __init__(self, inbox: queue.SimpleQueue, blobs: BlobStore, max_message_mb: int) -> None:
+    def __init__(self, inbox: queue.SimpleQueue, blobs: BlobStore, max_message_mb: int, *,
+                 relay: RelayHub | None = None, latest: LatestRelay | None = None) -> None:
         self._inbox = inbox
         self._blobs = blobs
         self._upload_cap = payload_byte_cap(max_message_mb)
+        self._relay = relay
+        self._latest = latest
 
     # ---- Register -----------------------------------------------------------------------------------------------
 
@@ -380,8 +400,13 @@ class HubServicer(pb_grpc.HubServicer):
         header = first.header
         if not _valid_agent_id(header.agent_id):
             return refuse("header")
-        if header.kind not in UPLOAD_KINDS:
+        relayed = header.kind == RELAY_UPLOAD_KIND and self._latest is not None
+        if header.kind not in UPLOAD_KINDS and not relayed:
             return refuse("kind")
+        if relayed:
+            refusal = self._relay_upload_caller(header, node_id)
+            if refusal is not None:
+                return refuse(refusal)
         total = int(header.total_size)
         if total < 0 or total > self._upload_cap:
             return refuse("too_large")
@@ -402,7 +427,12 @@ class HubServicer(pb_grpc.HubServicer):
             if size != total:
                 return refuse("size")
             if h.hexdigest() != header.digest:
+                if relayed:
+                    self._latest.count_refused()
                 return refuse("digest")
+            if relayed:
+                handed = True                          # complete() moves or deletes the spool file
+                return self._complete_relayed(header, spool)
             reply: Future = Future()
             self._inbox.put(UploadIn(header, spool, node_id, reply))
             handed = True
@@ -424,6 +454,9 @@ class HubServicer(pb_grpc.HubServicer):
     # ---- Download -----------------------------------------------------------------------------------------------
 
     def Download(self, request: pb.BlobRequest, context: grpc.ServicerContext):
+        if request.kind == "latest" and self._latest is not None:
+            yield from self._download_latest(request, context)
+            return
         path = self._blobs.frame_path(request.kind, request.agent_id, request.ident)
         if path is None:
             context.abort(grpc.StatusCode.NOT_FOUND,
@@ -438,12 +471,126 @@ class HubServicer(pb_grpc.HubServicer):
 
     # ---- Relay (T3.2) -------------------------------------------------------------------------------------------
 
+    def _relay_caller(self, context: grpc.ServicerContext) -> int:
+        """The number of the online node the interceptor verified (aborts otherwise, or without a relay)."""
+        relay = self._relay
+        if relay is None:
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "this hub has no relay")
+        if not relay.enabled:
+            context.abort(grpc.StatusCode.FAILED_PRECONDITION, "distributed.relay is false on this hub")
+        number = relay.number_of(node_id_of(context) or "")
+        if number is None:
+            context.abort(grpc.StatusCode.PERMISSION_DENIED, "unknown or offline node")
+        return number
+
     def RelaySend(self, request_iterator, context: grpc.ServicerContext) -> pb.ChunkSummary:
-        context.abort(grpc.StatusCode.UNIMPLEMENTED, "relay: T3.2")
+        """A sender node's frames for one or more target nodes, each into its pair buffer (blocking while full: the
+        end-to-end backpressure of spec 4.7); every drop is counted by ``RelayHub``."""
+        src = self._relay_caller(context)
+        received = dropped = 0
+        try:
+            for frame in request_iterator:
+                received += 1
+                if self._relay.put(src, int(frame.target_node), frame, len(frame.frame),
+                                   should_stop=lambda: not context.is_active()) is not None:
+                    dropped += 1
+        except grpc.RpcError:                          # the sender went away: what it sent so far is queued
+            pass
+        return pb.ChunkSummary(received=received, dropped=dropped)
 
     def RelayInbox(self, request_iterator, context: grpc.ServicerContext):
-        context.abort(grpc.StatusCode.UNIMPLEMENTED, "relay: T3.2")
-        yield  # pragma: no cover - abort raises
+        """The target node's stream: its first ``RelayCredit`` grants the initial credits, every later one returns
+        credits; items are pulls (first, no credit) and frames (one credit each). A newer inbox of the same node
+        detaches this one; frames sent but never credited back are counted at detach (P-PF3-14)."""
+        dst = self._relay_caller(context)
+        try:
+            first = next(request_iterator, None)
+        except grpc.RpcError:
+            return
+        if first is None:
+            return
+        handle = self._relay.attach(dst, initial_credits=int(first.frames))
+
+        def read_credits() -> None:
+            try:
+                for credit in request_iterator:
+                    self._relay.add_credits(handle, int(credit.frames))
+            except grpc.RpcError:
+                pass
+            finally:
+                self._relay.detach(handle)
+
+        threading.Thread(target=read_credits, name=f"relay-credits-n{dst}", daemon=True).start()
+        try:
+            while context.is_active() and not handle.detached:
+                got = self._relay.next_item(handle, timeout=RELAY_ITEM_POLL_SEC)
+                if got is None:
+                    continue
+                kind, item = got
+                yield pb.RelayItem(chunk=item) if kind == "chunk" else pb.RelayItem(pull=item)
+        finally:
+            self._relay.detach(handle)
+
+    def _download_latest(self, request: pb.BlobRequest, context: grpc.ServicerContext):
+        """``Download(kind="latest")``: the newest relayed weights above ``since_version`` (the same metadata as
+        ``NodeData.GetLatest``), ``not_modified`` when none is newer, ``UNAVAILABLE`` while the hub has none yet."""
+        latest = self._latest
+        if not _valid_agent_id(request.agent_id):
+            context.abort(grpc.StatusCode.INVALID_ARGUMENT, "invalid agent id")
+        since = int(request.since_version)
+        got = latest.open_newer(request.agent_id, since)
+        if got is None:
+            info = latest.latest(request.agent_id)
+            if info is not None and int(info.version) <= since:
+                yield not_modified_part(json.dumps({"agent_id": request.agent_id, "version": int(info.version)}))
+                return
+            context.abort(grpc.StatusCode.UNAVAILABLE, f"weights of {request.agent_id[:64]!r} are not on the hub "
+                                                       f"yet; retried at the next sync")
+        relayed, f = got
+        meta = json.dumps({"agent_id": relayed.agent_id, "version": relayed.version, "generation": relayed.generation,
+                           "size": relayed.size, "digest": relayed.digest, "teacher_active": relayed.teacher_active})
+        with f:
+            mapping = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
+            try:
+                yield from send_parts(mapping, meta_json=meta, digest=relayed.digest or None)
+            finally:
+                try:
+                    mapping.close()
+                except BufferError:          # a part view still alive (a cancelled stream): freed with it
+                    pass
+        latest.count_bytes(relayed.size)
+
+    def _relay_upload_caller(self, header: pb.UploadHeader, node_id: str) -> str | None:
+        """A ``relay_latest`` upload comes from the agent's learner node (else ``not_learner_node``)."""
+        relay, info = self._relay, self._latest.latest(header.agent_id)
+        number = None if relay is None else relay.number_of(node_id)
+        if info is None or number is None or number != int(info.node):
+            self._latest.count_refused()
+            return "not_learner_node"
+        return None
+
+    def _complete_relayed(self, header: pb.UploadHeader, spool: Path) -> pb.UploadReply:
+        """A whole ``relay_latest`` upload (size and digest checked): its frame header must name the agent and
+        version of the upload header; then ``LatestRelay.complete``."""
+        try:
+            with open(spool, "rb") as f, mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ) as mapping:
+                kind, meta = peek_meta(mapping)
+        except (OSError, ValueError, FrameError):
+            kind, meta = "", {}
+        if (kind != "weights" or not isinstance(meta, dict) or meta.get("agent_id") != header.agent_id
+                or meta.get("kind") != "latest" or meta.get("policy_version") != int(header.version)
+                or meta.get("generation") != int(header.generation)):
+            spool.unlink(missing_ok=True)
+            self._latest.count_refused()
+            return pb.UploadReply(accepted=False, reason="header")
+        try:
+            reason = self._latest.complete(header.agent_id, int(header.version), int(header.generation), spool,
+                                           teacher_active=bool(meta.get("teacher_active")), digest=header.digest)
+        except OSError as e:                           # a full disk: the node is asked again at the next pull
+            spool.unlink(missing_ok=True)
+            log.warning("relayed weights of %s v%s not kept: %s", header.agent_id, header.version, e)
+            return pb.UploadReply(accepted=False, reason="error")
+        return pb.UploadReply(accepted=reason == "accepted", reason="" if reason == "accepted" else reason)
 
     # ---- Admin --------------------------------------------------------------------------------------------------
 
@@ -708,15 +855,17 @@ def _bind(server: grpc.Server, address: str, credentials: grpc.ServerCredentials
 
 def build_server(*, inbox: queue.SimpleQueue, identity: HubIdentity, insecure: bool, listen: Sequence[str],
                  loopback_plain: bool, blobs: BlobStore, max_message_mb: int,
-                 bootstrap: BootstrapService | None = None) -> tuple[grpc.Server, dict[str, int]]:
+                 bootstrap: BootstrapService | None = None, relay: RelayHub | None = None,
+                 latest: LatestRelay | None = None) -> tuple[grpc.Server, dict[str, int]]:
     """The hub's gRPC server (unstarted) and ``{address or LOOPBACK_KEY: bound port}``. Every address of ``listen``
     is TLS with the hub identity's certificate, or plain with ``insecure``; ``loopback_plain`` adds a plain
     ``127.0.0.1:0`` port (``train``'s local node, R12). The token / node secrets are required in every mode (R1).
-    ``bootstrap``: the Bootstrap service to serve (``add_bootstrap``). OSError names an address it cannot bind."""
+    ``bootstrap``: the Bootstrap service to serve (``add_bootstrap``); ``relay`` / ``latest``: the hub relay (T3.2).
+    OSError names an address it cannot bind."""
     server = grpc.server(ThreadPoolExecutor(max_workers=SERVER_THREADS, thread_name_prefix="hub-rpc"),
                          interceptors=[AuthInterceptor(lambda: identity.token.secret, identity.nodes)],
                          options=server_options(max_message_mb))
-    pb_grpc.add_HubServicer_to_server(HubServicer(inbox, blobs, max_message_mb), server)
+    pb_grpc.add_HubServicer_to_server(HubServicer(inbox, blobs, max_message_mb, relay=relay, latest=latest), server)
     if bootstrap is not None:
         add_bootstrap(server, bootstrap)
     ports: dict[str, int] = {}

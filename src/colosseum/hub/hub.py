@@ -31,10 +31,16 @@ when none can there, over the agents that can collect anywhere: the node still p
 coordinator's matchmaker (PFSP, ``shuffle_seats``, ``check_lineup``) whose seats of agents that cannot collect on that
 node do not collect (``hub.state.collect_allowed``, spec 4.7, 4.8; T3.2): an agent collects on a node when it has an
 accepted latest version and a running learner on that node, or on another node that the requesting node reaches:
-through the hub relay (T3.2 (b)), or directly, as the node's ``Heartbeat.paths`` report (``_paths``; a node that cannot
-reach a learner's data port while the relay is off is named once in a WARNING). No cell is requested while no agent
-can collect (P-PF2-3). The versions a node is told about (``Welcome`` / ``Announce``) carry the learner node's
-loopback data addresses only when both nodes share a machine (``visible_version``).
+through the hub relay (``hub.relay``, unless ``distributed.relay: false``), or directly, as the node's
+``Heartbeat.paths`` report (``_paths``; a node that cannot reach a learner's data port while the relay is off is named
+once in a WARNING). No cell is requested while no agent can collect (P-PF2-3). The versions a node is told about
+(``Welcome`` / ``Announce``) carry the learner node's loopback data addresses only when both nodes share a machine
+(``visible_version``).
+
+Relay (spec 4.8; ``hub.relay``, served by ``hub.server``): ``RelayHub`` pair buffers carry chunks between nodes with
+credit flow, ``LatestRelay`` serves relay-only learners' weights (one pull, one upload per version); the main loop
+publishes the online nodes (``_publish_online``) and the latest versions (``_publish_latest``) and adds their counters
+to ``Hub._book`` under ``hub/<incarnation>`` whenever it saves ``hub_state.json`` (``_report_relay``).
 
 Results (spec 4.3, R8): each node batch is checked (``ResultIntake.check``: the node's own uids only), stamped with
 the hub's env steps (P-PF2-13) and submitted to the journal writer with its token ``(node, session, seq)``; the
@@ -220,7 +226,8 @@ class Hub(RunSinks):
         self._learner_alive: dict[str, bool] = {}
         self._paths: dict[int, dict[int, str]] = {}   # node number -> {learner node: path} (Heartbeat.paths, T3.2)
         self._machines: dict[str, str] = {}       # node id -> machine id (loopback addresses, T3.2)
-        self._relay = None                        # the hub relay (hub.relay.RelayHub): T3.2 (b)
+        self._relay = None                        # hub.relay.RelayHub (built by _prepare; T3.2)
+        self._latest = None                       # hub.relay.LatestRelay: relayed latest weights
         self._journal_row: int | None = None
         self._admin_handlers: dict[str, Callable[[dict], dict]] = {"hub.status": self._admin_status}
         self._handlers: dict[type, Callable[[Any], None]] = {
@@ -388,6 +395,7 @@ class Hub(RunSinks):
         self._identity = HubIdentity.load_or_create(self._options.identity_dir)
         self._blobs = BlobStore(self._run_dir)
         shutil.rmtree(self._blobs.incoming, ignore_errors=True)    # upload spools of a crashed hub
+        self._build_relay()
         self._wire_snapshot_holds(coordinator)
         self._register_blobs(setup, self._resume_states)
         self._pulse_setup()
@@ -397,6 +405,38 @@ class Hub(RunSinks):
         self._rotation = OwnerRotation(trainable)
         self._versions = VersionRegistry()
         self._intake = ResultIntake(journal=bool(cfg.match_log.enabled))
+
+    def _build_relay(self) -> None:
+        """The hub relay (spec 4.8, T3.2): chunk pair buffers between nodes (``RelayHub``; refused by the servicers
+        with ``distributed.relay: false``) and relayed latest weights (``LatestRelay`` under ``blobs/relay/``, cleared
+        at every hub start: an earlier process's files are not known to this one)."""
+        from colosseum.hub.relay import RELAY_PULL_WAIT_SEC, LatestRelay, RelayHub
+
+        root = self._blobs.dir / "relay"
+        shutil.rmtree(root, ignore_errors=True)
+        self._relay = RelayHub(enabled=bool(self._dist.relay))
+        self._latest = LatestRelay(root, self._relay, wait_sec=RELAY_PULL_WAIT_SEC,
+                                   make_pull=lambda agent, since, rid: pb.LatestRequest(
+                                       agent_id=agent, since_version=int(since), request_id=rid))
+
+    def _publish_online(self) -> None:
+        """The relay's view of the online nodes (session opened, node lost or removed)."""
+        if self._relay is not None:
+            self._relay.set_online({e.node_id: e.number for e in self._registry.online()})
+
+    def _publish_latest(self) -> None:
+        """The relay's view of every agent's latest version (after every accepted or re-sourced one)."""
+        if self._latest is not None:
+            self._latest.publish_versions({a: v for a in self._agent_ids if (v := self._versions.latest(a))})
+
+    def _report_relay(self) -> None:
+        """The relay's cumulative counters into ``Hub._book`` under ``hub/<incarnation>`` (A2)."""
+        if self._relay is None:
+            return
+        totals = dict(self._relay.stats())
+        for name, n in self._latest.stats().items():
+            totals[name] = totals.get(name, 0) + int(n)
+        self._book.report(f"hub/{self._incarnation}", totals)
 
     def _wire_snapshot_holds(self, coordinator: Coordinator) -> None:
         """Spec 4.2 (T3.1): a snapshot evicted while a granted lineup names it stays downloadable from
@@ -511,7 +551,8 @@ class Hub(RunSinks):
         def build(listen_hosts: list[str]):
             return build_server(inbox=self._inbox, identity=self._identity, insecure=insecure,
                                 listen=[f"{h}:{port}" for h in listen_hosts], loopback_plain=loopback_plain,
-                                blobs=self._blobs, max_message_mb=int(dist.max_message_mb))
+                                blobs=self._blobs, max_message_mb=int(dist.max_message_mb), relay=self._relay,
+                                latest=self._latest)
 
         from colosseum.core.errors import ConfigError
 
@@ -732,6 +773,7 @@ class Hub(RunSinks):
             self._cells.drop_node(record.number)
             self._holds.drop_node(record.number)
         self._resource_versions(self._registry.by_id(handle.node_id))     # Hello.data_addresses (T3.1)
+        self._publish_online()
         self._intake.open(handle.node_id, hello.session_id, int(hello.last_acked_seq))
         self._budget.report(handle.node_id, hello.session_id, int(hello.env_steps))
         placed = self._place_learners(record.number, node_hello)
@@ -793,6 +835,7 @@ class Hub(RunSinks):
         self._cells.drop_node(entry.number)
         self._holds.drop_node(entry.number)
         self._paths.pop(entry.number, None)
+        self._publish_online()                       # its relay buffers and inbox go (counted disconnect)
         handle = self._sessions.pop(entry.node_id, None)
         if handle is not None:
             handle.close(reason)
@@ -874,10 +917,11 @@ class Hub(RunSinks):
             if path == "down" and agents:
                 self._warn_once(("path_down", entry.number, target),
                                 f"node {entry.number} ({entry.name}) cannot reach the data port of node {target} and "
-                                f"the relay is off: node {entry.number} plays {agents} without collecting")
+                                f"the hub relay is off (distributed.relay: false): node {entry.number} plays {agents} "
+                                f"without collecting")
 
     def _relay_on(self) -> bool:
-        """Whether chunks can go through the hub (``distributed.relay`` and the relay itself: T3.2 (b))."""
+        """Whether chunks can go through the hub (the relay exists and ``distributed.relay`` is on)."""
         return self._relay is not None and bool(getattr(self._relay, "enabled", False))
 
     def _collecting_any(self) -> list[str]:
@@ -979,6 +1023,7 @@ class Hub(RunSinks):
             sourced = version_source(info, entry)          # where the other nodes fetch it (spec 4.5, T3.1)
             self._versions.replace_latest(sourced)
             self._new_versions[info.agent_id] = sourced
+            self._publish_latest()
             if info.agent_id not in self._announced_once:
                 self._announced_once.add(info.agent_id)
                 logger.info(f"agent {info.agent_id}: first weights (v{info.version}) published on node "
@@ -1011,6 +1056,7 @@ class Hub(RunSinks):
             sourced = version_source(latest, entry)
             if sourced != latest and self._versions.replace_latest(sourced):
                 self._new_versions[agent] = sourced
+        self._publish_latest()
 
     def _on_event(self, entry: Any, event: Any) -> None:
         """A node's ``Event`` (A1 kinds). A reported child error and a failed learner stop the run (A12, until
@@ -1335,6 +1381,7 @@ class Hub(RunSinks):
         unreserved; a failing tick write is one ERROR."""
         from colosseum.hub.state import HUB_STATE_FILE, HUB_STATE_VERSION, HubStateData, save_hub_state
 
+        self._report_relay()
         reserved = max(int(self._epochs.reserved_until) if self._epochs is not None else 0,
                        int(epoch_reserved_until or 0))
         state = self._budget.state()

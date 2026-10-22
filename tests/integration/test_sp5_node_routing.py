@@ -17,8 +17,8 @@ from colosseum.node.router import Counters, LocalDelivery
 from node_kit import FakeHub, run_node_in_thread, toy_node_options, wait_for
 
 
-def _config(tmp_path):
-    return cluster_config(tmp_path, {"agents.main": "{}", "rollout.envs_per_worker": 2})
+def _config(tmp_path, relay=True):
+    return cluster_config(tmp_path, {"agents.main": "{}", "rollout.envs_per_worker": 2, "distributed.relay": relay})
 
 
 def _version(node, addresses=(), relay_only=False):
@@ -32,7 +32,8 @@ def _heartbeat_paths(hub):
 
 
 def test_an_unreachable_learner_node_is_down_named_once_and_its_seats_are_not_routed(tmp_path, caplog):
-    hub = FakeHub(tmp_path, _config(tmp_path))
+    """``distributed.relay: false``; with the relay on the same node goes through the hub (``relay``)."""
+    hub = FakeHub(tmp_path, _config(tmp_path, relay=False))
     node = run_node_in_thread(toy_node_options(tmp_path, hub, workers=0))
     try:
         with caplog.at_level(logging.WARNING, logger="colosseum.node"):
@@ -45,7 +46,7 @@ def test_an_unreachable_learner_node_is_down_named_once_and_its_seats_are_not_ro
             wait_for(lambda: len(hub.messages("heartbeat")) >= 3, timeout=30)
         said = [r.getMessage() for r in caplog.records if "data port of node 7" in r.getMessage()]
         events = [e.message for e in hub.node_events("warning") if "node 7" in e.message]
-        assert len(said) == 1 and "relay is off" in said[0] and "['main']" in said[0]
+        assert len(said) == 1 and "relay is off (distributed.relay: false)" in said[0] and "['main']" in said[0]
         assert len(events) == 1
         assert node.stop() == 0
     finally:
@@ -74,4 +75,22 @@ def test_a_reachable_learner_node_is_direct_and_its_seats_go_via_the_node(tmp_pa
         if node.thread.is_alive():
             node.stop()
         port.stop()
+        hub.stop()
+
+
+def test_with_the_relay_on_an_unreachable_learner_node_goes_through_the_hub(tmp_path, caplog):
+    hub = FakeHub(tmp_path, _config(tmp_path))
+    node = run_node_in_thread(toy_node_options(tmp_path, hub, workers=0))
+    try:
+        with caplog.at_level(logging.WARNING, logger="colosseum.node"):
+            wait_for(lambda: node.agent.run_id is not None, timeout=30)
+            hub.announce(versions=[_version(7, relay_only=True)])
+            wait_for(lambda: _heartbeat_paths(hub) == {7: "relay"}, timeout=30)
+            assert node.agent._learner_routes["main"] == LearnerRoute("main", None, True, 1)
+        said = [r.getMessage() for r in caplog.records if "data port of node 7" in r.getMessage()]
+        assert len(said) == 1 and "chunks go through the hub" in said[0]
+        assert node.stop() == 0
+    finally:
+        if node.thread.is_alive():
+            node.stop()
         hub.stop()

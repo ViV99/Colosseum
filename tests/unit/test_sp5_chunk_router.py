@@ -197,3 +197,52 @@ def test_a_closed_learner_connection_is_a_disconnect_and_then_no_learner():
     assert delivery.deliver("m", b"c") == "no_learner" and not delivery.connected("m")
     assert counters.snapshot() == {"chunks_delivered": 1, "dropped_chunks.disconnect": 1,
                                    "dropped_chunks.no_learner": 1}
+
+
+def test_the_relay_receiver_never_dies_of_one_item_and_returns_credits(monkeypatch):
+    """P-PF3-6: an item that cannot be handled is logged and counted, its credit still returned; pulls go to
+    ``on_pull`` without a credit; a broken stream is reopened."""
+    from colosseum.node.router import RELAY_INITIAL_CREDITS, RelayReceiver
+
+    monkeypatch.setattr(router_mod, "RETRY_MIN_SEC", 0.05)
+    counters = Counters()
+    delivered, pulls, credits, opens = [], [], [], []
+
+    class Delivery:
+        def deliver(self, agent, frame):
+            if agent == "boom":
+                raise RuntimeError("a delivery bug")
+            delivered.append((agent, frame))
+
+    items = [("chunk", "boom", b"1"), ("bad",), ("pull", "p1"), ("chunk", "m", b"2")]
+    halted = threading.Event()
+
+    def open_inbox(requests):
+        opens.append(1)
+        reader = threading.Thread(target=lambda: credits.extend(requests), daemon=True)
+        reader.start()
+
+        def responses():
+            if len(opens) == 1:
+                yield from items
+                raise Unavailable()
+            while not halted.is_set():                # the second stream stays open, empty
+                time.sleep(0.05)
+        return responses()
+
+    def chunk_of(item):
+        if item[0] == "bad":
+            raise ValueError("unreadable")
+        return None if item[0] == "pull" else (item[1], item[2])
+
+    receiver = RelayReceiver(node_id="n", open_inbox=open_inbox, make_credit=lambda n, node_id: n,
+                             delivery=Delivery(), chunk_of=chunk_of, on_pull=pulls.append, counters=counters)
+    receiver.start()
+    assert _wait(lambda: len(opens) >= 2)                                  # reopened after the cut
+    assert receiver.is_alive()
+    assert delivered == [("m", b"2")] and pulls == [("pull", "p1")]
+    assert credits[:4] == [RELAY_INITIAL_CREDITS, 1, 1, 1]                 # three chunk items, no credit for a pull
+    assert counters.snapshot() == {"relay_frames_received": 2, "dropped_chunks.invalid": 2}
+    halted.set()
+    receiver.stop()
+    receiver.join(3)

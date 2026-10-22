@@ -18,7 +18,7 @@
   doubling to ``RETRY_MAX_SEC``; a stream that carried a frame resets it; frames that wait meanwhile stay queued:
   backpressure, not loss; P-PF3-7) and chooses the path again (a failed direct path is probed again after
   ``DIRECT_RETRY_SEC`` while the relay carries the frames, at every attempt without a relay).
-- ``LocalDelivery`` (receiving side, used by the data-port ``Chunks`` servicer; T3.2 (b) adds the relay receiver):
+- ``LocalDelivery`` (receiving side, used by the data-port ``Chunks`` servicer and ``RelayReceiver``):
   the frame goes to the local learner's chunk connection with ``send_bytes`` under that connection's lock (blocking
   while the learner does not read: gRPC flow control then holds the sending node back); no learner -> ``no_learner``,
   a broken connection -> ``disconnect`` (its entry is removed; the node opens a new one, at most once a second). A
@@ -28,8 +28,13 @@ Counters are cumulative for the router (the node's run; ``counters()``; the node
 amendment A2 names): ``chunks_routed``, ``chunks_sent.direct``, ``chunks_sent.relay``, ``chunks_delivered``,
 ``dropped_chunks.{disconnect,no_learner,invalid}``.
 
-Seam for T3.2 (b): ``relay_call`` (None until the hub relay exists, or with ``distributed.relay: false``) and the
-relay receiver, which hands relayed frames to the same ``LocalDelivery``.
+- ``RelayReceiver``: the node's ``Hub.RelayInbox`` stream (while it runs a learner and the relay is on):
+  ``RELAY_INITIAL_CREDITS`` credits, then one per frame handled (delivered or dropped); relayed frames go to the same
+  ``LocalDelivery`` (``relay_frames_received``); pull items (weights of a learner here, asked for by the hub) go to the
+  ``on_pull`` callback. It reconnects with a backoff and never dies of one item (P-PF3-6: an item's failure is logged
+  and counted ``dropped_chunks.invalid``).
+
+``relay_call`` is None with ``distributed.relay: false``: a sender without a direct path is then ``down``.
 """
 
 from __future__ import annotations
@@ -50,9 +55,9 @@ from colosseum.net.frame import FrameError, peek_meta
 logger = logging.getLogger(__name__)
 
 __all__ = [
-    "DIRECT_RETRY_SEC", "PATHS", "RETRY_MAX_SEC", "RETRY_MIN_SEC", "SENDER_QUEUE_FRAMES", "STREAM_ROTATE_FRAMES",
-    "STREAM_ROTATE_SEC", "ChunkRouter", "Counters", "LocalDelivery", "RemoteRoute", "RouteReader", "RouteTable",
-    "TargetSender",
+    "DIRECT_RETRY_SEC", "PATHS", "RELAY_INITIAL_CREDITS", "RETRY_MAX_SEC", "RETRY_MIN_SEC", "SENDER_QUEUE_FRAMES",
+    "STREAM_ROTATE_FRAMES", "STREAM_ROTATE_SEC", "ChunkRouter", "Counters", "LocalDelivery", "RelayReceiver",
+    "RemoteRoute", "RouteReader", "RouteTable", "TargetSender",
 ]
 
 SENDER_QUEUE_FRAMES = 32
@@ -61,6 +66,7 @@ STREAM_ROTATE_SEC = 2.0
 DIRECT_RETRY_SEC = 30.0
 RETRY_MIN_SEC, RETRY_MAX_SEC = 0.5, 10.0
 _POLL_SEC = 0.1
+RELAY_INITIAL_CREDITS = 16
 PATHS = ("direct", "relay", "down", "none")    # "none": no route to the target (any more)
 
 
@@ -357,6 +363,99 @@ def _retire(entry: tuple[Any, threading.Lock]) -> None:
                 pass
 
     threading.Thread(target=close, name="retire-learner-conn", daemon=True).start()
+
+
+class RelayReceiver(threading.Thread):
+    """This node's ``Hub.RelayInbox`` stream (module docstring). ``open_inbox(request_iterator)`` returns the response
+    iterator of the bidi call; ``make_credit(n, node_id)`` builds a ``RelayCredit``; ``chunk_of(item)`` gives
+    ``(agent, frame)`` of a chunk item (None: a pull); ``on_pull(item)`` handles a weights pull (it must not block:
+    the node hands it to its main loop). Reconnects with backoff ``RETRY_MIN_SEC`` -> ``RETRY_MAX_SEC``."""
+
+    def __init__(self, *, node_id: str, open_inbox: Callable[[Iterator[Any]], Iterator[Any]],
+                 make_credit: Callable[[int, str], Any], delivery: LocalDelivery,
+                 chunk_of: Callable[[Any], tuple[str, bytes] | None], on_pull: Callable[[Any], None],
+                 counters: Counters) -> None:
+        super().__init__(name="relay-inbox", daemon=True)
+        self._node_id = node_id
+        self._open = open_inbox
+        self._make_credit = make_credit
+        self._delivery = delivery
+        self._chunk_of = chunk_of
+        self._on_pull = on_pull
+        self._counters = counters
+        self._halt = threading.Event()
+        self._call: Any = None
+        self.connected = threading.Event()
+
+    def stop(self) -> None:
+        self._halt.set()
+        call = self._call
+        cancel = getattr(call, "cancel", None)
+        if cancel is not None:
+            cancel()
+
+    def _credits(self, grants: queue.Queue) -> Iterator[Any]:
+        yield self._make_credit(RELAY_INITIAL_CREDITS, self._node_id)
+        while not self._halt.is_set():
+            try:
+                n = grants.get(timeout=_POLL_SEC)
+            except queue.Empty:
+                continue
+            if n is None:
+                return
+            yield self._make_credit(n, self._node_id)
+
+    def _handle(self, item: Any, grants: queue.Queue) -> None:
+        """One item; never raises (P-PF3-6): a failure is logged and counted; a chunk item's credit is returned
+        whatever happened to it (pulls take no credit)."""
+        try:
+            chunk = self._chunk_of(item)
+        except Exception:  # noqa: BLE001 - one item never ends the inbox
+            logger.exception("relay inbox: an unreadable item is dropped")
+            self._counters.add("dropped_chunks.invalid")
+            grants.put(1)
+            return
+        if chunk is None:
+            try:
+                self._on_pull(item)
+            except Exception:  # noqa: BLE001
+                logger.exception("relay inbox: a weights pull could not be handled")
+            return
+        try:
+            self._counters.add("relay_frames_received")
+            self._delivery.deliver(chunk[0], chunk[1])     # counts its own drops
+        except Exception:  # noqa: BLE001
+            logger.exception("relay inbox: a relayed frame could not be delivered; it is dropped")
+            self._counters.add("dropped_chunks.invalid")
+        finally:
+            grants.put(1)
+
+    def run(self) -> None:
+        backoff = RETRY_MIN_SEC
+        while not self._halt.is_set():
+            grants: queue.Queue = queue.Queue()
+            try:
+                responses = self._call = self._open(self._credits(grants))
+                for item in responses:
+                    self.connected.set()
+                    backoff = RETRY_MIN_SEC
+                    self._handle(item, grants)
+                    if self._halt.is_set():
+                        break
+            except grpc.RpcError as e:
+                if not self._halt.is_set():
+                    code = e.code() if hasattr(e, "code") else None
+                    logger.info(f"relay inbox stream ended ({code}); reconnecting in {backoff:.1f} s")
+            except Exception:  # noqa: BLE001 - the inbox thread never dies
+                logger.exception("relay inbox: the stream failed; reconnecting")
+            finally:
+                grants.put(None)
+                self.connected.clear()
+                cancel = getattr(self._call, "cancel", None)
+                if cancel is not None:
+                    cancel()
+            self._halt.wait(backoff)
+            backoff = min(RETRY_MAX_SEC, backoff * 2)
 
 
 class RouteReader(threading.Thread):

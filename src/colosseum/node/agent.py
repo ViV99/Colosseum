@@ -81,8 +81,11 @@
     before the data port: learners on other nodes become remote routes as soon as their versions are known, the path
     to each is probed before any frame and reported (``Heartbeat.paths``, ``paths()``), workers send frames for them
     on their ``route`` connections (``LearnerRoute(via_node=True)`` unless the path is down), and frames from other
-    machines reach the local learners over the node's own ``chunks`` connections. The router's counters join
-    ``Heartbeat.counters``; it is stopped before the children are killed.
+    machines (the data port, or the hub relay inbox the node keeps while it runs a learner) reach the local learners
+    over the node's own ``chunks`` connections; the hub's weight pulls are answered with ``Upload(relay_latest)``.
+    Latest weights of a learner whose data port does not answer come through the hub (``Download(kind="latest")``)
+    unless ``distributed.relay`` is false. The router's counters join ``Heartbeat.counters``; it is stopped before the
+    children are killed.
 
 Threads besides the loop: the session reader (``HubSession``), the listener's ``Acceptor``, the transfer pool, the
 data port's servicers, the chunk router's readers and senders and the short threads that open the node's chunk
@@ -122,7 +125,7 @@ from colosseum.node.fetch import BlobFetched, LatestFetched, LatestFetchFailed, 
 from colosseum.node.learners import LearnerBlobsDone, NodeLearners
 from colosseum.node.lineups import CACHE_DROP_DELAY_SEC, FIXED_RETRY_SEC, LINEUP_WAIT_SEC, NodeLineups  # noqa: F401
 from colosseum.node.procs import ChildSpec, ChildSupervisor
-from colosseum.node.routing import LearnerConnOpened, NodeRouting, PathChanged
+from colosseum.node.routing import LearnerConnOpened, NodeRouting, PathChanged, RelayPull, RelayUploadDone
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC
 
 logger = logging.getLogger(__name__)
@@ -680,6 +683,10 @@ class NodeAgent:
                 self.routing.on_path_changed(item)
             elif isinstance(item, LearnerConnOpened):
                 self.routing.on_learner_conn(item)
+            elif isinstance(item, RelayPull):
+                self.routing.on_relay_pull(item)
+            elif isinstance(item, RelayUploadDone):
+                self.routing.on_relay_upload_done(item)
             else:
                 self._on_session_event(item)
 
@@ -723,6 +730,7 @@ class NodeAgent:
                 self._next_fetch_pump = now + FETCH_PUMP_SEC
                 self.lineups.pump_fetches(run, now)
                 self.routing.update_routes(run)
+                self.routing.sync_relay_inbox(run)
             self.routing.sync_delivery(run, now)
             if now >= self._next_prune:
                 self._next_prune = now + CACHE_PRUNE_SEC
@@ -914,7 +922,8 @@ class NodeAgent:
                                                      token_secret=self.options.token.secret,
                                                      identity=self._node_identity,
                                                      max_message_mb=int(dist.max_message_mb),
-                                                     connect_timeout_sec=float(dist.connect_timeout_sec)))
+                                                     connect_timeout_sec=float(dist.connect_timeout_sec)),
+                               relay=bool(dist.relay))
         self.routing.start(run)
         self._start_data_port(run)
         for la in welcome.learners:
@@ -1504,6 +1513,21 @@ class _RoutingHost:
     def set_delivery(self, delivery: Any) -> None:
         if self._agent._data_server is not None:
             self._agent._data_server.set_delivery(delivery)
+
+    @property
+    def node_id(self) -> str:
+        return self._agent._node_id
+
+    def hub_channel(self) -> Any:
+        return self._agent._channel
+
+    def hub_metadata(self) -> tuple:
+        from colosseum.net.grpc_util import node_metadata
+
+        return node_metadata(self._agent._node_id, self._agent._node_secret)
+
+    def submit(self, fn: Any, *args: Any) -> Any:
+        return self._agent._pool.submit(fn, *args)
 
 
 class _LearnerHost:

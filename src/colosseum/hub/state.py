@@ -54,7 +54,8 @@ from colosseum.core.types import FIXED_NETWORK_ID, LATEST_NETWORK_ID, Lineup, Ma
 from colosseum.net.messages import VersionInfo  # A7: defined there, re-exported here
 
 __all__ = [
-    "DROP_REASONS", "EPOCH_BLOCK", "EVICTED_HOLD_FACTOR", "HUB_STATE_FILE", "HUB_STATE_VERSION", "BudgetCounter",
+    "CHUNK_DROP_REASONS", "DROP_REASONS", "EPOCH_BLOCK", "EVICTED_HOLD_FACTOR", "HUB_STATE_FILE", "HUB_STATE_VERSION",
+    "BudgetCounter",
     "CellEntry", "CellKey", "CellTable", "EpochAllocator", "HubStateData", "NodeEntry", "NodeHello", "NodeRegistry",
     "OwnerRotation", "ResultIntake", "VersionInfo", "VersionRegistry", "load_hub_state", "restrict_collecting",
     "save_hub_state", "version_source", "SnapshotHolds", "snapshot_refs", "check_data_addresses",
@@ -68,6 +69,8 @@ HUB_STATE_FILE = "hub_state.json"
 HUB_STATE_VERSION = 1
 
 DROP_REASONS = ("invalid", "stale_generation")
+# Every reason a chunk is lost for (spec 4.7; ``dropped_chunks.<reason>`` in the counter books, T3.2 / T7.1).
+CHUNK_DROP_REASONS = ("disconnect", "no_learner", "stale", "stale_generation", "invalid", "overflow")
 
 
 # ---------------------------------------------------------------------------------------------------------------

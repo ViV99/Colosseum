@@ -64,8 +64,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DATA_PORT_TRIES", "DATA_SERVER_THREADS", "DataServer", "FetchError", "FetchedLatest", "check_fetched",
-    "data_addresses", "fetch_latest", "frame_digest", "is_loopback", "is_wildcard", "machine_addresses",
-    "open_data_port", "probe_direct",
+    "data_addresses", "fetch_latest", "fetch_latest_relay", "frame_digest", "is_loopback", "is_wildcard",
+    "machine_addresses", "open_data_port", "probe_direct",
     "read_latest_reply",
 ]
 
@@ -470,6 +470,24 @@ def read_latest_reply(parts: Iterator[pb.BlobPart], agent_id: str, *, max_messag
     if not isinstance(meta, dict):
         raise FetchError("invalid", "metadata is not an object")
     return check_fetched(agent_id, bytes(frame), meta, source)
+
+
+def fetch_latest_relay(channel: grpc.Channel, agent_id: str, since_version: int, *, max_message_mb: int,
+                       metadata: Sequence[tuple[str, str]], timeout: float = 60.0) -> FetchedLatest | None:
+    """Latest weights of a learner whose data port this node cannot reach, through the hub
+    (``Hub.Download(kind="latest")``; spec 4.8). None: not modified. Raises ``FetchError``; ``relay_pending`` while the
+    hub does not hold them yet (it pulls them from the learner node: retried at the next sync)."""
+    stub = pbg.HubStub(channel)
+    try:
+        parts = stub.Download(pb.BlobRequest(kind="latest", agent_id=agent_id, since_version=int(since_version)),
+                              metadata=tuple(metadata), timeout=timeout)
+        return read_latest_reply(parts, agent_id, max_message_mb=max_message_mb, source="relay")
+    except FetchError as e:
+        if e.reason == "rpc" and "UNAVAILABLE" in str(e) and "not on the hub yet" in str(e):
+            raise FetchError("relay_pending", str(e)) from e
+        raise
+    except grpc.RpcError as e:
+        raise FetchError("rpc", f"{e.code()}: {e.details()}") from e
 
 
 def fetch_latest(channel: grpc.Channel, agent_id: str, since_version: int, *, max_message_mb: int,

@@ -43,6 +43,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
+import time
 from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -272,16 +273,21 @@ class NodeFetcher:
         self._channels: dict[tuple, tuple[str, grpc.Channel]] = {}   # (node, addresses) -> (address, channel)
         self._warned: set[tuple[str, str]] = set()      # (agent, reason) of latest failures warned in this run
         self._full: dict[str, tuple[int, int]] = {}     # agent -> (version, size) that did not fit into the cache
+        self._relay = False                             # distributed.relay of the run (T3.2)
+        self._direct_failed: dict[int, float] = {}      # learner node -> when its data port last did not answer
 
     # ---- setup ----------------------------------------------------------------------------------------------
 
     def set_hub(self, channel: grpc.Channel, metadata: Sequence[tuple[str, str]]) -> None:
         self._hub_channel, self._hub_metadata = channel, tuple(metadata)
 
-    def start_run(self, *, number: int, sync_interval_sec: float, link: _DataLink) -> None:
-        """A new run (first ``Welcome``): a planner of this node number; the data-port link."""
+    def start_run(self, *, number: int, sync_interval_sec: float, link: _DataLink, relay: bool = False) -> None:
+        """A new run (first ``Welcome``): a planner of this node number; the data-port link; ``relay``: weights of a
+        learner whose data port does not answer come through the hub (``distributed.relay``, T3.2)."""
         self.planner = FetchPlanner(node=number, sync_interval_sec=sync_interval_sec, stats=self.stats)
         self._link = link
+        self._relay = bool(relay)
+        self._direct_failed.clear()
         self._warned.clear()
         self._full.clear()
 
@@ -460,41 +466,71 @@ class NodeFetcher:
             hit[1].close()
 
     def _latest_job(self, job: FetchJob, serial: int) -> None:
-        """A transfer-pool thread: ``GetLatest`` on the learner node's data port; posts the outcome."""
-        from colosseum.node.dataport import FetchError, fetch_latest
+        """A transfer-pool thread: ``GetLatest`` on the learner node's data port when one of its addresses answers
+        (a failed probe is remembered per learner node for ``router.DIRECT_RETRY_SEC``), else ``Download(kind=
+        "latest")`` through the hub when the relay is on (or the weights are parked on the hub: node -1, P-PF3-13;
+        never in poll mode: there is no hub then); posts the outcome."""
+        from colosseum.node.dataport import FetchError, fetch_latest, fetch_latest_relay
 
-        agent, link = job.agent_id, self._link
-        if link is None or link.make_channel is None:
-            self._post(LatestFetchFailed(agent, "unreachable", link.why_not if link else "no data link", serial))
-            return
-        if not job.source.addresses:
-            self._post(LatestFetchFailed(agent, "unreachable", f"node {job.source.node} announced no data port "
-                                         f"address (relay only)", serial))
-            return
+        agent, link, source = job.agent_id, self._link, job.source
+        via_hub = job.mode == "announced" and (self._relay or int(source.node) == -1)
+        why = ""
+        fetched, where = None, ""
         try:
-            channel = self._channel_for(job.source)
+            if link is None or link.make_channel is None:
+                why = link.why_not if link else "no data link"
+            elif not source.addresses or source.relay_only:
+                why = f"node {source.node} announced no data port address (relay only)"
+            elif self._direct_recently_failed(int(source.node)) and via_hub:
+                why = f"node {source.node}'s data port did not answer recently"
+            else:
+                channel = self._channel_for(source)
+                if channel is None:
+                    self._note_direct_failed(int(source.node))
+                    why = (f"no answer from {', '.join(source.addresses)} within {link.connect_timeout_sec:g} s")
+                else:
+                    try:
+                        fetched = fetch_latest(channel, agent, job.since_version, max_message_mb=link.max_message_mb,
+                                               metadata=link.metadata, timeout=DOWNLOAD_TIMEOUT_SEC)
+                    except FetchError as e:
+                        self._drop_channel(source)
+                        if e.reason == "rpc":                # the next try goes through the hub (when on)
+                            self._note_direct_failed(int(source.node))
+                        self._post(LatestFetchFailed(agent, e.reason, str(e), serial))
+                        return
+                    where = ", ".join(source.addresses)
+            if not where:
+                if not via_hub or self._hub_channel is None:
+                    self._post(LatestFetchFailed(agent, "unreachable", why, serial))
+                    return
+                fetched = fetch_latest_relay(self._hub_channel, agent, job.since_version,
+                                             max_message_mb=link.max_message_mb if link else 64,
+                                             metadata=self._hub_metadata, timeout=DOWNLOAD_TIMEOUT_SEC)
+                where = "the hub"
+        except FetchError as e:                          # the relayed fetch
+            self._post(LatestFetchFailed(agent, e.reason, str(e), serial))
+            return
         except Exception as e:  # noqa: BLE001 - reported as a failed fetch, retried after one interval
             self._post(LatestFetchFailed(agent, "unreachable", rpc_text(e), serial))
             return
-        if channel is None:
-            self._post(LatestFetchFailed(agent, "unreachable", f"no answer from {', '.join(job.source.addresses)} "
-                                         f"within {link.connect_timeout_sec:g} s", serial))
-            return
-        try:
-            fetched = fetch_latest(channel, agent, job.since_version, max_message_mb=link.max_message_mb,
-                                   metadata=link.metadata, timeout=DOWNLOAD_TIMEOUT_SEC)
-        except FetchError as e:
-            self._drop_channel(job.source)
-            self._post(LatestFetchFailed(agent, e.reason, str(e), serial))
-            return
-        source = job.source
         if (fetched is not None and job.mode == "announced" and fetched.version == source.version
                 and source.digest and fetched.digest != source.digest):
             self._drop_channel(source)
-            self._post(LatestFetchFailed(agent, "digest", f"v{fetched.version} from {', '.join(source.addresses)} "
-                                         f"is not the version the hub announced (digest)", serial))
+            self._post(LatestFetchFailed(agent, "digest", f"v{fetched.version} from {where} is not the version the "
+                                         f"hub announced (digest)", serial))
             return
         self._post(LatestFetched(agent, fetched, serial))
+
+    def _direct_recently_failed(self, node: int) -> bool:
+        from colosseum.node.router import DIRECT_RETRY_SEC
+
+        with self._channels_lock:
+            failed = self._direct_failed.get(node)
+        return failed is not None and time.monotonic() - failed < DIRECT_RETRY_SEC
+
+    def _note_direct_failed(self, node: int) -> None:
+        with self._channels_lock:
+            self._direct_failed[node] = time.monotonic()
 
     def latest_done(self, run: Any, ev: LatestFetched) -> Literal["published", "kept", "failed"]:
         """Main loop: a latest transfer of the current run ended. A newer version is published into the cache
@@ -538,6 +574,9 @@ class NodeFetcher:
         source = None if self.planner is None else self.planner.known(ev.agent_id)
         where = f" from node {source.node}" if source is not None else ""
         interval = "" if self.planner is None else f"; retried every {self.planner.interval:g} s"
+        if ev.reason == "relay_pending":                 # the hub pulls them from the learner node: normal at first
+            logger.debug(f"node: agent {ev.agent_id}: relayed weights not on the hub yet ({ev.detail})")
+            return
         self._warn(ev.agent_id, ev.reason, f"latest weights{where}: {ev.reason} ({ev.detail}){interval}")
 
     def _warn(self, agent: str, reason: str, text: str) -> None:
