@@ -6,7 +6,8 @@
   ``run_state.json`` names a live process (two hubs on one run dir are impossible);
 - the config: without ``-c`` the saved ``config.resolved.yaml`` (its SP2-SP4 ``transport`` section dropped before
   ``--set``, amendment A29; plus the agent set of ``agents_state.json`` once T8.2 writes it); with ``-c`` the new
-  file, and a WARNING lists every setting that differs from the saved one; ``--set`` applies in both cases;
+  file, and a WARNING lists every setting that differs from the saved one; ``--set`` applies in both cases (with
+  ``-c`` to the new file only, so the WARNING lists the ``--set`` changes too);
   ``run.dir`` / ``run.name`` always name the resumed dir (a ``-c`` file that names another one gets a WARNING);
 - ``training.resume_from`` of the config is not applied again (the run imported its parent when it started; an
   in-place resume continues the run's own state): an INFO line, or a WARNING when ``-c`` names another source;
@@ -216,10 +217,14 @@ def prepare_resume(run: str | Path, config_path: str | Path | None,
         raise ConfigError(f"--resume {run}: not a run dir (expected a dir with checkpoints/ and "
                           f"{RESOLVED_CONFIG_FILE}, e.g. runs/<name>)")
     check_not_running(root)
-    saved = _apply_agents_state(_load_saved(root, overrides), root)
     if config_path is None:
+        saved = _apply_agents_state(_load_saved(root, overrides), root)
         config, diff = saved, []
     else:
+        # With -c, --set applies only to the new config: the saved one is the reference of the diff (which then
+        # lists the --set changes too) and of the resume_from comparison; an override that names an agent only the
+        # new file has must not reach the saved config (review round 1).
+        saved = _apply_agents_state(_load_saved(root, None), root)
         config = load_config(config_path, dict(overrides) if overrides else None)
         diff = config_diff(_pin_run(saved, root, warn=False), _pin_run(config, root, warn=False))
         if diff:

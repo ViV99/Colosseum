@@ -69,9 +69,37 @@ def test_with_c_the_new_config_and_a_diff_warning(tmp_path, caplog):
         plan = prepare_resume(root, path, {"training.total_timesteps": 10**7})
     assert plan.from_file and plan.config.learner.batch_chunks == old_chunks + 5
     assert plan.config.run.name == root.name
-    assert plan.diff == [f"learner.batch_chunks: {old_chunks!r} -> {old_chunks + 5!r}"]
-    assert "differs from the run's saved config in 1 settings" in caplog.text
+    assert plan.diff == [f"learner.batch_chunks: {old_chunks!r} -> {old_chunks + 5!r}",
+                         "training.total_timesteps: 6000 -> 10000000"]          # --set is listed too (round 1)
+    assert "differs from the run's saved config in 2 settings" in caplog.text
     assert "the resumed run stays in" in caplog.text
+
+
+def test_with_c_set_applies_to_the_new_config_only(tmp_path, caplog):
+    """Review round 1: with -c, --set never reaches the saved config: an override of an agent only the new file has
+    is valid, and the diff lists the --set changes too."""
+    root = copy_sp4_run(tmp_path)
+    data = _saved(root)
+    data["agents"]["greedy2"] = {"kind": "scripted", "class": "colosseum.players.RandomBot", "kwargs": {}}
+    path = tmp_path / "new.yaml"
+    path.write_text(yaml.safe_dump(data))
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.resume"):
+        plan = prepare_resume(root, path, {"training.total_timesteps": 10**7, "agents.greedy2.kwargs": {"x": 1}})
+    assert plan.config.agents["greedy2"].kwargs == {"x": 1}
+    assert "training.total_timesteps: 6000 -> 10000000" in plan.diff
+    assert any(line.startswith("agents.greedy2.") for line in plan.diff)
+    assert "differs from the run's saved config" in caplog.text
+
+
+def test_with_c_an_agent_created_by_set_shows_in_the_diff(tmp_path):
+    root = copy_sp4_run(tmp_path)
+    data = _saved(root)
+    data["agents"]["b"] = {"kind": "trainable"}
+    path = tmp_path / "new.yaml"
+    path.write_text(yaml.safe_dump(data))
+    plan = prepare_resume(root, path, {"training.total_timesteps": 10**7, "agents.b.learner.device": "cpu"})
+    assert plan.diff and any(line.startswith("agents.b.") for line in plan.diff)
+    assert "training.total_timesteps: 6000 -> 10000000" in plan.diff
 
 
 def test_resume_from_is_not_applied_again(tmp_path, caplog):
