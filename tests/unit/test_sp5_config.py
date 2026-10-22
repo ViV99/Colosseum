@@ -184,3 +184,14 @@ def test_agent_ids_blob_and_blob_dash_are_reserved_by_the_weight_cache(tmp_path,
         load_config(path)
     for fine in ("blobby", "blob_net", "my-blob"):
         assert config_module.check_agent_id(fine) == fine
+
+
+def test_max_policy_lag_below_the_push_interval_is_a_config_error(tmp_path):
+    """T3.3 (A19): with max_policy_lag < weight_push_interval - 1 the learner would wait for ever for admissible
+    chunks; a global and a per-agent setting are both refused naming the key."""
+    with pytest.raises(ConfigError, match=r"learner\.max_policy_lag 2 is below learner\.weight_push_interval - 1"):
+        _load(tmp_path, _data(learner={"max_policy_lag": 2, "weight_push_interval": 5}))
+    with pytest.raises(ConfigError, match=r"agents\.b: invalid override(.|\n)*learner\.max_policy_lag 1"):
+        _load(tmp_path, _data(agents={"a": {}, "b": {"learner": {"max_policy_lag": 1}}}))   # default push interval 5
+    cfg = _load(tmp_path, _data(agents={"a": {}, "b": {"learner": {"max_policy_lag": 1, "weight_push_interval": 2}}}))
+    assert cfg.get_agent_config("b").learner.max_policy_lag == 1 and cfg.learner.max_policy_lag is None

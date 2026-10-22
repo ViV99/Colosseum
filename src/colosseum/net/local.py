@@ -29,12 +29,14 @@ counts it (``disconnect`` / ``no_learner``, spec 4.7: at most once); a connectio
 Frames to a local learner are never compressed (lz4 is only for frames that leave the machine, T3.2).
 
 Learner side: ``ConnectionIntake`` accepts the chunk connections, reads whole frames into a bounded deque and stops
-reading while it is full (backpressure through the sockets); ``get`` reads the frame's header meta, applies the
-misroute and generation rules on it (R16), then decodes and checks the frame (``decode_chunk(..., validator=)``,
-A17), counting every drop by reason. An EOF closes only that connection; a frame cut by
-a dying sender closes it and counts ``disconnect``. ``NodeOutputs`` publishes weights into the shared-memory cache and
-reports them, sends checkpoints and metrics to the node. ``QueueIntake`` / ``QueueOutputs`` keep SP4's queue path for
-the distributed roles (until T7.2).
+starting new frames while it is full (backpressure through the sockets); ``get`` reads the frame's header meta,
+applies the misroute, generation (R16) and policy-lag (``learner.max_policy_lag``, T3.3: ``stale``) rules on it, then
+decodes and checks the frame (``decode_chunk(..., validator=)``, A17), counting every drop by reason. Its one reader
+thread never blocks on a connection: frames are assembled from non-blocking sockets, so a sender stopped inside a
+frame holds back only itself, and after ``FRAME_STALL_SEC`` without a byte its connection is closed (``disconnect``).
+An EOF closes only that connection; a frame cut by a dying sender closes it and counts ``disconnect``.
+``NodeOutputs`` publishes weights into the shared-memory cache and reports them, sends checkpoints and metrics to the
+node. ``QueueIntake`` / ``QueueOutputs`` keep SP4's queue path for the distributed roles (until T7.2).
 """
 
 from __future__ import annotations
@@ -74,6 +76,7 @@ LEARNER_AGENT_CHARS = 24         # longer agent ids are hashed in learner socket
 SEND_SLICE_SEC = 0.5             # a blocked send_chunk wakes this often (results, control messages, stop)
 PROGRESS_INTERVAL_SEC = 0.5      # WorkerProgress cadence (spec 4.4: cumulative counters)
 INTAKE_REPORT_SEC = 1.0          # IntakeReport cadence
+FRAME_STALL_SEC = 10.0           # a chunk connection silent this long inside a frame is closed (frame: disconnect)
 _GENERATIONS_KEPT = 256          # version -> generation entries a worker keeps per agent
 
 
@@ -770,38 +773,78 @@ _LEN = struct.Struct("!i")       # multiprocessing.connection's message header: 
 _LEN64 = struct.Struct("!Q")     # an unsigned 64-bit length (CPython's Connection._send_bytes on Unix)
 
 
-def _read_exact(fd: int, n: int, *, at_start: bool) -> bytearray:
-    """``n`` bytes of ``fd``; EOFError for an end before the first byte of a message (``at_start``), _FrameCut for
-    an end after it (a sender killed mid-frame), OSError for socket errors."""
-    buf = bytearray(n)
-    view = memoryview(buf)
-    pos = 0
-    while pos < n:
-        got = os.readv(fd, [view[pos:]])
-        if got == 0:
-            if at_start and pos == 0:
-                raise EOFError
-            raise _FrameCut(f"end of stream after {pos} of {n} bytes")
-        pos += got
-    return buf
+class _FrameReader:
+    """Reads one chunk connection's ``send_bytes`` messages (CPython's Unix framing: a signed 32-bit length, or -1
+    and an unsigned 64-bit length, then the body) incrementally from its non-blocking socket, with explicit outcomes
+    instead of ``recv_bytes``'s, which reports a sender cut between the length and the body as a clean EOF.
 
+    ``read(now)`` takes what the socket holds without blocking and returns a whole frame, or None while the frame is
+    incomplete; EOFError for an end between messages, _FrameCut for an end inside one (after its first length byte),
+    _FrameTooLarge for a length above ``cap`` (the body stays unread: the caller closes the connection), OSError for
+    socket errors. ``started``: a frame is in progress; ``last_progress``: when its last bytes arrived (``now`` of
+    that ``read``; the intake's stall deadline)."""
 
-def _read_frame_bytes(conn: mpc.Connection, cap: int) -> bytearray:
-    """One ``send_bytes`` message of ``conn`` (Unix), read with explicit outcomes instead of ``recv_bytes``'s, which
-    reports a sender cut between the length and the body as a clean EOF: EOFError only for an end between messages,
-    _FrameCut for an end inside one, _FrameTooLarge for a length above ``cap`` (the body stays unread: the caller
-    closes the connection)."""
-    fd = conn.fileno()
-    (size,) = _LEN.unpack(_read_exact(fd, _LEN.size, at_start=True))
-    if size == -1:
-        (size,) = _LEN64.unpack(_read_exact(fd, _LEN64.size, at_start=False))
-    if size < 0 or size > cap:
-        raise _FrameTooLarge(f"a frame of {size} bytes, the cap is {cap}")
-    return _read_exact(fd, size, at_start=False) if size else bytearray()
+    def __init__(self, conn: mpc.Connection, cap: int) -> None:
+        self.conn = conn
+        self._fd = conn.fileno()
+        os.set_blocking(self._fd, False)
+        self._cap = int(cap)
+        self.last_progress = 0.0
+        self._clear()
+
+    def _clear(self) -> None:
+        self._head = bytearray()
+        self._need = _LEN.size
+        self._body: bytearray | None = None
+        self._pos = 0
+
+    @property
+    def started(self) -> bool:
+        return bool(self._head)
+
+    def read(self, now: float) -> bytearray | None:
+        while self._body is None:                 # the length: 4 bytes, or 4 + 8 for a 64-bit length
+            try:
+                data = os.read(self._fd, self._need - len(self._head))
+            except BlockingIOError:
+                return None
+            if not data:
+                if not self._head:
+                    raise EOFError
+                raise _FrameCut(f"end of stream after {len(self._head)} bytes of a frame's length")
+            self._head += data
+            self.last_progress = now
+            if len(self._head) < self._need:
+                continue
+            (size,) = _LEN.unpack_from(self._head)
+            if size == -1:
+                if self._need == _LEN.size:
+                    self._need += _LEN64.size
+                    continue
+                (size,) = _LEN64.unpack_from(self._head, _LEN.size)
+            if size < 0 or size > self._cap:
+                raise _FrameTooLarge(f"a frame of {size} bytes, the cap is {self._cap}")
+            self._body = bytearray(size)
+        body = self._body
+        with memoryview(body) as view:
+            while self._pos < len(body):
+                try:
+                    got = os.readv(self._fd, [view[self._pos:]])
+                except BlockingIOError:
+                    return None
+                if got == 0:
+                    raise _FrameCut(f"end of stream after {self._pos} of {len(body)} bytes")
+                self._pos += got
+                self.last_progress = now
+        self._clear()
+        return body
 
 
 class ChunkIntake(Protocol):
     def get(self, timeout: float) -> TrajectoryChunk: ...       # queue.Empty on timeout
+
+    def note_policy_version(self, version: int) -> None:
+        """The learner's current policy version, before each batch: the reference of ``max_policy_lag``."""
 
     @property
     def depth(self) -> int: ...
@@ -828,14 +871,25 @@ class ConnectionIntake:
     node (this object's reader thread is its only reader: ``LearnerEnvSteps`` -> ``value`` / ``env_steps``,
     ``Stop`` or EOF -> ``stop_flag``); ``capacity``: frames buffered (``learner.queue_size``); ``cap_bytes``: the
     largest frame accepted (``payload_byte_cap``). ``version_floor``: the first version of this generation; a chunk
-    of an older generation is kept only below it (R16). Only ``ChildHello(channel="chunks")`` connections are kept
-    (an ``Acceptor`` authenticates them with ``authkey``, the node's key, P-PF2-6). A frame goes through one path
-    (A17): header meta -> misroute and generation rules -> ``decode_chunk(..., validator=)``; every drop is counted
-    by reason. An unreadable control message or a failure of the reader thread logs an ERROR and sets ``stop_flag``;
-    an unexpected error on one chunk connection closes only that connection (``disconnect``)."""
+    of an older generation is kept only below it (R16). ``max_policy_lag`` (``learner.max_policy_lag``, T3.3): with
+    a bound, a chunk whose version is below the learner's current version (``note_policy_version``) minus the bound
+    is dropped as ``stale`` by its header, never decoded (so a stale frame's body is not checked). Only
+    ``ChildHello(channel="chunks")`` connections are kept (an ``Acceptor`` authenticates them with ``authkey``, the
+    node's key, P-PF2-6). A frame goes through one path (A17): header meta -> misroute, generation and lag rules ->
+    ``decode_chunk(..., validator=)``; every drop is counted by reason. An unreadable control message or a failure
+    of the reader thread logs an ERROR and sets ``stop_flag``; an unexpected error on one chunk connection closes
+    only that connection (``disconnect``).
+
+    One reader thread serves every connection without ever blocking on one of them: chunk sockets are non-blocking
+    and each frame is assembled from what its socket holds (``_FrameReader``). A frame in progress holds one slot of
+    ``capacity`` (a new frame is started only while the deque plus the frames in progress are below it, so they
+    never exceed it); a connection silent for ``stall_sec`` inside a frame (a stopped sender) is closed and its
+    frame counted ``disconnect`` (a sender that continues later also counts that frame as lost: an over-count of
+    one)."""
 
     def __init__(self, lst: mpc.Listener, control: ControlChannel, validator: ChunkValidator, *, authkey: bytes,
-                 agent_id: str, generation: int, version_floor: int, capacity: int, cap_bytes: int) -> None:
+                 agent_id: str, generation: int, version_floor: int, capacity: int, cap_bytes: int,
+                 max_policy_lag: int | None = None, stall_sec: float = FRAME_STALL_SEC) -> None:
         from colosseum.net.chunks import decode_chunk
 
         self._listener = lst
@@ -846,12 +900,15 @@ class ConnectionIntake:
         self.version_floor = int(version_floor)
         self._capacity = max(1, int(capacity))
         self._cap = int(cap_bytes)
+        self._max_lag = None if max_policy_lag is None else int(max_policy_lag)
+        self._min_version: int | None = None
+        self._stall_sec = float(stall_sec)
         self._decode = decode_chunk
         self._frames: collections.deque[bytes] = collections.deque()
         self._cond = threading.Condition()
         self._dropped: Counter = Counter()
         self._new: list[mpc.Connection] = []
-        self._conns: list[mpc.Connection] = []
+        self._readers: dict[mpc.Connection, _FrameReader] = {}      # used by the reader thread only
         self._wake_r, self._wake_w = mpc.Pipe(duplex=False)
         self._closed = threading.Event()
         self.stop_flag = threading.Event()
@@ -877,7 +934,13 @@ class ConnectionIntake:
         with self._cond:
             return dict(self._dropped)
 
+    def note_policy_version(self, version: int) -> None:
+        """The learner's current version (before each batch): chunks below ``version - max_policy_lag`` are stale."""
+        self._min_version = None if self._max_lag is None else int(version) - self._max_lag
+
     def get(self, timeout: float) -> TrajectoryChunk:
+        """The next valid chunk; queue.Empty after ``timeout`` (the whole call's budget: dropped frames never
+        extend it)."""
         deadline = time.monotonic() + timeout
         while True:
             with self._cond:
@@ -912,6 +975,10 @@ class ConnectionIntake:
         gen = meta.generation
         if gen != 0 and gen != self.generation and (gen > self.generation or meta.policy_version >= self.version_floor):
             self._drop("stale_generation")
+            return None
+        min_version = self._min_version
+        if min_version is not None and meta.policy_version < min_version:
+            self._drop("stale")                       # by its header: a stale frame is never decoded
             return None
         try:
             chunk, _ = self._decode(frame, cap=self._cap, validator=self._validator)
@@ -957,12 +1024,16 @@ class ConnectionIntake:
         control = self._control.conn
         while not self._closed.is_set():
             with self._cond:
-                self._conns.extend(self._new)
-                self._new = []
-                full = len(self._frames) >= self._capacity
-            waitables: list[Any] = [control, self._wake_r] + ([] if full else list(self._conns))
+                new, self._new = self._new, []
+            for conn in new:
+                self._add_reader(conn)
+            now = time.monotonic()
+            self._cut_stalled(now)
+            started = [conn for conn, reader in self._readers.items() if reader.started]
+            full = self._full(len(started))
+            waitables: list[Any] = [control, self._wake_r] + (started if full else list(self._readers))
             try:
-                ready = mpc.wait(waitables, timeout=0.5)
+                ready = mpc.wait(waitables, timeout=self._wait_timeout(now))
             except OSError:
                 ready = []
             for obj in ready:
@@ -970,14 +1041,39 @@ class ConnectionIntake:
                     self._drain_wake()
                 elif obj is control:
                     self._read_control()
-                else:
-                    with self._cond:                  # full again since the wait: leave the frame to its sender
-                        full = len(self._frames) >= self._capacity
-                    if not full:
-                        self._read_frame(obj)
+                elif obj in self._readers:
+                    self._read_frame(obj)
             if time.monotonic() - last_report >= INTAKE_REPORT_SEC:
                 last_report = time.monotonic()
                 self._control.send(IntakeReport(self.depth, self.dropped))
+
+    def _full(self, started: int) -> bool:
+        """No room for one more frame: the deque plus the ``started`` frames in progress fill ``capacity``."""
+        with self._cond:
+            return len(self._frames) + started >= self._capacity
+
+    def _add_reader(self, conn: mpc.Connection) -> None:
+        try:
+            self._readers[conn] = _FrameReader(conn, self._cap)
+        except (OSError, ValueError):             # closed already: nothing of it was read
+            self._close_conn(conn)
+
+    def _wait_timeout(self, now: float) -> float:
+        """The reader's wait: at most 0.5 s, and no later than the earliest stall deadline of a frame in progress."""
+        timeout = 0.5
+        for reader in self._readers.values():
+            if reader.started:
+                timeout = min(timeout, reader.last_progress + self._stall_sec - now)
+        return max(0.01, timeout)
+
+    def _cut_stalled(self, now: float) -> None:
+        """Close every connection silent for ``stall_sec`` inside a frame; the frame is lost (``disconnect``)."""
+        for conn, reader in list(self._readers.items()):
+            if reader.started and now - reader.last_progress >= self._stall_sec:
+                logger.warning(f"learner {self.agent_id}: a chunk sender stopped inside a frame for "
+                               f"{now - reader.last_progress:.1f} s; its connection is closed and the frame lost")
+                self._close_conn(conn)
+                self._drop("disconnect")
 
     def _drain_wake(self) -> None:
         try:
@@ -1006,8 +1102,11 @@ class ConnectionIntake:
             logger.warning(f"learner {self.agent_id}: unexpected control message {type(msg).__name__}")
 
     def _read_frame(self, conn: mpc.Connection) -> None:
+        reader = self._readers[conn]
+        if not reader.started and self._full(sum(r.started for r in self._readers.values())):
+            return                                # full again since the wait: leave the frame to its sender
         try:
-            frame = _read_frame_bytes(conn, self._cap)
+            frame = reader.read(time.monotonic())
         except EOFError:                          # the sender closed between frames: nothing lost
             self._close_conn(conn)
             return
@@ -1024,13 +1123,14 @@ class ConnectionIntake:
             self._close_conn(conn)
             self._drop("disconnect")
             return
+        if frame is None:                         # the rest of the frame is still on its way
+            return
         with self._cond:
             self._frames.append(frame)
             self._cond.notify()
 
     def _close_conn(self, conn: mpc.Connection) -> None:
-        if conn in self._conns:
-            self._conns.remove(conn)
+        self._readers.pop(conn, None)
         try:
             conn.close()
         except OSError:
@@ -1041,7 +1141,7 @@ class ConnectionIntake:
         self._wake()
         self._acceptor.close(timeout)
         self._read_thread.join(timeout)
-        for conn in self._conns + self._new + [self._wake_r, self._wake_w]:
+        for conn in list(self._readers) + self._new + [self._wake_r, self._wake_w]:
             try:
                 conn.close()
             except OSError:
@@ -1124,13 +1224,35 @@ class NodeOutputs:
 
 class QueueIntake:
     """``ChunkIntake`` over SP4's trajectory ``mp.Queue`` of payload dicts (decode + slot check, misrouted agent ->
-    ValueError, as SP4's ``collect_batch``)."""
+    ValueError, as SP4's ``collect_batch``). ``max_policy_lag`` as ``ConnectionIntake``'s, checked on the decoded
+    chunk's version (queue items are in memory already); stale chunks are counted in ``dropped``. Picklable (SP4's
+    learner process receives it): no lock; the counter has one writer, the thread calling ``get``."""
 
-    def __init__(self, q: Any, *, agent_id: str | None = None) -> None:
+    def __init__(self, q: Any, *, agent_id: str | None = None, max_policy_lag: int | None = None) -> None:
         self._q = q
         self.agent_id = agent_id
+        self._max_lag = None if max_policy_lag is None else int(max_policy_lag)
+        self._min_version: int | None = None
+        self._stale = 0
+
+    def note_policy_version(self, version: int) -> None:
+        """The learner's current version (before each batch): chunks below ``version - max_policy_lag`` are stale."""
+        self._min_version = None if self._max_lag is None else int(version) - self._max_lag
 
     def get(self, timeout: float) -> TrajectoryChunk:
+        """The next admissible chunk; queue.Empty after ``timeout`` (the whole call's budget)."""
+        deadline = time.monotonic() + timeout
+        while True:
+            chunk = self._take(max(0.0, deadline - time.monotonic()))
+            min_version = self._min_version
+            if min_version is None or chunk.policy_version >= min_version:
+                return chunk
+            self._stale += 1
+            if self._stale == 1:
+                logger.warning(f"learner {self.agent_id}: dropped a chunk (stale); further drops are only counted "
+                               f"(dropped_chunks)")
+
+    def _take(self, timeout: float) -> TrajectoryChunk:
         from colosseum.core.types import validate_slot_structure
 
         item = self._q.get(timeout=timeout)
@@ -1154,7 +1276,8 @@ class QueueIntake:
 
     @property
     def dropped(self) -> dict[str, int]:
-        return {}
+        stale = self._stale
+        return {"stale": stale} if stale else {}
 
 
 @dataclass

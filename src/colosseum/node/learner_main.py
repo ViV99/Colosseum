@@ -83,7 +83,7 @@ def _learner_main(*, name: str, incarnation: int, node: int, agent_id: str, gene
         channel = open_control()
         intake = ConnectionIntake(lst, channel, validator, authkey=authkey, agent_id=agent_id, generation=generation,
                                   version_floor=version_floor, capacity=config.learner.queue_size,
-                                  cap_bytes=cap_bytes)
+                                  cap_bytes=cap_bytes, max_policy_lag=config.learner.max_policy_lag)
         intake.env_steps = int(env_steps)
         outputs = NodeOutputs(channel, WeightCacheWriter(Path(cache_root), cache_prefix), agent_id=agent_id,
                               generation=generation, cap_bytes=cap_bytes)

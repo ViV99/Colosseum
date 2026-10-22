@@ -74,14 +74,15 @@ def _wait(pred, timeout=10.0):
 class _Learner:
     """An in-process ConnectionIntake with its control pair."""
 
-    def __init__(self, capacity=2, cap=1 << 26, generation=1, floor=0):
+    def __init__(self, capacity=2, cap=1 << 26, generation=1, floor=0, stall_sec=local.FRAME_STALL_SEC):
         self.name = _name("learner-a-i1")
         self.lst = listener(self.name, KEY)
         self.node_end, learner_end = mp.Pipe()
         self.control = ControlChannel(learner_end)
         validator = ChunkValidator(learner_role(), agent_id="a", teacher=False)
         self.intake = ConnectionIntake(self.lst, self.control, validator, authkey=KEY, agent_id="a",
-                                       generation=generation, version_floor=floor, capacity=capacity, cap_bytes=cap)
+                                       generation=generation, version_floor=floor, capacity=capacity, cap_bytes=cap,
+                                       stall_sec=stall_sec)
 
     def close(self):
         self.intake.close()
@@ -350,15 +351,15 @@ def test_an_unreadable_control_message_stops_the_learner(learner, caplog):
 
 
 def test_an_unexpected_error_on_one_chunk_connection_closes_only_that_one(learner, monkeypatch, caplog):
-    real = local._read_frame_bytes
+    real = local._FrameReader.read
     calls = []
 
-    def flaky(conn, cap):
+    def flaky(self, now):
         calls.append(1)
         if len(calls) == 1:
             raise RuntimeError("boom")
-        return real(conn, cap)
-    monkeypatch.setattr(local, "_read_frame_bytes", flaky)
+        return real(self, now)
+    monkeypatch.setattr(local._FrameReader, "read", flaky)
     lrn = learner(capacity=4)
     first = _hello(connect(lrn.name, KEY, timeout=5))
     first.send_bytes(_frame(1))
@@ -383,3 +384,43 @@ def test_closing_the_intake_closes_its_wake_pipe(learner):
     lrn = learner()
     lrn.intake.close()
     assert lrn.intake._wake_r.closed and lrn.intake._wake_w.closed
+
+
+def _stall_mid_frame(lrn, version=1):
+    """A chunk connection that sends a frame's length and half its body, then stops (a SIGSTOPped sender); returns
+    the connection and the rest of the frame once the intake has started reading that frame."""
+    conn = _hello(connect(lrn.name, KEY, timeout=5))
+    frame = _frame(version)
+    half = len(frame) // 2
+    os.write(conn.fileno(), struct.pack("!i", len(frame)) + frame[:half])
+    assert _wait(lambda: any(r.started for r in list(lrn.intake._readers.values())))   # inside the frame now
+    return conn, frame[half:]
+
+
+def test_a_sender_stalled_mid_frame_never_blocks_other_connections_or_control(learner):
+    """T2.2's deferred item (T3.3): one stalled sender holds only its own frame; other chunk connections and the
+    control connection keep flowing, and a sender that continues before the deadline loses nothing."""
+    lrn = learner(capacity=4, stall_sec=60.0)
+    stalled, rest = _stall_mid_frame(lrn, version=1)
+    other = _hello(connect(lrn.name, KEY, timeout=5))
+    other.send_bytes(_frame(2))
+    assert lrn.intake.get(timeout=5.0).policy_version == 2
+    lrn.node_end.send(LearnerEnvSteps(77))
+    assert _wait(lambda: lrn.intake.value == 77, timeout=5.0)
+    assert lrn.node_end.poll(5.0) and isinstance(lrn.node_end.recv(), IntakeReport)
+    lrn.node_end.send(Stop("budget"))
+    assert lrn.intake.stop_flag.wait(5)
+    os.write(stalled.fileno(), rest)                  # the sender continues: its frame arrives whole
+    assert lrn.intake.get(timeout=5.0).policy_version == 1
+    assert lrn.intake.dropped == {}
+
+
+def test_a_sender_stalled_past_the_deadline_is_cut_and_frees_its_slot(learner):
+    lrn = learner(capacity=1, stall_sec=0.3)
+    stalled, _ = _stall_mid_frame(lrn)
+    other = _hello(connect(lrn.name, KEY, timeout=5))
+    other.send_bytes(_frame(2))                        # capacity 1: waits for the stalled frame's slot
+    assert lrn.intake.get(timeout=5.0).policy_version == 2
+    assert lrn.intake.dropped == {"disconnect": 1}     # the stalled frame is lost and counted
+    assert stalled.poll(5.0) and os.read(stalled.fileno(), 1) == b""     # the intake closed the connection
+    stalled.close()

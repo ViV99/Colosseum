@@ -106,7 +106,8 @@ class MetricsHub:
     the console's arena win rate (ruling P11).
     SP5 (amendment A2): ``on_intake_stats`` takes the learners' intake reports: the last queue depth per agent
     (``intake_queue_depths``) and the cumulative chunk drops of each learner incarnation in ``intake_book`` (source
-    ``learner/<agent>/<generation>``, names ``dropped_chunks.<reason>``).
+    ``learner/<agent>/<generation>``, names ``dropped_chunks.<reason>``: ``invalid``, ``disconnect``,
+    ``stale_generation``, ``stale`` for ``learner.max_policy_lag``); ``chunk_drops`` gives their run totals by reason.
     """
 
     def __init__(self, *, writer: MetricsWriter, ratings_path: str | Path, agent_ids: list[str],
@@ -158,6 +159,12 @@ class MetricsHub:
         self._intake_depths[str(agent_id)] = int(depth)
         self.intake_book.report(f"learner/{agent_id}/{int(generation)}",
                                 {f"dropped_chunks.{reason}": int(n) for reason, n in dropped.items()})
+
+    def chunk_drops(self) -> dict[str, int]:
+        """Run totals of the learner-side chunk drops by reason (every learner incarnation of every agent, monotonic
+        over joins and restarts: ``intake_book``)."""
+        prefix = "dropped_chunks."
+        return {name[len(prefix):]: n for name, n in self.intake_book.totals().items() if name.startswith(prefix)}
 
     def intake_queue_depths(self) -> dict[str, int]:
         """The last intake depth each learner reported (``on_intake_stats``), by agent."""

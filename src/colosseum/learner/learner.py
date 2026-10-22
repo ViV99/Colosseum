@@ -30,6 +30,10 @@ last trained with. The value is in env steps, so a resume with another ``total_t
 Trainer states without the key (SP2-SP4) resume from the counter alone.
 
 ``version_floor`` (SP5, R9): a learner generation starts at the hub's version floor, so versions never go back.
+
+Policy lag (SP5 spec 4.7, 8): ``train`` records carry the lag mean / p50 / p95 / max of the batch and
+``dropped_stale_chunks``; with ``learner.max_policy_lag`` the intake drops chunks older than
+``current - max_policy_lag`` before decoding them (spec 4.7).
 """
 
 from __future__ import annotations
@@ -38,7 +42,7 @@ import io
 import logging
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from queue import Empty, Full
 from typing import TYPE_CHECKING, Any
 
@@ -218,14 +222,16 @@ def learner_process(
                 logger.info(f"Learner [{agent_id}]: consumed {consumed_samples} samples; budget reached")
                 break
 
-            # Block until exactly batch_chunks chunks arrived (None: stop requested).
+            # Block until exactly batch_chunks chunks arrived (None: stop requested). The version changes only in a
+            # train step, so the intake's max_policy_lag bound is exact for the whole batch.
+            intake.note_policy_version(algorithm.policy_version)
             chunks = collect_batch(intake, config.batch_chunks, stop_event, agent_id=agent_id)
             if chunks is None:
                 break
             total_chunks_received += len(chunks)
             consumed_samples += sum(c.num_acts for c in chunks)
             # Policy lag of the batch, measured before this train step bumps the version.
-            lags = [algorithm.policy_version - c.policy_version for c in chunks]
+            lag = lag_metrics(algorithm.policy_version, [c.policy_version for c in chunks])
 
             if progress_counter is not None:
                 progress_env_steps = max(progress_env_steps, int(progress_counter.value))
@@ -245,8 +251,8 @@ def learner_process(
                 metrics = algorithm.train_step(chunks)
             train_step += 1
             metrics["progress"] = float(progress)
-            metrics["policy_lag_mean"] = float(np.mean(lags))
-            metrics["policy_lag_max"] = float(np.max(lags))
+            metrics.update(lag)
+            metrics["dropped_stale_chunks"] = int(intake.dropped.get("stale", 0))   # this learner incarnation
 
             # Publish updated weights at the configured interval
             if train_step % config.weight_push_interval == 0:
@@ -361,6 +367,14 @@ def resolve_device(device_str: str) -> str:
     if device_str == "auto":
         return "cuda" if torch.cuda.is_available() else "cpu"
     return device_str
+
+
+def lag_metrics(current: int, versions: Sequence[int]) -> dict[str, float]:
+    """Policy lag (``current - policy_version``) of the chunks of one trained batch (spec 4.7, 8): mean, p50, p95
+    (``numpy.percentile``, linear interpolation) and max. Written to every ``train`` record."""
+    lags = np.asarray([int(current) - int(v) for v in versions], dtype=np.float64)
+    return {"policy_lag_mean": float(lags.mean()), "policy_lag_p50": float(np.percentile(lags, 50)),
+            "policy_lag_p95": float(np.percentile(lags, 95)), "policy_lag_max": float(lags.max())}
 
 
 def collect_batch(

@@ -387,6 +387,20 @@ class LearnerConfig(StrictModel):
             raise ValueError(f"learner.device must be auto, cpu, cuda, cuda:N or mps, got {device!r}")
         return device
 
+    @model_validator(mode="after")
+    def _check_policy_lag(self) -> LearnerConfig:
+        """SP5 T3.3 (A19): the learner pushes weights every ``weight_push_interval`` train steps and chunks of
+        version v stay admissible while its version is at most v + ``max_policy_lag``; below the push interval - 1
+        it would wait for ever for chunks of a version it never pushes."""
+        lag, push = self.max_policy_lag, self.weight_push_interval
+        if lag is not None and lag < push - 1:
+            raise ValueError(
+                f"learner.max_policy_lag {lag} is below learner.weight_push_interval - 1 ({push} - 1): after a weight "
+                f"push the learner can take at most {lag} + 1 steps on chunks of the pushed version, so it would "
+                f"wait for chunks that never come; raise max_policy_lag to at least {push - 1} or lower "
+                f"weight_push_interval")
+        return self
+
 
 class TrainingConfig(StrictModel):
     """Top-level training loop settings."""
