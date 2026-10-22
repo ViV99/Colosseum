@@ -18,5 +18,8 @@ def test_max_policy_lag_bounds_the_lag_of_every_trained_batch(tmp_path):
         assert record["policy_lag_p50"] <= record["policy_lag_p95"] <= record["policy_lag_max"]
     stale = [r["dropped_stale_chunks"] for r in train]
     assert stale[-1] >= 0 and stale == sorted(stale)              # cumulative for the learner incarnation
+    # No starvation: on chunks of the first weights alone the learner can take at most max_policy_lag + 1 = 3 steps
+    # (versions 0, 1, 2); a fourth step needs chunks of weights it pushed later, so the bound let training go on.
+    assert max(r["train_step"] for r in train) >= 4
     systems = run.records("system")
-    assert systems and systems[-1]["env_steps"] >= int(TINY["training.total_timesteps"])   # no starvation
+    assert systems and systems[-1]["env_steps"] >= int(TINY["training.total_timesteps"])

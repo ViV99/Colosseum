@@ -26,6 +26,7 @@ thread with a one-frame slot, so ``send_chunk`` waits in short slices (it keeps 
 messages, and sees a stop) while a busy learner applies backpressure; a broken or missing learner drops the chunk and
 counts it (``disconnect`` / ``no_learner``, spec 4.7: at most once); a connection that has not opened within
 ``OPEN_TIMEOUT_SEC`` counts as broken (P-PF2-6). Every drop counter of a worker is updated under one lock (P-PF2-15).
+A broken sender to a local learner whose route is unchanged is reopened at a later chunk after a backoff (R34).
 Frames to a local learner are never compressed (lz4 is only for frames that leave the machine, T3.2).
 
 Learner side: ``ConnectionIntake`` accepts the chunk connections, reads whole frames into a bounded deque and stops
@@ -72,6 +73,8 @@ MAX_ABSTRACT_NAME = 107          # Linux: 108 bytes of sun_path minus the leadin
 CONNECT_RETRY_SEC = 0.05
 HANDSHAKE_TIMEOUT_SEC = 5.0      # an accepted connection's authentication + ChildHello (P-PF2-6)
 OPEN_TIMEOUT_SEC = 10.0          # a FrameSender whose connection has not opened by then is broken (P-PF2-6)
+SENDER_REOPEN_SEC = 1.0          # a broken sender to a local learner is reopened after this (R34), doubling while
+SENDER_REOPEN_MAX_SEC = 30.0     # reopened senders never open, up to this
 LEARNER_AGENT_CHARS = 24         # longer agent ids are hashed in learner socket names (P-PF2-18)
 SEND_SLICE_SEC = 0.5             # a blocked send_chunk wakes this often (results, control messages, stop)
 PROGRESS_INTERVAL_SEC = 0.5      # WorkerProgress cadence (spec 4.4: cumulative counters)
@@ -402,6 +405,7 @@ class FrameSender:
         self._state = threading.Lock()          # broken / opened / the connection (never held while counting)
         self._slot: queue.Queue = queue.Queue(maxsize=1)
         self.broken = False
+        self.broken_at: float | None = None     # time.monotonic() of the failure (WorkerIO's reopen backoff, R34)
         self._closed = False
         self._opened = False
         self._started = time.monotonic()
@@ -460,10 +464,17 @@ class FrameSender:
                 return
         self._close_conn()
 
+    @property
+    def opened(self) -> bool:
+        """Its connection opened (it may have broken since)."""
+        return self._opened
+
     def _fail(self, why: str) -> None:
         with self._state:
             first = not self.broken
             self.broken = True
+            if first:
+                self.broken_at = time.monotonic()
         if first:
             logger.warning(f"frame sender {self.name}: {why}; its chunks are dropped (dropped_chunks.disconnect)")
         n = 0
@@ -529,7 +540,11 @@ class WorkerIO:
     ``WorkerProgress``; this object adds its chunk drops (``dropped_chunks_no_learner``, ``dropped_chunks_disconnect``)
     and the result batcher's drops (into ``dropped_results``). ``dropped`` is updated by this object and its sender
     threads under one lock (P-PF2-15). ``results_batch`` / ``results_flush_sec`` default to SP4's FX1 batching
-    (``RESULTS_BATCH_MAX`` / ``RESULTS_BATCH_SEC``)."""
+    (``RESULTS_BATCH_MAX`` / ``RESULTS_BATCH_SEC``). A broken sender to a local learner whose route is unchanged is
+    reopened at the next chunk once ``SENDER_REOPEN_SEC`` passed since it broke (R34: e.g. after the learner's
+    intake cut a stalled connection); the wait doubles, up to ``SENDER_REOPEN_MAX_SEC``, while reopened senders never
+    open (a learner that is gone), and resets after one opens; chunks while broken stay dropped and counted. The
+    route connection to the node is never reopened (the node closing it ends the worker anyway)."""
 
     def __init__(self, *, node: int, worker: int, incarnation: int, control: mpc.Connection,
                  route: mpc.Connection | None, cache: WeightCacheReader, routes: Mapping[str, LearnerRoute],
@@ -545,6 +560,7 @@ class WorkerIO:
         self._clock = clock
         self._routes: dict[str, LearnerRoute] = dict(routes)
         self._senders: dict[str, FrameSender] = {}       # by agent (local learner) or "<route>"
+        self._reopen_after: dict[str, float] = {}        # by agent: the reopen wait of a broken sender (R34)
         self.dropped: Counter = Counter()                # chunk drops by reason (under _drop_lock)
         self._drop_lock = threading.Lock()
         self._batcher = ResultBatcher(_ResultSink(self._control), worker, max_results=results_batch,
@@ -645,6 +661,16 @@ class WorkerIO:
     def _sender(self, route: LearnerRoute) -> FrameSender:
         key = route.agent_id if not route.via_node else "<route>"
         sender = self._senders.get(key)
+        if sender is not None and sender.broken and not route.via_node and sender.broken_at is not None:
+            wait = self._reopen_after.get(key, SENDER_REOPEN_SEC)
+            if time.monotonic() - sender.broken_at >= wait:
+                self._reopen_after[key] = (SENDER_REOPEN_SEC if sender.opened
+                                           else min(2.0 * wait, SENDER_REOPEN_MAX_SEC))
+                logger.info(f"worker {self.worker}: reopening the chunk connection to the learner of "
+                            f"{route.agent_id!r} ({wait:.0f} s after it broke)")
+                sender.close(0.0)
+                del self._senders[key]
+                sender = None
         if sender is None:
             if route.via_node:
                 conn = self._route_conn
@@ -883,13 +909,17 @@ class ConnectionIntake:
     One reader thread serves every connection without ever blocking on one of them: chunk sockets are non-blocking
     and each frame is assembled from what its socket holds (``_FrameReader``). A frame in progress holds one slot of
     ``capacity`` (a new frame is started only while the deque plus the frames in progress are below it, so they
-    never exceed it); a connection silent for ``stall_sec`` inside a frame (a stopped sender) is closed and its
-    frame counted ``disconnect`` (a sender that continues later also counts that frame as lost: an over-count of
-    one)."""
+    never exceed it); a connection with nothing to read for ``stall_sec`` inside a frame (a stopped sender) is closed
+    and its frame counted ``disconnect`` (data already in the socket is always read first, so a pause of the reader
+    itself cuts nobody). Costs: the stalled frame holds its slot until then (with ``capacity`` 1 every other sender
+    waits up to ``stall_sec``); a sender that continues later counts the same frame as lost too (an over-count of one)
+    and is broken until its worker reopens it (``WorkerIO``, R34: at the next chunk after ``SENDER_REOPEN_SEC``), so
+    that worker's chunks for this learner meanwhile are dropped and counted ``disconnect``."""
 
     def __init__(self, lst: mpc.Listener, control: ControlChannel, validator: ChunkValidator, *, authkey: bytes,
                  agent_id: str, generation: int, version_floor: int, capacity: int, cap_bytes: int,
-                 max_policy_lag: int | None = None, stall_sec: float = FRAME_STALL_SEC) -> None:
+                 max_policy_lag: int | None = None, stall_sec: float = FRAME_STALL_SEC,
+                 clock: Callable[[], float] = time.monotonic) -> None:
         from colosseum.net.chunks import decode_chunk
 
         self._listener = lst
@@ -903,12 +933,14 @@ class ConnectionIntake:
         self._max_lag = None if max_policy_lag is None else int(max_policy_lag)
         self._min_version: int | None = None
         self._stall_sec = float(stall_sec)
+        self._clock = clock                  # the reader's clock (stall deadlines, report cadence)
         self._decode = decode_chunk
         self._frames: collections.deque[bytes] = collections.deque()
         self._cond = threading.Condition()
         self._dropped: Counter = Counter()
         self._new: list[mpc.Connection] = []
         self._readers: dict[mpc.Connection, _FrameReader] = {}      # used by the reader thread only
+        self._in_progress = 0         # frames in progress when the reader last decided whether it is full
         self._wake_r, self._wake_w = mpc.Pipe(duplex=False)
         self._closed = threading.Event()
         self.stop_flag = threading.Event()
@@ -950,7 +982,7 @@ class ConnectionIntake:
                         raise queue.Empty
                     self._cond.wait(left)
                 frame = self._frames.popleft()
-                was_full = len(self._frames) + 1 >= self._capacity
+                was_full = len(self._frames) + 1 + self._in_progress >= self._capacity   # as _full
             if was_full:
                 self._wake()
             chunk = self._accept(frame)
@@ -1020,16 +1052,17 @@ class ConnectionIntake:
             self._closed.set()
 
     def _read_forever(self) -> None:
-        last_report = time.monotonic()
+        last_report = self._clock()
         control = self._control.conn
         while not self._closed.is_set():
             with self._cond:
                 new, self._new = self._new, []
             for conn in new:
                 self._add_reader(conn)
-            now = time.monotonic()
+            now = self._clock()
             self._cut_stalled(now)
             started = [conn for conn, reader in self._readers.items() if reader.started]
+            self._in_progress = len(started)
             full = self._full(len(started))
             waitables: list[Any] = [control, self._wake_r] + (started if full else list(self._readers))
             try:
@@ -1043,8 +1076,8 @@ class ConnectionIntake:
                     self._read_control()
                 elif obj in self._readers:
                     self._read_frame(obj)
-            if time.monotonic() - last_report >= INTAKE_REPORT_SEC:
-                last_report = time.monotonic()
+            if self._clock() - last_report >= INTAKE_REPORT_SEC:
+                last_report = self._clock()
                 self._control.send(IntakeReport(self.depth, self.dropped))
 
     def _full(self, started: int) -> bool:
@@ -1058,6 +1091,13 @@ class ConnectionIntake:
         except (OSError, ValueError):             # closed already: nothing of it was read
             self._close_conn(conn)
 
+    @staticmethod
+    def _readable(conn: mpc.Connection) -> bool:
+        try:
+            return bool(conn.poll(0))
+        except (OSError, ValueError, EOFError):
+            return False
+
     def _wait_timeout(self, now: float) -> float:
         """The reader's wait: at most 0.5 s, and no later than the earliest stall deadline of a frame in progress."""
         timeout = 0.5
@@ -1067,9 +1107,11 @@ class ConnectionIntake:
         return max(0.01, timeout)
 
     def _cut_stalled(self, now: float) -> None:
-        """Close every connection silent for ``stall_sec`` inside a frame; the frame is lost (``disconnect``)."""
+        """Close every connection silent for ``stall_sec`` inside a frame; the frame is lost (``disconnect``). A
+        connection whose socket holds data now is never cut (its bytes are read first): after a pause of this reader
+        itself (a stopped or frozen learner) healthy senders are past the deadline too."""
         for conn, reader in list(self._readers.items()):
-            if reader.started and now - reader.last_progress >= self._stall_sec:
+            if reader.started and now - reader.last_progress >= self._stall_sec and not self._readable(conn):
                 logger.warning(f"learner {self.agent_id}: a chunk sender stopped inside a frame for "
                                f"{now - reader.last_progress:.1f} s; its connection is closed and the frame lost")
                 self._close_conn(conn)
@@ -1106,7 +1148,7 @@ class ConnectionIntake:
         if not reader.started and self._full(sum(r.started for r in self._readers.values())):
             return                                # full again since the wait: leave the frame to its sender
         try:
-            frame = reader.read(time.monotonic())
+            frame = reader.read(self._clock())
         except EOFError:                          # the sender closed between frames: nothing lost
             self._close_conn(conn)
             return

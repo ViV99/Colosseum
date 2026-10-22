@@ -74,7 +74,8 @@ def _wait(pred, timeout=10.0):
 class _Learner:
     """An in-process ConnectionIntake with its control pair."""
 
-    def __init__(self, capacity=2, cap=1 << 26, generation=1, floor=0, stall_sec=local.FRAME_STALL_SEC):
+    def __init__(self, capacity=2, cap=1 << 26, generation=1, floor=0, stall_sec=local.FRAME_STALL_SEC,
+                 clock=time.monotonic):
         self.name = _name("learner-a-i1")
         self.lst = listener(self.name, KEY)
         self.node_end, learner_end = mp.Pipe()
@@ -82,7 +83,7 @@ class _Learner:
         validator = ChunkValidator(learner_role(), agent_id="a", teacher=False)
         self.intake = ConnectionIntake(self.lst, self.control, validator, authkey=KEY, agent_id="a",
                                        generation=generation, version_floor=floor, capacity=capacity, cap_bytes=cap,
-                                       stall_sec=stall_sec)
+                                       stall_sec=stall_sec, clock=clock)
 
     def close(self):
         self.intake.close()
@@ -397,6 +398,18 @@ def _stall_mid_frame(lrn, version=1):
     return conn, frame[half:]
 
 
+def _control_flows(lrn):
+    """With a frame stalled now: env steps and Stop reach the intake, and an IntakeReport is sent after the stall
+    began (reports already queued are drained first)."""
+    while lrn.node_end.poll(0):
+        lrn.node_end.recv()
+    lrn.node_end.send(LearnerEnvSteps(77))
+    assert _wait(lambda: lrn.intake.value == 77, timeout=5.0)
+    assert lrn.node_end.poll(5.0) and isinstance(lrn.node_end.recv(), IntakeReport)
+    lrn.node_end.send(Stop("budget"))
+    assert lrn.intake.stop_flag.wait(5)
+
+
 def test_a_sender_stalled_mid_frame_never_blocks_other_connections_or_control(learner):
     """T2.2's deferred item (T3.3): one stalled sender holds only its own frame; other chunk connections and the
     control connection keep flowing, and a sender that continues before the deadline loses nothing."""
@@ -405,11 +418,7 @@ def test_a_sender_stalled_mid_frame_never_blocks_other_connections_or_control(le
     other = _hello(connect(lrn.name, KEY, timeout=5))
     other.send_bytes(_frame(2))
     assert lrn.intake.get(timeout=5.0).policy_version == 2
-    lrn.node_end.send(LearnerEnvSteps(77))
-    assert _wait(lambda: lrn.intake.value == 77, timeout=5.0)
-    assert lrn.node_end.poll(5.0) and isinstance(lrn.node_end.recv(), IntakeReport)
-    lrn.node_end.send(Stop("budget"))
-    assert lrn.intake.stop_flag.wait(5)
+    _control_flows(lrn)
     os.write(stalled.fileno(), rest)                  # the sender continues: its frame arrives whole
     assert lrn.intake.get(timeout=5.0).policy_version == 1
     assert lrn.intake.dropped == {}
@@ -424,3 +433,77 @@ def test_a_sender_stalled_past_the_deadline_is_cut_and_frees_its_slot(learner):
     assert lrn.intake.dropped == {"disconnect": 1}     # the stalled frame is lost and counted
     assert stalled.poll(5.0) and os.read(stalled.fileno(), 1) == b""     # the intake closed the connection
     stalled.close()
+
+
+def test_control_flows_while_a_stalled_frame_fills_the_intake(learner):
+    lrn = learner(capacity=1, stall_sec=60.0)
+    stalled, rest = _stall_mid_frame(lrn)              # capacity 1: the frame in progress fills the intake
+    _control_flows(lrn)
+    os.write(stalled.fileno(), rest)
+    assert lrn.intake.get(timeout=5.0).policy_version == 1 and lrn.intake.dropped == {}
+
+
+def test_a_pause_of_the_reader_itself_never_cuts_a_sender_whose_bytes_are_waiting(learner):
+    """Review round 1: after a pause of the learner's own reader longer than the stall deadline (a debugger, a frozen
+    VM), a sender whose rest of the frame is already in the socket is read, not cut."""
+    offset = [0.0]
+    lrn = learner(capacity=4, stall_sec=5.0, clock=lambda: time.monotonic() + offset[0])
+    stalled, rest = _stall_mid_frame(lrn)
+    with lrn.intake._cond:                             # the reader stops at its next use of the lock: a paused reader
+        time.sleep(0.7)
+        os.write(stalled.fileno(), rest)               # the sender finishes meanwhile
+        offset[0] = 60.0                               # and the pause outlasts the stall deadline
+    assert lrn.intake.get(timeout=5.0).policy_version == 1
+    assert lrn.intake.dropped == {}
+
+
+def _reader_pair(cap=1 << 20):
+    ours, theirs = mp.Pipe()                           # a Unix socket pair
+    return local._FrameReader(ours, cap), theirs.fileno(), (ours, theirs)
+
+
+def test_the_frame_reader_assembles_a_split_32_bit_length_and_body():
+    reader, fd, conns = _reader_pair()
+    os.write(fd, struct.pack("!i", 5)[:2])
+    assert reader.read(1.0) is None and reader.started and reader.last_progress == 1.0
+    os.write(fd, struct.pack("!i", 5)[2:] + b"ab")
+    assert reader.read(2.0) is None and reader.last_progress == 2.0
+    os.write(fd, b"cde" + struct.pack("!i", 0))
+    assert reader.read(3.0) == b"abcde" and not reader.started
+    assert reader.read(4.0) == b""                     # a zero-length message
+    assert reader.read(5.0) is None and not reader.started
+    for c in conns:
+        c.close()
+
+
+def test_the_frame_reader_takes_a_64_bit_length_byte_by_byte():
+    reader, fd, conns = _reader_pair()
+    data = struct.pack("!i", -1) + struct.pack("!Q", 3) + b"xyz"
+    got = None
+    for i, byte in enumerate(data):
+        assert got is None
+        os.write(fd, bytes([byte]))
+        got = reader.read(float(i))
+    assert got == b"xyz"
+    for c in conns:
+        c.close()
+
+
+@pytest.mark.parametrize("written, error", [
+    (b"", EOFError),                                                      # between messages: nothing lost
+    (struct.pack("!i", -1) + struct.pack("!Q", 3)[:4], local._FrameCut),  # inside the 64-bit length
+    (struct.pack("!i", 9) + b"abc", local._FrameCut),                     # inside the body
+    (struct.pack("!i", 2_000_000), local._FrameTooLarge),                 # above the cap
+    (struct.pack("!i", -1) + struct.pack("!Q", 2**40), local._FrameTooLarge),
+])
+def test_the_frame_reader_reports_an_end_or_a_size_by_outcome(written, error):
+    reader, fd, conns = _reader_pair()
+    os.write(fd, written)
+    if error is not local._FrameTooLarge:
+        conns[1].close()                               # the sender is gone
+    with pytest.raises(error):
+        for _ in range(4):
+            reader.read(0.0)
+    conns[0].close()
+    if not conns[1].closed:
+        conns[1].close()

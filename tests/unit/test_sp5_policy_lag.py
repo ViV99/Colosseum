@@ -128,6 +128,10 @@ def test_connection_intake_drops_stale_frames_before_decoding():
         sender.send_bytes(_lag_frame(9))
         with pytest.raises(queue.Empty):
             intake.get(timeout=0.5)
+        deadline = time.monotonic() + 10.0              # the reader may not have taken the frame yet under load
+        while intake.dropped.get("stale", 0) < 3 and time.monotonic() < deadline:
+            with pytest.raises(queue.Empty):
+                intake.get(timeout=0.1)
         assert intake.dropped == {"stale": 3}
         sender.close()
     finally:

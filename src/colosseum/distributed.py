@@ -415,7 +415,7 @@ def run_distributed_learner(
         learner_process(
             agent_id=agent_id,
             algorithm_factory=algorithm_factory,
-            intake=QueueIntake(chunk_queue, agent_id=agent_id),
+            intake=QueueIntake(chunk_queue, agent_id=agent_id, max_policy_lag=acfg.learner.max_policy_lag),
             outputs=QueueOutputs(weight_queues=weight_sink, checkpoint_queue=checkpoint_queue,
                                  trajectory_queue=chunk_queue,
                                  weight_sync_interval=acfg.rollout.weight_sync_interval_sec),

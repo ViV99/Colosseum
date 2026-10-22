@@ -5,6 +5,7 @@ generations and batched, cumulative progress, stop and first-weights signals ove
 from __future__ import annotations
 
 import multiprocessing as mp
+import queue
 import secrets
 import threading
 import time
@@ -14,6 +15,7 @@ import numpy as np
 import pytest
 
 from colosseum.core.types import Lineup, SeatAssignment, TrajectoryChunk
+from colosseum.net import local
 from colosseum.net.chunks import ChunkValidator, WeightsMeta, decode_chunk
 from colosseum.net.local import (
     PROGRESS_INTERVAL_SEC,
@@ -265,3 +267,56 @@ def test_close_stops_every_sender_within_one_shared_deadline():
     io.close(timeout=0.5)
     assert time.monotonic() - start < 0.9     # one deadline for both, not 0.5 s each
     assert io.counters()["dropped_chunks_disconnect"] == 2               # the frames left in their slots
+
+
+def test_a_sender_cut_by_the_learner_reopens_and_its_later_chunks_are_accepted(monkeypatch):
+    """R34: the intake closes a worker's chunk connection (here: a read error on it); the worker's sender breaks,
+    counts its drops, and reopens at a later chunk after SENDER_REOPEN_SEC (route unchanged)."""
+    monkeypatch.setattr(local, "SENDER_REOPEN_SEC", 0.2)
+    real, calls = local._FrameReader.read, []
+
+    def cut_once(self, now):
+        calls.append(1)
+        if len(calls) == 1:
+            raise RuntimeError("cut by the intake")
+        return real(self, now)
+    monkeypatch.setattr(local._FrameReader, "read", cut_once)
+    name = address("abcdef12", secrets.token_hex(4), 3, "learner-a-i1")
+    node_end, learner_end = mp.Pipe()
+    intake = ConnectionIntake(listener(name, KEY), ControlChannel(learner_end),
+                              ChunkValidator(learner_role(), agent_id="a", teacher=False),
+                              authkey=KEY, agent_id="a", generation=1, version_floor=0, capacity=8, cap_bytes=1 << 24)
+    io, _ = _io(routes={"a": LearnerRoute("a", name, False, 1)})
+    io.send_chunk(TrajectoryChunk.from_payload(chunk_v2_payload(version=1, agent_id="a")))
+    assert _wait(lambda: intake.dropped == {"disconnect": 1})
+    got, version, deadline = None, 1, time.monotonic() + 15.0
+    while got is None and time.monotonic() < deadline:
+        version += 1
+        io.send_chunk(TrajectoryChunk.from_payload(chunk_v2_payload(version=version, agent_id="a")))
+        try:
+            got = intake.get(timeout=0.05)
+        except queue.Empty:
+            pass
+    assert got is not None and got.policy_version > 1         # a chunk sent after the cut arrived
+    assert io.counters()["dropped_chunks_disconnect"] >= 1     # while broken, chunks were dropped and counted
+    assert io._reopen_after["a"] == local.SENDER_REOPEN_SEC    # the reopened sender opened: the wait stays short
+    io.close()
+    intake.close()
+    node_end.close()
+
+
+def test_a_sender_that_never_opens_waits_longer_before_each_reopen(monkeypatch):
+    """R34: no busy reconnect loop to a learner that is gone (no listener): the reopen wait doubles."""
+    monkeypatch.setattr(local, "SENDER_REOPEN_SEC", 0.05)
+    monkeypatch.setattr(local, "OPEN_TIMEOUT_SEC", 0.1)
+    name = address("abcdef12", secrets.token_hex(4), 3, "learner-a-i1")     # nobody listens
+    io, _ = _io(routes={"a": LearnerRoute("a", name, False, 1)})
+    waits, deadline = [], time.monotonic() + 10.0
+    while len(waits) < 3 and time.monotonic() < deadline:
+        io.send_chunk(TrajectoryChunk.from_payload(chunk_v2_payload(agent_id="a")))
+        wait = io._reopen_after.get("a")
+        if wait is not None and (not waits or wait != waits[-1]):
+            waits.append(wait)
+        time.sleep(0.02)
+    assert waits[:3] == [0.1, 0.2, 0.4]
+    io.close(timeout=0.5)
