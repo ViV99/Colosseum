@@ -108,8 +108,9 @@
     fetched version, a snapshot or ``Welcome.fixed`` blob) is an ERROR with the hint and an ``Event(warning,
     error_kind="cache_full")``, once per episode; while it lasts no lineup request, no fetch and no learner start
     (kept until space returns); the free space is checked every heartbeat against ``2 x`` the largest frame the node
-    handled ``+ SPACE_MARGIN_BYTES`` and the state ends (INFO). A learner's own publish that does not fit is skipped
-    in the learner (``NodeOutputs.publish_weights``).
+    put or tried to put into the cache (blobs, fetched latest weights; never the learners' checkpoint frames, which go
+    only to the hub) ``+ SPACE_MARGIN_BYTES`` and the state ends (INFO). A learner's own publish that does not fit is
+    skipped in the learner (``NodeOutputs.publish_weights``: one ERROR per episode).
 
 Threads besides the loop: the session reader (``HubSession``), the listener's ``Acceptor``, the transfer pool, the
 data port's servicers, the chunk router's readers and senders and the short threads that open the node's chunk
@@ -370,11 +371,14 @@ class NodeAgent:
         self.routing = NodeRouting(_RoutingHost(self))   # chunks between machines (node.routing, item 12)
         self._published_paths: dict[int, str] = {}
         self._published_env_steps = 0
+        self._credentials: grpc.ChannelCredentials | None = None
+        self._old_channels: list[grpc.Channel] = []   # hub channels replaced after an outage (closed at the next one)
+        self._renew_channel = False                 # the session was lost: the next SessionUp renews _channel
         self._dormant = ""                          # item 13: "stopping" / "stopped" after hub_lost_timeout_sec
         self._dormant_deadline = 0.0
         self._wake_welcome: pb.Welcome | None = None   # a Welcome that came while the processes were stopping
         self._cache_full = False                    # item 14
-        self._largest_frame = 0                     # bytes of the largest frame this node handled (the space check)
+        self._largest_frame = 0                     # bytes of the largest frame bound for the cache (the space check)
         self._next_space_check = 0.0
 
     # ---- public ---------------------------------------------------------------------------------------------
@@ -570,25 +574,40 @@ class NodeAgent:
                 return False
 
     def _open_session(self, node_id: str, secret: str, credentials: grpc.ChannelCredentials | None) -> None:
-        from colosseum.net.grpc_util import channel_options
-        from colosseum.net.security import HUB_SERVER_NAME
         from colosseum.node.session import HubSession
 
         self._node_id, self._node_secret = node_id, secret
-        if credentials is None:
-            self._channel = grpc.insecure_channel(self.options.hub_address, options=channel_options(self._max_mb))
-        else:
-            self._channel = grpc.secure_channel(self.options.hub_address, credentials,
-                                                options=channel_options(self._max_mb, server_name=HUB_SERVER_NAME))
-        from colosseum.net.grpc_util import node_metadata
-
-        self.fetches.set_hub(self._channel, node_metadata(node_id, secret))
+        self._credentials = credentials
+        self._new_hub_channel()
         self._session = HubSession(self.options.hub_address, credentials=credentials, node_id=node_id,
                                    node_secret=secret, hello=self._hello, inbox=self._post,
                                    max_message_mb=self._max_mb)
         logger.info(f"node: session with the hub at {self.options.hub_address} "
                     f"({'plain' if credentials is None else 'TLS'})")
         self._session.start()
+
+    def _new_hub_channel(self) -> None:
+        """The channel of the node's uploads, blob downloads and relay calls (``_channel``), with its own subchannel
+        pool. After a lost session it is replaced at the next ``SessionUp`` (T4.4): a channel used during an outage
+        keeps gRPC's reconnect backoff (growing to 120 s), which would hold finals and start points back. The replaced
+        channel stays open until the next replacement or the node's end (transfers in flight on it finish or fail
+        and are retried)."""
+        from colosseum.net.grpc_util import channel_options, node_metadata
+        from colosseum.net.security import HUB_SERVER_NAME
+
+        if self._channel is not None:
+            for old in self._old_channels:
+                old.close()
+            self._old_channels = [self._channel]
+        own_pool = [("grpc.use_local_subchannel_pool", 1)]
+        if self._credentials is None:
+            self._channel = grpc.insecure_channel(self.options.hub_address,
+                                                  options=channel_options(self._max_mb) + own_pool)
+        else:
+            self._channel = grpc.secure_channel(self.options.hub_address, self._credentials,
+                                                options=channel_options(self._max_mb, server_name=HUB_SERVER_NAME)
+                                                + own_pool)
+        self.fetches.set_hub(self._channel, node_metadata(self._node_id, self._node_secret))
 
     def _probe_hardware(self) -> Any:
         from colosseum.node.hardware import probe
@@ -763,6 +782,9 @@ class NodeAgent:
 
         if isinstance(item, SessionUp):
             self._connected = True
+            if self._renew_channel:
+                self._renew_channel = False
+                self._new_hub_channel()
             run = self._run
             if run is not None:
                 resend = run.results.resend_all()
@@ -779,6 +801,7 @@ class NodeAgent:
             if self._connected:
                 logger.warning(f"node: the session with the hub ended ({item.reason}); reconnecting")
             self._connected = False
+            self._renew_channel = True
 
     def _tick(self, now: float) -> None:
         run = self._run
@@ -1319,7 +1342,6 @@ class NodeAgent:
         if entry is None or header.kind not in _UPLOAD_KINDS or header.agent_id != entry.agent_id:
             logger.warning(f"node: dropped a {header.kind!r} checkpoint of {header.agent_id!r} from {name}")
             return
-        self._note_frame(len(frame))
         replaced = self.uploads.replaced
         self.uploads.offer(header.agent_id, header.kind, int(header.generation), int(header.version), frame)
         if self.uploads.replaced > replaced:
@@ -1651,8 +1673,9 @@ class NodeAgent:
             self.supervisor.stop_all(0.0)
         if self._session is not None:
             self._session.close()
-        if self._channel is not None:
-            self._channel.close()                    # cancels the downloads and uploads in flight
+        for channel in (*self._old_channels, self._channel):
+            if channel is not None:
+                channel.close()                      # cancels the downloads and uploads in flight
         self.fetches.close_channels()                # cancels the data-port transfers in flight
         self._pool.shutdown(wait=False, cancel_futures=True)
         if self._run is not None:

@@ -1270,10 +1270,12 @@ class NodeOutputs:
                                                          generation=self.generation,
                                                          teacher_active=meta.teacher_active)
         except CacheFullError as e:
-            logger.error(f"learner {self.agent_id}: v{meta.policy_version} not published: {e}",
-                         exc_info=not self._cache_error_logged)
+            if not self._cache_error_logged:          # one ERROR per cache-full episode (SP5 T4.4); training goes on
+                logger.error(f"learner {self.agent_id}: v{meta.policy_version} not published: {e}; later versions "
+                             f"are skipped silently until the cache has space again")
             self._cache_error_logged = True
             return
+        self._cache_error_logged = False             # space again: a later full cache is a new episode
         self._control.send(VersionPublished(self.agent_id, self.generation, meta.policy_version, segment,
                                             len(frame), digest, meta.teacher_active))
 

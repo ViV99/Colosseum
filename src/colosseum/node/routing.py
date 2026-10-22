@@ -163,11 +163,11 @@ class NodeRouting:
         serial, post = run.serial, self._host.post
         dist = run.config.distributed
         self._relay = bool(dist.relay)
-        hub_channel, hub_md = self._host.hub_channel(), tuple(self._host.hub_metadata())
+        host, hub_md = self._host, tuple(self._host.hub_metadata())
         relay_call = None
-        if self._relay and hub_channel is not None:
-            def relay_call() -> Any:
-                return partial(pb_grpc.HubStub(hub_channel).RelaySend, metadata=hub_md)
+        if self._relay and host.hub_channel() is not None:
+            def relay_call() -> Any:                     # the node's current hub channel (replaced after an outage)
+                return partial(pb_grpc.HubStub(host.hub_channel()).RelaySend, metadata=hub_md)
         self.router = ChunkRouter(
             make_frame=lambda agent, gen, frame, target: pb.ChunkFrame(agent_id=agent, target_node=int(target),
                                                                        generation=int(gen), frame=frame),
@@ -363,11 +363,10 @@ class NodeRouting:
             return
         if self._receiver is not None:
             return
-        channel, md, serial, post = self._host.hub_channel(), tuple(self._host.hub_metadata()), run.serial, \
-            self._host.post
+        host, md, serial, post = self._host, tuple(self._host.hub_metadata()), run.serial, self._host.post
         self._receiver = RelayReceiver(
             node_id=self._host.node_id,
-            open_inbox=lambda requests: pb_grpc.HubStub(channel).RelayInbox(requests, metadata=md),
+            open_inbox=lambda requests: pb_grpc.HubStub(host.hub_channel()).RelayInbox(requests, metadata=md),
             make_credit=lambda n, node_id: pb.RelayCredit(frames=int(n), node_id=node_id),
             delivery=self.router.delivery,
             chunk_of=lambda item: ((item.chunk.agent_id, item.chunk.frame) if item.WhichOneof("i") == "chunk"

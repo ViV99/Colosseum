@@ -6,8 +6,9 @@ A ``NodeAgent`` in a thread (``node_kit.NodeThread``) reaches ``node_kit.FakeHub
 ``fault_proxy.TcpFaultProxy`` (the hub "goes away" by ``proxy.cut``); the toy game ``turns`` with one worker of two
 envs, lineup TTL 0.5 s, heartbeats every 0.1 s, ``hub_lost_collect_sec`` 1 s, ``shutdown_grace_sec`` 3 s. The node's
 reconnect backoff is shrunk (pre-flight ruling P-PF3-8) and so is the slow retry after the hub-lost timeout
-(``HUB_LOST_RETRY_SEC``); ``hub_lost_timeout_sec`` is 3 s where a cut must not reach it (each window at least the cut
-plus 1 s, P-PF3-8) and 2 s where it must. At most two loaded processes per test (the worker, the learner of ``a``)."""
+(``HUB_LOST_RETRY_SEC``); ``hub_lost_timeout_sec`` is 3-3.5 s where a cut must not reach it (each window at least
+the cut plus 1 s, P-PF3-8) and 2 s where it must. At most two loaded processes per test (the worker, the learner of
+``a``)."""
 from __future__ import annotations
 
 import logging
@@ -84,6 +85,7 @@ def test_lineups_outlive_their_ttl_while_the_hub_is_away(away):
     hub, proxy, node = away(_config(), lambda worker, env: FIXED)
     wait_for(lambda: len(hub.grants_sent) >= 4 and node.agent.env_steps > 0, timeout=60)   # TTLs expire and renew
     opened = len(hub.events(SessionOpened))
+    channel = node.agent._channel
     proxy.cut(2.0)
     wait_for(lambda: _away(node) > 0, timeout=10)
     hub.sync()
@@ -98,6 +100,8 @@ def test_lineups_outlive_their_ttl_while_the_hub_is_away(away):
     assert again.hello.session_id == hub.events(SessionOpened)[0].hello.session_id
     first = wait_for(lambda: hub.messages("lineup_request")[requests:], timeout=30)[0]
     assert sorted((c.worker, c.env) for c in first.cells) == [(0, 0), (0, 1)]   # the expired cells in one request
+    renewed = node.agent._channel        # uploads / downloads: a new channel, no gRPC backoff left from the outage
+    assert renewed is not channel and node.agent.fetches._hub_channel is renewed
     assert node.stop() == 0
 
 
@@ -155,14 +159,14 @@ def _no_learner(hub) -> int:
 
 
 def test_a_relay_only_learner_stops_collecting_after_hub_lost_collect_sec(away, caplog):
-    config = _config(agents={"b": {}, "random": scripted_agent()})
+    config = _config(timeout=3.5, agents={"b": {}, "random": scripted_agent()})
     with caplog.at_level(logging.INFO, logger="colosseum.node"):
         hub, proxy, node = away(config, lambda worker, env: B_VS_RANDOM, relay=True, setup=_relay_only_b(config))
         wait_for(lambda: node.agent.paths() == {7: "relay"}, timeout=60)
         wait_for(lambda: node.agent.counters().get("chunks_sent.relay", 0) > 0, timeout=60)
         dropped = _no_learner(hub)
         opened = len(hub.events(SessionOpened))
-        proxy.cut(1.8)
+        proxy.cut(2.5)
         wait_for(lambda: node.agent._learner_routes["b"].via_node is False, timeout=10)
         assert _away(node) >= 1.0
         _wait_reconnect(hub, opened)
