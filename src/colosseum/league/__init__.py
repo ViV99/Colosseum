@@ -14,6 +14,7 @@ _EXPORTS: dict[str, str] = {
     "BaseMatchmaker": "colosseum.league.base",
     "MatchmakerContext": "colosseum.league.base",
     "MixtureMatchmaker": "colosseum.league.mixture",
+    "NoLineupError": "colosseum.league.base",
     "PfspStats": "colosseum.league.pfsp",
 }
 

@@ -34,7 +34,8 @@ def test_a_learner_that_keeps_dying_fails_its_agent_and_the_other_trains_on(tmp_
     """Learners run until the run stops. SP5 T4.2 (spec 7.1, W04-25; it was "one exiting early stops the run" until
     T4.2, A12): agent_beta's learner dies at every start, so the hub restarts it (the node's ``LEARNER_RESTARTS``: 3)
     and then marks the agent ``failed``; agent_alpha keeps training (the workers never block on the dead learner); the
-    run then ends with exit code 1 (a failed agent, spec 7.5)."""
+    run then ends with exit code 1 (a failed agent, spec 7.5). Controller ruling R41: with the example's rivals-only mix
+    the failed agent (no weights) is no candidate, so alpha plays itself (the ``fallback`` source), never stalls."""
     data = load_config(REPO / "configs/examples/tic_tac_toe_multi.yaml").model_dump()
     data["training"]["total_timesteps"] = 10**9
     data["rollout"]["num_workers"] = 1
@@ -44,8 +45,8 @@ def test_a_learner_that_keeps_dying_fails_its_agent_and_the_other_trains_on(tmp_
     data["metrics"]["console_interval_sec"] = 0.5
     broken = dict(data["algorithm"], algorithm_class="colosseum.algorithms.appo.NoSuchAlgorithm")
     data["agents"]["agent_beta"]["algorithm"] = broken  # agent_beta's learner dies at startup
-    # beta never publishes weights, so once it failed it is never drawn (T4.1, W04-4): alpha needs self-play to go on
-    data["matchmaking"]["opponents"] = {"latest": 0.5, "snapshots": 0.0, "rivals": 0.5, "anchors": 0.0}
+    # the example's rivals-only mix stays: beta never published weights, so once it failed the matchmaker leaves it
+    # out (R41) and alpha's rivals share falls back to its own latest weights
     config = ColosseumConfig(**data)
     run = make_test_run_dir(config, tmp_path)
     hub = make_hub(config, run)

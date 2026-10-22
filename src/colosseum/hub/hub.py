@@ -62,7 +62,8 @@ node is reconciled (``LearnerTable.reconcile``: its learners of the current gene
 told to stop); ``Welcome.learners`` is the node's desired learner set. An agent without a slot is ``pending``: its
 seats do not collect, it owns no cells, and it plays with hub-held ("parked") weights when it has any (its newest
 stored snapshot, its ``init`` or ``training.resume_from`` weights: a ``VersionInfo`` with node -1 served by
-``Download(kind="latest")``, A27); lineups naming an agent without any weights are drawn again (``LINEUP_REDRAWS``).
+``Download(kind="latest")``, A27); the matchmaker leaves agents without any weights out
+(``Coordinator.set_seatable``, R41) and lineups that still name one are drawn again (``LINEUP_REDRAWS``).
 Announcements, snapshots and train metrics of a superseded generation are fenced (R16; results by
 ``ResultIntake.check``'s version cap). ``train`` without ``--listen`` stops at once when an agent cannot be placed on
 its machine (W04-26).
@@ -139,6 +140,7 @@ from colosseum.hub.state import (
     version_source,
     visible_version,
 )
+from colosseum.league.base import NoLineupError
 from colosseum.metrics.counters import CounterBook
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.net.messages import lineup_to_proto, version_from_proto, version_to_proto
@@ -342,8 +344,16 @@ class Hub(RunSinks, HubLearners):
 
     def _build_coordinator(self, setup: RunSetup) -> Coordinator:
         """The run's coordinator; its matchmaker reads the global env-step counter (share schedules)."""
-        return Coordinator(self._config, setup.spec, setup.player_roles, checkpoint_dir=self._run_dir.checkpoints,
-                           env_steps=lambda: int(self._budget.value), run_id=self._run_id)
+        coordinator = Coordinator(self._config, setup.spec, setup.player_roles,
+                                  checkpoint_dir=self._run_dir.checkpoints, env_steps=lambda: int(self._budget.value),
+                                  run_id=self._run_id)
+        coordinator.set_seatable(self._seatable)     # R41: the matchmaker leaves agents without weights out
+        return coordinator
+
+    def _seatable(self, agent: str) -> bool:
+        """``MatchmakerContext.seatable`` (R41): a trainable agent whose learner starts or runs or that has parked
+        weights (``_playable``); every agent before the learner table exists."""
+        return self._learners is None or self._playable(agent)
 
     def launch(self) -> int:
         """Run the hub until the run ends; returns the exit code (class docstring). Everything that can fail with a
@@ -1063,11 +1073,18 @@ class Hub(RunSinks, HubLearners):
         pending agent with nothing parked, W04-4) or, under R37, an unreachable agent without a snapshot, is drawn
         again (rejection sampling: the matchmaker's distribution conditioned on playable agents), up to
         ``LINEUP_REDRAWS`` times; then None (the cell asks again at its next request). Agents without weights named
-        by every draw are counted (``lineup_redraw_failed``) with one WARNING per owner."""
+        by every draw are counted (``lineup_redraw_failed``) with one WARNING per owner. Since R41 the matchmaker
+        leaves such agents out itself (``Coordinator.set_seatable``), so the redraws guard custom matchmakers; a
+        ``NoLineupError`` (a team nobody seatable can fill) is None with one WARNING per owner."""
         unplayable = {a for a in self._agent_ids if not self._playable(a)}
         named: set[str] = set()
         for _ in range(LINEUP_REDRAWS if (snapshots or unplayable) else 1):
-            lineup = self._coordinator.lineup_for(owner)
+            try:
+                lineup = self._coordinator.lineup_for(owner)
+            except NoLineupError as e:               # R41: a team only unseatable agents could fill
+                self._warn_once(("no_lineup", owner), f"matchmaking for {owner}: no lineup now ({e}); its cells ask "
+                                                      f"again")
+                return None
             bad = {s.agent_id for s in lineup.seats if s.network_id == LATEST_NETWORK_ID and s.agent_id in unplayable}
             if bad:
                 named |= bad

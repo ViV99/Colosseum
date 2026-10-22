@@ -112,9 +112,9 @@ def test_no_lineup_is_granted_while_no_agent_can_collect(tmp_path, caplog):
 def test_agents_collect_from_their_learners_placement_without_a_first_version(tmp_path):
     """Ruling R36: with both learners placed and alive and only ``a``'s first version accepted, ``b``'s seats collect
     too (the node holds a lineup until ``b``'s latest weights are cached); once ``b``'s learner failed they do not, and
-    (T4.1) ``b`` without any weights is not seated at all: with rivals only, no lineup is granted (counted). T4.2: a
-    failed learner no longer fails the run (``a`` trains on), so the grants above are not an artefact of a failing
-    hub."""
+    ``b`` without any weights is not seated at all (T4.1); controller ruling R41: the matchmaker leaves it out, so with
+    rivals only ``a`` falls back to its own latest weights and keeps getting grants (no redraw fails). T4.2: a failed
+    learner no longer fails the run."""
     mm = {"opponents": {"latest": 0.0, "snapshots": 0.0, "rivals": 1.0, "anchors": 0.0}}
     hub = lineup_hub(_config(("a", "b"), matchmaking=mm), tmp_path)
     node = open_node(hub, workers=2)
@@ -129,8 +129,32 @@ def test_agents_collect_from_their_learners_placement_without_a_first_version(tm
                                                       generation=1)))
     assert (hub._learners["a"].status, hub._learners["b"].status) == ("starting", "failed")
     assert hub._failure is None
-    assert request_cells(hub, node, [(g.worker, g.env, g.epoch, 0) for g in grants]) == []
-    assert hub._book.totals()["lineup_redraw_failed"] == 8
+    again = request_cells(hub, node, [(g.worker, g.env, g.epoch, 0) for g in grants])
+    assert len(again) == 8
+    for grant in again:
+        lineup = lineup_from_proto(grant.lineup)
+        assert {s.agent_id for s in lineup.seats} == {"a"} and {s.source for s in lineup.seats} == {"owner", "fallback"}
+    assert hub._book.totals().get("lineup_redraw_failed", 0) == 0
+
+
+def test_a_team_nobody_seatable_can_fill_gets_no_lineup_and_one_warning(tmp_path, caplog, monkeypatch):
+    """R41: the matchmaker's ``NoLineupError`` (e.g. an asymmetric game whose only prey agent failed without weights
+    and no anchor) is no lineup for that cell and one WARNING per owner, never a handler error."""
+    from colosseum.league.base import NoLineupError
+
+    hub = lineup_hub(_config(("a",)), tmp_path)
+    node = open_node(hub, workers=1)
+
+    def nobody(owner):
+        raise NoLineupError("agent 'a', layout '2p', team 1: nobody can play this team now")
+
+    monkeypatch.setattr(hub._coordinator, "lineup_for", nobody)
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
+        assert request_cells(hub, node, [(0, e, 0, 0) for e in range(4)]) == []
+        assert request_cells(hub, node, [(0, e, 0, 0) for e in range(4)]) == []
+    warnings = [r.getMessage() for r in caplog.records if "no lineup now" in r.getMessage()]
+    assert len(warnings) == 1 and "nobody can play this team now" in warnings[0]
+    assert not hub._handler_errors
 
 
 def test_a_node_without_a_path_to_the_learner_plays_without_collecting(tmp_path):

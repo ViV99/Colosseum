@@ -30,6 +30,12 @@ For an env whose training data belongs to owner O (the coordinator rotates owner
 
 PFSP weight of a candidate X: ``pfsp_weight(score of O@latest against X, weighting, exponent)``
 with O's ``pfsp`` config.
+
+Seatable agents (SP5, R41; ``MatchmakerContext.seatable``): the latest weights of a trainable agent other than O that
+is not seatable now (failed, or pending without any weights) are never a candidate (``latest`` / ``rivals`` cores,
+teammates, players of a role the core does not play); its stored snapshots still are. A category it alone filled is
+empty, so its share is spread as in step 3 (or the ``fallback`` source applies). A team or role nobody seatable can
+fill raises ``NoLineupError``. With every agent seatable the draws are exactly SP3's.
 """
 
 from __future__ import annotations
@@ -49,7 +55,7 @@ from colosseum.core.types import (
     SeatAssignment,
 )
 from colosseum.envs.game import GameSpec
-from colosseum.league.base import BaseMatchmaker, MatchmakerContext
+from colosseum.league.base import BaseMatchmaker, MatchmakerContext, NoLineupError
 from colosseum.league.lineups import enabled_layouts, permute_seats, playable_layouts
 from colosseum.league.pfsp import PlayerKey, pfsp_weight
 from colosseum.league.schedule import schedule_points, schedule_value
@@ -121,9 +127,11 @@ def opposing_teams(spec: GameSpec, layout: str, roles: frozenset[str]) -> list[i
 
 def _team_view(context: MatchmakerContext, owner: str, layout: str, team: int,
                env_steps: int) -> tuple[list[str], bool, dict[str, float]]:
-    """``(E_T in config order, owner in E_T, owner's anchors that play a role of T -> weight)``."""
+    """``(E_T in config order, owner in E_T, owner's anchors that play a role of T -> weight)``; E_T holds the owner
+    and the seatable agents only (R41; every agent with the default context)."""
     roles = team_roles(context.spec, layout, team)
-    players = [a for a in context.trainable if context.agents[a].roles & roles]
+    players = [a for a in context.trainable if context.agents[a].roles & roles
+               and (a == owner or context.seatable(a))]
     anchors = {a: w for a, w in context.anchors_at(owner, env_steps).items()
                if a in context.agents and context.agents[a].roles & roles}
     return players, owner in players, anchors
@@ -198,9 +206,11 @@ class MixtureMatchmaker(BaseMatchmaker):
                        env_steps: int) -> tuple[PlayerKey, str]:
         ctx = self.context
         players, owner_in, anchors = _team_view(ctx, owner, layout, team, env_steps)
+        roles = team_roles(ctx.spec, layout, team)
+        stored = [a for a in ctx.trainable if ctx.agents[a].roles & roles]    # snapshots of unseatable agents too
         candidates: dict[str, list[PlayerKey]] = {
             "latest": [(owner, LATEST_NETWORK_ID)] if owner_in else [(a, LATEST_NETWORK_ID) for a in players],
-            "snapshots": [(a, c) for a in players for c in ctx.snapshots(a)],
+            "snapshots": [(a, c) for a in stored for c in ctx.snapshots(a)],
             "rivals": [(a, LATEST_NETWORK_ID) for a in players if a != owner] if owner_in else [],
             "anchors": [(a, FIXED_NETWORK_ID) for a, w in anchors.items() if w > 0],
         }
@@ -213,8 +223,8 @@ class MixtureMatchmaker(BaseMatchmaker):
         else:
             category = "latest" if candidates["latest"] else "anchors"   # anchors with a weight > 0 now only
             if not candidates[category]:
-                raise RuntimeError(f"agent {owner!r}, layout {layout!r}, team {team}: nobody can play this team "
-                                   f"(validate_matchmaking should have caught it)")
+                raise NoLineupError(f"agent {owner!r}, layout {layout!r}, team {team}: nobody can play this team "
+                                    f"now (no seatable player, no snapshot, no anchor)")
             source = FALLBACK
             if (owner, layout) not in self._warned:
                 self._warned.add((owner, layout))
@@ -265,7 +275,7 @@ class MixtureMatchmaker(BaseMatchmaker):
         ctx = self.context
         agent = core[0]
         candidates: list[PlayerKey] = [(a, LATEST_NETWORK_ID) for a in ctx.trainable
-                                       if a != agent and role in ctx.agents[a].roles]
+                                       if a != agent and role in ctx.agents[a].roles and ctx.seatable(a)]
         candidates += [(agent, c) for c in ctx.snapshots(agent)]
         candidates += [(a, FIXED_NETWORK_ID) for a, w in anchors.items()
                        if w > 0 and a != agent and a in ctx.agents and role in ctx.agents[a].roles]
@@ -273,12 +283,12 @@ class MixtureMatchmaker(BaseMatchmaker):
 
     def _role_player(self, anchors: Mapping[str, float], role: str) -> PlayerKey:
         ctx = self.context
-        players = [a for a in ctx.trainable if role in ctx.agents[a].roles]
+        players = [a for a in ctx.trainable if role in ctx.agents[a].roles and ctx.seatable(a)]
         if players:
             return self._rng.choice(players), LATEST_NETWORK_ID
         options = [a for a, w in anchors.items() if w > 0 and a in ctx.agents and role in ctx.agents[a].roles]
         if not options:
-            raise RuntimeError(f"nobody plays role {role!r} (validate_matchmaking should have caught it)")
+            raise NoLineupError(f"nobody plays role {role!r} now (no seatable player, no anchor)")
         return self._weighted([(a, FIXED_NETWORK_ID) for a in options], [anchors[a] for a in options])
 
     def _seat(self, player: PlayerKey, source: str) -> SeatAssignment:

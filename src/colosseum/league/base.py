@@ -5,6 +5,15 @@ A matchmaker builds the ``Lineup`` of one env whose training data belongs to ``o
 finished match to ``on_result``. The context gives the game, the agents with their kinds and
 roles, each trainable agent's effective ``matchmaking`` config, the stored snapshots, the PFSP
 statistics (read only), the coordinator's env-step count and the run's RNG.
+
+Seatable agents (SP5 T4.2, controller ruling R41; spec 2.6, 7.1): ``MatchmakerContext.seatable(agent)`` says whether
+a trainable agent's latest weights can be played now (a learner that starts or runs, or hub-held weights). A
+``failed`` agent, or a ``pending`` one without any weights, is not seatable: a matchmaker leaves it out of its
+candidates (its stored snapshots stay playable), so its share goes to the other categories exactly as an empty pool's
+would. The built-in matchmaker does; a custom one should (the hub draws again a lineup that names an unseatable agent's
+latest weights, and gives the cell no lineup after ``LINEUP_REDRAWS`` such draws). Single-machine and SP3 runs: every
+agent is seatable (the default). A matchmaker that cannot fill a team with seatable players raises ``NoLineupError``
+(the hub: no lineup for that cell this time, one WARNING).
 """
 
 from __future__ import annotations
@@ -39,6 +48,14 @@ def _zero_env_steps() -> int:
     return 0
 
 
+def _always_seatable(agent_id: str) -> bool:
+    return True
+
+
+class NoLineupError(RuntimeError):
+    """No lineup can be built for this owner now: a team or role only unseatable agents could fill (R41)."""
+
+
 @dataclass
 class MatchmakerContext:
     """What a matchmaker may read (spec block 5). ``agents`` and ``trainable`` are in config order;
@@ -52,13 +69,15 @@ class MatchmakerContext:
     snapshots_fn: Callable[[str], Sequence[str]] = _no_snapshots
     pfsp_fn: Callable[[str, str, PlayerKey], float] | None = None
     env_steps_fn: Callable[[], int] = _zero_env_steps
+    seatable_fn: Callable[[str], bool] = _always_seatable
 
     @classmethod
     def from_config(cls, config: ColosseumConfig, spec: GameSpec, player_roles: Mapping[str, Sequence[str]], *,
                     rng: random.Random | None = None,
                     snapshots_fn: Callable[[str], Sequence[str]] = _no_snapshots,
                     pfsp_fn: Callable[[str, str, PlayerKey], float] | None = None,
-                    env_steps_fn: Callable[[], int] = _zero_env_steps) -> MatchmakerContext:
+                    env_steps_fn: Callable[[], int] = _zero_env_steps,
+                    seatable_fn: Callable[[str], bool] = _always_seatable) -> MatchmakerContext:
         """The context of a run: every agent of ``player_roles`` (``resolve_player_roles``) with its kind."""
         trainable = config.get_trainable_agent_ids()
         missing = [a for a in [*trainable, *config.fixed_agent_ids()] if a not in player_roles]
@@ -69,7 +88,7 @@ class MatchmakerContext:
             spec=spec, agents=agents, trainable=list(trainable),
             matchmaking={aid: config.get_agent_config(aid).matchmaking for aid in trainable},
             rng=rng if rng is not None else random.Random(config.training.seed),
-            snapshots_fn=snapshots_fn, pfsp_fn=pfsp_fn, env_steps_fn=env_steps_fn,
+            snapshots_fn=snapshots_fn, pfsp_fn=pfsp_fn, env_steps_fn=env_steps_fn, seatable_fn=seatable_fn,
         )
 
     @property
@@ -90,6 +109,15 @@ class MatchmakerContext:
 
     def env_steps(self) -> int:
         return int(self.env_steps_fn())
+
+    def seatable(self, agent_id: str) -> bool:
+        """Whether ``agent_id``'s latest weights can be seated now (module docstring; R41): always for scripted and
+        frozen agents; a trainable agent unless it failed or waits without any weights. Asked at every draw (the
+        hub's current state)."""
+        view = self.agents.get(agent_id)
+        if view is None or view.kind != "trainable":
+            return True
+        return bool(self.seatable_fn(agent_id))
 
     def anchors(self, owner: str) -> dict[str, float]:
         """``owner``'s effective anchors -> weight at ``env_steps()``."""
@@ -115,7 +143,9 @@ class BaseMatchmaker(ABC):
 
     @abstractmethod
     def lineup_for(self, owner: str) -> Lineup:
-        """The lineup of one env whose training data belongs to ``owner`` (a trainable agent)."""
+        """The lineup of one env whose training data belongs to ``owner`` (a trainable agent). It should seat other
+        trainable agents' latest weights only when ``context.seatable(agent)`` (module docstring; R41) and raise
+        ``NoLineupError`` when no lineup is possible now."""
 
     def on_result(self, result: MatchResult) -> None:
         """Called with every finished match (default: nothing)."""

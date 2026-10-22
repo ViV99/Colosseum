@@ -188,7 +188,7 @@ def test_a_pending_agent_plays_with_parked_weights(hubs, tmp_path):
     assert seated and all(not s.collect and s.network_id == "latest" for s in seated)
 
 
-def test_a_pending_agent_without_weights_is_not_drawn(hubs, caplog):
+def test_a_pending_agent_without_weights_is_not_drawn(hubs):
     hub = hubs(_config(matchmaking=MIXED))
     n1 = _node(hub, "n1", cpu=1, workers=10)
     n1.send(lineup_request=pb.LineupRequest(cells=[pb.CellRequest(worker=w, env=e) for w in range(10)
@@ -200,13 +200,14 @@ def test_a_pending_agent_without_weights_is_not_drawn(hubs, caplog):
     hub.stop()
 
     rivals = {"opponents": {"latest": 0.0, "snapshots": 0.0, "rivals": 1.0, "anchors": 0.0}}
-    with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
-        hub = hubs(_config(matchmaking=rivals), name="rivals")
-        n1 = _node(hub, "n1", cpu=1)
-        n1.send(lineup_request=pb.LineupRequest(cells=[pb.CellRequest(worker=0, env=e) for e in range(4)]))
-        poll_until(lambda: hub_counter(hub, "lineup_redraw_failed") > 0)
-        assert n1.messages("grants") == []
-    assert "draws in a row named agents without weights (b)" in caplog.text
+    hub = hubs(_config(matchmaking=rivals), name="rivals")        # R41: b is no candidate; a falls back to itself
+    n1 = _node(hub, "n1", cpu=1)
+    n1.send(lineup_request=pb.LineupRequest(cells=[pb.CellRequest(worker=0, env=e) for e in range(4)]))
+    grants = [g for batch in n1.wait_for("grants") for g in batch.grants]
+    assert len(grants) == 4
+    self_play = {("a", "owner"), ("a", "fallback")}
+    assert all({(s.agent_id, s.source) for s in lineup_from_proto(g.lineup).seats} == self_play for g in grants)
+    assert hub.hub._book.totals().get("lineup_redraw_failed", 0) == 0
 
 
 # ---- generations, reconciliation, fencing ---------------------------------------------------------------------

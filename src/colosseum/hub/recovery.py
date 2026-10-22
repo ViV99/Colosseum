@@ -65,13 +65,14 @@ class RecoveryStore:
 
     def __init__(self, run_root: str | Path) -> None:
         self._root = Path(run_root) / RECOVERY_DIR
+        self._warned: set[Path] = set()      # unreadable points already logged (one WARNING per path)
 
     def path(self, agent_id: str) -> Path:
         return self._root / agent_id / RECOVERY_FRAME
 
     def get(self, agent_id: str) -> RecoveryPoint | None:
         """The stored point (from the frame header; ``env_steps`` from meta.json, 0 when missing or not of this
-        point), or None (none yet, or an unreadable file: WARNING)."""
+        point), or None (none yet, or an unreadable file: one WARNING per path)."""
         path = self.path(agent_id)
         try:
             if not path.is_file():
@@ -82,7 +83,9 @@ class RecoveryStore:
             generation, version = int(meta["generation"]), int(meta["policy_version"])
             size = path.stat().st_size
         except (OSError, FrameError, KeyError, TypeError, ValueError) as e:
-            logger.warning(f"Recovery point {path} is unreadable ({type(e).__name__}: {e}); ignored")
+            if path not in self._warned:
+                self._warned.add(path)
+                logger.warning(f"Recovery point {path} is unreadable ({type(e).__name__}: {e}); ignored")
             return None
         env_steps = 0
         try:
@@ -107,6 +110,7 @@ class RecoveryStore:
         target = self.path(agent_id)
         target.parent.mkdir(parents=True, exist_ok=True)
         os.replace(spooled, target)
+        self._warned.discard(target)
         write_text_atomic(target.parent / RECOVERY_META, json.dumps(
             {"generation": int(generation), "version": int(version), "env_steps": int(env_steps)}) + "\n")
         return True, ""

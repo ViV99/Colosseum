@@ -84,14 +84,20 @@ class Coordinator:
                                  for a, roles in self._agent_roles.items()}
         self._match_results: deque[MatchResult] = deque(maxlen=10000)
         self._refresh_round = 0
+        self._seatable: Callable[[str], bool] = lambda agent_id: True     # R41: set_seatable (the hub)
         validate_matchmaking(spec, self._player_roles, config)
         self._context = MatchmakerContext.from_config(
             config, spec, self._player_roles, rng=self._rng, snapshots_fn=self._checkpoint_ids,
-            pfsp_fn=self._pfsp.score, env_steps_fn=env_steps,
+            pfsp_fn=self._pfsp.score, env_steps_fn=env_steps, seatable_fn=lambda agent_id: self._seatable(agent_id),
         )
         path = config.matchmaking.matchmaker_class
         matchmaker_cls = MixtureMatchmaker if path is None else load_matchmaker_class(path)
         self._matchmaker: BaseMatchmaker = build_matchmaker(matchmaker_cls, self._context, path)
+
+    def set_seatable(self, seatable: Callable[[str], bool]) -> None:
+        """The matchmaker's runtime availability of trainable agents (``MatchmakerContext.seatable``; SP5 R41): the
+        hub's ``_playable``, asked at every draw. Default: every agent."""
+        self._seatable = seatable
 
     @property
     def player_roles(self) -> dict[str, list[str]]:

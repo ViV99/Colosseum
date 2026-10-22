@@ -81,3 +81,13 @@ def test_an_unreadable_point_is_ignored_with_a_warning(tmp_path, caplog):
     with caplog.at_level(logging.WARNING, logger="colosseum.hub.recovery"):
         assert RecoveryStore(tmp_path).get("main") is None
     assert "unreadable" in caplog.text
+
+
+def test_an_unreadable_point_is_warned_about_once(tmp_path, caplog):
+    path = tmp_path / "recovery" / "main" / "recovery.frame"
+    path.parent.mkdir(parents=True)
+    path.write_bytes(b"CSTF\x01\x00")
+    store = RecoveryStore(tmp_path)
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.recovery"):
+        assert store.get("main") is None and store.get("main") is None and store.get("main") is None
+    assert len([r for r in caplog.records if "is unreadable" in r.getMessage()]) == 1

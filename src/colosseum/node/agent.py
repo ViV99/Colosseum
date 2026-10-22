@@ -1435,6 +1435,7 @@ class NodeAgent:
         """The stop's deadline passed: checkpoint frames not uploaded yet are given up (``UploadQueue.drop_waiting``;
         the ones in flight are cancelled with the transfers). Every final is an ERROR here and a ``warning`` event to
         the hub (A1)."""
+        in_flight = {u.ticket for u in self.uploads.in_flight()}
         pending = [*self.uploads.in_flight(), *self.uploads.drop_waiting()]
         if not pending:
             return
@@ -1442,8 +1443,10 @@ class NodeAgent:
                      f"waited for any longer")
         for upload in pending:
             if upload.kind == FINAL:
+                what = ("its upload was not confirmed (it may still land)" if upload.ticket in in_flight
+                        else "was not uploaded")
                 logger.error(f"node: the final snapshot v{upload.version} of {upload.agent_id} (generation "
-                             f"{upload.generation}) was not uploaded")
+                             f"{upload.generation}): {what}")
                 self._event("warning", proc=f"learner-{upload.agent_id}",
                             message=f"final v{upload.version} not uploaded before the stop deadline")
 

@@ -1361,13 +1361,14 @@ class StepCounter:
 
 
 def make_matchmaker_context(spec, roles, *, kinds=None, matchmaking=None, per_agent=None, snapshots=None,
-                            scores=None, env_steps=None, seed: int = 0):
+                            scores=None, env_steps=None, seed: int = 0, seatable=None):
     """A ``MatchmakerContext`` over plain dicts.
 
     ``roles``: ``{agent: [roles]}`` in config order; ``kinds``: ``{agent: kind}`` (default trainable);
     ``matchmaking``: the raw global section; ``per_agent``: raw per-agent overrides;
     ``snapshots``: ``{agent: [checkpoint ids]}``; ``scores``: ``{(owner, (agent, network)): PFSP score}``
-    (default 0.5); ``env_steps``: a callable (default 0).
+    (default 0.5); ``env_steps``: a callable (default 0); ``seatable``: ``MatchmakerContext.seatable_fn`` (SP5 R41;
+    default every agent).
     """
     import random as _random
 
@@ -1385,6 +1386,7 @@ def make_matchmaker_context(spec, roles, *, kinds=None, matchmaking=None, per_ag
         snapshots_fn=lambda agent_id: list((snapshots or {}).get(agent_id, [])),
         pfsp_fn=lambda layout, owner, player: (scores or {}).get((owner, player), 0.5),
         env_steps_fn=env_steps if env_steps is not None else StepCounter(0),
+        **({} if seatable is None else {"seatable_fn": seatable}),
     )
 
 
