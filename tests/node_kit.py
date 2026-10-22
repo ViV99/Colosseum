@@ -13,6 +13,9 @@ server).
   agent's latest weights through ``Download(kind="latest")``.
 - ``toy_node_options(tmp_path, hub, **kw)``: ``NodeOptions`` of a registered, insecure one-worker node.
 - ``run_node_in_thread(options)`` / ``stop_node(...)``: a ``NodeAgent`` in a thread of the test process.
+- ``run_node_main(options_json)`` (T4.4): a node agent as a script (its own process, SIGINT / SIGTERM handlers,
+  logging to stderr) for the signal and exit-code tests; ``node_options_json`` / ``start_node_main`` build and start
+  one (``python -c``, its own session).
 - ``wait_for(pred, timeout)``: poll a predicate.
 """
 from __future__ import annotations
@@ -416,6 +419,68 @@ class NodeThread:
 
 def run_node_in_thread(options: NodeOptions) -> NodeThread:
     return NodeThread(options)
+
+
+_PATH_FIELDS = ("identity_root", "log_dir")
+
+
+def node_options_json(options: NodeOptions) -> str:
+    """``options`` as the JSON ``run_node_main`` takes (the token as its text; no in-memory data credentials)."""
+    import dataclasses
+    import json
+
+    data: dict[str, Any] = {}
+    for f in dataclasses.fields(options):
+        value = getattr(options, f.name)
+        if f.name == "data_credentials":
+            continue
+        if f.name == "token":
+            value = str(value)
+        elif isinstance(value, Path):
+            value = str(value)
+        elif isinstance(value, tuple):
+            value = list(value)
+        data[f.name] = value
+    return json.dumps(data)
+
+
+def run_node_main(options_json: str) -> int:
+    """The node agent as a script (T4.4): ``NodeOptions`` from ``options_json`` (``node_options_json``), process
+    logging to stderr, SIGINT / SIGTERM stop it (``node.agent.install_stop_signals``); returns ``NodeAgent.run``'s
+    exit code."""
+    import json
+    import logging
+
+    from colosseum.net.security import parse_token
+    from colosseum.node.agent import install_stop_signals
+    from colosseum.utils.logging import setup_process_logging
+
+    data = json.loads(options_json)
+    data["token"] = parse_token(data["token"])
+    for name in _PATH_FIELDS:
+        if data.get(name) is not None:
+            data[name] = Path(data[name])
+    for name, value in list(data.items()):
+        if isinstance(value, list):
+            data[name] = tuple(tuple(v) if isinstance(v, list) else v for v in value)
+    setup_process_logging(None, "node", console_level=logging.INFO)
+    agent = NodeAgent(NodeOptions(**data))
+    install_stop_signals(agent)
+    return agent.run()
+
+
+def start_node_main(options: NodeOptions, stderr: Path) -> Any:
+    """``run_node_main`` in its own process and session (``python -c``; ``tests/`` on its path); its stderr goes to
+    ``stderr``. Returns the ``Popen``; the caller signals / waits / kills it (process group)."""
+    import subprocess
+    import sys
+
+    from cli_runner import child_env
+
+    code = "import sys, node_kit; sys.exit(node_kit.run_node_main(sys.argv[1]))"
+    with open(stderr, "wb") as err:
+        return subprocess.Popen([sys.executable, "-c", code, node_options_json(options)], env=child_env(),
+                                stdout=subprocess.DEVNULL, stderr=err, start_new_session=True)
 
 
 def start_node_process(options: NodeOptions, log_dir: Path) -> Any:

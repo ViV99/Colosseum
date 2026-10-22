@@ -202,7 +202,7 @@ def test_the_hub_lost_timeout_stops_the_processes_and_the_hub_brings_them_back(a
         opened = len(hub.events(SessionOpened))
         proxy.cut(4.0)
         wait_for(lambda: not any(pid_alive(pid) for pid in before.values()), timeout=30)
-        assert _away(node) < 4.0 and node.thread.is_alive()                # stopped within the cut; the agent runs
+        assert len(hub.events(SessionOpened)) == opened and node.thread.is_alive()   # within the cut; it runs on
         said = [r.getMessage() for r in caplog.records if "processes stopped" in r.getMessage()]
         assert said == ["node: the hub is away 2 s: processes stopped; reconnecting every 0.2–0.4 s (Ctrl+C to stop)"]
         announced = len(hub.versions("a"))

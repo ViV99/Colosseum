@@ -56,19 +56,31 @@
    counters ``weight_fetch*`` and the data port's ``data_port.*``: A2), cumulative for the node process.
    ``MetricsBatch`` every ``METRICS_FLUSH_SEC``; due result batches every pass, unacked ones again after
    ``RESULT_RESEND_SEC`` on a live session (P-PF2-4) and all of them after every reconnect.
-9. **Commands.** ``stop_run`` stops (item 10); ``start_learner`` / ``stop_learner`` start or stop one learner
-   (stopped, it sends its final snapshot, which is uploaded); ``release`` stops like item 10, then forgets the run
-   (its children, cache files, lock and listener) and keeps the session (``once``: the node then exits 0; serving
-   another run is T6.3's); ``set_evaluators`` / ``update_code`` (T5.1 / T8.3) are logged and ignored.
-10. **Stop** (``stop_run`` or ``request_stop``): ``Stop`` to every child; the loop keeps reading results until every
-    child exited or the grace passed (``LOCAL_CHILD_GRACE_SEC`` for the local node, ``distributed.shutdown_grace_sec -
-    5`` otherwise); the rest is killed; the result buffer is flushed and its acks awaited until the grace's deadline +
-    ``ACK_WAIT_EXTRA_SEC``, as are the checkpoint uploads (the learners' finals first; what is left then is given up,
-    an ERROR per final); what is still unacked then is counted in ``dropped_results_node_buffer`` (P-PF2-4 b); a last
-    ``Heartbeat``, ``Event(run_stopped)``; the transfers
-    still running are cancelled (``TRANSFER_JOIN_SEC``); the node's cache files and lock are removed; the session
-    closes. Worst case of a local node (``LOCAL_CHILD_GRACE_SEC`` 5 s): 5 s grace + 2 s kill + 1 s acks / uploads +
-    1 s transfer join = 9 s, plus the session's close (immediate while the hub answers; ``HubSession`` bounds it).
+9. **Commands.** ``stop_run`` stops (item 10; its ``reason`` ``grace=<sec>`` is the hub's stop grace, A1);
+   ``start_learner`` / ``stop_learner`` start or stop one learner (stopped, it sends its final snapshot, which is
+   uploaded); ``release`` stops like item 10, then forgets the run (its children, cache files, lock and listener) and
+   keeps the session (``once``: the node then exits 0; serving another run is T6.3's); ``set_evaluators`` /
+   ``update_code`` (T5.1 / T8.3) are logged and ignored.
+10. **Stop** (spec 7.4; T4.4): ``stop_run``, ``release``, or the node's own stop (``request_stop``, SIGINT / SIGTERM
+    through ``install_stop_signals``: an ``Event(node_leaving)`` first, W04-24). ``Stop`` goes to the workers and
+    evaluators (they flush their results), to the learners once the workers are gone or half the children's window
+    passed (no worker loses its learner mid-chunk; each learner sends its final snapshot); the children's window is
+    ``NodeOptions.shutdown_grace_sec``, else the hub's ``stop_run`` grace less what the hub keeps for the rest
+    (``SHUTDOWN_GRACE_SEC - LOCAL_CHILD_GRACE_SEC`` on ``train``'s local node, ``REMOTE_GRACE_MARGIN_SEC`` elsewhere),
+    else the run's default; the rest is killed; the result buffer is flushed and its acks and the checkpoint uploads
+    (the learners' finals first) awaited until the hub's grace less ``ACK_MARGIN_SEC`` (at least the children's
+    deadline + ``ACK_WAIT_EXTRA_SEC``); what is left then is given up (an ERROR per final), unacked results are counted
+    in ``dropped_results_node_buffer`` (P-PF2-4 b); a last ``Heartbeat``, then ``Event(node_stopped)`` after a
+    ``stop_run`` (``run_stopped`` otherwise). After a ``stop_run`` a persistent node (not ``--once``, not ``train``'s
+    local node) forgets the run and waits for the next ``Welcome`` (spec 2.1: INFO ``run finished; waiting for the
+    next run of this hub``); otherwise the transfers still running are cancelled (``TRANSFER_JOIN_SEC``), the node's
+    cache files and lock are removed and the session closes. Exit codes (spec 7.5): 0 after a stop, 128 + signum after
+    a signal, 1 after the hub-lost timeout with ``--once`` (P17), a refusal or a failure. Worst case of a local node
+    (``LOCAL_CHILD_GRACE_SEC`` 5 s): 5 s + 2 s kill + 1 s acks / uploads + 1 s transfer join = 9 s, plus the session's
+    close (immediate while the hub answers; ``HubSession`` bounds it).
+    A child whose exit is seen before its control hello reached the loop waits up to ``EXIT_DRAIN_SEC`` for it (a
+    ``ChildError`` sent just before the exit is a reported error); a learner's checkpoint frame is read off the loop
+    (``_start_frame_read``; one not complete within ``FRAME_READ_TIMEOUT_SEC`` gets its learner killed).
 
 11. **Weights of other machines' learners** (spec 4.5, 4.6; SP5 T3.1). A node started with a data port
     (``NodeOptions.data_port``: ``-1`` the hub config's ``distributed.data_port``, ``0`` ephemeral) binds it after
@@ -170,6 +182,8 @@ LOCAL_CHILD_GRACE_SEC = SHUTDOWN_GRACE_SEC - 2.0   # children of train's local n
 REMOTE_GRACE_MARGIN_SEC = 5.0   # remote nodes: distributed.shutdown_grace_sec minus this
 ACK_WAIT_EXTRA_SEC = 1.0        # result acks are awaited until the children's deadline plus this
 EXIT_DRAIN_SEC = 1.0            # an exited child's control connection is read to its end within this (P-PF2-11)
+FRAME_READ_TIMEOUT_SEC = 60.0   # a learner that does not finish sending one checkpoint frame within this is killed
+ACK_MARGIN_SEC = 1.0            # stop_run: acks and uploads are awaited until the hub's grace minus this (T4.4)
 TRANSFER_THREADS = 4
 TRANSFER_JOIN_SEC = 1.0         # at the end, cancelled transfers are waited for this long before the cache cleanup
 FETCH_PUMP_SEC = 0.1            # the fetch planner is asked for due latest transfers at most this often
@@ -227,6 +241,18 @@ class _Accepted:
 @dataclass
 class _StopRequested:
     reason: str
+    signum: int | None = None          # SIGINT / SIGTERM: the node exits with 128 + signum
+
+
+@dataclass
+class _FrameRead:
+    """A checkpoint frame read off the main loop (``_start_frame_read``): ``frame`` or ``error``."""
+
+    conn: Any
+    name: str
+    header: Any
+    frame: bytes | None
+    error: BaseException | None
 
 
 @dataclass
@@ -376,15 +402,28 @@ class NodeAgent:
         self._renew_channel = False                 # the session was lost: the next SessionUp renews _channel
         self._dormant = ""                          # item 13: "stopping" / "stopped" after hub_lost_timeout_sec
         self._dormant_deadline = 0.0
-        self._wake_welcome: pb.Welcome | None = None   # a Welcome that came while the processes were stopping
+        self._wake_pending = False                  # a Welcome came while the processes stopped (item 13)
         self._cache_full = False                    # item 14
+        self._stop_kind = ""                        # "stop_run" / "release" / "leave" (request_stop, a signal)
+        self._stop_reason = ""
+        self._learners_stop_at = 0.0                # the stop: learners get Stop once the workers are gone or then
+        self._learners_told = True
+        self._exit_waits: dict[str, tuple[int | None, float]] = {}   # exited before their hello arrived (P-PF2-11)
+        self._frame_reads: dict[Any, tuple] = {}    # conn -> (reader thread, start, child name, [its _FrameRead])
         self._largest_frame = 0                     # bytes of the largest frame bound for the cache (the space check)
         self._next_space_check = 0.0
 
     # ---- public ---------------------------------------------------------------------------------------------
 
-    def request_stop(self) -> None:
-        self._post(_StopRequested("stop requested"))
+    def request_stop(self, signum: int | None = None) -> None:
+        """Stop the node (thread-safe; a signal handler may call it): ``node_leaving`` to the hub, the children
+        stopped within ``distributed.shutdown_grace_sec``; ``run`` returns 0, or 128 + ``signum`` (spec 7.5)."""
+        if signum is None:
+            self._post(_StopRequested("stop requested"))
+        else:
+            import signal as signal_mod
+
+            self._post(_StopRequested(signal_mod.Signals(signum).name, int(signum)))
 
     @property
     def results(self) -> ResultBuffer | None:
@@ -436,7 +475,7 @@ class NodeAgent:
                 logger.error(f"node: {e}")
                 return 1
             if identity is None:
-                return 0
+                return self._exit_code
             self._open_session(*identity)
             while not self._done:
                 self._pass()
@@ -567,6 +606,8 @@ class NodeAgent:
             try:
                 item = self._inbox.get(timeout=max(0.0, min(0.1, end - time.monotonic())))
                 if isinstance(item, _StopRequested):
+                    if item.signum is not None:
+                        self._exit_code = 128 + int(item.signum)
                     return True
             except queue.Empty:
                 pass
@@ -706,7 +747,7 @@ class NodeAgent:
     # ---- the loop ---------------------------------------------------------------------------------------------
 
     def _pass(self) -> None:
-        conns = list(self._child_conns)
+        conns = [c for c in self._child_conns if c not in self._frame_reads]   # a frame being read: its thread
         try:
             ready = mpc.wait([self._wake_r, *conns, *self.supervisor.sentinels()], timeout=LOOP_WAIT_SEC)
         except OSError:
@@ -719,7 +760,10 @@ class NodeAgent:
         self._drain_inbox()
         for name, code in self.supervisor.exited():
             self._on_exit(name, code)
-        self._tick(time.monotonic())
+        now = time.monotonic()
+        self._check_exit_waits(now)
+        self._check_frame_reads(now)
+        self._tick(now)
         self._update_hello_state()
         self._publish_views()
 
@@ -761,7 +805,9 @@ class NodeAgent:
             elif isinstance(item, LatestFetchFailed):
                 self.lineups.on_latest_fetch_failed(item)
             elif isinstance(item, _StopRequested):
-                self._begin_stop(item.reason)
+                self._begin_stop(item.reason, signum=item.signum)
+            elif isinstance(item, _FrameRead):
+                self._on_frame_read(item)
             elif isinstance(item, LearnerBlobsDone):
                 self.learners.on_blobs(item)
             elif isinstance(item, _UploadDone):
@@ -816,7 +862,8 @@ class NodeAgent:
             if not run.started and not self._dormant:
                 self._maybe_start_workers(run)
             self.learners.start_pending(run, spawn=not (self._dormant or self._cache_full))
-            self.lineups.request_lineups()
+            if not self._dormant:                    # item 13: no lineup while the processes stop or are stopped
+                self.lineups.request_lineups()
             self.lineups.expire_waiting()
             self.lineups.deliver(run)
             if now >= self._next_fetch_pump:
@@ -833,7 +880,7 @@ class NodeAgent:
         if self._done:
             return
         if run is None:                              # released (or no Welcome yet): heartbeats keep the session
-            if self._released and self._connected and now >= self._next_heartbeat:
+            if self._run_serial and self._connected and now >= self._next_heartbeat:
                 self._next_heartbeat = now + self._heartbeat_sec
                 self._send(pb.NodeMessage(heartbeat=pb.Heartbeat(
                     env_steps=self._env_steps(), dropped_results=self._dropped_carry,
@@ -892,14 +939,17 @@ class NodeAgent:
             logger.warning(f"node: the hub now runs {welcome.run_id[:8]}, this node serves {run.run_id[:8]}; "
                            f"ignored (switching runs is the join command's, T6.3)")
             return
-        if self._dormant == "stopping":              # item 13: handled once the processes are gone
-            self._wake_welcome = welcome
-            return
+        # Item 13: a Welcome after the hub-lost timeout restarts the run's processes. One that comes while they still
+        # stop is applied at once (versions, routes, the desired learners: a listed learner that is stopping starts
+        # again as its successor); only the spawns wait until every process is gone (_finish_hub_lost_stop).
+        stopping = self._dormant == "stopping"
         woke = self._dormant == "stopped"
-        if woke:
+        if stopping:
+            self._wake_pending = True
+            logger.info(f"node: the hub is back: run {run.run_id[:8]} starts its processes again once they stopped")
+        elif woke:
             self._dormant = ""
-            self._reported.clear()
-            self._disabled.clear()
+            self._reported.clear()                   # (disabled worker slots stay off until the node restarts)
             logger.info(f"node: the hub is back: run {run.run_id[:8]} starts its processes on this node again")
         else:
             logger.info(f"node: session resumed for run {run.run_id[:8]} (node {run.number})")
@@ -1091,6 +1141,8 @@ class NodeAgent:
             run.fixed_roles[agent] = tuple(cached.meta.roles) if cached.meta.roles else tuple(run.spec.roles)
         daemon = run.config.rollout.vec_env != "subprocess"            # P-PF2-7
         for i in range(run.workers):
+            if f"worker-{i}" in self._disabled:     # a disabled slot stays off until the node restarts (spec 7.1)
+                continue
             kwargs = dict(name=f"worker-{i}", log_dir=str(run.log_dir), node=run.number, worker=i,
                           node_address=run.node_address, authkey=run.authkey, config=run.config,
                           agent_ids=list(run.agent_ids), agent_roles=run.agent_roles,
@@ -1106,7 +1158,8 @@ class NodeAgent:
 
     def _on_command(self, cmd: pb.Command) -> None:
         if cmd.kind == "stop_run":
-            self._begin_stop(f"the hub stopped the run ({cmd.reason or 'stop_run'})")
+            self._begin_stop(f"the hub stopped the run ({cmd.reason or 'stop_run'})", stop_run=True,
+                             grace=_grace_of(cmd.reason))
         elif cmd.kind == "release":
             self._begin_stop(f"the hub released this node ({cmd.reason or 'release'})", release=True)
         elif cmd.kind == "start_learner":
@@ -1130,7 +1183,8 @@ class NodeAgent:
 
         name = hello.name
         proc = self.supervisor.get(name)
-        if (self._run is None or proc is None or proc.exitcode is not None
+        exited = proc is not None and proc.exitcode is not None
+        if (self._run is None or proc is None or (exited and name not in self._exit_waits)
                 or int(hello.incarnation) != self.supervisor.incarnation(name)):
             logger.debug(f"node: closed a connection of {name!r} (incarnation {hello.incarnation}): not a live child")
             conn.close()
@@ -1141,6 +1195,8 @@ class NodeAgent:
                 self._close_conn(old)
             self._control[name] = conn
             self._child_conns[conn] = name
+            if exited:                               # its exit waits for this hello: read to its end, then classify
+                return
             if self._stopping:
                 self._child_send(name, conn, Stop("the node stops"))
             elif self._dormant and self.supervisor.role(name) != "learner":   # learners: NodeLearners sends it
@@ -1150,8 +1206,8 @@ class NodeAgent:
             elif self.supervisor.role(name) == "learner":
                 self.learners.on_connected(name)
         elif hello.channel == "route":              # frames for other machines: the router reads them (item 12)
-            if self._stopping or self._dormant or self.supervisor.role(name) != "worker" or not self.routing.add_worker(
-                    conn, _slot_index(name)):
+            if (exited or self._stopping or self._dormant or self.supervisor.role(name) != "worker"
+                    or not self.routing.add_worker(conn, _slot_index(name))):
                 conn.close()
         else:
             conn.close()
@@ -1195,9 +1251,10 @@ class NodeAgent:
                         self._oversized_checkpoint(name, message, cap)
                         self._close_conn(conn)     # the frame stays unread: the learner's connection ends
                         return
-                    # A blocking read of one whole frame: a learner SIGSTOPped in the middle of it stalls the loop
-                    # (SIGKILL gives EOF at once); bounding it is T4.4's.
-                    frame = conn.recv_bytes(cap)
+                    # The frame is read off the loop (a learner stopped in the middle of it never stalls the node;
+                    # one stuck longer than FRAME_READ_TIMEOUT_SEC is killed): the connection waits meanwhile.
+                    self._start_frame_read(conn, name, message, cap)
+                    return
             except (EOFError, ConnectionResetError, BrokenPipeError):
                 # The peer is gone: a clean end, or (Linux AF_UNIX) a peer that exited with data of ours unread,
                 # which reads as ECONNRESET; its exit is reported by the exit path, not as a read failure.
@@ -1216,6 +1273,67 @@ class NodeAgent:
                 self._on_checkpoint(name, message, frame)
             else:
                 self._on_child_message(name, message)
+
+    def _start_frame_read(self, conn: mpc.Connection, name: str, header: Any, cap: int) -> None:
+        """Read ``header``'s frame in a short thread (it posts ``_FrameRead``); the loop leaves the connection alone
+        until then (``_pass`` does not wait on it, ``_close_conn`` leaves its closing to ``_on_frame_read``)."""
+        box: list[_FrameRead] = []
+
+        def read() -> None:
+            frame, error = None, None
+            try:
+                frame = conn.recv_bytes(cap)
+            except BaseException as e:  # noqa: BLE001 - reported to the loop
+                error = e
+            box.append(_FrameRead(conn, name, header, frame, error))
+            self._post(box[0])
+
+        thread = threading.Thread(target=read, name=f"node-frame-{name}", daemon=True)
+        self._frame_reads[conn] = (thread, time.monotonic(), name, box)
+        thread.start()
+
+    def _on_frame_read(self, item: _FrameRead) -> None:
+        """A checkpoint frame of a learner was read (or its read failed: the connection ends as a read in the loop
+        would end it); the connection is read by the loop again."""
+        if self._frame_reads.pop(item.conn, None) is None:
+            return                                   # handled already (_drain_to_eof)
+        if item.conn not in self._child_conns:       # closed while it was read: closed now
+            _close_quietly(item.conn)
+            return
+        error = item.error
+        if error is None:
+            self._on_checkpoint(item.name, item.header, item.frame)
+            return
+        if not isinstance(error, (EOFError, ConnectionResetError, BrokenPipeError)):
+            logger.error(f"node: reading a checkpoint frame from {item.name} failed ({type(error).__name__}: {error}); "
+                         f"its connection is closed")
+            self.learners.note_failure(item.name, f"the node could not read its checkpoint frame ({error})")
+        self._close_conn(item.conn)
+
+    def _check_frame_reads(self, now: float) -> None:
+        """A learner that has not finished sending a checkpoint frame within ``FRAME_READ_TIMEOUT_SEC`` (stopped or
+        stuck mid-frame) is killed; its read then ends and its exit is reported as any death."""
+        for _thread, started, name, _box in list(self._frame_reads.values()):
+            if now - started < FRAME_READ_TIMEOUT_SEC or ("frame_stuck", name, started) in self._warned:
+                continue
+            self._warned.add(("frame_stuck", name, started))
+            text = f"its checkpoint frame did not arrive within {FRAME_READ_TIMEOUT_SEC:g} s; killed"
+            logger.error(f"node: {name}: {text}")
+            self.learners.note_failure(name, text)
+            proc = self.supervisor.get(name)
+            if proc is not None and proc.exitcode is None:
+                proc.kill()
+
+    def _finish_frame_read(self, conn: mpc.Connection, timeout: float) -> None:
+        """``_drain_to_eof``: the frame being read off ``conn`` (its sender exited: the data is in the socket or it
+        ends) is waited for up to ``timeout`` and handled now."""
+        reading = self._frame_reads.get(conn)
+        if reading is None:
+            return
+        thread, _started, _name, box = reading
+        thread.join(max(0.0, timeout))
+        if box:                                      # its posted copy is ignored later (no longer in _frame_reads)
+            self._on_frame_read(box[0])
 
     def _oversized_checkpoint(self, name: str, header: Any, cap: int) -> None:
         """A checkpoint header announcing a frame above the cap (the learner checks first, so this is a learner of
@@ -1247,8 +1365,11 @@ class NodeAgent:
             log_path = "" if run is None else str(run.log_dir / f"{name}.log")
             logger.error(f"node: {name} failed ({message.kind}): {message.message}")
             self.learners.note_failure(name, f"{message.kind}: {message.message}")   # its death report names it
+            from colosseum.node.logs import tail_for_event
+
             self._event("child_error", proc=name, error_kind=message.kind, message=message.message,
-                        context=f"node {self._number} ({self._name}), {message.context}", log_path=log_path)
+                        context=f"node {self._number} ({self._name}), {message.context}", log_path=log_path,
+                        log_tail=tail_for_event(log_path))
         else:
             self.learners.on_message(name, message)
 
@@ -1256,16 +1377,20 @@ class NodeAgent:
         name = self._child_conns.pop(conn, None)
         if name is not None and self._control.get(name) is conn:
             del self._control[name]
-        try:
-            conn.close()
-        except OSError:
-            pass
+        if conn in self._frame_reads:                # its reader thread still uses it: closed in _on_frame_read
+            return
+        _close_quietly(conn)
 
     def _drain_to_eof(self, name: str) -> None:
         """Read an exited child's control connection to its end, bounded by ``EXIT_DRAIN_SEC`` (P-PF2-11)."""
         conn = self._control.get(name)
         deadline = time.monotonic() + EXIT_DRAIN_SEC
         while conn is not None and self._control.get(name) is conn:
+            if conn in self._frame_reads:
+                self._finish_frame_read(conn, deadline - time.monotonic())
+                if conn in self._frame_reads:        # not done within the bound: its connection ends here
+                    break
+                continue
             remaining = deadline - time.monotonic()
             try:
                 if remaining <= 0 or not conn.poll(remaining):
@@ -1277,6 +1402,13 @@ class NodeAgent:
             self._close_conn(c)
 
     def _on_exit(self, name: str, code: int | None) -> None:
+        """A child exited. One whose control hello has not reached the loop yet (the ``Acceptor``'s handshake runs in
+        its thread) waits up to ``EXIT_DRAIN_SEC`` for it (``_check_exit_waits``): a ``ChildHello`` + ``ChildError``
+        sent just before the exit is a reported error, not a death (carried item of T2.4 (a))."""
+        if name not in self._control and name not in self._exit_waits and not self._stopping:
+            self._exit_waits[name] = (code, time.monotonic() + EXIT_DRAIN_SEC)
+            return
+        self._exit_waits.pop(name, None)
         self._drain_to_eof(name)
         if self._stopping:
             return
@@ -1294,6 +1426,11 @@ class NodeAgent:
             return
         self._restart_or_disable(run, name, role, code, log_path)
 
+    def _check_exit_waits(self, now: float) -> None:
+        for name, (code, deadline) in list(self._exit_waits.items()):
+            if name in self._control or now >= deadline or self._stopping:
+                self._on_exit(name, code)
+
     def _restart_or_disable(self, run: _Run | None, name: str, role: str | None, code: int | None,
                             log_path: str) -> None:
         """Spec 7.1 (T4.2): a worker or evaluator that died without reporting an error is started again (a new
@@ -1302,11 +1439,10 @@ class NodeAgent:
         ``worker_restarts`` (A2); after the limit its slot is off until the node process restarts
         (``slot_disabled``, a WARNING here). Both events carry the exit code, the log path and its tail."""
         from colosseum.node import procs
-        from colosseum.node.logs import log_tail
+        from colosseum.node.logs import tail_for_event
 
         logger.warning(f"node: {name} died (exit {code}) without reporting an error; see {log_path}")
-        fields = dict(proc=name, exit_code=int(code or 0), log_path=log_path,
-                      log_tail=log_tail(Path(log_path)) if log_path else b"")
+        fields = dict(proc=name, exit_code=int(code or 0), log_path=log_path, log_tail=tail_for_event(log_path))
         if run is None or role not in ("worker", "evaluator"):
             return
         worker = _slot_index(name) if role == "worker" else None
@@ -1462,8 +1598,8 @@ class NodeAgent:
 
     def _finish_hub_lost_stop(self, run: _Run, now: float) -> None:
         """Every child exited (or the grace passed: the rest is killed): the cells and routes are cleared (the results
-        buffer and the upload queue stay); ``--once`` ends the agent with 1 (ruling P17); a ``Welcome`` that came
-        meanwhile starts the run's processes again."""
+        buffer and the upload queue stay); ``--once`` ends the agent with 1 (ruling P17); after a ``Welcome`` that came
+        meanwhile (applied at once) the workers start again now."""
         if self.supervisor.alive() and now < self._dormant_deadline:
             return
         if self.supervisor.alive():
@@ -1479,9 +1615,11 @@ class NodeAgent:
         if self.options.once:
             self._exit_code, self._done = 1, True
             return
-        welcome, self._wake_welcome = self._wake_welcome, None
-        if welcome is not None:
-            self._on_welcome(welcome)
+        if self._wake_pending:                       # the hub came back meanwhile: its Welcome was applied
+            self._wake_pending = False
+            self._dormant = ""
+            self._reported.clear()
+            self._maybe_start_workers(run)
 
     def _note_frame(self, size: int) -> None:
         self._largest_frame = max(self._largest_frame, int(size or 0))
@@ -1565,29 +1703,75 @@ class NodeAgent:
 
     # ---- the stop ---------------------------------------------------------------------------------------------
 
-    def _begin_stop(self, reason: str, *, release: bool = False) -> None:
-        """Item 10 (``release``: then forget the run and keep the session)."""
-        from colosseum.net.local import Stop
-
+    def _begin_stop(self, reason: str, *, release: bool = False, stop_run: bool = False, grace: float | None = None,
+                    signum: int | None = None) -> None:
+        """Item 10 (spec 7.4; T4.4). ``stop_run``: the hub ends the run (``grace``: its stop grace from the command,
+        A1); ``release``: then forget the run and keep the session; otherwise the node stops on its own (Ctrl+C,
+        SIGTERM: ``signum``, ``request_stop``) and tells the hub first (``node_leaving``, W04-24)."""
         if self._stopping:
             return
         self._stopping = True
+        self._stop_kind = "release" if release else "stop_run" if stop_run else "leave"
+        self._stop_reason = reason
+        if signum is not None:
+            self._exit_code = 128 + int(signum)
         self._releasing = release and self._run is not None
         now = time.monotonic()
         run = self._run
         logger.info(f"node: stopping ({reason})")
+        if self._stop_kind == "leave" and self._connected and run is not None:
+            self._send(pb.NodeMessage(event=pb.Event(kind="node_leaving")))
         if run is None:
             self._stop_phase = "acks"
             self._ack_deadline = now
             return
-        for name, conn in list(self._control.items()):
-            self._child_send(name, conn, Stop(reason))
-        self._children_deadline = now + run.grace
+        window = self._children_window(run, grace)
+        self._children_deadline = now + window
+        # acks and uploads (the learners' finals) get the hub's whole grace less a margin (T4.2 (a)'s carried item: a
+        # large final is not given up at the children's deadline + 1 s)
+        self._ack_deadline = max(self._children_deadline + ACK_WAIT_EXTRA_SEC,
+                                 now + (grace - ACK_MARGIN_SEC if grace is not None else 0.0))
+        self._stop_others(reason)
+        # Learners stop once the workers are gone (their last chunks are consumed, no worker loses its receiver:
+        # carried item of T2.5 (a2)), at the latest after half the children's window (their finals need the rest).
+        self._learners_told = False
+        self._learners_stop_at = now + window / 2.0
         self._stop_phase = "children"
+
+    def _children_window(self, run: _Run, grace: float | None) -> float:
+        """How long the children get after ``Stop``: ``NodeOptions.shutdown_grace_sec`` when set; with the hub's
+        ``stop_run`` grace that grace less the time the hub keeps for the rest of the node's stop (2 s on ``train``'s
+        local node, as ``LOCAL_CHILD_GRACE_SEC`` within ``SHUTDOWN_GRACE_SEC``; ``REMOTE_GRACE_MARGIN_SEC`` elsewhere);
+        else the run's default (``_Run.grace``)."""
+        if self.options.shutdown_grace_sec is not None or grace is None:
+            return run.grace
+        margin = SHUTDOWN_GRACE_SEC - LOCAL_CHILD_GRACE_SEC if self.options.local else REMOTE_GRACE_MARGIN_SEC
+        return max(1.0, float(grace) - margin)
+
+    def _stop_others(self, reason: str) -> None:
+        """``Stop`` to every child that is not a learner (workers flush their results)."""
+        from colosseum.net.local import Stop
+
+        for name, conn in list(self._control.items()):
+            if self.supervisor.role(name) != "learner":
+                self._child_send(name, conn, Stop(reason))
+
+    def _stop_learners(self) -> None:
+        """``Stop`` to every learner (each sends its final snapshot: the upload queue takes it first)."""
+        from colosseum.net.local import Stop
+
+        self._learners_told = True
+        for name, conn in list(self._control.items()):
+            if self.supervisor.role(name) == "learner":
+                self._child_send(name, conn, Stop(self._stop_reason))
 
     def _stop_step(self, now: float) -> None:
         run = self._run
         if self._stop_phase == "children":
+            if not self._learners_told:
+                others = [n for n in self.supervisor.alive() if self.supervisor.role(n) != "learner"]
+                if not others or now >= self._learners_stop_at:
+                    self._stop_learners()
             if self.supervisor.alive() and now < self._children_deadline:
                 return
             self.routing.stop()                      # item 12: before the children are killed
@@ -1598,7 +1782,7 @@ class NodeAgent:
             if run is not None:
                 for message in run.results.flush():
                     self._send(message)
-            self._ack_deadline = max(now, self._children_deadline) + ACK_WAIT_EXTRA_SEC
+            self._ack_deadline = max(self._ack_deadline, max(now, self._children_deadline) + ACK_WAIT_EXTRA_SEC)
             self._stop_phase = "acks"
             return
         if self._stop_phase == "acks":
@@ -1611,12 +1795,18 @@ class NodeAgent:
                 if self._connected:
                     self._send_metrics()
                     self._send_heartbeat(run)
-            if self._connected:
-                self._send(pb.NodeMessage(event=pb.Event(kind="run_stopped")))
+            if self._connected:                      # node_stopped: the hub's stop_run is done here (spec 7.4)
+                kind = "node_stopped" if self._stop_kind == "stop_run" else "run_stopped"
+                self._send(pb.NodeMessage(event=pb.Event(kind=kind)))
             if self._releasing and run is not None:
-                self._forget_run(run)
+                self._forget_run(run, released=True)
                 if self.options.once:
                     self._done = True
+                return
+            if (self._stop_kind == "stop_run" and run is not None and not self.options.local
+                    and not self.options.once):    # a persistent node (spec 2.1): the session stays
+                self._forget_run(run, released=False)
+                logger.info("node: run finished; waiting for the next run of this hub")
                 return
             self._done = True
 
@@ -1639,13 +1829,16 @@ class NodeAgent:
                 self._event("warning", proc=f"learner-{upload.agent_id}",
                             message=f"final v{upload.version} not uploaded before the stop deadline")
 
-    def _forget_run(self, run: _Run) -> None:
-        """After ``release``: the run's resources go (``_teardown_run``) and so do its books; the session stays.
-        This node serves nothing further of this run (``_released``); serving another run is T6.3's."""
+    def _forget_run(self, run: _Run, *, released: bool) -> None:
+        """After ``release`` or the end of a run (``stop_run`` on a persistent node): the run's resources go
+        (``_teardown_run``) and so do its books; the session stays. A released node serves nothing further
+        (``_released``; serving another run is T6.3's); after a run's end the next ``Welcome`` (a new run, or the same
+        run continued by ``hub --resume``) starts afresh."""
         self._teardown_run(run)
         self._dropped_carry += int(run.results.dropped)
         self._heartbeat_sec = run.heartbeat_sec
-        self._released.add(run.run_id)
+        if released:
+            self._released.add(run.run_id)
         self._run = None
         self.supervisor = ChildSupervisor()
         self.cells = CellTracker(retry_sec=LINEUP_RETRY_SEC, clock=time.monotonic)
@@ -1659,7 +1852,11 @@ class NodeAgent:
         for book in (self._reported, self._disabled):
             book.clear()
         self._stopping, self._releasing, self._stop_phase = False, False, ""
-        logger.info(f"node: released run {run.run_id[:8]}; the session stays open")
+        self._stop_kind = ""
+        self._dormant, self._wake_pending, self._cache_full = "", False, False
+        self._exit_waits.clear()
+        if released:
+            logger.info(f"node: released run {run.run_id[:8]}; the session stays open")
 
     def _close(self) -> None:
         """Children, the session, transfers, then the run's resources and cache files (every path out of ``run``).
@@ -1904,6 +2101,26 @@ def _release_partial_start(acceptor: Any, lst: Any, root: Path | None, prefix: s
             logger.warning(f"node: cannot remove the weight cache files of {prefix}: {e}")
 
 
+def _close_quietly(conn: Any) -> None:
+    try:
+        conn.close()
+    except OSError:
+        pass
+
+
+def _grace_of(reason: str) -> float | None:
+    """``Command(stop_run).reason`` = ``grace=<sec>`` (A1): the hub's stop grace; None when absent or malformed."""
+    for part in str(reason or "").split(","):
+        key, _, value = part.strip().partition("=")
+        if key == "grace":
+            try:
+                grace = float(value)
+            except ValueError:
+                return None
+            return grace if 0 < grace < 3600 else None
+    return None
+
+
 def _slot_index(name: str) -> int:
     return int(name.rsplit("-", 1)[1])
 
@@ -1976,8 +2193,6 @@ def local_node_target(*, options: NodeOptions, log_dir: str) -> None:
 def main(argv: Sequence[str] | None = None) -> int:
     """``python -m colosseum.node.agent --hub ADDR --token-file F [--insecure] [--workers N] [--name NAME]`` (the
     loader's target, T6.2; ``join`` defines the full flags in T6.3)."""
-    import signal
-
     from colosseum.net.security import parse_token
     from colosseum.utils.logging import setup_process_logging
 
@@ -1992,9 +2207,17 @@ def main(argv: Sequence[str] | None = None) -> int:
     options = NodeOptions(hub_address=args.hub, token=parse_token(Path(args.token_file).read_text()),
                           insecure=args.insecure, workers=args.workers, name=args.name)
     agent = NodeAgent(options)
-    for sig in (signal.SIGINT, signal.SIGTERM):
-        signal.signal(sig, lambda *_: agent.request_stop())
+    install_stop_signals(agent)
     return agent.run()
+
+
+def install_stop_signals(agent: NodeAgent) -> None:
+    """SIGINT / SIGTERM stop ``agent`` (its children first; ``run`` then returns 128 + signum, spec 7.5). Main thread
+    only."""
+    import signal
+
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        signal.signal(sig, lambda signum, _frame: agent.request_stop(signum))
 
 
 if __name__ == "__main__":

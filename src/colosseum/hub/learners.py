@@ -84,8 +84,8 @@ class HubLearners:
         gets a free slot (``_start_learner``), the rest are ``pending`` (an INFO when the reason changes; parked
         weights when they have any). No pass runs while no node is online. ``train`` without ``--listen`` fails the
         run when an agent stays pending with its local node online (W04-26)."""
-        if self._learners is None or not self._agent_ids or not self._registry.online():
-            return                                   # before any node: nothing to place, nobody to play parked weights
+        if self._learners is None or not self._agent_ids or not self._registry.online() or self._shutting_down:
+            return                                   # before any node, or the run stops (T4.4): nothing to place
         configs = self._setup.agent_configs
         agents = {a: configs[a].learner for a in self._agent_ids if self._learners[a].status != "failed"}
         current = self._learners.current()

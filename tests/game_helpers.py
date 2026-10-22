@@ -1598,6 +1598,19 @@ class PlayerErrorBot(ScriptedBot):
         raise RuntimeError("bot failure on purpose")
 
 
+class WorkerPlayerErrorBot(ScriptedBot):
+    """Random legal play, except in a worker process (``COLOSSEUM_PROCESS_NAME`` ``worker-*``), where ``act`` raises
+    (SP5 T4.4): ``validate`` plays it normally, a node's worker reports a PlayerError with its context."""
+
+    def reset(self, *, role, seat, layout, rng) -> None:
+        self._role, self._rng = self.game_spec.roles[role], rng
+
+    def act(self, obs, mask, info):
+        if str(os.environ.get(ENV_PROCESS_NAME, "")).startswith("worker"):
+            raise RuntimeError("bot failure on purpose")
+        return random_legal_action(self._role, mask, self._rng)
+
+
 def biased_model(config, agent_id: str, logits, seed: int = 0):
     """A ``GameTestModel`` of trainable ``agent_id`` whose policy head has zero weights and bias ``logits``: it
     plays one fixed distribution whatever it sees (``[20, 0, 0]``: always action 0)."""

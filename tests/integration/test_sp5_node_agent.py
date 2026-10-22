@@ -504,7 +504,7 @@ def test_a_learner_trains_on_the_node_and_uploads_its_snapshots(hub_factory, nod
     monkeypatch.setattr(node_session, "RECONNECT_MIN_SEC", 0.05)
     monkeypatch.setattr(node_session, "RECONNECT_MAX_SEC", 0.2)
     hub = _learner_hub(hub_factory)
-    node = node_factory(hub)
+    node = node_factory(hub, once=True)                             # T4.4: a persistent node stays after stop_run
     first = wait_for(lambda: hub.versions("a"), timeout=60)[0]
     assert (first.generation, first.version, first.node) == (1, 0, node.agent.number) and first.size > 0
     wait_for(lambda: max(_train_steps(hub), default=0) >= 3, timeout=60)
@@ -528,7 +528,7 @@ def test_a_learner_trains_on_the_node_and_uploads_its_snapshots(hub_factory, nod
     hub.sync()
     (final,) = hub.uploads_of("final")
     assert final.agent_id == "a" and final.generation == 1 and final.version >= versions[-1]
-    assert hub.node_events("run_stopped")
+    assert hub.node_events("node_stopped")
     assert not node.agent.supervisor.alive()
     assert not list(shm_dir().glob(f"{prefix}*")) and not list(shm_dir().glob(f".{prefix}*"))
 
@@ -599,7 +599,7 @@ def test_children_die_with_their_node(tmp_path, hub_factory):
 
 def test_stop_finishes_within_the_local_grace(hub_factory, node_factory):
     hub = _learner_hub(hub_factory)
-    node = node_factory(hub, shutdown_grace_sec=agent_mod.LOCAL_CHILD_GRACE_SEC)
+    node = node_factory(hub, shutdown_grace_sec=agent_mod.LOCAL_CHILD_GRACE_SEC, once=True)
     wait_for(lambda: max(_train_steps(hub), default=0) >= 2, timeout=60)
     start = time.monotonic()
     hub.send_command("stop_run", reason="grace=5")

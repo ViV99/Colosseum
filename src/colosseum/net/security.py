@@ -267,7 +267,7 @@ def _load_key(path: Path) -> ec.EllipticCurvePrivateKey:
 
 
 def _now() -> datetime.datetime:
-    return datetime.datetime.now(datetime.UTC)
+    return datetime.datetime.now(datetime.UTC)    # ts: informational (X.509 validity dates are wall-clock)
 
 
 def _make_ca(key: ec.EllipticCurvePrivateKey) -> x509.Certificate:

@@ -78,8 +78,8 @@ from colosseum.net.security import HubIdentity, SecurityError, private_dir
 
 __all__ = [
     "ADMIN_REPLY_TIMEOUT_SEC", "CLOSE_GRACE_SEC", "LOOPBACK_KEY", "OUTBOUND_QUEUE_SIZE", "REGISTER_REPLY_TIMEOUT_SEC",
-    "SERVER_THREADS", "UPLOAD_CLAIMED_WAIT_SEC", "UPLOAD_KINDS", "UPLOAD_REPLY_TIMEOUT_SEC", "AdminIn", "BlobStore",
-    "HubServicer",
+    "HELLO_TIMEOUT_SEC", "SERVER_THREADS", "UPLOAD_CLAIMED_WAIT_SEC", "UPLOAD_KINDS", "UPLOAD_REPLY_TIMEOUT_SEC",
+    "AdminIn", "BlobStore", "HubServicer",
     "NodeMessageIn", "RegisterIn", "SessionClosed", "SessionHandle", "SessionOpened", "StopRequested", "UploadIn",
     "blob_file_name", "blob_ident", "build_server", "hello_from_proto",
 ]
@@ -97,6 +97,7 @@ LOOPBACK_KEY = "loopback"            # the plain loopback port in build_server's
 POLL_SEC = 0.5
 
 UPLOAD_KINDS = ("checkpoint", "final", "recovery")              # agent_file: T8.2
+HELLO_TIMEOUT_SEC = 10.0              # a Session stream must send its Hello within this (T4.4)
 RELAY_UPLOAD_KIND = "relay_latest"                               # T3.2: handled in the servicer (LatestRelay)
 RELAY_ITEM_POLL_SEC = 0.25
 REGISTERED_KINDS = ("fixed", "teacher", "init")
@@ -337,10 +338,17 @@ class HubServicer(pb_grpc.HubServicer):
 
     def Session(self, request_iterator, context: grpc.ServicerContext):
         node_id = node_id_of(context)                  # verified by the interceptor
+        # SP5 T4.4 (carried item of T2.3): a stream without its Hello within HELLO_TIMEOUT_SEC is cancelled, so an
+        # authenticated node cannot hold a server thread forever.
+        timer = threading.Timer(HELLO_TIMEOUT_SEC, context.cancel)
+        timer.daemon = True
+        timer.start()
         try:
             first = next(request_iterator)
         except (StopIteration, grpc.RpcError):
             return
+        finally:
+            timer.cancel()
         if first.WhichOneof("m") != "hello":
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "the first session message must be Hello")
         hello = first.hello

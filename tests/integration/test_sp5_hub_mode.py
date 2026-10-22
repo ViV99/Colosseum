@@ -23,8 +23,8 @@ def test_hub_trains_with_a_node_that_connects_in_process(tmp_path):
         assert info.mode == "hub" and info.tls is False and re.fullmatch(r"127\.0\.0\.1:[1-9]\d*", info.loopback)
         identity = HubIdentity.load_or_create(Path(info.identity_dir))
         node = NodeThread(NodeOptions(hub_address=info.loopback, token=identity.token, insecure=True, workers=1,
-                                      cpu_learners=1, identity_root=tmp_path / "node",
-                                      log_dir=tmp_path / "node-logs"))
+                                      cpu_learners=1, identity_root=tmp_path / "node", once=True,
+                                      log_dir=tmp_path / "node-logs"))       # --once: it exits after the run (T4.4)
         assert proc.wait(240) == 0, (root.parent / "hubrun.stderr").read_text()[-3000:]
         node.thread.join(60)
         assert not node.thread.is_alive() and node.exit_code == 0

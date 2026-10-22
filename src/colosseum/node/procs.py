@@ -1,7 +1,8 @@
 """Child processes of a node (SP5 spec 1, 7.1): spawn, named incarnations, restart limits, bounded stop.
 
 Every child is started with ``utils.process.start_process`` (SIGINT blocked until its ``run_child`` body ignores it)
-and runs ``init_child_process`` (``PR_SET_PDEATHSIG``: it dies with the node; T4.4 adds the macOS watchdog). The
+and runs ``init_child_process`` (``watch_parent``, re-exported here: ``PR_SET_PDEATHSIG`` on Linux, a watchdog thread
+elsewhere, SP5 spec 7.8: it dies with the node). The
 death signal fires when the *thread* that started the child exits, so the node starts its children only from its
 main-loop thread. The supervisor never shares a lock, queue or event with a child: it only starts, polls
 (``exitcode``), terminates and kills them; everything else goes over the children's own connections
@@ -17,11 +18,11 @@ from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Any, Literal
 
-from colosseum.utils.process import start_process
+from colosseum.utils.process import start_process, watch_parent  # watch_parent: the contract's node.procs name
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["LEARNER_RESTARTS", "WORKER_RESTARTS", "ChildSpec", "ChildSupervisor"]
+__all__ = ["LEARNER_RESTARTS", "WORKER_RESTARTS", "ChildSpec", "ChildSupervisor", "watch_parent"]
 
 WORKER_RESTARTS = (3, 600.0)        # max restarts per window (s): workers and evaluators (spec 7.1)
 LEARNER_RESTARTS = (3, 1800.0)      # learners (T4.2 uses it)

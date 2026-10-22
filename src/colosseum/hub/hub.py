@@ -103,6 +103,7 @@ import json
 import logging
 import multiprocessing as mp
 import queue
+import re
 import shutil
 import signal
 import threading
@@ -160,6 +161,7 @@ from colosseum.metrics.counters import CounterBook
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.net.messages import lineup_to_proto, version_from_proto, version_to_proto
 from colosseum.net.proto import colosseum_v1_pb2 as pb
+from colosseum.node.logs import LOG_TAIL_BYTES
 from colosseum.players.registry import FixedPlayers
 from colosseum.utils.logging import setup_process_logging
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC, ProcessSupervisor, start_process
@@ -187,6 +189,8 @@ _LOOPBACK_OF = {"[::]": "[::1]", "0.0.0.0": "127.0.0.1", "127.0.0.1": "127.0.0.1
                 "[::1]": "[::1]"}
 PENDING_EVICTIONS_MAX = 10_000            # evictions kept per node while its stream is down (oldest dropped)
 LINEUP_REDRAWS = 16                       # draws for a lineup whose latest seats this node can play (W04-4, R37)
+_TAIL_EVENTS = ("proc_died", "learner_failed", "slot_disabled", "child_error")   # events that carry a log tail
+_PROC_NAME_RE = re.compile(r"(?:worker|evaluator)-[0-9]{1,6}|learner-[A-Za-z0-9_][A-Za-z0-9_-]{0,127}|node")
 
 
 @dataclass(frozen=True)
@@ -305,7 +309,10 @@ class Hub(RunSinks, HubLearners):
         self._new_versions: dict[str, Any] = {}   # accepted since the last Announce, by agent
         self._pending_evictions: dict[str, list[tuple[str, str]]] = {}   # node id -> evictions not delivered yet
         self._announced_once: set[str] = set()    # agents with an accepted version (logged once)
-        self._run_stopped: set[str] = set()      # node ids that finished stop_run
+        self._run_stopped: set[str] = set()      # node ids that finished stop_run (run_stopped / node_stopped)
+        self._leaving: set[str] = set()          # node ids that announced node_leaving (W04-24, T4.4)
+        self._lost_counted: set[str] = set()     # node ids counted in nodes_lost since their last session
+        self._stop_grace = 0.0                   # the grace of the current stop (_stop_nodes)
         self._nodes_lost = 0
         self._warned: set[tuple] = set()
         self._handler_errors: set[str] = set()
@@ -403,8 +410,6 @@ class Hub(RunSinks, HubLearners):
                 raise
             killed = self._shutdown()
             code = self._exit_code_after_shutdown(code, killed)
-            if code == 0 and self._failure is not None:      # reported during the shutdown (SP4 R3-08)
-                code = 1
         finally:
             try:
                 self._finish_metrics()
@@ -416,6 +421,8 @@ class Hub(RunSinks, HubLearners):
                         self._supervisor.restore_signal_handlers()
                     finally:
                         self._release_pulse_queues()
+        if self._failure is not None:      # also one handled while the metrics were finished (carried, T2.5 (a2))
+            code = 1
         return code
 
     # ---- start ------------------------------------------------------------------------------------------------
@@ -994,6 +1001,8 @@ class Hub(RunSinks, HubLearners):
         self._sessions[handle.node_id] = handle
         self._machines[handle.node_id] = record.machine_id
         self._run_stopped.discard(handle.node_id)
+        self._leaving.discard(handle.node_id)
+        self._lost_counted.discard(handle.node_id)
         node_hello = hello_from_proto(hello)
         addresses = check_data_addresses(node_hello.data_addresses)
         if addresses is None:                        # the same bound as DataAddresses (_on_data_addresses)
@@ -1044,6 +1053,9 @@ class Hub(RunSinks, HubLearners):
             del self._sessions[ev.node_id]
             if not self._shutting_down:
                 logger.info(f"node {self._node_label(ev.node_id)}: session closed ({ev.reason})")
+            entry = self._registry.by_id(ev.node_id)
+            if ev.node_id in self._leaving and entry is not None:
+                self._node_left(entry)
 
     def _on_node_lost(self, entry: Any, *, reason: str = "lost", relocate_now: bool = False) -> None:
         """A node silent for ``node_lost_after_sec`` (or removed: ``reason``): its cells go (their unfinished
@@ -1061,6 +1073,10 @@ class Hub(RunSinks, HubLearners):
         if self._learners is not None:               # after the pop: parking announces, never to the lost stream
             since = float("-inf") if relocate_now else entry.last_heartbeat
             wait = float(self._dist.learner_relocate_after_sec)
+            if relocate_now:                         # learners already waiting for this node move now too (T4.4)
+                for agent in self._learners.on_node(entry.number):
+                    if self._learners[agent].status == "relocating":
+                        self._learners[agent].lost_since = since
             for agent in self._learners.node_lost(entry.number, since):
                 if relocate_now:
                     logger.warning(f"Learner of {agent}: node {entry.number} ({entry.name}) {reason}; relocating it "
@@ -1072,7 +1088,9 @@ class Hub(RunSinks, HubLearners):
             self._update_pending_value()
             if relocate_now:
                 self._relocate_due(time.monotonic())
-        self._nodes_lost += 1
+        if entry.node_id not in self._lost_counted:  # a node lost, then removed or left, counts once (T4.4)
+            self._lost_counted.add(entry.node_id)
+            self._nodes_lost += 1
         why = ""
         if reason == "lost":                          # it may come back and resend its unacked batches
             why = f": no heartbeat for more than {self._dist.node_lost_after_sec:g} s"
@@ -1115,6 +1133,17 @@ class Hub(RunSinks, HubLearners):
             return
         message = ev.message
         kind = message.WhichOneof("m")
+        try:
+            self._on_node_message(ev, entry, message, kind)
+        except Exception as e:  # noqa: BLE001 - nothing a node sends stops the hub (T4.4, spec 7.1)
+            self._book.add("dropped_events.handler_error", 1)
+            first = ("handler_error", entry.number, kind) not in self._warned
+            self._warned.add(("handler_error", entry.number, kind))
+            logger.error(f"node {entry.number} ({entry.name}): handling its {kind} message failed "
+                         f"({type(e).__name__}: {e}); dropped (dropped_events.handler_error)", exc_info=first)
+
+    def _on_node_message(self, ev: Any, entry: Any, message: Any, kind: str | None) -> None:
+        """``_on_message``'s dispatch by oneof (a handler's exception is counted there)."""
         if kind == "heartbeat":
             self._on_heartbeat(ev.node_id, ev.session_id, message.heartbeat)
         elif kind == "lineup_request":
@@ -1198,8 +1227,8 @@ class Hub(RunSinks, HubLearners):
 
         entry = self._registry.by_id(node_id)
         handle = self._sessions.get(node_id)
-        if entry is None or handle is None or entry.session_id != session_id:
-            return
+        if entry is None or handle is None or entry.session_id != session_id or self._shutting_down:
+            return                                   # the run stops: no new lineups (T4.4, spec 7.4)
         collecting = self._collecting_any()
         if not collecting:                           # P-PF2-3: nothing allocated; the node asks again
             logger.debug(f"node {entry.number}: no agent can collect yet; {len(req.cells)} cells wait")
@@ -1317,6 +1346,10 @@ class Hub(RunSinks, HubLearners):
                                         **{str(k): float(v) for k, v in train.values.items()},
                                         "learner_node": int(learner.slot.node), "generation": learner.generation})
         for stats in metrics.workers:
+            if int(stats.worker) < 0 or int(stats.incarnation) < 0 or any(int(v) < 0
+                                                                         for v in stats.counters.values()):
+                self._count_drop(entry.number, "dropped_metrics", "invalid", "worker stats with negative values")
+                continue
             self._hub.on_worker_stats({"node": entry.number, "worker_id": int(stats.worker),
                                        "incarnation": int(stats.incarnation),
                                        **{str(k): int(v) for k, v in stats.counters.items()}})
@@ -1396,21 +1429,34 @@ class Hub(RunSinks, HubLearners):
         """A node's ``Event`` (A1 kinds; module docstring «Failures»). A worker's or evaluator's reported child error
         stops the run (A12, ``_fail_run``, first wins); a learner's is a WARNING (its death report follows:
         ``_on_learner_death``). A worker's or evaluator's death without a report is a WARNING (the node restarts it and
-        counts ``worker_restarts`` itself, A2); a disabled worker slot's cells are dropped."""
+        counts ``worker_restarts`` itself, A2); a disabled worker slot's cells are dropped. T4.4: an unknown kind or a
+        malformed process name is dropped (``dropped_events.invalid``, one WARNING per node); a tail above
+        ``LOG_TAIL_BYTES`` is cut; a remote node's log tail is kept in ``logs/nodes/<node>/<proc>.log.tail`` and the
+        messages name it and the node's own log (``_log_reference``, spec 7.7); ``node_stopped`` / ``run_stopped``: the
+        node finished its stop; ``node_leaving``: ``_on_node_leaving``."""
+        from colosseum.net.messages import EVENT_KINDS
+
         where = f"node {entry.number} ({entry.name})"
         kind = event.kind
-        log = f" (see {event.log_path})" if event.log_path else ""
+        if kind not in EVENT_KINDS or (event.proc and not _PROC_NAME_RE.fullmatch(event.proc)):
+            self._count_drop(entry.number, "dropped_events", "invalid", "events of an unknown kind or process")
+            return
+        if len(event.log_tail) > LOG_TAIL_BYTES:      # a valid event is never dropped for its tail (T4.4)
+            event.log_tail = bytes(event.log_tail[-LOG_TAIL_BYTES:])
+        see = ""
+        if kind in _TAIL_EVENTS and (event.log_tail or event.log_path):
+            see = self._log_reference(entry, event)
+        log = f" ({see})" if see else ""
         learner = event.proc.startswith("learner-")
         if kind == "child_error":
             if learner:
                 logger.warning(f"{where}: {event.proc} reported an error ({event.error_kind}): {event.message} "
                                f"[{event.context or where}]{log}; the node reports its exit")
             else:
-                see = f"; see {event.log_path}" if event.log_path else ""
-                self._fail_run(f"{event.proc} failed ({event.error_kind}): {event.message}{see}",
+                self._fail_run(f"{event.proc} failed ({event.error_kind}): {event.message}{'; ' + see if see else ''}",
                                context=event.context or where)
         elif kind in ("proc_died", "learner_failed") and learner:
-            self._on_learner_death(entry, event)
+            self._on_learner_death(entry, event, log)
         elif kind == "proc_died":
             logger.warning(f"{event.proc} of {where} died with exit code {event.exit_code}; restarted{log}")
         elif kind == "slot_disabled":
@@ -1422,15 +1468,70 @@ class Hub(RunSinks, HubLearners):
             if name == "worker" and index.isdigit():   # it never asks again: its cells and lineups go
                 self._cells.drop_worker(entry.number, int(index))
                 self._holds.drop_worker(entry.number, int(index))
-        elif kind == "run_stopped":
+        elif kind in ("run_stopped", "node_stopped"):
             self._run_stopped.add(entry.node_id)
-            logger.info(f"{where} stopped its processes")
+            logger.info(f"node {entry.number} stopped" if kind == "node_stopped" else f"{where} stopped its processes")
+            if entry.node_id in self._leaving:
+                self._node_left(entry)
+        elif kind == "node_leaving":
+            self._on_node_leaving(entry)
         elif kind == "warning":
             logger.warning(f"{where}: {event.proc}: {event.message}")
         else:
             logger.debug(f"{where}: event {kind!r} ignored")
 
-    def _on_learner_death(self, entry: Any, event: Any) -> None:
+    def _log_reference(self, entry: Any, event: Any) -> str:
+        """Where to read a dead or failing process's log (spec 7.7): ``see <run tail path> (node log <path>)`` for a
+        remote node (``_write_log_tail``), ``see <local log>`` for ``train``'s local node, whose logs are in the run
+        dir already."""
+        if entry.data_path == "local":
+            return f"see {event.log_path or self._run_dir.logs / (event.proc + '.log')}"
+        path = self._write_log_tail(entry.number, event)
+        node_log = f" (node log {event.log_path})" if event.log_path else ""
+        return f"see {path}{node_log}" if path is not None else f"see {event.log_path}"     # no tail: the node log
+
+    def _write_log_tail(self, node: int, event: Any) -> Path | None:
+        """``runs/<name>/logs/nodes/<node>/<proc>.log.tail``: the last ``LOG_TAIL_BYTES`` of a remote process's log
+        (spec 7.7), written atomically and overwritten by the next event of that process; None when the event carries
+        no tail or the file cannot be written (one WARNING)."""
+        import os
+
+        from colosseum.core.run_dir import safe_path_component
+
+        if not event.log_tail:
+            return None
+        name = safe_path_component(event.proc, "proc")
+        path = self._run_dir.logs / "nodes" / str(int(node)) / f"{name}.log.tail"
+        tmp = path.with_name(f".{path.name}.tmp")
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp.write_bytes(bytes(event.log_tail[-LOG_TAIL_BYTES:]))
+            os.replace(tmp, path)
+        except OSError as e:
+            tmp.unlink(missing_ok=True)
+            self._warn_once(("log_tail", node), f"node {node}: cannot write {path} ({e})")
+            return None
+        return path
+
+    def _on_node_leaving(self, entry: Any) -> None:
+        """The node stops on its own (Ctrl+C, SIGTERM, ``--once`` end; spec 7.4, ruling W04-24): its cells go at once
+        and it gets no new lineup or learner; once it reports its processes stopped (its finals and results are in)
+        or its stream ends, it is lost and its learners relocate without ``learner_relocate_after_sec``
+        (``_node_left``)."""
+        self._leaving.add(entry.node_id)
+        self._cells.drop_node(entry.number)
+        self._holds.drop_node(entry.number)
+        logger.info(f"node {entry.number} ({entry.name}) is leaving; its cells are dropped")
+        if entry.node_id in self._run_stopped:
+            self._node_left(entry)
+
+    def _node_left(self, entry: Any) -> None:
+        self._leaving.discard(entry.node_id)
+        if entry.state == "online":
+            entry.state = "lost"                     # first: no placement pass offers its slots any more
+            self._on_node_lost(entry, reason="left", relocate_now=True)
+
+    def _on_learner_death(self, entry: Any, event: Any, log: str = "") -> None:
         """``proc_died`` / ``learner_failed`` of ``learner-<agent>`` (spec 7.1; T4.2). Only a report of the agent's
         current generation on the node of its slot counts (an older incarnation's is DEBUG). ``proc_died``: a new
         generation on the same slot from the newest recovery point (or the hub-start source), ``learner_restarts``
@@ -1440,7 +1541,6 @@ class Hub(RunSinks, HubLearners):
         agent = event.proc.removeprefix("learner-")
         generation = int(event.generation)
         where = f"node {entry.number} ({entry.name})"
-        log = f" (see {event.log_path})" if event.log_path else ""
         current = (agent in self._learners and self._learner_node_of(agent) == entry.number
                    and generation == self._learners[agent].generation)
         if not current:
@@ -1833,32 +1933,51 @@ class Hub(RunSinks, HubLearners):
     # ---- stop -------------------------------------------------------------------------------------------------
 
     def _send_stop_run(self, handle: Any) -> None:
+        handle.send(pb.HubMessage(command=pb.Command(kind="stop_run", reason=f"grace={self._stop_grace:g}")))
 
-        handle.send(pb.HubMessage(command=pb.Command(kind="stop_run", reason=f"grace={self._grace():g}")))
-
-    def _grace(self) -> float:
-        return float(LOCAL_SHUTDOWN_GRACE_SEC if self._options.mode == "train" else self._dist.shutdown_grace_sec)
-
-    def _shutdown(self) -> list[str]:
-        """Stop every node and child within the grace (``LOCAL_SHUTDOWN_GRACE_SEC`` for ``train``,
-        ``distributed.shutdown_grace_sec`` otherwise); returns the children that had to be terminated.
-
-        A last ``Announce`` (the budget's env steps, R28) and then ``stop_run`` go to every live session and the pulse
-        is told to stop; meanwhile the inbox, the commits and
-        the pulse are drained (final snapshots arrive as uploads, the last results as batches), until every node
-        that has a session finished its stop (``run_stopped``) and every child exited, or the grace passed. Then the
-        rest is terminated and killed, and the pulse queues' reads get until the deadline (at least 1 s after the
-        kill)."""
-        grace = self._grace()
-        deadline = time.monotonic() + grace
+    def _stop_nodes(self) -> float:
+        """Steps 1-2 of the stop (spec 7.4; T4.4): the grace (``LOCAL_SHUTDOWN_GRACE_SEC`` while every online node is
+        local, ``distributed.shutdown_grace_sec`` otherwise: final snapshots travel over the network), no new lineup
+        or learner placement from now on, the pulse told to stop, a last ``Announce`` (the budget's env steps, R28 (b))
+        and ``stop_run`` with the grace to every live session (a node that connects later gets it after its
+        ``Welcome``). Returns the grace."""
+        online = [] if self._registry is None else self._registry.online()
+        remote = any(e.data_path != "local" for e in online)
+        grace = float(self._dist.shutdown_grace_sec) if remote else float(LOCAL_SHUTDOWN_GRACE_SEC)
+        self._stop_grace = grace
+        logger.debug(f"stop grace {grace:g} s ({'remote nodes' if remote else 'local nodes only'})")
         self._shutting_down = True
         self._stop_event.set()
-        # R28 (b): a last Announce first, so the final env-step count reaches the learners (LR progress) before their
-        # final snapshots and trainer states; the session's order keeps it ahead of stop_run.
         if self._sessions and self._coordinator is not None:
-            self._broadcast_announce()
+            self._broadcast_announce()               # the session's order keeps it ahead of stop_run
         for handle in list(self._sessions.values()):
             self._send_stop_run(handle)
+        return grace
+
+    def _expected_finals(self) -> dict[tuple[str, int], int]:
+        """``(agent, generation) -> node`` of the learners starting or running at the stop: their final snapshots."""
+        out: dict[tuple[str, int], int] = {}
+        if self._learners is None:
+            return out
+        for agent in self._agent_ids:
+            entry = self._learners[agent]
+            if entry.status in ("starting", "running") and entry.slot is not None:
+                out[(agent, int(entry.generation))] = int(entry.slot.node)
+        return out
+
+    def _shutdown(self) -> list[str]:
+        """Stop every node and child within one deadline (spec 7.4; T4.4); returns the children that had to be
+        terminated.
+
+        ``_stop_nodes`` picks the grace and sends ``stop_run``; then the inbox, the commits and the pulse are drained
+        (final snapshots arrive as uploads, the last results as batches) until every node with a session finished its
+        stop (``node_stopped`` / ``run_stopped``: it sends that only after its finals were uploaded or given up and its
+        results acked or given up) and every child exited, or the deadline passed (a WARNING names the final snapshots
+        that did not arrive and the nodes still stopping). Then the rest is terminated and killed, and the pulse
+        queues' reads get until the deadline (at least 1 s after the kill). With only local nodes this is SP4's one
+        ``SHUTDOWN_GRACE_SEC`` deadline (pre-flight ruling P-PF3-23; the 10 s guarantee)."""
+        start = time.monotonic()
+        deadline = start + float(LOCAL_SHUTDOWN_GRACE_SEC)
         first_error: Exception | None = None
 
         def poll() -> None:
@@ -1872,13 +1991,21 @@ class Hub(RunSinks, HubLearners):
                     first_error = first_error or e
 
         killed: list[str] = []
+        grace = float(LOCAL_SHUTDOWN_GRACE_SEC)
         try:
+            expected = self._expected_finals()
+            grace = self._stop_nodes()
+            deadline = start + grace
+            done = False
             while time.monotonic() < deadline:
                 poll()
                 nodes_done = all(node_id in self._run_stopped for node_id in self._sessions)
                 if nodes_done and not self._supervisor.alive():
+                    done = True
                     break
             poll()
+            if not done:
+                self._warn_stop_incomplete(expected)
         finally:
             killed = self._supervisor.kill_remaining()
             if killed:
@@ -1896,6 +2023,21 @@ class Hub(RunSinks, HubLearners):
             raise first_error
         return killed
 
+    def _warn_stop_incomplete(self, expected: Mapping[tuple[str, int], int]) -> None:
+        """The stop's deadline passed: one WARNING naming the final snapshots that did not arrive (their node did not
+        report its stop either) and the nodes still stopping."""
+        stopped = {self._number_of(n) for n in self._run_stopped}
+        missing = [f"{agent} (node {node})" for (agent, generation), node in sorted(expected.items())
+                   if (agent, generation) not in self._finals and node not in stopped]
+        stopping = [self._node_label(n) for n in self._sessions if n not in self._run_stopped]
+        parts = []
+        if missing:
+            parts.append(f"final snapshots missing: {', '.join(missing)}")
+        if stopping:
+            parts.append(f"nodes still stopping: {', '.join(stopping)}")
+        if parts:
+            logger.warning(f"The stop's grace ({self._stop_grace:g} s) passed; {'; '.join(parts)}")
+
     def _shutdown_after_error(self, error: BaseException) -> None:
         """Tear down after ``error``. A teardown failure is logged and noted on ``error``,
         which stays the exception the caller raises."""
@@ -1912,6 +2054,8 @@ class Hub(RunSinks, HubLearners):
         finishing (e.g. right after the budget was reached) still gives 128 + signum."""
         if code == 0 and self._supervisor.received_signal is not None:
             code = self._signal_exit_code()
+        if self._failure is not None and code != 1:   # also after a signal: a snapshot that could not be saved, a
+            code = 1                                  # reported child error (SP4 R3-08; carried item of T2.5 (b))
         failed = [] if self._learners is None else self._learners.failed()
         if code == 0 and failed:                  # spec 7.1 / 7.5: a failed agent ends the run with exit code 1 (T4.2)
             logger.error(f"Training of {', '.join(failed)} failed (the learner restart limit was reached); exit code 1")

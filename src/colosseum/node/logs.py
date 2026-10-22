@@ -1,12 +1,13 @@
 """Node logs (SP5 spec 7.7): a remote node's processes log under ``<cache_home>/colosseum/logs/<ca8>/<run_id>/``
 (``train``'s local node logs into the run dir's ``logs/``); ``log_tail`` is what a node sends the hub when a process
-dies (T4.4 stores it as ``<proc>.log.tail``)."""
+dies or reports an error (``tail_for_event``; the hub stores it as ``runs/<name>/logs/nodes/<node>/<proc>.log.tail``,
+SP5 T4.4)."""
 
 from __future__ import annotations
 
 from pathlib import Path
 
-__all__ = ["LOG_TAIL_BYTES", "log_tail", "node_log_dir"]
+__all__ = ["LOG_TAIL_BYTES", "log_tail", "node_log_dir", "tail_for_event"]
 
 LOG_TAIL_BYTES = 64 * 1024
 
@@ -29,3 +30,8 @@ def log_tail(path: Path, limit: int = LOG_TAIL_BYTES) -> bytes:
             return f.read()
     except OSError:
         return b""
+
+
+def tail_for_event(path: Path | str) -> bytes:
+    """The ``Event.log_tail`` of a process whose log is ``path``: its last ``LOG_TAIL_BYTES`` (b"" when missing)."""
+    return log_tail(Path(path), LOG_TAIL_BYTES) if path else b""

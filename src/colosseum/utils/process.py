@@ -39,9 +39,44 @@ def set_parent_death_signal(sig: int = signal.SIGTERM) -> bool:
         return False
 
 
+# How often the portable parent watch (no PR_SET_PDEATHSIG: macOS) checks the parent (SP5 spec 7.8).
+PARENT_WATCH_SEC = 1.0
+
+
+def start_parent_watchdog(poll: float = PARENT_WATCH_SEC, *, getppid: Callable[[], int] = os.getppid,
+                          on_death: Callable[[], None] | None = None) -> threading.Thread:
+    """A daemon thread that ends this process when its parent dies: every ``poll`` seconds it compares the parent
+    pid with the one at the start (an orphan is re-parented, e.g. to launchd), and then calls ``on_death`` (default:
+    ``os._exit(1)``: no cleanup can block it). The fallback of ``watch_parent`` where ``PR_SET_PDEATHSIG`` does not
+    exist."""
+    original = getppid()
+    die = on_death if on_death is not None else (lambda: os._exit(1))
+
+    def watch() -> None:
+        while True:
+            time.sleep(poll)
+            if getppid() != original:
+                die()
+                return
+
+    thread = threading.Thread(target=watch, name="parent-watch", daemon=True)
+    thread.start()
+    return thread
+
+
+def watch_parent(sig: int = signal.SIGTERM) -> str:
+    """Die with the parent (spec 7.8): ``PR_SET_PDEATHSIG`` on Linux (``"pdeathsig"``), else a watchdog thread
+    (``"watchdog"``, macOS). Children of nodes and of the hub call it first (``init_child_process``)."""
+    if set_parent_death_signal(sig):
+        return "pdeathsig"
+    start_parent_watchdog()
+    return "watchdog"
+
+
 def init_child_process() -> None:
     """Signal policy for every child: ignore Ctrl-C (the main process coordinates the stop)
-    and die if the main process disappears (R3-17, R6-07).
+    and die if the main process disappears (R3-17, R6-07; SP5 spec 7.8: ``watch_parent``, a watchdog thread where
+    ``PR_SET_PDEATHSIG`` does not exist).
 
     ``start_process`` starts children with SIGINT blocked; ignoring it first discards a
     Ctrl-C that is pending since then, and only then is it unblocked (CPython's
@@ -52,7 +87,7 @@ def init_child_process() -> None:
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     if hasattr(signal, "pthread_sigmask"):
         signal.pthread_sigmask(signal.SIG_UNBLOCK, {signal.SIGINT})
-    set_parent_death_signal(signal.SIGTERM)
+    watch_parent(signal.SIGTERM)
     if not parent_alive():
         os._exit(1)
 

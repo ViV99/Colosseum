@@ -4,9 +4,9 @@ The hub (``colosseum.hub.hub.run_training`` / ``run_hub``) writes ``running`` wi
 ``finished`` when ``launch`` returns 0 / 130 / 143 (budget reached, SIGINT, SIGTERM: final checkpoints were saved),
 ``stopped`` with exit code 130 for a Ctrl-C (``KeyboardInterrupt``) that reaches ``run_training`` (during the
 start, before the hub's signal handlers: nothing was saved) and ``failed`` for any other exit code or an
-exception. Readers (report, dashboard) decide whether a
-``running`` run is alive by its pid (``os.kill(pid, 0)``) and, on Linux, by the process start time from
-``/proc/<pid>/stat`` recorded with it (a reused pid is not the run) — never by wall-clock timestamps.
+exception. Readers (report, dashboard) decide whether a ``running`` run is alive by its pid (``os.kill(pid, 0)``)
+and by the process start time recorded with it (Linux ``/proc/<pid>/stat``, macOS ``ps -o lstart=``; SP5 spec 7.8:
+a reused pid is not the run) — never by wall-clock timestamps.
 Other keys of the file are preserved on every rewrite. The run id is not here: it lives in ``run.json``
 (``colosseum.core.run_dir.RUN_INFO_FILE``, contract amendment A2). Only ``run_training`` / ``run_hub`` write this
 file (not the benchmark's in-process ``Hub`` nor the distributed roles: their run dirs read as "unknown").
@@ -16,6 +16,8 @@ from __future__ import annotations
 
 import json
 import os
+import subprocess
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -38,11 +40,34 @@ class RunState:
 
 
 def process_start_ticks(pid: int) -> int | None:
-    """Field 22 of ``/proc/<pid>/stat`` (start time in clock ticks after boot); None off Linux or if gone."""
+    """The start time of ``pid``, an integer compared only with itself on the same machine (a reused pid is not the
+    same process): on Linux field 22 of ``/proc/<pid>/stat`` (clock ticks after boot); on macOS
+    ``ps -o lstart= -p <pid>`` in seconds since the epoch (SP5 spec 7.8); None elsewhere or when the process is
+    gone."""
+    if sys.platform.startswith("linux"):
+        try:
+            text = Path(f"/proc/{int(pid)}/stat").read_text()
+            return int(text.rsplit(")", 1)[1].split()[19])
+        except (OSError, ValueError, IndexError):
+            return None
+    if sys.platform == "darwin":
+        return _ps_start_seconds(pid)
+    return None
+
+
+def _ps_start_seconds(pid: int) -> int | None:
+    """macOS: ``ps -o lstart=`` ("Mon Oct 18 12:00:00 2026", C locale) as local epoch seconds; None if gone."""
     try:
-        text = Path(f"/proc/{int(pid)}/stat").read_text()
-        return int(text.rsplit(")", 1)[1].split()[19])
-    except (OSError, ValueError, IndexError):
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True,
+                             timeout=5.0, env={**os.environ, "LC_ALL": "C"})
+    except (OSError, subprocess.SubprocessError):
+        return None
+    text = " ".join(out.stdout.split())
+    if out.returncode != 0 or not text:
+        return None
+    try:
+        return int(time.mktime(time.strptime(text, "%a %b %d %H:%M:%S %Y")))
+    except (ValueError, OverflowError):
         return None
 
 

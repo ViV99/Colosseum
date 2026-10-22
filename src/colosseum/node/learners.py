@@ -214,6 +214,10 @@ class NodeLearners:
         current = self._entries.get(agent)
         if current is not None:
             queued = 0 if current.successor is None else int(current.successor.generation)
+            if (generation == current.generation and current.state == "stopping" and current.stop_reason == "hub_lost"
+                    and current.successor is None):
+                current.successor = assignment       # T4.4: the hub came back while it stopped; it starts again after
+                return
             if generation in (current.generation, queued):
                 return                               # the same assignment again (Welcome + start_learner): one start
             if generation < max(current.generation, queued):
