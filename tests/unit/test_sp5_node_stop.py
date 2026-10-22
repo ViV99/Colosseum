@@ -154,3 +154,22 @@ def test_a_learner_stuck_mid_frame_is_killed(make_agent, monkeypatch):
         agent._drain_inbox()
         time.sleep(0.01)
     assert node_end not in agent._frame_reads and node_end not in agent._child_conns   # EOF: the connection ends
+
+
+def test_no_exit_waits_while_dormant_and_a_newer_incarnation_drops_a_wait(make_agent, tmp_path):
+    """Review round 1 of T4.4 (b): a child exiting while the processes stop for the hub-lost timeout is handled at
+    once (never left to drain a newer incarnation's connection later), and a wait whose child was started again is
+    dropped (no second process for the same name)."""
+    agent = make_agent()
+    supervisor = agent.supervisor = _Supervisor()
+    agent._run = SimpleNamespace(log_dir=tmp_path, run_id="r" * 32, envs=1, workers=1)
+    agent._dormant = "stopping"
+    agent._on_exit("worker-0", 0)
+    assert not agent._exit_waits and not supervisor.restarts
+    agent._dormant = ""
+    agent._on_exit("worker-0", -9)
+    assert "worker-0" in agent._exit_waits
+    supervisor.incarnation = lambda name: 2                       # the node started it again meanwhile
+    agent._check_exit_waits(time.monotonic() + agent_mod.EXIT_DRAIN_SEC)
+    assert not agent._exit_waits and not supervisor.restarts
+    agent._run = None

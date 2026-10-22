@@ -372,6 +372,8 @@ class NodeAgent:
         self._released: set[str] = set()            # run ids this node released (never served again)
         self._releasing = False
         self._dropped_carry = 0                     # dropped_results_node_buffer of released runs (per session)
+        self._counter_base: dict[str, int] = {}     # raw counters when the current session began (_forget_run)
+        self._stale_stream = False                  # the stream is the previous session's (no heartbeats on it)
         self._heartbeat_sec = 1.0
         self._events: deque = deque()
         self._events_dropped = 0
@@ -408,7 +410,7 @@ class NodeAgent:
         self._stop_reason = ""
         self._learners_stop_at = 0.0                # the stop: learners get Stop once the workers are gone or then
         self._learners_told = True
-        self._exit_waits: dict[str, tuple[int | None, float]] = {}   # exited before their hello arrived (P-PF2-11)
+        self._exit_waits: dict[str, tuple] = {}     # exited before their hello arrived: (code, deadline, incarnation)
         self._frame_reads: dict[Any, tuple] = {}    # conn -> (reader thread, start, child name, [its _FrameRead])
         self._largest_frame = 0                     # bytes of the largest frame bound for the cache (the space check)
         self._next_space_check = 0.0
@@ -828,6 +830,7 @@ class NodeAgent:
 
         if isinstance(item, SessionUp):
             self._connected = True
+            self._stale_stream = False
             if self._renew_channel:
                 self._renew_channel = False
                 self._new_hub_channel()
@@ -880,11 +883,12 @@ class NodeAgent:
         if self._done:
             return
         if run is None:                              # released (or no Welcome yet): heartbeats keep the session
-            if self._run_serial and self._connected and now >= self._next_heartbeat:
+            if self._run_serial and self._connected and not self._stale_stream and now >= self._next_heartbeat:
                 self._next_heartbeat = now + self._heartbeat_sec
+                counters = self._node_counters(None)
                 self._send(pb.NodeMessage(heartbeat=pb.Heartbeat(
-                    env_steps=self._env_steps(), dropped_results=self._dropped_carry,
-                    counters=self._node_counters(None))))
+                    env_steps=self._env_steps(), dropped_results=counters["dropped_results_node_buffer"],
+                    counters=counters)))
             return
         for message in run.results.due():
             self._send(message)
@@ -1405,8 +1409,9 @@ class NodeAgent:
         """A child exited. One whose control hello has not reached the loop yet (the ``Acceptor``'s handshake runs in
         its thread) waits up to ``EXIT_DRAIN_SEC`` for it (``_check_exit_waits``): a ``ChildHello`` + ``ChildError``
         sent just before the exit is a reported error, not a death (carried item of T2.4 (a))."""
-        if name not in self._control and name not in self._exit_waits and not self._stopping:
-            self._exit_waits[name] = (code, time.monotonic() + EXIT_DRAIN_SEC)
+        if (name not in self._control and name not in self._exit_waits and not self._stopping
+                and not self._dormant):              # dormant: nothing is classified, nothing waits
+            self._exit_waits[name] = (code, time.monotonic() + EXIT_DRAIN_SEC, self.supervisor.incarnation(name))
             return
         self._exit_waits.pop(name, None)
         self._drain_to_eof(name)
@@ -1427,8 +1432,10 @@ class NodeAgent:
         self._restart_or_disable(run, name, role, code, log_path)
 
     def _check_exit_waits(self, now: float) -> None:
-        for name, (code, deadline) in list(self._exit_waits.items()):
-            if name in self._control or now >= deadline or self._stopping:
+        for name, (code, deadline, incarnation) in list(self._exit_waits.items()):
+            if incarnation != self.supervisor.incarnation(name):
+                del self._exit_waits[name]           # a newer incarnation runs now: the old exit is moot
+            elif name in self._control or now >= deadline or self._stopping or self._dormant:
                 self._on_exit(name, code)
 
     def _restart_or_disable(self, run: _Run | None, name: str, role: str | None, code: int | None,
@@ -1664,7 +1671,12 @@ class NodeAgent:
         return "alive" if proc is not None and proc.exitcode is None else "dead"
 
     def _node_counters(self, run: _Run | None) -> dict[str, int]:
-        """The A2 node counters, cumulative per session (a released run's drops are carried)."""
+        """The A2 node counters, cumulative per session (a released run's drops are carried; a new session after a
+        finished run counts from 0: ``_counter_base``, the process-cumulative values when it began)."""
+        raw = self._raw_counters(run)
+        return {k: max(0, v - self._counter_base.get(k, 0)) for k, v in raw.items()}
+
+    def _raw_counters(self, run: _Run | None) -> dict[str, int]:
         dropped = self._dropped_carry + (0 if run is None else int(run.results.dropped))
         out = {"lineup_fetch_failed": int(self._counters["lineup_fetch_failed"]),
                "dropped_results_node_buffer": dropped, "worker_restarts": int(self._counters["worker_restarts"]),
@@ -1681,11 +1693,12 @@ class NodeAgent:
             load = 0.0
         cached = sorted(f"{k.kind}:{k.agent_id}:{k.ident}"
                         for k in (*self.lineups.cached, *(k for k in run.fixed_keys if self.lineups.has(run, k))))
+        counters = self._node_counters(run)
         self._send(pb.NodeMessage(heartbeat=pb.Heartbeat(
-            env_steps=self._env_steps(), dropped_results=self._dropped_carry + int(run.results.dropped),
+            env_steps=self._env_steps(), dropped_results=counters["dropped_results_node_buffer"],
             procs=[pb.ProcState(name=n, state=self._proc_state(n), restarts=max(0, self.supervisor.incarnation(n) - 1))
                    for n in self.supervisor.names()],
-            load=load, cached_keys=cached, counters=self._node_counters(run),
+            load=load, cached_keys=cached, counters=counters,
             paths=self.routing.heartbeat_paths())))
 
     def _send_metrics(self) -> None:
@@ -1831,7 +1844,7 @@ class NodeAgent:
 
     def _forget_run(self, run: _Run, *, released: bool) -> None:
         """After ``release`` or the end of a run (``stop_run`` on a persistent node): the run's resources go
-        (``_teardown_run``) and so do its books; the session stays. A released node serves nothing further
+        (``_teardown_run``) and so do its books; the stream stays. A released node serves nothing further
         (``_released``; serving another run is T6.3's); after a run's end the next ``Welcome`` (a new run, or the same
         run continued by ``hub --resume``) starts afresh."""
         self._teardown_run(run)
@@ -1857,6 +1870,16 @@ class NodeAgent:
         self._exit_waits.clear()
         if released:
             logger.info(f"node: released run {run.run_id[:8]}; the session stays open")
+            return
+        # A finished run (stop_run on a persistent node): the next run, or this run continued by hub --resume, is a
+        # new budget session (spec 4.4: env steps are cumulative per (node, session)): a new session id at the next
+        # reconnect, env steps and the A2 counters from 0 (review round 1 of T4.4 (b)).
+        self._progress.clear()
+        self._worker_stats.clear()
+        self._stats_changed.clear()
+        self._counter_base = self._raw_counters(None)
+        self.session_id = uuid.uuid4().hex
+        self._stale_stream = True                    # the old session's books on the hub are never lowered
 
     def _close(self) -> None:
         """Children, the session, transfers, then the run's resources and cache files (every path out of ``run``).

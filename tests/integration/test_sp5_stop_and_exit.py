@@ -280,3 +280,44 @@ def test_hub_exit_code_with_a_failed_agent(tmp_path):
             if proc.poll() is None:
                 os.killpg(proc.pid, signal.SIGKILL)
                 proc.wait()
+
+
+def test_a_persistent_node_starts_the_next_run_as_a_new_budget_session(tmp_path, monkeypatch):
+    """Review round 1 of T4.4 (b): after a ``stop_run`` a persistent node serves the next run with a new session id
+    and its env steps and counters from 0 (a new run's budget never starts with the old run's steps)."""
+    import uuid
+
+    from colosseum.hub.server import SessionOpened
+    from colosseum.node import session as node_session
+    from node_kit import run_node_in_thread
+
+    monkeypatch.setattr(node_session, "RECONNECT_MIN_SEC", 0.05)
+    monkeypatch.setattr(node_session, "RECONNECT_MAX_SEC", 0.2)
+    fixed = Lineup("2p", [SeatAssignment("random", "fixed", False), SeatAssignment("bot2", "fixed", False)])
+    hub = FakeHub(tmp_path, make_test_config("turns", agents={"a": {}, "random": scripted_agent(),
+                                                              "bot2": scripted_agent()},
+                                             rollout={"envs_per_worker": 2}, distributed={"heartbeat_sec": 0.1}))
+    hub.grant(lambda worker, env: fixed)
+    node = run_node_in_thread(toy_node_options(tmp_path, hub))
+    try:
+        wait_for(lambda: hub.heartbeats() and hub.heartbeats()[-1].env_steps > 0, timeout=60)
+        first = hub.events(SessionOpened)[0].hello.session_id
+        hub.send_command("stop_run", reason="grace=3")
+        wait_for(lambda: hub.node_events("node_stopped") and node.agent.run_id is None, timeout=30)
+        old_run = hub.run_id
+        old_steps = max(b.env_steps for b in hub.heartbeats())
+        hub.call(lambda: setattr(hub, "run_id", uuid.uuid4().hex))
+        opened = len(hub.events(SessionOpened))
+        hub.close_session()
+        again = wait_for(lambda: hub.events(SessionOpened)[opened:], timeout=30)[0].hello
+        assert again.session_id != first and again.env_steps == 0 and again.last_acked_seq == 0
+        beats = lambda: [e.message.heartbeat for e in hub.node_messages("heartbeat")  # noqa: E731
+                         if e.session_id == again.session_id]
+        wait_for(lambda: beats() and beats()[-1].env_steps > 0, timeout=60)        # it plays the new run
+        assert beats()[0].env_steps < old_steps                                     # counted from 0 again
+        assert beats()[0].counters["dropped_results_node_buffer"] == 0
+        assert wait_for(lambda: [r for r in hub.results() if r.uid.startswith(f"{hub.run_id}/")], timeout=60)
+        assert node.agent.run_id == hub.run_id != old_run
+    finally:
+        assert node.stop() == 0
+        hub.stop()
