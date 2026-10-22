@@ -58,6 +58,25 @@ def test_cells_are_requested_once_until_answered_and_again_after_their_ttl():
     assert cells.live() == [(0, 0, 7, 1)]
 
 
+def test_a_ttl_shorter_than_the_retry_wait_renews_at_the_ttl():
+    """``retry_sec`` holds back only a request without an answer: an answered cell is due again at its TTL (FX6: a
+    0.1 s ``match_refresh_interval_sec`` renewed only every ``LINEUP_RETRY_SEC`` = 1 s)."""
+    clock = Clock()
+    cells = CellTracker(retry_sec=1.0, clock=clock)
+    cells.add_worker(0, 1, incarnation=1)
+    assert cells.due() == [(0, 0, 0, 1)]
+    clock.t = 0.01
+    assert cells.granted(0, 0, epoch=4, ttl_sec=0.1, lineup="L0", keys={})
+    cells.deliver(0, 0)
+    clock.t = 0.1
+    assert cells.due() == []                                        # the TTL runs from the grant
+    clock.t = 0.12
+    assert cells.due() == [(0, 0, 4, 1)]                            # not held until the retry wait (1.0)
+    assert cells.due() == []                                        # requested: once until answered
+    clock.t = 1.2
+    assert cells.due() == [(0, 0, 4, 1)]                            # no answer within retry_sec: asked again
+
+
 def test_a_failed_fetch_keeps_the_old_lineup_and_retries_later():
     clock = Clock()
     cells = CellTracker(retry_sec=2.0, clock=clock)

@@ -205,6 +205,7 @@ class CellTracker:
             return False
         now = self._clock()
         c.requested = False
+        c.retry_at = 0.0                         # answered: the retry wait no longer holds it back, its TTL does
         c.epoch = int(epoch)
         c.deadline = float("inf") if ttl_sec <= 0 else now + float(ttl_sec)
         c.waiting = (lineup, dict(keys))

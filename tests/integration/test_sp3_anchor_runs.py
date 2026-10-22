@@ -1,6 +1,13 @@
 """`colosseum train` with a scripted anchor: anchors are drawn by their share, never collect, are
 rating entities (they appear in the ``games`` matrix), and the played shares reach metrics.jsonl
-(spec block 5, T3.3)."""
+(spec block 5, T3.3).
+
+The share is a property of the matchmaker's draws, and a cell plays one drawn lineup for every episode until its grant
+expires (``rollout.match_refresh_interval_sec``), so episodes are not independent samples: with the TINY 1 s refresh
+a run draws only ~30 lineups (8 cells x 3-5 grants), and the first block of 8 played (fixed by ``training.seed``: 6
+of 8 anchors) covers about half the episodes, played at full speed before the learner loads the CPU (shares
+0.59-0.64 in every run, 0.73 under heavy load; FX6). The test refreshes every 0.1 s: a run draws ~100 lineups or
+more (more under load)."""
 from __future__ import annotations
 
 from pathlib import Path
@@ -15,7 +22,7 @@ def test_a_scripted_anchor_plays_its_share_and_shows_in_metrics_and_ratings(tmp_
         agents={"agent_0": {}, "bot": {"kind": "scripted", "class": "colosseum.players.RandomBot"}},
         matchmaking={"opponents": {"latest": 0.5, "snapshots": 0.0, "rivals": 0.0, "anchors": 0.5}},
     )
-    run = run_train(config, tmp_path, name="anchor")
+    run = run_train(config, tmp_path, name="anchor", overrides={"rollout.match_refresh_interval_sec": "0.1"})
     assert run.returncode == 0, run.stderr[-3000:]
     teams = anchors = 0.0
     for record in run.records("episodes"):
