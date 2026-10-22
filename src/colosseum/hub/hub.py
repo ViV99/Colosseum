@@ -26,10 +26,15 @@ replies through futures or a session's outbound queue. The main loop (``_main_lo
    hub is the only budget authority, spec 4.4).
 
 Lineups (spec 4.2): a node asks for cells; every cell gets an epoch (``CellTable``, epochs reserved in blocks with an
-fsync'd ``hub_state.json``, R7), an owner by the deficit rotation over the agents that can collect anywhere (an
-accepted latest version and a learner), and a lineup from the coordinator's matchmaker (PFSP, ``shuffle_seats``,
-``check_lineup``) whose seats of agents without a learner on that node do not collect (amendment A11, until T3.2).
-No cell is requested while no agent can collect (P-PF2-3).
+fsync'd ``hub_state.json``, R7), an owner by the deficit rotation over the agents that can collect on that node (else,
+when none can there, over the agents that can collect anywhere: the node still plays), and a lineup from the
+coordinator's matchmaker (PFSP, ``shuffle_seats``, ``check_lineup``) whose seats of agents that cannot collect on that
+node do not collect (``hub.state.collect_allowed``, spec 4.7, 4.8; T3.2): an agent collects on a node when it has an
+accepted latest version and a running learner on that node, or on another node that the requesting node reaches:
+through the hub relay (T3.2 (b)), or directly, as the node's ``Heartbeat.paths`` report (``_paths``; a node that cannot
+reach a learner's data port while the relay is off is named once in a WARNING). No cell is requested while no agent
+can collect (P-PF2-3). The versions a node is told about (``Welcome`` / ``Announce``) carry the learner node's
+loopback data addresses only when both nodes share a machine (``visible_version``).
 
 Results (spec 4.3, R8): each node batch is checked (``ResultIntake.check``: the node's own uids only), stamped with
 the hub's env steps (P-PF2-13) and submitted to the journal writer with its token ``(node, session, seq)``; the
@@ -85,12 +90,15 @@ from colosseum.hub.setup import (  # re-exported: the contract names colosseum.h
     warn_static_ownership_skew,
 )
 from colosseum.hub.state import (
+    PATH_STATES,
     CellKey,
     SnapshotHolds,
     check_data_addresses,
-    restrict_collecting,
+    collect_allowed,
     snapshot_refs,
+    strip_collect,
     version_source,
+    visible_version,
 )
 from colosseum.metrics.counters import CounterBook
 from colosseum.metrics.wandb_logger import WandBLogger
@@ -210,6 +218,9 @@ class Hub(RunSinks):
         self._sessions: dict[str, Any] = {}       # node id -> its current SessionHandle
         self._learner_node: dict[str, int] = {}   # agent -> node number of its learner
         self._learner_alive: dict[str, bool] = {}
+        self._paths: dict[int, dict[int, str]] = {}   # node number -> {learner node: path} (Heartbeat.paths, T3.2)
+        self._machines: dict[str, str] = {}       # node id -> machine id (loopback addresses, T3.2)
+        self._relay = None                        # the hub relay (hub.relay.RelayHub): T3.2 (b)
         self._journal_row: int | None = None
         self._admin_handlers: dict[str, Callable[[dict], dict]] = {"hub.status": self._admin_status}
         self._handlers: dict[type, Callable[[Any], None]] = {
@@ -555,7 +566,9 @@ class Hub(RunSinks):
 
     def _start_local_node(self) -> None:
         """R12: ``train``'s node as a spawned child (number 0, an in-memory node record: no ``Register``) on the
-        plain loopback port; it starts the workers and the learners."""
+        plain loopback port; it starts the workers and the learners. With ``train --listen`` its data port binds on the
+        ``--listen`` host with a certificate the hub mints in memory (ruling R30), so other machines' nodes reach its
+        learners directly."""
         local = self._options.local_node
         if local is None:
             return
@@ -563,10 +576,19 @@ class Hub(RunSinks):
         from colosseum.node.hardware import machine_id
 
         record, secret = self._identity.nodes.add_ephemeral("local", machine_id())
+        insecure = bool(self._options.insecure or self._dist.insecure)
+        data_credentials = None
+        if local.data_port and not insecure:          # R30: its data port's certificate, minted in memory
+            from colosseum.net.security import mint_node_credentials
+
+            minted = mint_node_credentials(self._identity, record.node_id)
+            data_credentials = (minted.key_pem, minted.cert_pem, minted.ca_pem)
         options = NodeOptions(hub_address=f"127.0.0.1:{self._ports[LOOPBACK_KEY]}", token=self._identity.token,
-                              loopback_plain=True, workers=int(local.workers), evaluators=int(local.evaluators),
-                              local=True, credentials=(record.node_id, 0, secret), log_dir=Path(local.log_dir),
-                              data_port=-1 if local.data_port else None)
+                              insecure=insecure, loopback_plain=True, workers=int(local.workers),
+                              evaluators=int(local.evaluators), local=True, credentials=(record.node_id, 0, secret),
+                              log_dir=Path(local.log_dir), data_port=-1 if local.data_port else None,
+                              data_host=self._options.listen if local.data_port else None,
+                              data_credentials=data_credentials)
         # Not daemonic: the node starts its own children (carried item of T2.4); it dies with the hub (PDEATHSIG)
         # and the shutdown waits for it (LOCAL_SHUTDOWN_GRACE_SEC) before it is killed.
         proc = self._mp.Process(target=local_node_target, name="node",
@@ -696,6 +718,7 @@ class Hub(RunSinks):
         if old is not None and old is not handle:
             old.close("superseded")
         self._sessions[handle.node_id] = handle
+        self._machines[handle.node_id] = record.machine_id
         self._run_stopped.discard(handle.node_id)
         node_hello = hello_from_proto(hello)
         addresses = check_data_addresses(node_hello.data_addresses)
@@ -715,7 +738,8 @@ class Hub(RunSinks):
         cfg = self._config
         agents = [pb.AgentState(agent_id=aid, kind=cfg.agent_kind(aid), status="active", start_env_steps=0)
                   for aid in cfg.agent_ids()]
-        versions = [version_to_proto(v) for aid in self._agent_ids if (v := self._versions.latest(aid)) is not None]
+        versions = self._versions_for(handle.node_id, [v for aid in self._agent_ids
+                                                       if (v := self._versions.latest(aid)) is not None])
         handle.send(pb.HubMessage(welcome=pb.Welcome(
             node_number=record.number, run_id=self._run_id, config_json=cfg.model_dump_json(by_alias=True),
             agents=agents, versions=versions, evictions=self._take_evictions(handle.node_id),
@@ -768,6 +792,7 @@ class Hub(RunSinks):
         matches are never reported), its stream is closed. T4.2 adds the relocation of its learners."""
         self._cells.drop_node(entry.number)
         self._holds.drop_node(entry.number)
+        self._paths.pop(entry.number, None)
         handle = self._sessions.pop(entry.node_id, None)
         if handle is not None:
             handle.close(reason)
@@ -824,6 +849,36 @@ class Hub(RunSinks):
             return
         self._budget.report(node_id, session_id, int(heartbeat.env_steps))
         self._book.report(f"{node_id}/{session_id}", {str(k): int(v) for k, v in heartbeat.counters.items()})
+        entry = self._registry.by_id(node_id)
+        if entry is not None:
+            self._on_paths(entry, heartbeat.paths)
+
+    def _on_paths(self, entry: Any, reported: Any) -> None:
+        """``Heartbeat.paths`` (T3.2, spec 4.8): the node's whole current view of the learner nodes it sends chunks
+        to (``direct`` / ``relay`` / ``down`` / ``none``); another value is dropped (``node_messages.invalid``). A node
+        that reports ``down`` while the relay is off is named in one WARNING per pair of nodes."""
+        paths: dict[int, str] = {}
+        bad = 0
+        for p in reported:
+            if p.path in PATH_STATES:
+                paths[int(p.node)] = str(p.path)
+            else:
+                bad += 1
+        if bad:
+            self._count_drop(entry.number, "node_messages", "invalid", "path reports", bad)
+        self._paths[entry.number] = paths
+        if self._relay_on():
+            return
+        for target, path in paths.items():
+            agents = sorted(a for a, n in self._learner_node.items() if n == target)
+            if path == "down" and agents:
+                self._warn_once(("path_down", entry.number, target),
+                                f"node {entry.number} ({entry.name}) cannot reach the data port of node {target} and "
+                                f"the relay is off: node {entry.number} plays {agents} without collecting")
+
+    def _relay_on(self) -> bool:
+        """Whether chunks can go through the hub (``distributed.relay`` and the relay itself: T3.2 (b))."""
+        return self._relay is not None and bool(getattr(self._relay, "enabled", False))
 
     def _collecting_any(self) -> list[str]:
         """Agents that can collect anywhere: an accepted latest version and a learner (spec 4.2, 4.7)."""
@@ -831,8 +886,15 @@ class Hub(RunSinks):
                 if self._learner_alive.get(a) and self._versions.latest(a) is not None]
 
     def _collecting_on(self, number: int) -> list[str]:
-        """Agents that can collect on node ``number``: until T3.2 only those whose learner runs there (A11)."""
-        return [a for a in self._collecting_any() if self._learner_node.get(a) == number]
+        """Agents that can collect on node ``number`` (``hub.state.collect_allowed``): their learner runs there, or
+        the node reaches it (the relay, or a direct path the node reported)."""
+        relay, paths = self._relay_on(), self._paths.get(number, {})
+        out = []
+        for agent in self._collecting_any():
+            learner = self._learner_node.get(agent)
+            if collect_allowed(number, learner, relay=relay, path=paths.get(learner)):
+                out.append(agent)
+        return out
 
     def _on_lineup_request(self, node_id: str, session_id: str, req: Any) -> None:
         """Answer a node's ``LineupRequest`` in this pass (spec 4.2; P-PF2-2, P-PF2-3, P-PF2-17; A11)."""
@@ -867,15 +929,15 @@ class Hub(RunSinks):
                 self._holds.drop_cell(key)
         cells = self._cells.request(entry.number, requested, now)
         keys = [c.key for c in cells]
-        owners = self._rotation.assign(keys, collecting=collecting, owners=self._cells.owners(exclude=keys),
+        here = self._collecting_on(entry.number)     # T3.2: else this node plays without collecting
+        owners = self._rotation.assign(keys, collecting=here or collecting, owners=self._cells.owners(exclude=keys),
                                        previous={c.key: c.owner if c.owner is not None else c.previous
                                                  for c in cells})                     # P-PF2-2
-        local = self._collecting_on(entry.number)
         ttl = float(self._config.rollout.match_refresh_interval_sec)
         grants = []
         for cell in cells:
             owner = owners[cell.key]
-            lineup = restrict_collecting(self._coordinator.lineup_for(owner), local)
+            lineup = strip_collect(self._coordinator.lineup_for(owner), here)
             lineup = dataclasses.replace(lineup, epoch=cell.epoch)
             self._cells.grant(cell.key, owner, ttl, now)
             self._holds.grant(cell.key, snapshot_refs(lineup))       # evicted snapshots it names stay servable
@@ -1240,12 +1302,24 @@ class Hub(RunSinks):
                     pending = self._pending_evictions.setdefault(entry.node_id, [])
                     pending.extend(new)
                     del pending[:-PENDING_EVICTIONS_MAX]
-        versions = [version_to_proto(v) for v in self._new_versions.values()]
+        new_versions = list(self._new_versions.values())
         self._new_versions = {}
         for node_id, handle in list(self._sessions.items()):
             handle.send(pb.HubMessage(announce=pb.Announce(
-                versions=versions, evictions=self._take_evictions(node_id), env_steps=self._budget.value,
-                collect_allowed=True)))
+                versions=self._versions_for(node_id, new_versions), evictions=self._take_evictions(node_id),
+                env_steps=self._budget.value, collect_allowed=True)))
+
+    def _versions_for(self, node_id: str, infos: list) -> list:
+        """``infos`` as node ``node_id`` sees them (``pb.VersionInfo``): the learner node's loopback data addresses
+        only for a node on the same machine (``hub.state.visible_version``; carried decision 3a of T3.1)."""
+        machine = self._machines.get(node_id)
+        out = []
+        for info in infos:
+            source = self._registry.get(int(info.node)) if info.node >= 0 else None
+            same = (source is not None and machine is not None
+                    and self._machines.get(source.node_id) == machine)
+            out.append(version_to_proto(visible_version(info, same_machine=same)))
+        return out
 
     def _take_evictions(self, node_id: str) -> list:
         """The evictions not yet delivered to ``node_id`` (``pb.Eviction``), now handed out."""

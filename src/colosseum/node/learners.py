@@ -113,6 +113,11 @@ class NodeLearners:
     def agents(self) -> list[str]:
         return list(self._entries)
 
+    def routed(self) -> dict[str, str]:
+        """Agents whose learner runs here and takes chunks (``running``, workers routed to it) -> its listener name:
+        the node opens its own chunk connection to it for frames from other machines (T3.2)."""
+        return {e.agent_id: e.listener_name for e in self._entries.values() if e.state == "running" and e.routed}
+
     def hello_entries(self) -> tuple:
         """``(agent, generation, version)`` of the running learners (``Hello.learners``)."""
         return tuple((e.agent_id, e.generation, max(e.version, 0)) for e in self._entries.values()
@@ -329,6 +334,9 @@ class NodeLearners:
             from colosseum.net.local import LearnerRoute
 
             entry.version = max(entry.version, int(message.version))
+            # The route goes to the workers before the VersionAnnounce below goes to the hub, and the hub grants
+            # collecting seats for an agent only once it accepted a version: on a first start no lineup collects for
+            # this learner before every worker of this node has its route (T3.2, carried item of T2.4 (b)).
             if not entry.routed and entry.state == "running":
                 entry.routed = True
                 self._host.set_route(LearnerRoute(entry.agent_id, entry.listener_name, False, entry.generation))

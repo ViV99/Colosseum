@@ -90,7 +90,8 @@ def test_train_runs_a_hub_and_a_local_node_to_the_budget(tmp_path):
 
 
 def test_train_listen_opens_a_tls_port_and_keeps_the_loopback(tmp_path):
-    cmd = train_cmd(TTT_CONFIG, tmp_path / "runs", "listen", {"distributed.port": "0"}) + ["--listen", "127.0.0.1"]
+    cmd = train_cmd(TTT_CONFIG, tmp_path / "runs", "listen", {"distributed.port": "0", "distributed.data_port": "0"}
+                    ) + ["--listen", "127.0.0.1"]
     proc = run_in_session(cmd, timeout=240)
     assert proc.returncode == 0, proc.stderr[-3000:]
     root = tmp_path / "runs" / "listen"
@@ -98,7 +99,10 @@ def test_train_listen_opens_a_tls_port_and_keeps_the_loopback(tmp_path):
     (address,) = info.addresses
     assert re.fullmatch(r"127\.0\.0\.1:[1-9]\d*", address) and info.tls is True
     assert info.loopback != address and info.loopback.startswith("127.0.0.1:") and not info.loopback_tls
-    assert f"session with the hub at {info.loopback} (plain)" in (root / "logs" / "node.log").read_text()
+    node_log = (root / "logs" / "node.log").read_text()
+    assert f"session with the hub at {info.loopback} (plain)" in node_log
+    # R30 (T3.2): the local node's data port, with a certificate the hub minted, on the --listen host
+    assert re.search(r"data port 127\.0\.0\.1:\d+ \(mutual TLS\); announced as 127\.0\.0\.1:\d+", node_log)
 
 
 @pytest.mark.parametrize("signum, code", [(signal.SIGINT, 130), (signal.SIGTERM, 143)])

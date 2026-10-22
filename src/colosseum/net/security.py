@@ -16,7 +16,10 @@ serve clients without one (the installer, the first registration), so the hub po
 hub RPC after registration carries the node id and a per-node secret in metadata (``x-colosseum-node``,
 ``x-colosseum-node-secret``); the hub keeps only the secret's SHA-256 (``nodes.json``). Registration and admin RPCs
 carry the token secret (``x-colosseum-token``). Node data ports (node <-> node) are full mutual TLS with node
-certificates issued by the CA (CN = node id, SAN ``colosseum-node``). ``ban`` and ``rotate`` revoke both kinds.
+certificates issued by the CA (CN = node id, SANs ``colosseum-node`` and ``n<number>.colosseum-node``: a client checks
+the second one, so a data port answers only for the node the hub announced as the source, SP5 T3.2). ``train``'s local
+node gets its key and certificate minted in memory by the hub (``mint_node_credentials``; ruling R30). ``ban`` and
+``rotate`` revoke both kinds.
 ``--insecure`` drops TLS but keeps the token and node secrets; loopback (``train`` without ``--listen``) is plain.
 
 A node's identity per hub CA lives in ``<data_home>/colosseum/node/<ca fingerprint>/`` (``0700``): ``node.key``
@@ -70,6 +73,14 @@ BOOK_VERSION = 1
 CERT_BACKDATE = datetime.timedelta(days=7)          # tolerate machine clocks a few days apart
 CA_LIFETIME = datetime.timedelta(days=20 * 365)
 NODE_LIFETIME = datetime.timedelta(days=10 * 365)
+
+
+def node_server_name(number: int) -> str:
+    """The TLS server name of node ``number``'s data port (a SAN of its certificate; T3.2): a client that connects to
+    the source the hub announced overrides the target name with it, so another node's certificate of the same CA
+    (a banned node's, say) cannot answer in its place. Node numbers are unique per hub CA (registered nodes never
+    reuse one; ``train``'s local nodes are 0)."""
+    return f"n{int(number)}.{NODE_SERVER_NAME}"
 
 
 class SecurityError(Exception):
@@ -580,7 +591,8 @@ class HubIdentity:
         self.nodes.reload()                       # the same object: interceptors holding it see the empty book
 
     def issue_node_certificate(self, node_id: str, public_key_pem: bytes) -> bytes:
-        """A client + server certificate for the node's key (CN = node id, SAN ``colosseum-node``), signed by the CA."""
+        """A client + server certificate for the node's key (CN = node id, SANs ``colosseum-node`` and, for a node of
+        the book (ephemeral ones included), ``node_server_name(number)``), signed by the CA."""
         if not NODE_ID_RE.fullmatch(node_id):
             raise SecurityError(f"invalid node id {node_id!r}")
         try:
@@ -590,17 +602,21 @@ class HubIdentity:
         if not isinstance(public, ec.EllipticCurvePublicKey) or not isinstance(public.curve, ec.SECP256R1):
             raise SecurityError("the node's key must be an ECDSA P-256 (secp256r1) key")
         ca = x509.load_pem_x509_certificate(self.ca_pem)
+        record = self.nodes.get(node_id)
+        names = [x509.DNSName(NODE_SERVER_NAME)]
+        if record is not None:
+            names.append(x509.DNSName(node_server_name(record.number)))
         now = _now()
         cert = (x509.CertificateBuilder()
                 .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, node_id)]))
                 .issuer_name(ca.subject).public_key(public).serial_number(x509.random_serial_number())
                 .not_valid_before(now - CERT_BACKDATE).not_valid_after(now + NODE_LIFETIME)
                 .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
-                .add_extension(x509.SubjectAlternativeName([x509.DNSName(NODE_SERVER_NAME)]), critical=False)
+                .add_extension(x509.SubjectAlternativeName(names), critical=False)
                 .add_extension(x509.ExtendedKeyUsage([ExtendedKeyUsageOID.SERVER_AUTH,
                                                       ExtendedKeyUsageOID.CLIENT_AUTH]), critical=False)
                 .sign(self._key, hashes.SHA256()))
-        if self.nodes.get(node_id) is not None:
+        if record is not None:
             self.nodes.set_cert_serial(node_id, format(cert.serial_number, "x"))
         return cert.public_bytes(serialization.Encoding.PEM)
 
@@ -652,6 +668,11 @@ class NodeIdentity:
         return path.read_bytes() if path.exists() else None
 
     @property
+    def ca_pem(self) -> bytes:
+        """The pinned hub CA (``ca.crt``, kept at registration)."""
+        return (self.path / "ca.crt").read_bytes()
+
+    @property
     def registered(self) -> bool:
         return bool(self.node_id and self.secret and self.cert_pem)
 
@@ -683,6 +704,26 @@ class NodeIdentity:
         for name in ("node.json", "node.crt", "ca.crt"):
             (self.path / name).unlink(missing_ok=True)
         self.node_id = self.number = self.name = self.secret = None
+
+
+@dataclass(frozen=True)
+class MemoryNodeIdentity:
+    """A node's data-port credentials held in memory (``train``'s local node, ruling R30; a T1.3 contract amendment of
+    SP5 T3.2): what ``data_server_credentials`` / ``data_channel_credentials`` read of a ``NodeIdentity``."""
+
+    node_id: str
+    key_pem: bytes
+    cert_pem: bytes
+    ca_pem: bytes
+
+
+def mint_node_credentials(hub: HubIdentity, node_id: str) -> MemoryNodeIdentity:
+    """A fresh key and its certificate for ``node_id`` (a node of ``hub``'s book, e.g. the ephemeral record of
+    ``train``'s local node), never written to disk (ruling R30)."""
+    key = ec.generate_private_key(ec.SECP256R1())
+    public = key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+    cert = hub.issue_node_certificate(node_id, public)
+    return MemoryNodeIdentity(node_id=node_id, key_pem=_key_pem(key), cert_pem=cert, ca_pem=hub.ca_pem)
 
 
 # ---------------------------------------------------------------------------
@@ -717,7 +758,7 @@ def hub_channel_credentials(ca_pem: bytes) -> grpc.ChannelCredentials:
     return grpc.ssl_channel_credentials(root_certificates=ca_pem)
 
 
-def data_server_credentials(node: NodeIdentity, ca_pem: bytes) -> grpc.ServerCredentials:
+def data_server_credentials(node: NodeIdentity | MemoryNodeIdentity, ca_pem: bytes) -> grpc.ServerCredentials:
     """Mutual TLS for a node's data port: the node's certificate, clients must present a certificate of the CA."""
     if node.cert_pem is None:
         raise SecurityError("the node has no certificate yet: register with the hub first")
@@ -725,8 +766,9 @@ def data_server_credentials(node: NodeIdentity, ca_pem: bytes) -> grpc.ServerCre
                                        require_client_auth=True)
 
 
-def data_channel_credentials(node: NodeIdentity, ca_pem: bytes) -> grpc.ChannelCredentials:
-    """Mutual TLS to another node's data port (with ``channel_options(server_name=NODE_SERVER_NAME)``)."""
+def data_channel_credentials(node: NodeIdentity | MemoryNodeIdentity, ca_pem: bytes) -> grpc.ChannelCredentials:
+    """Mutual TLS to another node's data port (with ``channel_options(server_name=node_server_name(<its number>))``:
+    only that node's certificate is accepted; ``NODE_SERVER_NAME`` accepts any node of the CA)."""
     if node.cert_pem is None:
         raise SecurityError("the node has no certificate yet: register with the hub first")
     return grpc.ssl_channel_credentials(root_certificates=ca_pem, private_key=node.key_pem,

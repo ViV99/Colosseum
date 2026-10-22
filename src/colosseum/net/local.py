@@ -561,6 +561,7 @@ class WorkerIO:
         self._routes: dict[str, LearnerRoute] = dict(routes)
         self._senders: dict[str, FrameSender] = {}       # by agent (local learner) or "<route>"
         self._reopen_after: dict[str, float] = {}        # by agent: the reopen wait of a broken sender (R34)
+        self._lz4: dict[str, Any] = {}                   # agent -> frame.Lz4Probe of its frames to other machines
         self.dropped: Counter = Counter()                # chunk drops by reason (under _drop_lock)
         self._drop_lock = threading.Lock()
         self._batcher = ResultBatcher(_ResultSink(self._control), worker, max_results=results_batch,
@@ -647,8 +648,14 @@ class WorkerIO:
             self._count_drop("no_learner")
             return
         sender = self._sender(route)
+        probe = self._lz4_probe(chunk.agent_id) if route.via_node else None     # frames that leave the machine
+        compress = probe is not None and probe.compress()
         frame = encode_chunk(chunk, generation=self._generation_of(chunk.agent_id, chunk.policy_version),
-                             node=self.node, worker=self.worker, compress=False)   # lz4 for remote targets: T3.2
+                             node=self.node, worker=self.worker, compress=compress)
+        if compress:                                 # every compressed frame is measured, sent or not (P-PF1-8)
+            from colosseum.net.frame import frame_sizes
+
+            probe.observe(*frame_sizes(frame))
         while not sender.put(frame, timeout=SEND_SLICE_SEC):
             self.idle()
             if self._stopped:
@@ -659,7 +666,19 @@ class WorkerIO:
         with self._drop_lock:
             self.dropped[reason] += 1
 
+    def _lz4_probe(self, agent_id: str) -> Any:
+        """Adaptive lz4 per agent for frames to learners on other machines (spec 4.9; T3.2)."""
+        probe = self._lz4.get(agent_id)
+        if probe is None:
+            from colosseum.net.frame import Lz4Probe
+
+            probe = self._lz4[agent_id] = Lz4Probe(clock=self._clock)
+        return probe
+
     def _sender(self, route: LearnerRoute) -> FrameSender:
+        # Every agent routed via the node shares one sender over the route connection ("<route>"): a route change of
+        # one agent never closes it (``_set_route`` closes senders by agent key), and its failure means the node is gone
+        # (every later via-node frame is counted ``disconnect``) (T3.2).
         key = route.agent_id if not route.via_node else "<route>"
         sender = self._senders.get(key)
         if sender is not None and not sender.broken and sender.opened:

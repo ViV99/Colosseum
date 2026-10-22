@@ -29,7 +29,7 @@ def test_concurrent_probes_of_one_place_keep_one_channel_and_close_the_other(mon
 
     monkeypatch.setattr(dataport, "probe_direct", probe)
     fetcher = NodeFetcher(submit=lambda *a: None, post=lambda item: None)
-    fetcher._link = _DataLink(lambda a: None, (), 1.0, 64)
+    fetcher._link = _DataLink(lambda a, n: None, (), 1.0, 64)
     source = SimpleNamespace(node=7, addresses=("127.0.0.1:1",))
     got = []
     threads = [threading.Thread(target=lambda: got.append(fetcher._channel_for(source))) for _ in range(2)]

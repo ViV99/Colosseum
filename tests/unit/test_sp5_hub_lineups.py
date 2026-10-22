@@ -1,4 +1,4 @@
-"""The hub's lineups (SP5 T2.5; spec 4.2, 4.7; pre-flight rulings P-PF2-2, P-PF2-3, P-PF2-17; amendment A11): the
+"""The hub's lineups (SP5 T2.5, T3.2; spec 4.2, 4.7; pre-flight rulings P-PF2-2, P-PF2-3, P-PF2-17): the
 real ``Hub._on_lineup_request`` on its coordinator, cell table and rotation, driven in-process through
 ``hub_kit``'s recording session handles."""
 from __future__ import annotations
@@ -117,7 +117,9 @@ def test_seats_of_agents_without_a_learner_do_not_collect(tmp_path):
         assert any(s.agent_id == "b" for s in lineup.seats)
 
 
-def test_until_t32_a_node_collects_only_for_its_own_learners(tmp_path):
+def test_a_node_without_a_path_to_the_learner_plays_without_collecting(tmp_path):
+    """T3.2 (spec 4.7, 4.8): without the hub relay a remote learner's seats collect only on a node that reported a
+    direct path to it (``test_sp5_hub_paths.py``); before that the node still gets lineups, none collecting."""
     hub = lineup_hub(_config(("a",)), tmp_path)
     first = open_node(hub, name="learner-node", workers=1)
     second = open_node(hub, name="worker-node", workers=1, cpu_learners=0, no_learners=True)
@@ -125,7 +127,7 @@ def test_until_t32_a_node_collects_only_for_its_own_learners(tmp_path):
     assert [la.agent_id for la in first.of("welcome")[0].learners] == ["a"] and not second.of("welcome")[0].learners
     accept_version(hub, "a")
     elsewhere = request_cells(hub, second, [(0, e, 0, 0) for e in range(4)])
-    assert len(elsewhere) == 4                                            # A11: granted, but nothing collects
+    assert len(elsewhere) == 4                                            # granted, but nothing collects
     assert all(not _collecting(lineup_from_proto(g.lineup)) for g in elsewhere)
     here = request_cells(hub, first, [(0, e, 0, 0) for e in range(4)])
     assert all(_collecting(lineup_from_proto(g.lineup)) == {"a"} for g in here)

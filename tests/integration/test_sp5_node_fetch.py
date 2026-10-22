@@ -205,8 +205,8 @@ def test_a_frame_that_is_not_the_announced_version_is_refused(setup):
 
 
 def test_the_local_node_without_a_certificate_has_no_data_port_and_says_so_at_info(tmp_path, caplog):
-    """Ruling R30: ``train``'s local node (no node certificate until T3.2) runs without a data port; its learners are
-    relay-only for remote nodes, which is expected: an INFO, not a WARNING."""
+    """Ruling R30: ``train``'s local node without minted credentials (``train`` without ``--listen``) runs without a
+    data port; no remote node needs one then: an INFO, not a WARNING."""
     from colosseum.node.agent import NodeOptions
 
     hub = FakeHub(tmp_path, _config(tmp_path))
@@ -221,6 +221,45 @@ def test_the_local_node_without_a_certificate_has_no_data_port_and_says_so_at_in
             assert node.stop() == 0
         said = [r for r in caplog.records if "no data port" in r.getMessage()]
         assert [r.levelno for r in said] == [logging.INFO] and node.agent.data_port() is None
+    finally:
+        if node is not None and node.thread.is_alive():
+            node.stop()
+        hub.stop()
+
+
+def test_the_local_node_with_minted_credentials_serves_mutual_tls_on_its_listen_host(tmp_path):
+    """Ruling R30 (T3.2): ``train --listen``'s local node gets a certificate the hub mints in memory; its data port
+    binds on the listen host, announces only that address, and accepts a node of the same CA that names node 0."""
+    from colosseum.net.security import mint_node_credentials
+    from colosseum.node.agent import NodeOptions
+    from colosseum.node.dataport import fetch_latest, probe_direct
+    from colosseum.node.fetch import NodeFetcher
+    from net_kit import node_identity, register
+
+    hub = FakeHub(tmp_path, _config(tmp_path))
+    record, secret = hub.identity.nodes.add_ephemeral("local", "machine-local")
+    minted = mint_node_credentials(hub.identity, record.node_id)
+    options = NodeOptions(hub_address=hub.address, token=hub.token, loopback_plain=True, local=True, workers=0,
+                          credentials=(record.node_id, 0, secret), data_port=0, data_host="127.0.0.1",
+                          data_credentials=(minted.key_pem, minted.cert_pem, minted.ca_pem),
+                          log_dir=tmp_path / "local-logs")
+    node = None
+    try:
+        node = run_node_in_thread(options)
+        wait_for(lambda: node.agent.data_port() is not None, timeout=30)
+        port = node.agent.data_port()
+        wait_for(lambda: hub.messages("addresses"), timeout=10)
+        assert list(hub.messages("addresses")[-1].data_addresses) == [f"127.0.0.1:{port}"]
+        client = node_identity(tmp_path, hub.identity.fingerprint, "remote")
+        register(hub.identity, client, name="remote", machine_id="machine-remote")
+        link = NodeFetcher.link(insecure=False, token_secret="", identity=client, max_message_mb=64,
+                                connect_timeout_sec=5.0)
+        found = probe_direct([f"127.0.0.1:{port}"], lambda a: link.make_channel(a, 0), 5.0)
+        assert found is not None                                       # mutual TLS with the minted certificate
+        with pytest.raises(Exception, match="NOT_FOUND"):              # reached (no learner of main runs there)
+            fetch_latest(found[1], "main", -1, max_message_mb=64, timeout=10)
+        found[1].close()
+        assert node.stop() == 0
     finally:
         if node is not None and node.thread.is_alive():
             node.stop()

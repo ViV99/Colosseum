@@ -77,9 +77,17 @@
     4). A failed first fetch keeps the waiting lineups' old ones (``lineup_fetch_failed``); a full cache is an ERROR
     with the hint. ``counters()`` and ``fetch_history()`` are copies the loop publishes every pass.
 
-Threads besides the loop: the session reader (``HubSession``), the listener's ``Acceptor``, the transfer pool and
-the data port's servicers; they only post into the inbox (a ``SimpleQueue`` plus a non-blocking wake pipe in the
-loop's ``wait`` list) or read snapshots the loop publishes. The loop never blocks on the network and reads only
+12. **Chunks between machines** (spec 4.7, 4.8; SP5 T3.2; ``node.routing``). Each run has a chunk router, started
+    before the data port: learners on other nodes become remote routes as soon as their versions are known, the path
+    to each is probed before any frame and reported (``Heartbeat.paths``, ``paths()``), workers send frames for them
+    on their ``route`` connections (``LearnerRoute(via_node=True)`` unless the path is down), and frames from other
+    machines reach the local learners over the node's own ``chunks`` connections. The router's counters join
+    ``Heartbeat.counters``; it is stopped before the children are killed.
+
+Threads besides the loop: the session reader (``HubSession``), the listener's ``Acceptor``, the transfer pool, the
+data port's servicers, the chunk router's readers and senders and the short threads that open the node's chunk
+connections to its learners (item 12); they only post into the inbox (a ``SimpleQueue`` plus a non-blocking wake pipe
+in the loop's ``wait`` list) or read snapshots the loop publishes. The loop never blocks on the network and reads only
 connections ``wait`` reported ready.
 """
 
@@ -114,6 +122,7 @@ from colosseum.node.fetch import BlobFetched, LatestFetched, LatestFetchFailed, 
 from colosseum.node.learners import LearnerBlobsDone, NodeLearners
 from colosseum.node.lineups import CACHE_DROP_DELAY_SEC, FIXED_RETRY_SEC, LINEUP_WAIT_SEC, NodeLineups  # noqa: F401
 from colosseum.node.procs import ChildSpec, ChildSupervisor
+from colosseum.node.routing import LearnerConnOpened, NodeRouting, PathChanged
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC
 
 logger = logging.getLogger(__name__)
@@ -172,6 +181,8 @@ class NodeOptions:
     data_port: int | None = None       # None: no data port; 0 ephemeral; -1 distributed.data_port (A23; T3.1)
     data_addresses: tuple[str, ...] | None = None    # announced instead of the probed ones (port forwards; T3.1)
     credentials: tuple[str, int, str] | None = None   # the local node's (node_id, number, node_secret) from the hub
+    data_host: str | None = None       # the data port's bind host (None: loopback for a loopback hub, else all; T3.2)
+    data_credentials: tuple[bytes, bytes, bytes] | None = None   # local node: (key, cert, CA) PEM from the hub (R30)
     shutdown_grace_sec: float | None = None           # None: LOCAL_CHILD_GRACE_SEC / shutdown_grace_sec - 5
 
 
@@ -289,7 +300,6 @@ class NodeAgent:
         self.lineups = NodeLineups(_LineupHost(self), self.fetches)   # lineups and the cache (node.lineups, R31)
         self._control: dict[str, mpc.Connection] = {}
         self._child_conns: dict[mpc.Connection, str] = {}
-        self._route_conns: set[mpc.Connection] = set()
         self._reported: set[str] = set()           # children that sent a ChildError
         self._disabled: set[str] = set()
         self._progress: dict[tuple[int, int], int] = {}            # (worker, incarnation) -> cumulative env steps
@@ -322,6 +332,8 @@ class NodeAgent:
         self._next_fetch_pump = 0.0
         self._published_counters: dict[str, int] = {}
         self._published_history: dict[str, list[int]] = {}
+        self.routing = NodeRouting(_RoutingHost(self))   # chunks between machines (node.routing, item 12)
+        self._published_paths: dict[int, str] = {}
 
     # ---- public ---------------------------------------------------------------------------------------------
 
@@ -358,6 +370,11 @@ class NodeAgent:
         """The bound data port (None: none)."""
         server = self._data_server
         return None if server is None else server.port
+
+    def paths(self) -> dict[int, str]:
+        """The chunk path to every learner node this node sends to (``direct`` / ``relay`` / ``down`` / ``none``; a
+        copy the loop publishes every pass; any thread)."""
+        return dict(self._published_paths)
 
     def run(self) -> int:
         """The node's loop until its stop; returns the exit code (0 after a stop, 1 after a refusal or a failure)."""
@@ -412,6 +429,10 @@ class NodeAgent:
                 raise _Refused("a local node needs the hub's credentials (NodeOptions.credentials)")
             node_id, number, secret = opts.credentials
             self._number = int(number)
+            if opts.data_credentials is not None:     # R30: its data port's certificate, minted by the hub
+                from colosseum.net.security import MemoryNodeIdentity
+
+                self._node_identity = MemoryNodeIdentity(node_id, *opts.data_credentials)
             if self._plain():
                 return node_id, secret, None
             host, port = _split_address(opts.hub_address)
@@ -620,6 +641,7 @@ class NodeAgent:
         """Copies other threads read: the counters and fetch history (accessors), the agents whose learner runs here
         (the data port)."""
         self._published_counters = self._node_counters(self._run)
+        self._published_paths = self.routing.paths()
         history = self.fetches.stats.history
         if sum(map(len, history.values())) != sum(map(len, self._published_history.values())):
             self._published_history = {agent: list(versions) for agent, versions in history.items()}
@@ -654,6 +676,10 @@ class NodeAgent:
                 self.learners.on_blobs(item)
             elif isinstance(item, _UploadDone):
                 self._on_upload_done(item)
+            elif isinstance(item, PathChanged):
+                self.routing.on_path_changed(item)
+            elif isinstance(item, LearnerConnOpened):
+                self.routing.on_learner_conn(item)
             else:
                 self._on_session_event(item)
 
@@ -696,6 +722,8 @@ class NodeAgent:
             if now >= self._next_fetch_pump:
                 self._next_fetch_pump = now + FETCH_PUMP_SEC
                 self.lineups.pump_fetches(run, now)
+                self.routing.update_routes(run)
+            self.routing.sync_delivery(run, now)
             if now >= self._next_prune:
                 self._next_prune = now + CACHE_PRUNE_SEC
                 self.lineups.prune_cache(run, now)
@@ -885,6 +913,7 @@ class NodeAgent:
                                                      identity=self._node_identity,
                                                      max_message_mb=int(dist.max_message_mb),
                                                      connect_timeout_sec=float(dist.connect_timeout_sec)))
+        self.routing.start(run)
         self._start_data_port(run)
         for la in welcome.learners:
             self.learners.assign(run, la)
@@ -900,9 +929,11 @@ class NodeAgent:
         from colosseum.node.dataport import open_data_port
 
         opts = self.options
+        delivery = self.routing.delivery
         if self._data_server is not None:
             self._data_server.set_cache(run.reader)
             self._data_server.set_node(run.number)
+            self._data_server.set_delivery(delivery)
             return
         if opts.data_port is None:
             return
@@ -912,7 +943,7 @@ class NodeAgent:
             hub_host=_split_address(opts.hub_address)[0], insecure=opts.insecure, token_secret=opts.token.secret,
             identity=self._node_identity, cache=run.reader, own_agents=lambda: self._own_learners,
             banned=lambda: self._banned, max_message_mb=int(dist.max_message_mb), node=run.number,
-            announced=opts.data_addresses, local=opts.local)
+            announced=opts.data_addresses, local=opts.local, host=opts.data_host, delivery=delivery)
         if opened is None:
             return
         self._data_server, addresses = opened
@@ -991,9 +1022,10 @@ class NodeAgent:
                 self._on_worker_connected(name, conn)
             elif self.supervisor.role(name) == "learner":
                 self.learners.on_connected(name)
-        elif hello.channel == "route":
-            self._child_conns[conn] = name
-            self._route_conns.add(conn)
+        elif hello.channel == "route":              # frames for other machines: the router reads them (item 12)
+            if self._stopping or self.supervisor.role(name) != "worker" or not self.routing.add_worker(
+                    conn, _slot_index(name)):
+                conn.close()
         else:
             conn.close()
 
@@ -1028,9 +1060,6 @@ class NodeAgent:
             try:
                 if not conn.poll(0):
                     return
-                if conn in self._route_conns:
-                    conn.recv_bytes()               # frames for other machines: T3.2
-                    continue
                 message = conn.recv()
                 frame = None
                 if isinstance(message, CheckpointHeader):     # its frame follows at once (one send under a lock)
@@ -1097,7 +1126,6 @@ class NodeAgent:
 
     def _close_conn(self, conn: mpc.Connection) -> None:
         name = self._child_conns.pop(conn, None)
-        self._route_conns.discard(conn)
         if name is not None and self._control.get(name) is conn:
             del self._control[name]
         try:
@@ -1223,6 +1251,7 @@ class NodeAgent:
                **self.fetches.counters()}
         if self._data_server is not None:
             out.update({f"data_port.{k}": int(v) for k, v in self._data_server.counters_snapshot().items()})
+        out.update(self.routing.counters())
         return out
 
     def _send_heartbeat(self, run: _Run) -> None:
@@ -1236,7 +1265,8 @@ class NodeAgent:
             env_steps=self._env_steps(), dropped_results=self._dropped_carry + int(run.results.dropped),
             procs=[pb.ProcState(name=n, state=self._proc_state(n), restarts=max(0, self.supervisor.incarnation(n) - 1))
                    for n in self.supervisor.names()],
-            load=load, cached_keys=cached, counters=self._node_counters(run))))
+            load=load, cached_keys=cached, counters=self._node_counters(run),
+            paths=self.routing.heartbeat_paths())))
 
     def _send_metrics(self) -> None:
         learners = self.learners
@@ -1278,6 +1308,7 @@ class NodeAgent:
         if self._stop_phase == "children":
             if self.supervisor.alive() and now < self._children_deadline:
                 return
+            self.routing.stop()                      # item 12: before the children are killed
             if self.supervisor.alive():
                 self.supervisor.stop_all(0.0)
             for name, code in self.supervisor.exited():
@@ -1328,7 +1359,7 @@ class NodeAgent:
         self.lineups.clear()
         for book in (self._learner_routes, self._uploads, self._control, self._child_conns):
             book.clear()
-        for book in (self._route_conns, self._reported, self._disabled):
+        for book in (self._reported, self._disabled):
             book.clear()
         self._stopping, self._releasing, self._stop_phase = False, False, ""
         logger.info(f"node: released run {run.run_id[:8]}; the session stays open")
@@ -1340,6 +1371,7 @@ class NodeAgent:
         removed, so no download puts a segment after the cleanup; the wake pipe closes last."""
         with self._wake_lock:
             self._closed = True
+        self.routing.stop()
         if self.supervisor.alive():
             self.supervisor.stop_all(0.0)
         if self._session is not None:
@@ -1364,6 +1396,7 @@ class NodeAgent:
         prefix without a lock, which the next node's ``cleanup_dead`` removes)."""
         from colosseum.node.weights import release_node_lock
 
+        self.routing.stop()
         run.acceptor.close()
         try:
             run.listener.close()
@@ -1423,6 +1456,52 @@ class _LineupHost:
         name = f"worker-{worker}"
         conn = self._agent._control.get(name)
         return conn is not None and self._agent._child_send(name, conn, message)
+
+
+class _RoutingHost:
+    """``node.routing.RoutingHost`` over the agent: the narrow interface ``NodeRouting`` uses."""
+
+    def __init__(self, agent: NodeAgent) -> None:
+        self._agent = agent
+
+    @property
+    def number(self) -> int:
+        return self._agent._number
+
+    @property
+    def stopping(self) -> bool:
+        return self._agent._stopping
+
+    def current_run(self) -> Any:
+        return self._agent._run
+
+    def post(self, item: object) -> None:
+        self._agent._post(item)
+
+    def planner(self) -> Any:
+        return self._agent.fetches.planner
+
+    def data_link(self) -> Any:
+        return self._agent.fetches.data_link
+
+    def local_learners(self) -> list[str]:
+        return self._agent.learners.agents()
+
+    def routed_learners(self) -> dict[str, str]:
+        return self._agent.learners.routed()
+
+    def worker_route(self, agent_id: str) -> Any:
+        return self._agent._learner_routes.get(agent_id)
+
+    def set_route(self, route: Any) -> None:
+        self._agent._set_route(route)
+
+    def event(self, kind: str, **fields: Any) -> None:
+        self._agent._event(kind, **fields)
+
+    def set_delivery(self, delivery: Any) -> None:
+        if self._agent._data_server is not None:
+            self._agent._data_server.set_delivery(delivery)
 
 
 class _LearnerHost:

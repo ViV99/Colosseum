@@ -3,8 +3,8 @@ learner node's versions with its data addresses, the second node downloads them 
 them; frozen and teacher blobs reach every node by id, an ``init`` blob only the node that runs the agent's learner.
 
 ``cluster_kit``: the hub and both nodes run in threads of the test process (TLS hub port, mutual-TLS data ports);
-the loaded processes are node a's learner and node b's worker (2). Until T3.2 node b's ``main`` seats do not collect
-(amendment A11), so the learner stays at its initial version 0."""
+the loaded processes are node a's learner and node b's worker (2). Since T3.2 node b's ``main`` seats collect over
+the direct path to node a's data port, so the learner trains and node b follows its versions."""
 from __future__ import annotations
 
 import json
@@ -46,15 +46,15 @@ def test_a_second_node_plays_with_the_learner_nodes_weights_and_the_frozen_blob(
                                        **ANCHORS_ONLY})
     with cluster(tmp_path, config, NODES, learner_first="main") as (hub, (a, b)):
         assert wait_until(lambda: journal_results_by_node(hub).get(b.agent.number, 0) >= 20, 120)
-        assert b.agent.fetch_history() == {"main": [0]}          # the learner's initial weights, downloaded once
+        history = b.agent.fetch_history()["main"]
+        assert history[0] == 0 and history == sorted(set(history))   # the initial weights first, each version once
         frozen = _cache(b).get(_blob(hub, "fixed", "frozen"))
         assert frozen is not None and frozen.meta.architecture == networks
-        assert wait_until(lambda: hub_counter(hub, "weight_fetches") == 1, 30)
-        assert a.agent.counters()["data_port.latest_served"] == 1
+        assert wait_until(lambda: hub_counter(hub, "weight_fetches") >= 1, 30)
+        assert a.agent.counters()["data_port.latest_served"] >= 1
         assert a.agent.counters()["weight_fetches"] == 0         # its own learner is never fetched
         rows = [r for r in journal_rows(hub) if f"/n{b.agent.number}/" in r.uid]
         assert rows and all(any(s.agent_id == "frozen" and s.network_id == "fixed" for s in r.seats) for r in rows)
-        assert all(s.version_end == 0 for r in rows for s in r.seats if s.agent_id == "main")
         assert hub.stop() == 0
 
 
@@ -81,7 +81,7 @@ def test_a_ban_in_an_announce_closes_the_learner_nodes_data_port_to_that_node(tm
                                        "agents.random": {"kind": "scripted", "class": "colosseum.players.RandomBot"},
                                        **ANCHORS_ONLY})
     with cluster(tmp_path, config, NODES, learner_first="main") as (hub, (a, b)):
-        assert wait_until(lambda: b.agent.fetch_history() == {"main": [0]}, 120)
+        assert wait_until(lambda: b.agent.fetch_history().get("main"), 120)
         b_identity = NodeIdentity.load_or_create(hub.token.ca_fingerprint, tmp_path / "nodes" / "b")
         credentials = data_channel_credentials(b_identity, (b_identity.path / "ca.crt").read_bytes())
 
@@ -100,7 +100,7 @@ def test_a_ban_in_an_announce_closes_the_learner_nodes_data_port_to_that_node(tm
                 return "PERMISSION_DENIED" in str(e)
             return False
 
-        assert get_latest().version == 0                       # b's certificate is served
+        assert get_latest().version >= 0                       # b's certificate is served
         a_id = hub.hub._registry.get(a.agent.number).node_id
         hub.hub._sessions[a_id].send(pb.HubMessage(announce=pb.Announce(banned_node_ids=[b_identity.node_id])))
         assert wait_until(refused, 30)

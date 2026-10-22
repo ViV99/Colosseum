@@ -25,12 +25,12 @@ Rules (``FetchPlanner.due``):
 - ``skip`` agents are left out (``NodeFetcher``: a version that did not fit into a full cache is not fetched again
   until space frees or a newer version is announced).
 
-A fetched frame of the announced version must carry the digest the hub announced: the authenticity anchor of a
-direct fetch covers the announced version only (a peer at a data-port address cannot substitute other weights for
-it). A newer version that the hub has not announced yet carries no hub digest: until T3.2 such a frame is accepted
-without an anchor; T3.2's per-node identity check of the data port's certificate closes that (ruling R32). Every
-frame's header must agree with the reply's metadata (``dataport.check_fetched``). Refusals count as failed
-fetches.
+Authenticity of a direct fetch: the channel's TLS server name is ``security.node_server_name(<source number>)``, a
+SAN only the announced learner node's certificate carries, so no other node of the CA (a banned one's still valid
+certificate included) can answer for it (T3.2, closing ruling R32's gap); a frame of the announced version must also
+carry the digest the hub announced, and a newer version the hub has not announced yet is anchored by that source
+identity alone. With ``--insecure`` there is no certificate: the token secret is the only check (spec 3.3). Every
+frame's header must agree with the reply's metadata (``dataport.check_fetched``). Refusals count as failed fetches.
 
 ``NodeFetcher`` runs the transfers in the node's transfer pool; its threads touch no main-loop state: they post
 ``BlobFetched`` / ``LatestFetched`` / ``LatestFetchFailed`` into the node inbox, and the main loop decides what the
@@ -245,7 +245,7 @@ class LatestFetchFailed:
 class _DataLink:
     """How this node opens channels to other nodes' data ports (set per run)."""
 
-    make_channel: Callable[[str], grpc.Channel] | None    # None: this node cannot (no certificate)
+    make_channel: Callable[[str, int], grpc.Channel] | None    # (address, node number); None: this node cannot
     metadata: tuple[tuple[str, str], ...]
     connect_timeout_sec: float
     max_message_mb: int
@@ -285,6 +285,11 @@ class NodeFetcher:
         self._warned.clear()
         self._full.clear()
 
+    @property
+    def data_link(self) -> _DataLink | None:
+        """The run's data-port link (the chunk router opens its direct channels with it too, T3.2)."""
+        return self._link
+
     def clear_run(self) -> None:
         """The run was released: its transfers are forgotten (they were cancelled and waited for)."""
         self._blobs.clear()
@@ -305,25 +310,26 @@ class NodeFetcher:
     def link(*, insecure: bool, token_secret: str, identity: Any, max_message_mb: int,
              connect_timeout_sec: float) -> _DataLink:
         """The data-port link of a node: plain + the token secret (``--insecure``), else mutual TLS with the node's
-        certificate (a node without one, ``train``'s local node, cannot reach other data ports)."""
+        certificate (a node without one, ``train``'s local node without ``--listen``, cannot reach other data ports);
+        a TLS channel to node ``n`` accepts only ``n``'s certificate (``security.node_server_name``, T3.2)."""
         from colosseum.net.grpc_util import channel_options
-        from colosseum.net.security import MD_TOKEN, NODE_SERVER_NAME, data_channel_credentials
+        from colosseum.net.security import MD_TOKEN, data_channel_credentials, node_server_name
 
         # Every data channel has its own subchannels: a probe after a failed one connects at once instead of waiting
         # for the reconnect backoff of a subchannel shared through grpc's global pool.
         own_pool = [("grpc.use_local_subchannel_pool", 1)]
         if insecure:
-            def plain(address: str) -> grpc.Channel:
+            def plain(address: str, node: int) -> grpc.Channel:
                 return grpc.insecure_channel(address, options=channel_options(max_message_mb) + own_pool)
             return _DataLink(plain, ((MD_TOKEN, token_secret),), float(connect_timeout_sec), int(max_message_mb))
         if identity is None or identity.cert_pem is None:
             return _DataLink(None, (), float(connect_timeout_sec), int(max_message_mb),
                              why_not="this node has no node certificate for data ports")
-        credentials = data_channel_credentials(identity, (identity.path / "ca.crt").read_bytes())
+        credentials = data_channel_credentials(identity, identity.ca_pem)
 
-        def tls(address: str) -> grpc.Channel:
+        def tls(address: str, node: int) -> grpc.Channel:
             return grpc.secure_channel(address, credentials,
-                                       options=channel_options(max_message_mb, server_name=NODE_SERVER_NAME)
+                                       options=channel_options(max_message_mb, server_name=node_server_name(node))
                                        + own_pool)
         return _DataLink(tls, (), float(connect_timeout_sec), int(max_message_mb))
 
@@ -429,7 +435,9 @@ class NodeFetcher:
             hit = self._channels.get(key)
         if hit is not None:
             return hit[1]
-        probed = probe_direct(list(source.addresses), link.make_channel, link.connect_timeout_sec)
+        node = int(source.node)
+        probed = probe_direct(list(source.addresses), lambda address: link.make_channel(address, node),
+                              link.connect_timeout_sec)
         if probed is None:
             return None
         with self._channels_lock:

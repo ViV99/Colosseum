@@ -193,3 +193,31 @@ def test_a_frame_whose_header_disagrees_with_the_metadata_is_invalid(field, valu
     with pytest.raises(FetchError) as e:
         check_fetched("main", f, meta, "direct")
     assert e.value.reason == "invalid"
+
+
+def test_a_client_accepts_only_the_announced_nodes_certificate(tmp_path, pki):
+    """Per-node data-port identity (SP5 T3.2; closes ruling R32's gap): the client's TLS server name names the source
+    node the hub announced (``node_server_name``), so a data port presenting another node's certificate of the same
+    CA (a banned node posing as the learner's port, say) is refused."""
+    from colosseum.net.security import node_server_name
+    from colosseum.node.fetch import NodeFetcher
+
+    impostor = DataServer(cache=_cache(tmp_path), own_agents=lambda: {"main"}, max_message_mb=MAX_MB, insecure=False,
+                          token_secret=pki["hub"].token.secret, node=pki["b"].number)
+    impostor.start(0, credentials=data_server_credentials(pki["b"], pki["hub"].ca_pem), host="127.0.0.1")
+    link = NodeFetcher.link(insecure=False, token_secret="", identity=pki["a"], max_message_mb=MAX_MB,
+                            connect_timeout_sec=3.0)
+    address = f"127.0.0.1:{impostor.port}"
+    try:
+        assert pki["a"].number != pki["b"].number
+        assert node_server_name(pki["a"].number) == f"n{pki['a'].number}.colosseum-node"
+        posing = link.make_channel(address, pki["a"].number)            # the hub announced node a at this address
+        with pytest.raises(FetchError, match="UNAVAILABLE"):             # the handshake fails: b's certificate
+            fetch_latest(posing, "main", -1, max_message_mb=MAX_MB, timeout=5)
+        assert probe_direct([address], lambda a: link.make_channel(a, pki["a"].number), timeout=2.0) is None
+        honest = link.make_channel(address, pki["b"].number)            # node b's own port
+        assert fetch_latest(honest, "main", -1, max_message_mb=MAX_MB, timeout=10).version == 3
+        posing.close()
+        honest.close()
+    finally:
+        impostor.stop()

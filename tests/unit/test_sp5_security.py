@@ -192,7 +192,7 @@ def test_a_node_identity_keeps_its_key_and_registration(tmp_path):
     cert = x509.load_pem_x509_certificate(again.cert_pem)
     assert cert.subject.get_attributes_for_oid(NameOID.COMMON_NAME)[0].value == record.node_id
     assert cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(
-        x509.DNSName) == [NODE_SERVER_NAME]
+        x509.DNSName) == [NODE_SERVER_NAME, f"n1.{NODE_SERVER_NAME}"]      # + the per-node name (T3.2)
     cert.verify_directly_issued_by(x509.load_pem_x509_certificate(hub.ca_pem))
     assert hub.nodes.get(record.node_id).cert_serial == format(cert.serial_number, "x")
     again.forget()

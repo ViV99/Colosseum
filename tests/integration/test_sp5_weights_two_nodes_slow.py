@@ -2,7 +2,7 @@
 network download per version, counted where it happens and summed by the hub.
 
 ``cluster_kit`` on localhost: node a runs the learner and one worker (it trains), node b one worker that plays the
-learner's latest weights (without collecting until T3.2, amendment A11). 3 loaded processes: slow."""
+learner's latest weights (and collects for it over the direct path, T3.2). 3 loaded processes: slow."""
 from __future__ import annotations
 
 import pytest

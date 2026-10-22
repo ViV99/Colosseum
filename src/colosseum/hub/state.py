@@ -21,14 +21,17 @@ appear here, only durations (``ttl_sec``).
   expire together this reproduces SP4's ``trainable[(g + round) % n]``.
 - ``SnapshotHolds`` / ``snapshot_refs``: evicted snapshots a granted lineup still names stay downloadable (spec 4.2,
   T3.1).
-- ``restrict_collecting``: seats of agents that cannot collect (no running learner) do not collect (spec 4.7).
+- ``restrict_collecting`` / ``strip_collect``: seats of agents that cannot collect on a node do not collect (spec 4.7);
+  ``collect_allowed``: whether they can (a running learner, on that node, or reachable from it: the relay or a direct
+  path the node reported, spec 4.8; T3.2).
 - ``BudgetCounter``: the one budget (spec 4.4): a saved base plus the increments of each (node, session)'s cumulative
   env-step counter since its last saved value.
 - ``VersionInfo`` (defined in ``colosseum.net.messages``, amendment A7) is re-exported here.
 - ``VersionRegistry``: per agent the current learner generation, the highest accepted version, the version cap of
   every superseded generation and the latest announcement (spec 4.5, 7.2; R16: a superseded generation ``g`` is
   stale only above ``cap(g)``); ``version_source`` fills a latest announcement with where to fetch it (the learner
-  node's number and data addresses, T3.1).
+  node's number and data addresses, T3.1); ``visible_version`` hides the learner node's loopback addresses from
+  nodes on other machines (T3.2).
 - ``ResultIntake``: checks of every match result a node sends (spec 4.3, 3.4: never raises) and the batch dedup / ack
   bookkeeping per (node, session, seq) (R8), with drop counters by reason and one WARNING per (node, reason).
 - ``HubStateData`` / ``save_hub_state`` / ``load_hub_state``: ``runs/<name>/hub_state.json`` (amendment A3).
@@ -36,6 +39,7 @@ appear here, only durations (``ttl_sec``).
 
 from __future__ import annotations
 
+import ipaddress
 import json
 import math
 import os
@@ -54,7 +58,8 @@ __all__ = [
     "CellEntry", "CellKey", "CellTable", "EpochAllocator", "HubStateData", "NodeEntry", "NodeHello", "NodeRegistry",
     "OwnerRotation", "ResultIntake", "VersionInfo", "VersionRegistry", "load_hub_state", "restrict_collecting",
     "save_hub_state", "version_source", "SnapshotHolds", "snapshot_refs", "check_data_addresses",
-    "DATA_ADDRESSES_MAX", "DATA_ADDRESS_CHARS_MAX",
+    "DATA_ADDRESSES_MAX", "DATA_ADDRESS_CHARS_MAX", "collect_allowed", "strip_collect", "visible_version",
+    "PATH_STATES",
 ]
 
 EPOCH_BLOCK = 1024                   # R7: epochs reserved per hub_state.json write
@@ -410,6 +415,27 @@ def restrict_collecting(lineup: Lineup, collecting: Collection[str]) -> Lineup:
     return replace(lineup, seats=seats)
 
 
+PATH_STATES = ("direct", "relay", "down", "none")     # Heartbeat.paths values (node.router.PATHS)
+
+
+def collect_allowed(node: int, learner_node: int | None, *, relay: bool, path: str | None) -> bool:
+    """May a seat of an agent collect on ``node`` (spec 4.7: no collecting seats without a learner; 4.8: an
+    unreachable learner only through the relay)? ``learner_node``: the node of the agent's running learner (None:
+    pending, failed, relocating); ``path``: what ``node`` last reported for the learner's node (``Heartbeat.paths``:
+    "direct" / "relay" / "down"; None: not yet); ``relay``: whether the hub relays chunks."""
+    if learner_node is None:
+        return False
+    if learner_node == node:
+        return True
+    return bool(relay) or path == "direct"
+
+
+def strip_collect(lineup: Lineup, allowed: Collection[str]) -> Lineup:
+    """A copy of ``lineup`` whose seats of agents outside ``allowed`` do not collect (they still play); the lineup
+    itself when nothing changes (``restrict_collecting``)."""
+    return restrict_collecting(lineup, allowed)
+
+
 # ---------------------------------------------------------------------------------------------------------------
 # Budget
 # ---------------------------------------------------------------------------------------------------------------
@@ -576,6 +602,27 @@ def version_source(info: VersionInfo, entry: NodeEntry) -> VersionInfo:
     yet)."""
     return replace(info, node=int(entry.number), addresses=tuple(entry.data_addresses),
                    relay_only=not entry.data_addresses)
+
+
+def _loopback_address(address: str) -> bool:
+    host = address.rpartition(":")[0].strip("[]") if ":" in address else address
+    if host in ("localhost", ""):
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
+
+def visible_version(info: VersionInfo, *, same_machine: bool) -> VersionInfo:
+    """``info`` as a node sees it (carried decision 3a of T3.1): loopback data addresses only for a node on the learner
+    node's own machine; a source left without an address is ``relay_only`` for the others."""
+    if same_machine or not info.addresses:
+        return info
+    kept = tuple(a for a in info.addresses if not _loopback_address(a))
+    if kept == tuple(info.addresses):
+        return info
+    return replace(info, addresses=kept, relay_only=info.relay_only or not kept)
 
 
 # ---------------------------------------------------------------------------------------------------------------

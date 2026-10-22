@@ -375,3 +375,25 @@ def test_the_reopen_wait_resets_once_a_reopened_sender_opens_and_on_a_route_chan
     io.close()
     intake.close()
     node_end.close()
+
+
+def test_frames_for_another_machine_go_on_the_route_connection_lz4_probed_per_agent():
+    """T3.2 (spec 4.7, 4.9): agents routed via the node share the worker's route connection; their frames (they leave
+    the machine) are compressed while each agent's ``Lz4Probe`` measures them; they decode as usual."""
+    from colosseum.net.frame import frame_sizes
+
+    node_side, worker_side = mp.Pipe()
+    control_node, control_worker = mp.Pipe()
+    io = WorkerIO(node=3, worker=1, incarnation=2, control=control_worker, route=worker_side, cache=FakeCache(),
+                  routes={"a": LearnerRoute("a", None, True, 1), "b": LearnerRoute("b", None, True, 1)}, authkey=KEY)
+    for agent in ("a", "b", "a"):
+        io.send_chunk(TrajectoryChunk.from_payload(chunk_v2_payload(agent_id=agent)))
+    frames = [node_side.recv_bytes() for _ in range(3)]
+    assert all(frame_sizes(f)[1] != frame_sizes(f)[0] for f in frames)          # lz4 while probing
+    assert [decode_chunk(f, cap=1 << 24)[1].agent_id for f in frames] == ["a", "b", "a"]
+    assert set(io._lz4) == {"a", "b"}                                             # one probe per agent
+    io._set_route(LearnerRoute("b", None, False, 0))                             # b leaves: the shared sender stays
+    io.send_chunk(TrajectoryChunk.from_payload(chunk_v2_payload(agent_id="a")))
+    assert decode_chunk(node_side.recv_bytes(), cap=1 << 24)[1].agent_id == "a"
+    io.close()
+    control_node.close()

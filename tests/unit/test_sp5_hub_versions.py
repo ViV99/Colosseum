@@ -35,13 +35,13 @@ def test_an_accepted_version_reaches_every_node_with_the_learner_nodes_addresses
     learner = open_node(hub, name="learner")
     other = open_node(hub, name="other", cpu_learners=0, no_learners=True)
     number = hub._learner_node["a"]
-    _addresses(hub, learner, "10.0.0.2:47102", "127.0.0.1:47102")
+    _addresses(hub, learner, "10.0.0.2:47102", "192.168.1.2:47102")
     hub._broadcast_announce()
     _announce(hub, learner, 3, number)
     hub._broadcast_announce()
     [info] = _announced(other)
     assert (info.version, info.node, info.addresses, info.relay_only, info.teacher_active) == (
-        3, number, ("10.0.0.2:47102", "127.0.0.1:47102"), False, True)
+        3, number, ("10.0.0.2:47102", "192.168.1.2:47102"), False, True)
     assert hub._versions.latest("a") == info                            # Welcome.versions too
     late = open_node(hub, name="late", cpu_learners=0, no_learners=True)
     assert [version_from_proto(v) for v in late.of("welcome")[0].versions] == [info]

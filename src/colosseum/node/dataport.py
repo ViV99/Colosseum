@@ -7,7 +7,9 @@ TLS (plain + the token secret with ``--insecure``).
   ``meta_json`` is ``{"agent_id", "version", "generation", "size", "digest", "teacher_active"}`` (the cache
   pointer; ``digest`` = blake2b-16 of the frame). Answered without the hub (spec 4.5). Only this node's own
   learners' weights are served (no re-serving of fetched weights: one owner per version).
-- ``Chunks(stream ChunkFrame)``: frames for this node's learners (T3.2; refused with ``UNIMPLEMENTED`` until then).
+- ``Chunks(stream ChunkFrame)``: frames for this node's learners (T3.2): each frame goes undecoded to its learner's
+  chunk connection (``router.LocalDelivery``, blocking: end-to-end backpressure); one without a learner here, or for
+  another node, is dropped and counted; ``UNIMPLEMENTED`` while the node serves no run.
 
 Peers: with TLS the client certificate must be issued by the hub's CA (``require_client_auth``) and its common name
 (the node id) must not be banned (``banned()``, from ``Welcome`` / ``Announce``; the check is
@@ -18,7 +20,10 @@ TLS handshake (the client sees ``UNAVAILABLE``).
 
 Binding (spec 3.1): ``distributed.data_port``, the next free port when it is taken (``DATA_PORT_TRIES`` in all;
 ``grpc.so_reuseport`` is off in ``server_options``, otherwise a second node on the machine would silently share the
-port); port 0 binds an ephemeral port (tests). ``data_addresses`` lists what the node announces.
+port); port 0 binds an ephemeral port (tests). A node announces only addresses its port is bound on
+(``open_data_port``): ``data_addresses`` for a port on every interface. A client checks the serving node's identity:
+its channel's TLS server name is ``security.node_server_name(<the source's number>)``, a SAN only that node's
+certificate carries.
 
 ``probe_direct`` (also used by the chunk router, T3.2) and ``fetch_latest`` are the client side.
 """
@@ -58,7 +63,7 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DATA_PORT_TRIES", "DATA_SERVER_THREADS", "DataServer", "FetchError", "FetchedLatest", "check_fetched",
-    "data_addresses", "fetch_latest", "frame_digest", "is_loopback", "open_data_port", "probe_direct",
+    "data_addresses", "fetch_latest", "frame_digest", "is_loopback", "is_wildcard", "open_data_port", "probe_direct",
     "read_latest_reply",
 ]
 
@@ -137,6 +142,11 @@ class DataServer(pbg.NodeDataServicer):
     def set_cache(self, cache: Any) -> None:
         self._cache = cache
 
+    def set_delivery(self, delivery: Any | None) -> None:
+        """The run's ``router.LocalDelivery`` (the node binds its data port once per process and its chunk router is
+        per run, T3.2); None: ``Chunks`` is refused (``UNIMPLEMENTED``)."""
+        self._delivery = delivery
+
     def counters_snapshot(self) -> dict[str, int]:
         with self._lock:
             return dict(self.counters)
@@ -206,8 +216,24 @@ class DataServer(pbg.NodeDataServicer):
         self._count("latest_served")
 
     def Chunks(self, request_iterator: Iterable[pb.ChunkFrame], context: grpc.ServicerContext) -> pb.ChunkSummary:  # noqa: N802
+        """Frames for this node's learners (spec 4.7): each goes to its learner's chunk connection undecoded
+        (``LocalDelivery.deliver``, blocking while the learner does not read: gRPC flow control then holds the
+        sender back). A frame for another node or an agent without a learner here is dropped (counted); the stream
+        itself never fails because of one frame."""
         self._check_token(context)
-        context.abort(grpc.StatusCode.UNIMPLEMENTED, "chunks over the data port arrive with T3.2")
+        delivery = self._delivery
+        if delivery is None:
+            context.abort(grpc.StatusCode.UNIMPLEMENTED, "this node takes no chunks (no run yet)")
+        received = dropped = 0
+        for frame in request_iterator:
+            received += 1
+            if frame.target_node != self._node:
+                delivery.count("dropped_chunks.no_learner")
+                dropped += 1
+                continue
+            if delivery.deliver(frame.agent_id, frame.frame) is not None:
+                dropped += 1
+        return pb.ChunkSummary(received=received, dropped=dropped)
 
     # --- internals -----------------------------------------------------------------------------------------------
 
@@ -233,16 +259,25 @@ class DataServer(pbg.NodeDataServicer):
             self.counters[name] = self.counters.get(name, 0) + 1
 
 
+def is_wildcard(host: str) -> bool:
+    """``host`` binds every interface (``0.0.0.0``, ``[::]``)."""
+    return host.strip("[]") in ("0.0.0.0", "::", "")
+
+
 def open_data_port(*, port: int, hub_host: str, insecure: bool, token_secret: str, identity: Any, cache: Any,
                    own_agents: Callable[[], Collection[str]], banned: Callable[[], Collection[str]],
                    max_message_mb: int, node: int, announced: Sequence[str] | None = None,
-                   local: bool = False) -> tuple[DataServer, tuple[str, ...]] | None:
-    """A node's data port (``NodeAgent``, item 11): mutual TLS with the node's certificate (``identity``, a
-    ``NodeIdentity`` with its CA in ``ca.crt``), or plain + the token secret (``insecure``); bound on loopback when the
-    hub is on loopback, else on every interface (pre-flight ruling P-PF3-21), at ``port`` or the next free one.
-    Returns the started server and the addresses to announce (``announced``, else ``data_addresses``); None after one
-    WARNING when it cannot be opened (no node certificate, no free port). ``local``: ``train``'s node, which has no
-    node certificate until T3.2 (ruling R30: its learners are relay-only for remote nodes; an INFO, not a WARNING)."""
+                   local: bool = False, host: str | None = None,
+                   delivery: Any | None = None) -> tuple[DataServer, tuple[str, ...]] | None:
+    """A node's data port (``NodeAgent``, item 11): mutual TLS with the node's certificate (``identity``: a
+    ``NodeIdentity``, or the ``MemoryNodeIdentity`` the hub minted for ``train``'s local node, R30), or plain + the
+    token secret (``insecure``); bound on ``host`` (default: loopback when the hub is on loopback, else every interface,
+    pre-flight ruling P-PF3-21), at ``port`` or the next free one; ``delivery``: the run's ``router.LocalDelivery``
+    (``Chunks``). Returns the started server and the addresses to announce: ``announced`` when given (port forwards),
+    else only addresses the port is bound on (carried decision 3a of T3.1): every interface's (``data_addresses``)
+    for a wildcard host, else ``host:port``. None after one WARNING when it cannot be opened (no node certificate, no
+    free port). ``local``: ``train``'s node, which has no node certificate without ``--listen`` (an INFO, not a
+    WARNING: its learners need no data port then)."""
     from colosseum.net.security import data_server_credentials
 
     hint = "other machines reach this node's learners only through the hub"
@@ -253,19 +288,25 @@ def open_data_port(*, port: int, hub_host: str, insecure: bool, token_secret: st
                        f"node: no data port: this node has no node certificate; {hint}")
             return None
         try:
-            credentials = data_server_credentials(identity, (identity.path / "ca.crt").read_bytes())
+            credentials = data_server_credentials(identity, identity.ca_pem)
         except Exception as e:  # noqa: BLE001 - the node runs without a data port
             logger.warning(f"node: no data port ({type(e).__name__}: {e}); {hint}")
             return None
     server = DataServer(cache=cache, own_agents=own_agents, max_message_mb=max_message_mb, insecure=insecure,
-                        token_secret=token_secret, banned=banned, node=node)
-    host = "127.0.0.1" if is_loopback(hub_host) else "0.0.0.0"
+                        token_secret=token_secret, banned=banned, node=node, delivery=delivery)
+    if host is None:
+        host = "127.0.0.1" if is_loopback(hub_host) else "0.0.0.0"
     try:
         bound = server.start(port, credentials=credentials, host=host)
     except OSError as e:
         logger.warning(f"node: no data port ({e}); {hint}")
         return None
-    addresses = tuple(announced) if announced else tuple(data_addresses(bound, hub_host))
+    if announced:
+        addresses = tuple(announced)
+    elif is_wildcard(host):
+        addresses = tuple(data_addresses(bound, hub_host))
+    else:
+        addresses = (f"{host}:{bound}",)
     logger.info(f"node: data port {host}:{bound} ({'plain + token' if insecure else 'mutual TLS'}); announced as "
                 f"{', '.join(addresses)}")
     return server, addresses
