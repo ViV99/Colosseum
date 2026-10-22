@@ -241,6 +241,27 @@ class SystemStats:
         self._worker_timeout = float(worker_timeout_sec)
         self._workers: dict[WorkerKey, tuple[float, dict]] = {}
         self._cumulative: dict[str, dict[WorkerKey, int]] = {key: {} for key in CUMULATIVE_WORKER_KEYS}
+        # An in-place resume (SP5 T4.3, P-PF3-5): the run-level totals of the previous hub incarnations.
+        self._base: dict[str, int] = {key: 0 for key in CUMULATIVE_WORKER_KEYS}
+        self._match_log_base = 0              # the journal writers' drops of the previous incarnations
+        self._match_log_dropped = 0           # this incarnation's writer drops (the last snapshot's)
+
+    def state(self) -> dict[str, Any]:
+        """The run-level cumulative counters (``hub_state.json`` ``counters["system_stats"]``, P-PF3-5): per
+        ``CUMULATIVE_WORKER_KEYS`` key its total, and the journal writers' dropped results; ``restore`` continues
+        them, so ``dropped_reward_episodes`` and ``dropped_match_results`` stay monotonic across an in-place
+        resume."""
+        return {"cumulative": {key: self.cumulative(key) for key in CUMULATIVE_WORKER_KEYS},
+                "match_log_dropped": self._match_log_base + self._match_log_dropped}
+
+    def restore(self, state: Mapping[str, Any] | None) -> None:
+        """Continue the totals of ``state()`` of a previous hub incarnation (unknown keys are ignored)."""
+        state = state or {}
+        self._base = {key: 0 for key in CUMULATIVE_WORKER_KEYS}
+        for key, value in (state.get("cumulative") or {}).items():
+            if key in self._base:
+                self._base[key] = int(value)
+        self._match_log_base = int(state.get("match_log_dropped") or 0)
 
     def on_train_step(self, agent_id: str, train_step: int) -> None:
         self._train_steps[agent_id] = max(int(train_step), self._train_steps.get(agent_id, 0))
@@ -253,8 +274,8 @@ class SystemStats:
                 per_worker[worker] = max(per_worker.get(worker, 0), int(stats[key]))
 
     def cumulative(self, key: str) -> int:
-        """A ``CUMULATIVE_WORKER_KEYS`` counter for the whole run."""
-        return int(sum(self._cumulative[key].values()))
+        """A ``CUMULATIVE_WORKER_KEYS`` counter for the whole run (previous hub incarnations included)."""
+        return self._base[key] + int(sum(self._cumulative[key].values()))
 
     def snapshot(self, env_steps: int, queue_depths: dict[str, int], *,
                  match_log: dict[str, Any] | None = None) -> dict[str, Any]:
@@ -275,10 +296,13 @@ class SystemStats:
             "queue_depths": dict(queue_depths),
             "parked_buffers": int(sum(int(w.get("parked_buffers", 0)) for _, w in self._workers.values())),
             "dropped_reward_episodes": self.cumulative("dropped_reward_episodes"),
-            "dropped_match_results": self.cumulative("dropped_results") + int((match_log or {}).get("dropped", 0)),
+            "dropped_match_results": self.cumulative("dropped_results") + self._match_log_base
+            + int((match_log or {}).get("dropped", 0)),
             "match_log": None if match_log is None else dict(match_log),
             "workers_reporting": len(self._workers),
         }
+        if match_log is not None:
+            self._match_log_dropped = int(match_log.get("dropped", 0))
         self._last_t = now
         self._last_env_steps = int(env_steps)
         self._last_train_steps = dict(self._train_steps)

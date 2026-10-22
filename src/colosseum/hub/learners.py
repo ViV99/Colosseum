@@ -357,14 +357,17 @@ class HubLearners:
     # ---- start points (T4.1; A28) ------------------------------------------------------------------------------
 
     def _resume_start_sources(self) -> dict[str, tuple[str, int, str]]:
-        """The hub-start source of every trainable agent's learner (A28; T4.3 replaces it for an in-place resume):
-        ``(weights_blob, version, description)``. A ``training.resume_from`` state becomes the start point
-        ``start:resume`` (one checkpoint frame: weights plus trainer-state bytes, none = weights only, as SP3's
-        ``.pt`` resume) written once to ``BlobStore.start_path(agent, "resume")``, its checkpoint identity (a
-        checkpoint dir's id and ``meta.json`` run id, R38) in ``_start_checkpoints``; else ``init`` (the
-        ``Welcome.fixed`` blob); else factory weights."""
+        """The hub-start source of every trainable agent's learner (A28): ``(weights_blob, version, description)``.
+        A ``training.resume_from`` state becomes the start point ``start:resume`` (one checkpoint frame: weights plus
+        trainer-state bytes, none = weights only, as SP3's ``.pt`` resume) written once to
+        ``BlobStore.start_path(agent, "resume")``; an in-place resume's state (``_resolve_in_place``: the run's own
+        newest snapshot with ``trainer_state.pt``, SP5 T4.3) becomes ``start:ckpt_v<N>`` the same way; its
+        checkpoint identity (a checkpoint dir's id and ``meta.json`` run id, R38) goes to ``_start_checkpoints``; else
+        ``init`` (the ``Welcome.fixed`` blob); else factory weights. T4.2's rule then prefers the agent's recovery
+        point when it is not older (``_learner_start_source``)."""
         from colosseum.net.chunks import encode_checkpoint
 
+        in_place = bool(getattr(self._options, "resume", False))
         out: dict[str, tuple[str, int, str]] = {}
         for agent in self._agent_ids:
             state = self._resume_states.get(agent)
@@ -376,8 +379,12 @@ class HubLearners:
                                            "model_state": state["model_state"],
                                            "trainer_state_bytes": None if trainer is None else bytes(trainer),
                                            "final": False}, kind="recovery", generation=0)
-                self._blobs.write_start(agent, "resume", frame)
-                out[agent] = ("start:resume", version, f"{state['source']} (policy_version {version})")
+                ident = str(state.get("start_ident") or "resume")
+                self._blobs.write_start(agent, ident, frame)
+                what = (f"snapshot {ident} (policy_version {version}"
+                        + ("" if trainer is not None else ", weights only") + ")" if in_place
+                        else f"{state['source']} (policy_version {version})")
+                out[agent] = (f"start:{ident}", version, what)
                 identity = _checkpoint_identity(state["source"])
                 if identity is not None:
                     self._start_checkpoints[agent] = identity
@@ -385,7 +392,18 @@ class HubLearners:
                 out[agent] = ("init", 0, f"init {init.source}")
             else:
                 out[agent] = ("", 0, "factory weights")
+            if in_place:
+                logger.info(f"Resume [{agent}]: learners start from {self._learner_start_source_of(agent, out)}")
         return out
+
+    def _learner_start_source_of(self, agent: str, sources: dict[str, tuple[str, int, str]]) -> str:
+        """The description of ``agent``'s first learner start with the hub-start ``sources`` (the recovery point
+        when it is not older; ``_learner_start_source``'s rule)."""
+        hub_start = sources[agent]
+        point = self._recovery.get(agent) if self._recovery is not None else None
+        if point is not None and point.version >= hub_start[1]:
+            return f"the recovery point v{point.version} (generation {point.generation})"
+        return hub_start[2]
 
 
 def _checkpoint_identity(source: str) -> tuple[str, str | None] | None:

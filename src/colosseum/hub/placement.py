@@ -383,11 +383,19 @@ class LearnerTable:
 
     def state(self, local_nodes: Collection[int] = ()) -> dict:
         """``hub_state.json`` ``learners`` (JSON-ready); ``local_nodes``: numbers of nodes that die with the hub
-        (train's local node), so a resume does not wait for them."""
+        (train's local node), so a resume does not wait for them. ``lost_node`` / ``lost_device``: a pending agent's
+        ``lost_slot`` (R42) on a node that does not die with the hub, so its node can still bring the learner back to
+        a resumed hub (``load_resumed``; SP5 T4.3)."""
+        def lost(e: LearnerEntry) -> LearnerSlot | None:
+            slot = e.lost_slot
+            return None if slot is None or slot.node in local_nodes else slot
+
         return {"version": TABLE_STATE_VERSION, "agents": {
             a: {"status": e.status, "node": None if e.slot is None else e.slot.node,
                 "device": None if e.slot is None else e.slot.device, "generation": e.generation, "reason": e.reason,
-                "local": e.slot is not None and e.slot.node in local_nodes}
+                "local": e.slot is not None and e.slot.node in local_nodes,
+                "lost_node": None if (ls := lost(e)) is None else ls.node,
+                "lost_device": None if ls is None else ls.device}
             for a, e in self._entries.items()}}
 
     def load_resumed(self, state: Mapping[str, Any] | None, *, now: float) -> list[str]:
@@ -395,13 +403,17 @@ class LearnerTable:
         remote node wait for it as ``relocating`` from ``now`` (the node reconnects and is reconciled, or they
         relocate after ``learner_relocate_after_sec``); learners of a local node (it died with the hub) and
         ``failed`` agents are ``pending`` at once (failed ones are retried); generations continue; agents not in
-        this table are dropped. Returns the awaited agents."""
+        this table are dropped. A pending agent's saved ``lost_node`` / ``lost_device`` (R42) becomes its
+        ``lost_slot`` again, so that node reconnecting with the learner of the current generation gets it back.
+        Returns the awaited agents."""
         awaited = []
         for agent, saved in (state or {}).get("agents", {}).items():
             entry = self._entries.get(agent)
             if entry is None:
                 continue
             entry.generation = max(entry.generation, int(saved.get("generation") or 0))
+            if saved.get("status") == "pending" and saved.get("lost_node") is not None:
+                entry.lost_slot = LearnerSlot(int(saved["lost_node"]), str(saved.get("lost_device") or ""))
             if (saved.get("status") in ("starting", "running", "relocating") and saved.get("node") is not None
                     and not saved.get("local")):
                 entry.status = "relocating"

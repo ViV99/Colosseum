@@ -266,7 +266,7 @@ def test_table_state_round_trip_on_resume_waits_for_remote_nodes_only():
     table.assign("e", LearnerSlot(1, "cpu"), generation=7)          # on the local node (dies with the hub)
     state = table.state(local_nodes={1})
     assert state["agents"]["a"] == {"status": "running", "node": 2, "device": "cpu", "generation": 4, "reason": "",
-                                    "local": False}
+                                    "local": False, "lost_node": None, "lost_device": None}      # lost_*: T4.3, R42
     assert state["agents"]["e"]["local"] is True
     resumed = LearnerTable(["a", "b", "c", "d", "e"])
     assert resumed.load_resumed(state, now=50.0) == ["a"]

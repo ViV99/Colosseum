@@ -136,7 +136,7 @@ def test_devices_and_slots_decide_where_learners_start(hubs):
     assert (s2.learner.agent_id, s2.learner.generation, s2.learner.device) == ("b", 1, "cpu")
     assert [x.agent_id for x in n1.messages("welcome")[0].learners] == ["a"]       # its desired learner set
     assert _learner(hub, "a") == {"status": "starting", "node": n1.number, "device": "cuda:0", "generation": 1,
-                                  "reason": "", "local": False}
+                                  "reason": "", "local": False, "lost_node": None, "lost_device": None}
     assert (_learner(hub, "b")["node"], _learner(hub, "b")["device"]) == (n2.number, "cpu")
 
 

@@ -69,10 +69,12 @@ class RunSinks:
     def _open_match_log(self, coordinator: Coordinator) -> None:
         """The match log (spec block 1). The journal is opened here first, so a schema or file problem is a
         ConfigError before any child starts (a file that is not an SQLite database is moved aside by
-        ``MatchLog``); a run-dir resume imports the resumed run's journal (an SP3 run dir has none: INFO, the
-        journal starts empty); the in-memory comparison table of the live ratings is read from it once; then the
-        writer thread starts with its own connection (opened in the thread). Evicted snapshots reach the writer
-        through the coordinator's evict listener. Node batches are submitted with their token (R8)."""
+        ``MatchLog``; an SP4 journal is migrated to schema 2 in place); a run-dir resume imports the resumed run's
+        journal (an SP3 run dir has none: INFO, the journal starts empty), an in-place resume imports nothing and
+        replays the journal rows its league state does not hold (``_replay_journal``, R8; also with the journal
+        off: read only); the in-memory comparison table of the live ratings is read from it once; then the writer
+        thread starts with its own connection (opened in the thread). Evicted snapshots reach the writer through the
+        coordinator's evict listener. Node batches are submitted with their token (R8)."""
         import sqlite3
         from functools import partial
 
@@ -90,12 +92,15 @@ class RunSinks:
         from colosseum.core.run_dir import read_run_id
 
         cfg = self._config
+        in_place = bool(self._options.resume)
         if not cfg.match_log.enabled:
             logger.info("Match log: off (match_log.enabled is false)")
+            if in_place:
+                self._replay_journal()               # read only: the league state stays exact (SP5 T4.3)
             return
         resume_from = cfg.training.resume_from
-        parent = (Path(resume_from) if resume_from and classify_resume_source(resume_from) == RESUME_RUN_DIR
-                  else None)
+        parent = (Path(resume_from) if resume_from and not in_place
+                  and classify_resume_source(resume_from) == RESUME_RUN_DIR else None)
         run = RunInfo(run_id=self._run_id, name=self._run_dir.run_name or self._run_dir.root.name,
                       parent_run_id=read_run_id(parent) if parent is not None else None, game=cfg.env.env_class,
                       config_hash=config_hash(cfg), checkpoint_interval=cfg.checkpoint.interval)
@@ -133,6 +138,8 @@ class RunSinks:
                 raise ConfigError(f"Match log {path} cannot be read ({type(e).__name__}: {e}); {hint}") from e
         finally:
             log.close()
+        if in_place:
+            self._replay_journal()          # after the migration (the writer opened it), before any compaction
         self._comparison_table = table
         mlc = cfg.match_log
         self._match_log_writer = MatchLogWriter(
@@ -336,9 +343,18 @@ class RunSinks:
         """A run-dir resume restores the resumed run's ratings and PFSP statistics (spec block 7.4); a run dir
         without league_state.json (an SP3 run dir, or an SP4 run that never saved one, e.g. killed before its first
         metrics tick) gives an INFO line and empty tables. A resume from a checkpoint dir or a .pt starts empty, as
-        in SP3."""
+        in SP3. An in-place resume (SP5 T4.3) loads the run's own ``league_state.json`` (``training.resume_from`` is
+        not applied again)."""
         from colosseum.coordinator.checkpoint_manager import RESUME_RUN_DIR, classify_resume_source
 
+        if self._options.resume:                      # in place: the run's own league state (SP5 T4.3)
+            path = self._run_dir.league_state_path
+            if coordinator.load_league_state(path):
+                logger.info(f"Resume: league state (ratings, PFSP statistics) restored from {path}")
+            else:
+                logger.info(f"Resume: {self._run_dir.root} has no {LEAGUE_STATE_FILE}; ratings and PFSP statistics "
+                            f"are rebuilt from the journal")
+            return
         resume_from = self._config.training.resume_from
         if not resume_from or classify_resume_source(resume_from) != RESUME_RUN_DIR:
             return
@@ -352,13 +368,14 @@ class RunSinks:
 
     def _save_league_state(self) -> None:
         """Write league_state.json (each metrics tick and at the end) with the journal watermark (the highest
-        journal row accounted; None without the journal); a failure is an ERROR, never a crash."""
+        journal row accounted; None: nothing journaled and nothing replayed; an in-place resume seeds it from the
+        loaded state and the replay, also with the journal off, so it is never None with rows accounted: SP5 T4.3);
+        a failure is an ERROR, never a crash."""
         if self._coordinator is None:
             return
         try:
             self._coordinator.save_league_state(self._run_dir.league_state_path, env_steps=int(self._budget.value),
-                                                journal_row=self._journal_row if self._intake is not None
-                                                and self._intake.journal else None)
+                                                journal_row=self._journal_row)
         except Exception as e:  # noqa: BLE001 - the league state must never stop training
             logger.error(f"Writing {self._run_dir.league_state_path} failed ({type(e).__name__}: {e})",
                          exc_info=not self._league_state_error_logged)

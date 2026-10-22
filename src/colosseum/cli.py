@@ -108,24 +108,32 @@ def _parse_overrides(overrides: tuple[str, ...]) -> dict:
     return result
 
 
+_RESUME_HELP = ("Continue the run dir RUN in place (same dir and run id; refused while it runs). -c is optional: "
+                "without it the run's saved config is used; --set applies either way.")
+
+
 @main.command()
-@click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
+@click.option("--config", "-c", default=None, type=click.Path(exists=True), help="Path to config YAML file")
+@click.option("--resume", "resume", default=None, metavar="RUN", type=click.Path(exists=True, file_okay=False),
+              help=_RESUME_HELP)
 @click.option("--listen", "listen", is_flag=False, flag_value="0.0.0.0", default=None, metavar="[ADDR]",
               help="Also accept other machines' nodes on ADDR:distributed.port (TLS); without ADDR all interfaces")
 @click.option("--set", "overrides", multiple=True,
               help="Override config values (e.g., --set rollout.num_workers=8)." + _SET_HELP_YAML)
-def train(config: str, listen: str | None, overrides: tuple[str, ...]) -> None:
+def train(config: str | None, resume: str | None, listen: str | None, overrides: tuple[str, ...]) -> None:
     """Train the config's agents: a hub and a local node on this machine (other machines join with --listen).
 
     Exit code: 0 budget reached, 1 config error or a failure (a child error, a dead process), 130 SIGINT, 143 SIGTERM.
     """
+    if config is None and resume is None:
+        raise click.UsageError("Missing option '-c' / '--config'.")
     from colosseum.utils.process import limit_main_blas_threads
 
     limit_main_blas_threads()   # first: numpy is imported below; this process's BLAS gets one thread (SP4)
     with _config_errors():
         from colosseum.hub.hub import run_training  # imports torch: about a second
 
-        code = run_training(config, overrides=_parse_overrides(overrides) or None, listen=listen)
+        code = run_training(config, overrides=_parse_overrides(overrides) or None, listen=listen, resume=resume)
     sys.exit(code)
 
 
@@ -136,15 +144,17 @@ def train(config: str, listen: str | None, overrides: tuple[str, ...]) -> None:
 @click.option("--port", default=None, type=click.IntRange(0, 65535),
               help="The hub's port (default distributed.port; 0: an ephemeral port, see runs/<name>/hub.json)")
 @click.option("--insecure", is_flag=True, default=False, help="No TLS (trusted LAN only); the token stays required")
+@click.option("--resume", "resume", default=None, metavar="RUN", type=click.Path(exists=True, file_okay=False),
+              help=_RESUME_HELP + " Without --port it listens on the port of the run's previous hub.json.")
 @click.option("--set", "overrides", multiple=True, help="Override config values." + _SET_HELP_YAML)
 @click.pass_context
 def hub_group(ctx: click.Context, config: str | None, listen: str | None, port: int | None, insecure: bool,
-              overrides: tuple[str, ...]) -> None:
+              resume: str | None, overrides: tuple[str, ...]) -> None:
     """Run a hub that machines join (colosseum join, T6.3); exit 0 at the budget, 1 on errors, 130 / 143 on signals."""
     if ctx.invoked_subcommand is not None:
         return
-    if config is None:
-        raise click.UsageError("colosseum hub needs --config / -c")
+    if config is None and resume is None:
+        raise click.UsageError("colosseum hub needs --config / -c (or --resume RUN)")
     from colosseum.utils.process import limit_main_blas_threads
 
     limit_main_blas_threads()   # first: numpy is imported below (as for train)
@@ -152,7 +162,7 @@ def hub_group(ctx: click.Context, config: str | None, listen: str | None, port: 
         from colosseum.hub.hub import run_hub  # imports torch: about a second
 
         code = run_hub(config, overrides=_parse_overrides(overrides) or None, listen=listen, port=port,
-                       insecure=insecure)
+                       insecure=insecure, resume=resume)
     sys.exit(code)
 
 

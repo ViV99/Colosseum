@@ -82,6 +82,18 @@ dropped. A lost node's cells go at once and its learners wait ``learner_relocate
 (``relocating``, parked weights), then move to a matching free slot with a new generation from the newest recovery
 point (``_relocate_due``; ``strict`` placement or no free slot: ``pending``); a node that returns within the wait keeps
 its learner, one that returns later is told to stop it (T4.1's reconciliation).
+
+In-place resume (spec 5.4; T4.3; ``hub.resume``): ``train --resume RUN`` / ``hub --resume RUN`` continue the same run
+dir and run id (``_prepare_in_place``: refused while the run lives, the saved config or ``-c`` with a diff WARNING,
+strict checks of the remaining agents, the previous resolved config kept as ``config.resolved.<k>.yaml``). The hub
+(``HubOptions.resume``) then restores ``hub_state.json`` (``_resume_hub_state``: the budget counter, epochs from the
+next block (R7), versions and generations (restored versions are relay only until their node confirms its data
+addresses), both counter books and the drop totals, the lost-node count, the learner table: remote learners are
+awaited ``learner_relocate_after_sec`` with parked weights, the local node's are placed again), loads the run's own
+league state and replays the journal rows it does not hold (``_replay_journal``, R8; the watermark is seeded so they
+are never replayed twice), starts learners from the newest stored snapshot with trainer state (``start:ckpt_v<N>``,
+or the newer recovery point) and never applies ``training.resume_from`` again. An SP4 run dir (no ``hub_state.json``)
+continues from the env steps its files reached, its journal migrated to schema 2.
 """
 
 from __future__ import annotations
@@ -198,7 +210,9 @@ class HubOptions:
     """How the hub runs: ``mode`` ``train`` (with ``local_node``) or ``hub`` (nodes connect); ``listen``: train: None
     = loopback only, else ``ADDR:distributed.port`` (TLS) too; hub: None = all interfaces; ``port``: hub: None =
     ``distributed.port``; ``insecure``: no TLS (also ``distributed.insecure``); ``identity_dir``: the hub identity
-    (default ``security.hub_identity_dir()``)."""
+    (default ``security.hub_identity_dir()``); ``resume``: continue the run dir in place (SP5 T4.3, spec 5.4:
+    ``hub_state.json``, the league state and its journal replay, the snapshot pool, the learners), with
+    ``resume_env_steps`` the start count of a run dir without ``hub_state.json`` (``hub.resume.start_env_steps``)."""
 
     mode: Literal["train", "hub", "idle"] = "train"
     listen: str | None = None
@@ -206,6 +220,8 @@ class HubOptions:
     insecure: bool = False
     local_node: LocalNodeOptions | None = None
     identity_dir: Path | None = None
+    resume: bool = False
+    resume_env_steps: int = 0
 
 
 class Hub(RunSinks, HubLearners):
@@ -280,6 +296,7 @@ class Hub(RunSinks, HubLearners):
         self._relay = None                        # hub.relay.RelayHub (built by _prepare; T3.2)
         self._latest = None                       # hub.relay.LatestRelay: relayed latest weights
         self._journal_row: int | None = None
+        self._counters_saved: dict[str, Any] = {}  # hub_state.json counters of a resumed run (A3: loaded whole)
         self._admin_handlers: dict[str, Callable[[dict], dict]] = {"hub.status": self._admin_status}
         self._handlers: dict[type, Callable[[Any], None]] = {
             NodeMessageIn: self._on_message, SessionOpened: self._on_session_opened,
@@ -421,6 +438,8 @@ class Hub(RunSinks, HubLearners):
 
         cfg = self._config
         trainable = cfg.get_trainable_agent_ids()
+        if self._options.resume and self._run_dir.run_id is None:
+            logger.info(f"Resume: {self._run_dir.root} has no run.json (an SP3 run dir); it gets a run id now")
         self._run_id = self._run_dir.ensure_run_id()
         logger.info(f"Colosseum: Starting the hub ({self._options.mode}; run id {self._run_id})")
         logger.info(f"  Agents: {trainable}")
@@ -438,9 +457,13 @@ class Hub(RunSinks, HubLearners):
         self._known_agents = set(cfg.agent_ids())
 
         coordinator = self._build_coordinator(setup)
-        self._resume_states = self._resolve_resume(setup.agent_configs, setup.role_specs)
-        self._load_league_state(coordinator)          # before the import: evictions there forget PFSP entries
-        self._import_snapshot_pool(coordinator)
+        if self._options.resume:                      # in place (T4.3): the run's own snapshots, not resume_from
+            self._resume_states = self._resolve_in_place(coordinator, setup.agent_configs, setup.role_specs)
+            self._load_league_state(coordinator)
+        else:
+            self._resume_states = self._resolve_resume(setup.agent_configs, setup.role_specs)
+            self._load_league_state(coordinator)      # before the import: evictions there forget PFSP entries
+            self._import_snapshot_pool(coordinator)
         # Kickstart teachers and init weights are resolved here (ConfigError before any process starts).
         self._teachers = {aid: resolve_teacher(cfg, aid, setup.spec) for aid in trainable}
         self._init_states = self._resolve_init(setup.spec, self._resume_states)
@@ -463,11 +486,137 @@ class Hub(RunSinks, HubLearners):
         self._pulse_setup()
         self._registry = NodeRegistry()
         self._epochs = EpochAllocator(0, self._reserve_epochs)
-        self._cells = CellTable(self._epochs)
-        self._rotation = OwnerRotation(trainable)
         self._versions = VersionRegistry()
         self._learners = LearnerTable(trainable)
+        if self._options.resume:
+            self._resume_hub_state()
+        self._cells = CellTable(self._epochs)
+        self._rotation = OwnerRotation(trainable)
         self._intake = ResultIntake(journal=bool(cfg.match_log.enabled))
+        if self._options.resume:
+            for agent in trainable:                   # awaited learners play hub-held weights until adopted
+                if self._learners[agent].status == "relocating":
+                    self._park(agent)
+
+    # ---- in-place resume (SP5 T4.3, spec 5.4) ----------------------------------------------------------------
+
+    def _resolve_in_place(self, coordinator: Coordinator, agent_configs: Mapping[str, ColosseumConfig],
+                          role_specs: Mapping[str, Any]) -> dict[str, dict | None]:
+        """Each trainable agent's hub-start source of an in-place resume: its newest stored snapshot with
+        ``trainer_state.pt`` (else its newest one, weights only: a WARNING, the optimizer starts fresh), checked
+        against the agent's roles and architecture (ConfigError before any process starts); None for an agent
+        without snapshots (added with ``-c``: ``init`` or factory weights). ``training.resume_from`` is not applied
+        again; the env-step counter comes from ``hub_state.json`` / the run dir (``_resume_hub_state``), not from the
+        snapshot."""
+        from colosseum.coordinator.checkpoint_manager import TRAINER_FILE, check_model_state, resolve_resume
+        from colosseum.core.registry import build_model
+        from colosseum.core.roles import role_signature
+
+        manager = coordinator.checkpoint_manager
+        states: dict[str, dict | None] = {}
+        for aid, acfg in agent_configs.items():
+            infos = manager.list_checkpoints(aid)
+            if not infos:
+                states[aid] = None
+                logger.info(f"Resume [{aid}]: no stored snapshot (an agent added since); it starts fresh")
+                continue
+            with_trainer = [c for c in infos if (c.path / TRAINER_FILE).is_file()]
+            chosen = with_trainer[-1] if with_trainer else infos[-1]
+            state = resolve_resume(str(chosen.path), aid, expected_signature=role_signature(role_specs[aid]))
+            check_model_state(build_model(acfg, role_specs[aid]), state["model_state"], state["source"])
+            if not with_trainer and self._config.checkpoint.save_optimizer:
+                logger.warning(f"Resume [{aid}]: no stored snapshot has trainer_state.pt; {chosen.checkpoint_id}'s "
+                               f"weights are restored, the optimizer / LR state and trainer counters start fresh")
+            state["start_ident"] = chosen.checkpoint_id
+            states[aid] = state
+        return states
+
+    def _resume_hub_state(self) -> None:
+        """``hub_state.json`` of the previous hub incarnation (A3): the budget counter with its node sessions, the
+        epoch reservation (R7: epochs continue at the next block), versions and generations (R16; restored
+        latest versions keep no data addresses: relay only until their learner node's session confirms them,
+        ``_resource_versions`` / its next announcement), both counter books, the run-level worker / journal drop
+        totals (P-PF3-5; every other ``counters`` key is kept and saved again, D16), the lost-node count and the
+        learner table (``LearnerTable.load_resumed``: remote learners are awaited, a local node's are placed again).
+        Without the file (an SP4 / SP3 run dir) the counter starts at ``HubOptions.resume_env_steps``."""
+        from colosseum.core.errors import ConfigError
+        from colosseum.hub.state import HUB_STATE_FILE, BudgetCounter, EpochAllocator, VersionRegistry, load_hub_state
+
+        path = self._run_dir.root / HUB_STATE_FILE
+        try:
+            data = load_hub_state(path)
+        except ValueError as e:
+            raise ConfigError(f"Cannot read {path} ({e}); restore it, or move it away to continue with the counters "
+                              f"of metrics.jsonl and the journal") from e
+        if data is None:
+            steps = int(self._options.resume_env_steps)
+            self._budget = BudgetCounter(base=steps)
+            logger.info(f"Resume: {self._run_dir.root} has no {HUB_STATE_FILE} (an SP4 run dir); counters continue "
+                        f"from env step {steps} (metrics.jsonl, the journal, the snapshots)")
+            return
+        if data.run_id and data.run_id != self._run_id:
+            raise ConfigError(f"{path} belongs to run {data.run_id}; this dir's run.json names {self._run_id}")
+        self._budget = BudgetCounter(base=int(data.env_steps), sessions=data.sessions)
+        self._epochs = EpochAllocator(int(data.epoch_reserved_until), self._reserve_epochs)
+        versions = VersionRegistry.from_state(data.versions)
+        for agent in list(data.versions):
+            latest = versions.accepted(agent)
+            if latest is not None and (latest.addresses or not latest.relay_only):
+                versions.replace_latest(replace(latest, addresses=(), relay_only=True))
+        self._versions = versions
+        self._known_agents |= set(data.versions)     # results of agents removed with -c are still journaled
+        counters = dict(data.counters)
+        self._book = CounterBook.from_state(counters.get("book"))
+        self._counters_saved = counters
+        self._nodes_lost = int(data.nodes_lost)
+        for agent in self._learners.load_resumed(data.learners, now=time.monotonic()):
+            entry = self._learners[agent]
+            logger.info(f"Resume: waiting for node {entry.slot.node} to bring back the learner of {agent} (generation "
+                        f"{entry.generation}), up to learner_relocate_after_sec "
+                        f"({self._dist.learner_relocate_after_sec:g} s)")
+        logger.info(f"Resume: hub state restored (env step {self._budget.value}, epochs above "
+                    f"{self._epochs.reserved_until}, {self._nodes_lost} nodes lost so far)")
+
+    def _restore_metric_counters(self) -> None:
+        """The metrics hub's run-level counters of a resumed run (A3, P-PF3-5): the learners' intake book and the
+        worker / journal drop totals, so every cumulative ``system`` counter stays monotonic."""
+        if self._hub is None or not self._counters_saved:
+            return
+        self._hub.intake_book = CounterBook.from_state(self._counters_saved.get("intake_book"))
+        self._hub.restore_cumulative(self._counters_saved.get("system_stats"))
+
+    def _replay_journal(self) -> None:
+        """R8 (spec 5.1, 5.4): account the journal's training matches the loaded league state does not hold yet
+        (``league_replay_window``: after its watermark; an SP4 state: stamped after its env steps; none: every
+        detailed one) into the ratings and PFSP statistics, in commit order, before any node session and before the
+        writer thread can compact; then seed the watermark (``_journal_row``) with the journal's last row (every
+        row up to it is accounted now), so a league state saved before this incarnation's first commit never asks
+        the next resume to replay them again. Read only (also with the journal off)."""
+        from colosseum.arena.matchlog import MatchLogReader
+        from colosseum.coordinator.coordinator import league_replay_window
+
+        info = self._coordinator.loaded_league_state
+        after, min_steps = league_replay_window(info)
+        path = self._run_dir.matches_path
+        if not path.exists():
+            self._journal_row = 0
+            logger.info("Resume: no journal; nothing to replay into the ratings and PFSP statistics")
+            return
+        with MatchLogReader(path) as reader:
+            replayed, skipped = self._coordinator.replay_results(
+                result for _, result in reader.results_after(after, min_env_steps=min_steps))
+            folded = reader.folded_after(after) if after is not None else None
+            last = reader.last_row()
+        self._journal_row = max(int(after or 0), int(last or 0))
+        window = (f"after row {after}" if after is not None
+                  else f"stamped after env step {min_steps}" if min_steps is not None else "all rows")
+        text = (f"Resume: replayed {replayed} training matches of the journal into the ratings and PFSP statistics "
+                f"({window})")
+        if folded:
+            text += f"; {folded} were already folded into counts and are not replayed"
+        if skipped:
+            text += f"; {skipped} skipped (a layout or outcome kind this game no longer has)"
+        logger.info(text)
 
     def _build_relay(self) -> None:
         """The hub relay (spec 4.8, T3.2): chunk pair buffers between nodes (``RelayHub``; refused by the servicers
@@ -580,6 +729,7 @@ class Hub(RunSinks, HubLearners):
         """The metrics hub, the journal (and its writer), the live ratings and the retention wiring, before any port
         or child exists: an open failure cannot orphan a node; ``_finish_metrics`` closes whatever was opened."""
         self._open_metrics(self._resume_states)
+        self._restore_metric_counters()
         self._open_match_log(self._coordinator)
         self._open_live_ratings()
         self._wire_retention()
@@ -1644,11 +1794,15 @@ class Hub(RunSinks, HubLearners):
         reserved = max(int(self._epochs.reserved_until) if self._epochs is not None else 0,
                        int(epoch_reserved_until or 0))
         state = self._budget.state()
+        counters = {**self._counters_saved, "book": self._book.state()}     # unknown keys survive (A3, D16)
+        if self._hub is not None:
+            counters["intake_book"] = self._hub.intake_book.state()
+            counters["system_stats"] = self._hub.system_state()            # P-PF3-5
+        counters.setdefault("intake_book", {})
         data = HubStateData(version=HUB_STATE_VERSION, run_id=self._run_id or "", env_steps=int(state["env_steps"]),
                             sessions=dict(state["sessions"]), epoch_reserved_until=reserved,
                             versions=self._versions.state() if self._versions is not None else {},
-                            counters={"book": self._book.state(),
-                                      "intake_book": self._hub.intake_book.state() if self._hub is not None else {}},
+                            counters=counters,
                             nodes_lost=int(self._nodes_lost),
                             learners={} if self._learners is None else self._learners.state(
                                 local_nodes={e.number for e in self._registry.all() if e.data_path == "local"}))
@@ -1771,29 +1925,38 @@ class Hub(RunSinks, HubLearners):
 
 
 def _run(config_path: str | None, overrides: dict | None, make_options: Callable[[ColosseumConfig, RunDir],
-                                                                                 HubOptions], *, what: str) -> int:
+                                                                                 HubOptions], *, what: str,
+         resume: str | Path | None = None) -> int:
     """SP4's ``run_training`` body around a ``Hub``: spawn, logging, the config validated before the run dir exists,
-    the resume source checked, the global seed, the run dir and its resolved config, ``run_state.json``."""
+    the resume source checked, the global seed, the run dir and its resolved config, ``run_state.json``. ``resume``:
+    continue that run dir in place (``_prepare_in_place``)."""
     from colosseum.utils.seeding import apply_global_seed
 
     mp.set_start_method("spawn", force=True)
     setup_process_logging(None, "main", console_level=logging.INFO)
-    config = load_config(config_path, overrides)
-    # Before the run dir exists: an invalid config leaves nothing behind, so a corrected retry
-    # with the same run.name works. Hub.launch does not validate again.
-    validate_run_config(config)
-    if config.training.resume_from:
-        from colosseum.coordinator.checkpoint_manager import classify_resume_source
-        classify_resume_source(config.training.resume_from)  # exists and has a known layout (nothing loaded)
-    apply_global_seed(config.training.seed)  # after overrides: --set training.seed works
-    run_dir = RunDir.create(config, config_path)
-    config = run_dir.with_run_name(config)  # the resolved config and checkpoint hashes agree
-    setup_process_logging(run_dir.logs, "main", console_level=logging.INFO)
-    run_dir.write_resolved_config(config)
+    if resume is not None:
+        config, run_dir, resume_env_steps = _prepare_in_place(resume, config_path, overrides)
+    else:
+        config = load_config(config_path, overrides)
+        # Before the run dir exists: an invalid config leaves nothing behind, so a corrected retry
+        # with the same run.name works. Hub.launch does not validate again.
+        validate_run_config(config)
+        if config.training.resume_from:
+            from colosseum.coordinator.checkpoint_manager import classify_resume_source
+            classify_resume_source(config.training.resume_from)  # exists and has a known layout (nothing loaded)
+        apply_global_seed(config.training.seed)  # after overrides: --set training.seed works
+        run_dir = RunDir.create(config, config_path)
+        config = run_dir.with_run_name(config)  # the resolved config and checkpoint hashes agree
+        setup_process_logging(run_dir.logs, "main", console_level=logging.INFO)
+        run_dir.write_resolved_config(config)
+        resume_env_steps = 0
     print(f"Run directory: {run_dir.root}", flush=True)
     _record_run_state(run_dir, "running")
+    options = make_options(config, run_dir)
+    if resume is not None:
+        options = replace(options, resume=True, resume_env_steps=resume_env_steps)
     try:
-        code = Hub(config, run_dir, options=make_options(config, run_dir), validated=True).launch()
+        code = Hub(config, run_dir, options=options, validated=True).launch()
     except KeyboardInterrupt:
         # Ctrl-C before launch installed its signal handlers (the CLI exits 130): nothing was saved
         _record_run_state(run_dir, "stopped", exit_code=130)
@@ -1808,20 +1971,87 @@ def _run(config_path: str | None, overrides: dict | None, make_options: Callable
     return code
 
 
-def run_training(config_path: str | None, overrides: dict | None = None, *, listen: str | None = None) -> int:
+def _prepare_in_place(resume: str | Path, config_path: str | None,
+                      overrides: dict | None) -> tuple[ColosseumConfig, RunDir, int]:
+    """In-place resume before the hub starts (SP5 T4.3, spec 5.4; ``hub.resume``): refused while the run lives,
+    the effective config (the saved one, or ``-c`` with a diff WARNING; ``--set`` either way) validated, the
+    remaining agents checked strictly against their snapshots (nothing is written before these pass); then the
+    previous ``config.resolved.yaml`` is kept as ``config.resolved.<k>.yaml``, the effective one written and the
+    run's logs appended. Returns the config, the run dir and the start env steps of a run dir without
+    ``hub_state.json``."""
+    from colosseum.hub.resume import check_resumed_agents, commit_resume, prepare_resume
+    from colosseum.utils.seeding import apply_global_seed
+
+    # What prepare_resume logs (the -c diff, resume_from, the budget) goes to the console now and to main.log once
+    # the checks passed (nothing is written to the run dir before).
+    kept: list[logging.LogRecord] = []
+    keeper = _KeepRecords(kept)
+    resume_logger = logging.getLogger("colosseum.hub.resume")
+    resume_logger.addHandler(keeper)
+    try:
+        plan = prepare_resume(resume, config_path, overrides)
+        config = plan.config
+        validate_run_config(config)
+        setup = setup_run(config, validate=False)
+        check_resumed_agents(plan.run_dir.root, setup.agent_configs, setup.role_specs)
+    finally:
+        resume_logger.removeHandler(keeper)
+    apply_global_seed(config.training.seed)
+    backup = commit_resume(plan)
+    run_dir = plan.run_dir
+    setup_process_logging(run_dir.logs, "main", console_level=logging.INFO)
+    files = [h for h in logging.getLogger().handlers if isinstance(h, logging.FileHandler)]
+    for record in kept:
+        for handler in files:
+            if record.levelno >= handler.level:
+                handler.handle(record)
+    added = sorted(set(config.get_trainable_agent_ids()) - {p.name for p in run_dir.checkpoints.glob("*")
+                                                             if p.is_dir()})
+    logger.info(f"Resume: continuing run {run_dir.root.name} (run id {plan.run_id or 'new'}) in place at env step "
+                f"{plan.start_env_steps}; previous config kept as {backup}")
+    if added:
+        logger.info(f"Resume: agents without snapshots start fresh: {added} (their schedules count from env step 0 "
+                    f"of the run)")
+    return config, run_dir, plan.start_env_steps
+
+
+class _KeepRecords(logging.Handler):
+    """Keeps the records it gets (``_prepare_in_place``)."""
+
+    def __init__(self, out: list[logging.LogRecord]) -> None:
+        super().__init__(logging.INFO)
+        self._out = out
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self._out.append(record)
+
+
+def run_training(config_path: str | None, overrides: dict | None = None, *, listen: str | None = None,
+                 resume: str | Path | None = None) -> int:
     """Entry point of ``colosseum train``: a hub and its local node on this machine (``listen``: also accept other
-    machines' nodes on ``listen:distributed.port``, TLS). Returns the process exit code."""
+    machines' nodes on ``listen:distributed.port``, TLS; ``resume``: continue that run dir in place, ``config_path``
+    optional). Returns the process exit code."""
     def options(config: ColosseumConfig, run_dir: RunDir) -> HubOptions:
         local = replace(LocalNodeOptions.from_config(config, run_dir), data_port=listen is not None)
         return HubOptions(mode="train", listen=listen, local_node=local)
 
-    return _run(config_path, overrides, options, what="Training")
+    return _run(config_path, overrides, options, what="Training", resume=resume)
 
 
 def run_hub(config_path: str | None, overrides: dict | None = None, *, listen: str | None = None,
-            port: int | None = None, insecure: bool = False) -> int:
-    """Entry point of ``colosseum hub``: a hub that nodes join (no local node). Returns the process exit code."""
+            port: int | None = None, insecure: bool = False, resume: str | Path | None = None) -> int:
+    """Entry point of ``colosseum hub``: a hub that nodes join (no local node). Returns the process exit code.
+    ``resume``: continue that run dir in place; without ``port`` it listens on the port of its previous ``hub.json``
+    (nodes reconnect to the address they know; ruling W04-20), else ``distributed.port``."""
     def options(config: ColosseumConfig, run_dir: RunDir) -> HubOptions:
-        return HubOptions(mode="hub", listen=listen, port=port, insecure=insecure, local_node=None)
+        chosen = port
+        if resume is not None:
+            from colosseum.hub.registry import read_hub_json
+            from colosseum.hub.resume import resume_port
 
-    return _run(config_path, overrides, options, what="Training")
+            previous = read_hub_json(run_dir.root)
+            chosen = resume_port(previous.addresses if previous is not None else (), port,
+                                 int(config.distributed.port))
+        return HubOptions(mode="hub", listen=listen, port=chosen, insecure=insecure, local_node=None)
+
+    return _run(config_path, overrides, options, what="Training", resume=resume)
