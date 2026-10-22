@@ -1,5 +1,6 @@
 """learner/factory.py (spec block 6): teachers are resolved in the main process into numpy specs and
-built in the learner; the launcher and the distributed learner build their algorithms there (T4.1)."""
+built in the learner; the node's learner (SP5: ``train``'s path, T2.5 b) and the distributed learner build their
+algorithms there (T4.1)."""
 from __future__ import annotations
 
 import sys
@@ -12,7 +13,7 @@ from colosseum.core.errors import ConfigError
 from colosseum.core.ipc import assert_no_tensors
 from colosseum.core.registry import build_model, env_spec, validate_config
 from colosseum.learner.factory import TeacherSpec, build_algorithm, resolve_teacher
-from game_helpers import agent_role_of, make_test_config, make_test_run_dir, write_ckpt_dir, write_test_config
+from game_helpers import agent_role_of, make_test_config, write_ckpt_dir, write_test_config
 
 BOT = {"kind": "scripted", "class": "colosseum.players.RandomBot"}
 
@@ -128,76 +129,34 @@ def test_teachers_are_per_agent(tmp_path):
     assert resolve_teacher(cfg, "a", spec).lambda_ == 0.3 and resolve_teacher(cfg, "b", spec) is None
 
 
-def test_launcher_passes_numpy_teacher_specs_and_the_spec_to_learners(tmp_path, monkeypatch, restore_global_rng):
-    import colosseum.launcher as launcher_module
+def test_the_local_node_passes_numpy_teacher_specs_and_the_spec_to_learners(tmp_path, restore_global_rng):
+    """The hub resolves the teacher and sends its weights as a ``teacher`` blob (spec: nodes read no file); the node
+    gives the learner a numpy ``TeacherSpec`` with exactly those weights."""
+    from hub_kit import local_node_spawns
 
     base = make_test_config("turns")
-    path, _ = _teacher_pt(tmp_path, base)
+    path, source = _teacher_pt(tmp_path, base)
     cfg = make_test_config("turns", kickstart={"teacher": str(path)})
-    learner_kwargs: list[dict] = []
-
-    class _Stop(Exception):
-        pass
-
-    class FakeProcess:
-        exitcode = 0
-
-        def __init__(self, target, kwargs, name=None, daemon=None):
-            self.target, self.kwargs = target, kwargs
-
-        def start(self):
-            if self.target is launcher_module._learner_target:
-                learner_kwargs.append(self.kwargs)
-            else:
-                raise _Stop
-
-        def is_alive(self):
-            return False
-
-        def join(self, timeout=None):
-            pass
-
-    monkeypatch.setattr(launcher_module.mp, "Process", FakeProcess)
-    with pytest.raises(_Stop):
-        launcher_module.Launcher(cfg, make_test_run_dir(cfg, tmp_path)).launch()
-    (kwargs,) = learner_kwargs
-    assert isinstance(kwargs["teacher"], TeacherSpec) and kwargs["teacher"].source == str(path)
+    specs, _run = local_node_spawns(cfg, tmp_path)
+    (kwargs,) = [s.kwargs for s in specs if s.role == "learner"]
+    teacher = kwargs["teacher"]
+    assert isinstance(teacher, TeacherSpec) and teacher.kind == "neural"
+    assert teacher.source.startswith("hub blob ")                       # the file's weights, sent by the hub
+    expected = {k: v.detach().numpy() for k, v in source.state_dict().items()}
+    assert teacher.frozen.model_state.keys() == expected.keys()
+    assert all(np.array_equal(teacher.frozen.model_state[k], v) for k, v in expected.items())
     assert kwargs["spec"] == env_spec(cfg)
     assert_no_tensors(kwargs, "learner kwargs")
 
 
-def test_launcher_passes_scripted_teachers_to_the_workers(tmp_path, monkeypatch, restore_global_rng):
-    import colosseum.launcher as launcher_module
+def test_the_local_node_passes_scripted_teachers_to_the_workers(tmp_path, restore_global_rng):
     from colosseum.players.registry import BotSpec
+    from hub_kit import local_node_spawns
 
     cfg = make_test_config("turns", agents={"agent_0": {"kickstart": {"teacher": "bot"}}, "bot": BOT},
                            matchmaking={"anchors": []})
-    started: dict[str, dict] = {}
-
-    class _Stop(Exception):
-        pass
-
-    class FakeProcess:
-        exitcode = 0
-
-        def __init__(self, target, kwargs, name=None, daemon=None):
-            self.target, self.kwargs = target, kwargs
-
-        def start(self):
-            role = "learner" if self.target is launcher_module._learner_target else "worker"
-            started[role] = self.kwargs
-            if role == "worker":
-                raise _Stop
-
-        def is_alive(self):
-            return False
-
-        def join(self, timeout=None):
-            pass
-
-    monkeypatch.setattr(launcher_module.mp, "Process", FakeProcess)
-    with pytest.raises(_Stop):
-        launcher_module.Launcher(cfg, make_test_run_dir(cfg, tmp_path)).launch()
+    specs, _run = local_node_spawns(cfg, tmp_path)
+    started = {s.role: s.kwargs for s in specs}
     assert started["worker"]["teachers"] == {"agent_0": BotSpec("colosseum.players.RandomBot", {})}
     assert started["learner"]["teacher"].kind == "scripted"
     assert_no_tensors(started["worker"]["teachers"], "worker teachers")

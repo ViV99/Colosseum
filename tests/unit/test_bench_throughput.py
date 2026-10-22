@@ -197,12 +197,22 @@ def test_benchmark_runs_the_hub_with_quarter_second_heartbeats(tmp_path):
 
 def test_the_launcher_fallback_is_only_for_a_tree_without_the_hub(tmp_path, monkeypatch):
     """``--tree`` of a checkout without ``colosseum.hub.hub`` measures the SP4 Launcher; a hub that exists but fails
-    to import is an error, never a silent switch to the SP4 path."""
+    to import is an error, never a silent switch to the SP4 path. (This tree has no launcher: a stand-in module plays
+    the measured checkout's ``colosseum.launcher``.)"""
     import sys
+    import threading
+    import types
 
     from colosseum.core.run_dir import RunDir
-    from colosseum.launcher import Launcher
 
+    class Launcher:                                   # the SP4 interface the bench uses
+        def __init__(self, config, run_dir):
+            self.config, self.run_dir = config, run_dir
+            self._stop_event = threading.Event()
+
+    sp4 = types.ModuleType("colosseum.launcher")
+    sp4.Launcher = Launcher
+    monkeypatch.setitem(sys.modules, "colosseum.launcher", sp4)
     cfg = bench._make_config(1, str(tmp_path))
     run_dir = RunDir.create(cfg)
     monkeypatch.setitem(sys.modules, "colosseum.hub.hub", None)          # "no such module" (ModuleNotFoundError)

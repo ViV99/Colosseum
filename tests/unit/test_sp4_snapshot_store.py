@@ -232,8 +232,8 @@ def test_imported_sp3_snapshots_are_ordinary_not_final(tmp_path):
     assert ids(legacy, agent) == [f"ckpt_v{final}", f"ckpt_v{final + 20}"]
 
 
-def test_the_launcher_reapplies_retention_once_per_new_live_refit(tmp_path):
-    from colosseum.launcher import Launcher
+def test_the_hub_reapplies_retention_once_per_new_live_refit(tmp_path):
+    from colosseum.hub.hub import Hub
 
     calls = []
 
@@ -254,24 +254,24 @@ def test_the_launcher_reapplies_retention_once_per_new_live_refit(tmp_path):
         def latest(self):
             return self.snapshot
 
-    launcher = object.__new__(Launcher)          # only the attributes the two methods read
-    launcher._config = make_test_config("turns", checkpoint={"keep_top_k": 2})
-    launcher._coordinator, launcher._live_ratings, launcher._agent_ids = _Coord(), _Live(), ["a", "b"]
-    launcher._retention_version = None
-    launcher._wire_retention()
+    hub = object.__new__(Hub)               # only the attributes the two methods read
+    hub._config = make_test_config("turns", checkpoint={"keep_top_k": 2})
+    hub._coordinator, hub._live_ratings, hub._agent_ids = _Coord(), _Live(), ["a", "b"]
+    hub._retention_version = None
+    hub._wire_retention()
     assert calls == [("source", None)]
     calls.clear()
-    launcher._reapply_retention()                # no refit yet
-    launcher._live_ratings.snapshot = _Snapshot(1, {}, {})
-    launcher._reapply_retention()
-    launcher._reapply_retention()                # the same refit: nothing new
-    launcher._live_ratings.snapshot = _Snapshot(2, {}, {})
-    launcher._reapply_retention()
+    hub._reapply_retention()                # no refit yet
+    hub._live_ratings.snapshot = _Snapshot(1, {}, {})
+    hub._reapply_retention()
+    hub._reapply_retention()                # the same refit: nothing new
+    hub._live_ratings.snapshot = _Snapshot(2, {}, {})
+    hub._reapply_retention()
     assert calls == ["a", "b", "a", "b"]
     calls.clear()
-    launcher._config = make_test_config("turns")  # keep_top_k 0: scores never decide, no rerun
-    launcher._live_ratings.snapshot = _Snapshot(3, {}, {})
-    launcher._reapply_retention()
+    hub._config = make_test_config("turns")  # keep_top_k 0: scores never decide, no rerun
+    hub._live_ratings.snapshot = _Snapshot(3, {}, {})
+    hub._reapply_retention()
     assert calls == []
 
 
@@ -338,7 +338,7 @@ def test_top_k_with_real_live_ratings_keeps_the_best_snapshot_for_the_top_k_reas
 def test_imported_rated_snapshots_survive_until_the_first_refit_of_a_resumed_run(tmp_path):
     from colosseum.coordinator.coordinator import Coordinator
     from colosseum.core.registry import env_spec
-    from colosseum.launcher import Launcher
+    from colosseum.hub.hub import Hub
     from colosseum.players.registry import resolve_player_roles
 
     parent_cfg = make_test_config("turns", checkpoint={"interval": 10, "keep_last": 5, "keep_every": 0})
@@ -349,7 +349,7 @@ def test_imported_rated_snapshots_survive_until_the_first_refit_of_a_resumed_run
                                                 "top_k_min_games": 0, "keep_every": 0, "max_snapshots": 3})
     spec = env_spec(cfg)
     child = Coordinator(cfg, spec, resolve_player_roles(cfg, spec), tmp_path / "child", run_id="child")
-    child.import_snapshots(tmp_path / "parent")              # as Launcher.launch: before the live ratings exist
+    child.import_snapshots(tmp_path / "parent")              # as Hub.launch: before the live ratings exist
     # (before the fix, "no ratings" read as "rated with 0 games" and the import evicted v10-v40 at once)
     child.save_checkpoint_payload(_payload(60))
     assert ids(child.checkpoint_manager, "agent_0") == [f"ckpt_v{v}" for v in (10, 20, 30, 40, 50, 60)]
@@ -360,14 +360,14 @@ def test_imported_rated_snapshots_survive_until_the_first_refit_of_a_resumed_run
         def latest(self):
             return self.snapshot
 
-    launcher = object.__new__(Launcher)
-    launcher._config, launcher._coordinator, launcher._live_ratings = cfg, child, _Live()
-    launcher._agent_ids, launcher._retention_version = ["agent_0"], None
-    launcher._wire_retention()
-    launcher._reapply_retention()                            # no refit yet: nothing changes
+    hub = object.__new__(Hub)
+    hub._config, hub._coordinator, hub._live_ratings = cfg, child, _Live()
+    hub._agent_ids, hub._retention_version = ["agent_0"], None
+    hub._wire_retention()
+    hub._reapply_retention()                            # no refit yet: nothing changes
     assert len(ids(child.checkpoint_manager, "agent_0")) == 6
-    launcher._live_ratings.snapshot = _real_snapshot()       # the first refit (it includes the parent's journal)
-    launcher._reapply_retention()
+    hub._live_ratings.snapshot = _real_snapshot()       # the first refit (it includes the parent's journal)
+    hub._reapply_retention()
     assert ids(child.checkpoint_manager, "agent_0") == ["ckpt_v20", "ckpt_v60"]
     assert child.checkpoint_manager.retention_reasons("agent_0")["ckpt_v20"] == "kept: top_k"
 

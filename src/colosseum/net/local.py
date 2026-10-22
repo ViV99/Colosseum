@@ -34,7 +34,7 @@ misroute and generation rules on it (R16), then decodes and checks the frame (``
 A17), counting every drop by reason. An EOF closes only that connection; a frame cut by
 a dying sender closes it and counts ``disconnect``. ``NodeOutputs`` publishes weights into the shared-memory cache and
 reports them, sends checkpoints and metrics to the node. ``QueueIntake`` / ``QueueOutputs`` keep SP4's queue path for
-the launcher (until T2.5) and the distributed roles (until T7.2).
+the distributed roles (until T7.2).
 """
 
 from __future__ import annotations

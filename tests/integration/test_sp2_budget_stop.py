@@ -1,10 +1,10 @@
-"""The SP2 launcher stops every process once the global env-step budget is reached (T7.1)."""
+"""The hub (SP2's launcher, SP5 T2.5 b) stops every process once the global env-step budget is reached (T7.1)."""
 import time
 from pathlib import Path
 
 from colosseum.core.config import ColosseumConfig, load_config
-from colosseum.launcher import Launcher
 from game_helpers import make_test_run_dir
+from hub_kit import make_hub
 
 REPO = Path(__file__).resolve().parents[2]
 
@@ -20,15 +20,15 @@ def test_launch_stops_at_the_env_step_budget(tmp_path):
     data["learner"]["device"] = "cpu"
     data["metrics"]["use_wandb"] = False
     config = ColosseumConfig(**data)
-    launcher = Launcher(config, make_test_run_dir(config, tmp_path))
+    hub = make_hub(config, make_test_run_dir(config, tmp_path))
     start = time.monotonic()
-    assert launcher.launch() == 0
-    assert launcher.env_steps_done >= 400
+    assert hub.launch() == 0
+    assert hub.env_steps_done >= 400
     assert time.monotonic() - start < 120
 
 
 def test_a_dead_learner_stops_the_run(tmp_path, caplog):
-    """Local learners run until stop_event; one exiting early must stop the run.
+    """Learners run until the run stops; one exiting early must stop the run (until T4.2, A12).
 
     Otherwise the workers block on the dead learner's full chunk queue and the
     other agent starves while the budget is never reached.
@@ -43,15 +43,17 @@ def test_a_dead_learner_stops_the_run(tmp_path, caplog):
     data["agents"]["agent_beta"]["algorithm"] = broken  # agent_beta's learner dies at startup
     config = ColosseumConfig(**data)
     run = make_test_run_dir(config, tmp_path)
-    launcher = Launcher(config, run)
+    hub = make_hub(config, run)
     start = time.monotonic()
-    with caplog.at_level("ERROR", logger="colosseum.launcher"):
-        assert launcher.launch() == 1
+    with caplog.at_level("ERROR", logger="colosseum.hub.hub"):
+        assert hub.launch() == 1
     assert time.monotonic() - start < 120
-    assert launcher.env_steps_done < 10**9
-    # The failure names the dead process and points to its log (T6.5).
-    expected = f"learner-agent_beta died (exit 1), see {run.logs / 'learner-agent_beta.log'}"
-    assert any(r.levelname == "ERROR" and r.getMessage() == expected for r in caplog.records)
+    assert hub.env_steps_done < 10**9
+    # The failure names the dead process and points to its log (T6.5); since SP5 the node reports the learner's error
+    # and the hub fails the run with it (amendment A12): one ERROR.
+    errors = [r.getMessage() for r in caplog.records if r.levelname == "ERROR"]
+    assert len(errors) == 1 and "learner-agent_beta failed (crash)" in errors[0], errors
+    assert f"see {run.logs / 'learner-agent_beta.log'}" in errors[0]
     # The crash and its traceback are in the dead learner's own log file (T6.2).
     crash_log = (run.logs / "learner-agent_beta.log").read_text()
     assert "learner-agent_beta crashed" in crash_log and "NoSuchAlgorithm" in crash_log

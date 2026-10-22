@@ -1,14 +1,14 @@
-"""A spawned worker process builds and seats scripted and frozen players from FixedPlayers (SP3 T1.4)."""
+"""A spawned worker process builds and seats scripted and frozen players from FixedPlayers (SP3 T1.4); since SP5
+(T2.5 b) the node's worker: bots from the node's spawn arguments, a frozen agent's weights from the hub's blob (against
+``node_kit.FakeHub``, with the trainable agent's learner on the node)."""
 from __future__ import annotations
-
-import multiprocessing as mp
 
 import torch
 
 from colosseum.core.registry import build_model
-from colosseum.core.types import FIXED_NETWORK_ID, Lineup, SeatAssignment, TrajectoryChunk, WeightPayload
-from colosseum.launcher import _worker_target, setup_run
+from colosseum.core.types import FIXED_NETWORK_ID, Lineup, SeatAssignment
 from game_helpers import agent_role_of, frozen_agent, make_test_config, scripted_agent
+from node_kit import intake_drops, train_on_node, train_steps, wait_for, worker_counters
 
 WIDE_KWARGS = {"core": "none", "hidden": 32}
 
@@ -18,35 +18,22 @@ def test_a_spawned_worker_seats_scripted_and_frozen_players_that_never_collect(t
     _roles, role = agent_role_of(base, "agent_0")
     pt = tmp_path / "wide.pt"
     torch.save(build_model(base.get_agent_config("agent_0"), role).state_dict(), pt)
-    config = make_test_config("turns", rollout={"envs_per_worker": 2, "chunk_length": 4}, agents={
+    config = make_test_config("turns", rollout={"envs_per_worker": 2, "chunk_length": 4},
+                              learner={"batch_chunks": 1, "device": "cpu"}, agents={
         "agent_0": {}, "rnd": scripted_agent(), "wide": frozen_agent(pt, networks={"kwargs": WIDE_KWARGS})})
-    setup = setup_run(config, validate=False)
     lineups = [Lineup("2p", [SeatAssignment("agent_0"), SeatAssignment("rnd", FIXED_NETWORK_ID, False)]),
                Lineup("2p", [SeatAssignment("wide", FIXED_NETWORK_ID, False), SeatAssignment("agent_0")])]
-    ctx = mp.get_context("spawn")
-    trajectories, weights, results, stop = ctx.Queue(maxsize=64), ctx.Queue(maxsize=1), ctx.Queue(maxsize=100), \
-        ctx.Event()
-    # the learner's initial weights: a worker plays no match before them (ruling A-M3)
-    weights.put(WeightPayload.from_model(
-        "agent_0", 0, build_model(setup.agent_configs["agent_0"], setup.role_specs["agent_0"])))
-    proc = ctx.Process(target=_worker_target, daemon=True, kwargs=dict(
-        worker_id=0, config=config, agent_ids=["agent_0"], agent_roles=setup.agent_roles,
-        agent_configs=setup.agent_configs, role_specs=setup.role_specs,
-        trajectory_queues={"agent_0": trajectories}, weight_queues={"agent_0": weights}, stop_event=stop,
-        lineups=lineups, results_queue=results, fixed_players=setup.fixed,
-    ))
-    proc.start()
+    hub, node = train_on_node(tmp_path, config, learners=["agent_0"], workers=1, lineup=lambda w, e: lineups[e],
+                              frozen={"wide": pt})
     try:
-        got = []
-        while len(got) < 4:                       # the worker puts its results in batches (lists)
-            got.extend(results.get(timeout=60))
-        chunks = [TrajectoryChunk.from_payload(trajectories.get(timeout=60)) for _ in range(2)]
+        wait_for(lambda: len(hub.results()) >= 4 and worker_counters(hub).get("chunks_sent", 0) >= 2
+                 and train_steps(hub, "agent_0") >= 1, timeout=120)
+        got = hub.results()
+        counters = worker_counters(hub)
     finally:
-        stop.set()
-        proc.join(timeout=10)
-        if proc.is_alive():
-            proc.terminate()
-            proc.join(timeout=5)
+        node.stop()
+        hub.stop()
     assert {(s.agent_id, s.network_id) for r in got for s in r.seats} == {
         ("agent_0", "latest"), ("rnd", FIXED_NETWORK_ID), ("wide", FIXED_NETWORK_ID)}
-    assert all(c.agent_id == "agent_0" for c in chunks)
+    # every chunk is agent_0's: none went without a learner (fixed seats never record), none dropped by its learner
+    assert counters.get("dropped_chunks_no_learner", 0) == 0 and not intake_drops(hub, "agent_0")

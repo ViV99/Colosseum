@@ -1,4 +1,5 @@
-"""SP2 learner entry points: per-agent seed streams and torch threads (SP1 guarantees, T7.1)."""
+"""SP2 learner entry points: per-agent seed streams and torch threads (SP1 guarantees, T7.1); since SP5 (T2.5 b) the
+node's learner body (``node.learner_main._learner_main``, its node side stubbed) and the node's spawn arguments."""
 from __future__ import annotations
 
 import sys
@@ -9,7 +10,7 @@ import torch
 
 from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.utils.seeding import derive_seed, learner_seed
-from game_helpers import agent_role_of, make_test_config, make_test_run_dir, write_test_config
+from game_helpers import agent_role_of, make_test_config, write_test_config
 
 
 def _flat(state: dict) -> np.ndarray:
@@ -43,24 +44,19 @@ def test_learner_seed_streams_are_deterministic_and_distinct():
     assert all(0 <= learner_seed(s, i) < 2**32 for s in (-5, 0, 2**40) for i in range(3))
 
 
-def _learner_main(config: ColosseumConfig, agent_id: str = "agent_0", **kwargs) -> None:
-    from colosseum.core.registry import env_spec
-    from colosseum.launcher import _learner_main as main
-    from colosseum.learner.factory import resolve_teacher
+def _learner_main(monkeypatch, config: ColosseumConfig, agent_id: str = "agent_0", **kwargs) -> None:
+    """The node's learner body for ``config``'s ``agent_id`` (``node_kit.run_learner_main``: no node, no listener)."""
+    from node_kit import run_learner_main
 
-    spec = env_spec(config)
-    _roles, role = agent_role_of(config, agent_id)
-    main(agent_id=agent_id, config=config.get_agent_config(agent_id), role_spec=role, spec=spec,
-         teacher=resolve_teacher(config, agent_id, spec), trajectory_queue=None, weight_queues=[], stop_event=None,
-         metrics_queue=None, **kwargs)
+    run_learner_main(monkeypatch, config, agent_id, **kwargs)
 
 
-def test_local_learner_weights_follow_training_seed(capture_learner_model, restore_global_rng):
+def test_local_learner_weights_follow_training_seed(monkeypatch, capture_learner_model, restore_global_rng):
     cfg = make_test_config("turns", training={"seed": 3})
 
     def run(seed):
         torch.manual_seed(12345 + len(capture_learner_model))  # a different global state each time
-        _learner_main(cfg, seed=seed)
+        _learner_main(monkeypatch, cfg, seed=seed)
         return capture_learner_model[-1]
 
     a, b, c = run(learner_seed(3, 0)), run(learner_seed(3, 0)), run(learner_seed(4, 0))
@@ -68,48 +64,21 @@ def test_local_learner_weights_follow_training_seed(capture_learner_model, resto
     assert not np.array_equal(a, run(learner_seed(3, 1)))
 
 
-def test_launcher_gives_each_learner_its_own_seed_stream(tmp_path, monkeypatch, restore_global_rng):
-    import colosseum.launcher as launcher_module
+def test_the_local_node_gives_each_learner_its_own_seed_stream(tmp_path, restore_global_rng):
+    from hub_kit import local_node_spawns
 
-    learner_kwargs: list[dict] = []
-
-    class _Stop(Exception):
-        pass
-
-    class FakeProcess:
-        exitcode = 0
-
-        def __init__(self, target, kwargs, name=None, daemon=None):
-            self.target, self.kwargs = target, kwargs
-
-        def start(self):
-            if self.target is launcher_module._learner_target:
-                learner_kwargs.append(self.kwargs)
-            else:
-                raise _Stop  # first worker: every learner has been started
-
-        def is_alive(self):
-            return False
-
-        def join(self, timeout=None):
-            pass
-
-    monkeypatch.setattr(launcher_module.mp, "Process", FakeProcess)
     cfg = make_test_config("asymmetric", training={"seed": 11})
-    run = make_test_run_dir(cfg, tmp_path, name="seeded")
-    with pytest.raises(_Stop):
-        launcher_module.Launcher(cfg, run).launch()
+    specs, run = local_node_spawns(cfg, tmp_path, name="seeded")
+    learner_kwargs = [s.kwargs for s in specs if s.role == "learner"]
     assert [k["agent_id"] for k in learner_kwargs] == ["hunter", "prey"]
     assert [k["log_dir"] for k in learner_kwargs] == [str(run.logs)] * 2
     assert [k["seed"] for k in learner_kwargs] == [learner_seed(11, 0), learner_seed(11, 1)]
     assert [k["role_spec"] for k in learner_kwargs] == [agent_role_of(cfg, a)[1] for a in ("hunter", "prey")]
     assert learner_kwargs[0]["checkpoint_interval"] == cfg.checkpoint.interval
 
-    learner_kwargs.clear()
     unseeded = make_test_config("asymmetric", training={"seed": None})
-    with pytest.raises(_Stop):
-        launcher_module.Launcher(unseeded, make_test_run_dir(unseeded, tmp_path, name="unseeded")).launch()
-    assert [k["seed"] for k in learner_kwargs] == [None, None]
+    specs, _run = local_node_spawns(unseeded, tmp_path / "u", name="unseeded")
+    assert [s.kwargs["seed"] for s in specs if s.role == "learner"] == [None, None]
 
 
 def test_run_learner_seeds_before_building_the_model(tmp_path, monkeypatch, capture_learner_model,
@@ -153,7 +122,7 @@ def test_run_learner_seeds_before_building_the_model(tmp_path, monkeypatch, capt
         assert role_dir.name in (f"{resolved.run.name}-learner-alpha", f"{resolved.run.name}-learner-beta")
         assert "learner" not in resolved.run.name
     cfg = make_test_config("turns", agents={"alpha": {}, "beta": {}}, training={"seed": 5})
-    _learner_main(cfg, agent_id="alpha", seed=learner_seed(5, 0))  # same stream as a local-mode learner
+    _learner_main(monkeypatch, cfg, agent_id="alpha", seed=learner_seed(5, 0))  # same stream as a local-mode learner
     assert np.array_equal(a, capture_learner_model[-1])
 
 
@@ -171,7 +140,7 @@ def _run_learner_target(monkeypatch, config, num_learners, seen=None):
     monkeypatch.setattr(sys, "path", list(sys.path))
     before = torch.get_num_threads()
     try:
-        _learner_main(config, num_learners=num_learners)
+        _learner_main(monkeypatch, config, num_learners=num_learners)
     finally:
         torch.set_num_threads(before)
     return seen["threads"], seen["algorithm"]

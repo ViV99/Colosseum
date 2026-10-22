@@ -39,7 +39,7 @@ def test_metrics_jsonl_ratings_json_and_console(tmp_path):
 
 
 def test_launch_logs_to_wandb_on_per_agent_axes_and_finishes(tmp_path, monkeypatch):
-    """The launcher wires WandBLogger into the hub (T6.4): run name and resolved config at init,
+    """The hub wires WandBLogger into its metrics hub (T6.4): run name and resolved config at init,
     train rows on ``<agent>/train_step`` and global rows on ``env_steps`` without ``step=``."""
     import sys
 
@@ -47,9 +47,9 @@ def test_launch_logs_to_wandb_on_per_agent_axes_and_finishes(tmp_path, monkeypat
 
     from cli_runner import TTT_CONFIG
     from colosseum.core.config import ColosseumConfig, load_config
-    from colosseum.launcher import Launcher
     from colosseum.metrics.jsonl import GLOBAL_KINDS
     from game_helpers import make_test_run_dir
+    from hub_kit import make_hub
 
     fake = FakeWandb()
     monkeypatch.setitem(sys.modules, "wandb", fake)
@@ -61,7 +61,7 @@ def test_launch_logs_to_wandb_on_per_agent_axes_and_finishes(tmp_path, monkeypat
     data["metrics"].update(use_wandb=True, log_interval=1)
     config = ColosseumConfig(**data)
     run = make_test_run_dir(config, tmp_path)
-    Launcher(config, run).launch()
+    make_hub(config, run).launch()
 
     assert fake.init_kwargs["name"] == (run.run_name or run.root.name)
     assert fake.init_kwargs["config"]["training"]["total_timesteps"] == 400

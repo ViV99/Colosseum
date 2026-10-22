@@ -149,7 +149,7 @@ def test_setup_process_logging_file_info_console_warning(tmp_path, capsys, resto
 
 def test_setup_process_logging_main_console_info(tmp_path, capsys, restore_root_logging):
     setup_process_logging(None, "main", console_level=logging.INFO)
-    logging.getLogger("colosseum.launcher").info("progress-line")
+    logging.getLogger("colosseum.hub.hub").info("progress-line")
     assert "progress-line" in capsys.readouterr().err
 
 

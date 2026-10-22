@@ -17,8 +17,9 @@ from colosseum.core.config import CheckpointConfig, ColosseumConfig, load_config
 from colosseum.core.errors import ConfigError
 from colosseum.core.registry import build_model
 from colosseum.core.roles import role_signature
-from colosseum.launcher import Launcher, setup_run
+from colosseum.hub.hub import setup_run
 from game_helpers import agent_role_of, make_coordinator, make_test_config, make_test_run_dir
+from hub_kit import make_hub
 
 
 def sd(value: float) -> dict[str, np.ndarray]:
@@ -169,15 +170,15 @@ def test_a_run_dir_resume_imports_the_pool_and_a_checkpoint_dir_resume_does_not(
                                         meta_extra={"env_steps": version})
     resumed = make_test_config("turns", agents={"a": {}, "b": {}}, checkpoint={"keep_last": 5},
                                training={"resume_from": str(tmp_path / "old")})
-    launcher = Launcher(resumed, make_test_run_dir(resumed, tmp_path, name="new"))
-    coord = make_coordinator(resumed, launcher._run_dir.checkpoints)
-    launcher._import_snapshot_pool(coord)
+    hub = make_hub(resumed, make_test_run_dir(resumed, tmp_path, name="new"))
+    coord = make_coordinator(resumed, hub._run_dir.checkpoints)
+    hub._import_snapshot_pool(coord)
     assert ids(coord.checkpoint_manager, "a") == ids(coord.checkpoint_manager, "b") == ["ckpt_v20", "ckpt_v40"]
     from_ckpt = make_test_config("turns", agents={"a": {}, "b": {}},
                                  training={"resume_from": str(tmp_path / "old" / "checkpoints" / "a" / "ckpt_v40")})
-    launcher2 = Launcher(from_ckpt, make_test_run_dir(from_ckpt, tmp_path, name="new2"))
-    coord2 = make_coordinator(from_ckpt, launcher2._run_dir.checkpoints)
-    launcher2._import_snapshot_pool(coord2)
+    hub2 = make_hub(from_ckpt, make_test_run_dir(from_ckpt, tmp_path, name="new2"))
+    coord2 = make_coordinator(from_ckpt, hub2._run_dir.checkpoints)
+    hub2._import_snapshot_pool(coord2)
     assert ids(coord2.checkpoint_manager, "a") == []
 
 
@@ -225,11 +226,11 @@ def test_a_resume_from_a_snapshot_without_trainer_state_warns_that_the_optimizer
 
     def resume(source, name, **checkpoint):
         resumed = make_test_config("solo", training={"resume_from": str(source)}, checkpoint=checkpoint)
-        launcher = Launcher(resumed, make_test_run_dir(resumed, tmp_path, name=name))
+        hub = make_hub(resumed, make_test_run_dir(resumed, tmp_path, name=name))
         setup = setup_run(resumed, validate=False)
         caplog.clear()
-        with caplog.at_level(logging.WARNING, logger="colosseum.launcher"):
-            launcher._resolve_resume(setup.agent_configs, setup.role_specs)
+        with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
+            hub._resolve_resume(setup.agent_configs, setup.role_specs)
         return [r.getMessage() for r in caplog.records if "trainer_state.pt" in r.getMessage()]
 
     for source in (tmp_path / "old", tmp_path / "old" / "checkpoints" / "agent_0" / "ckpt_v10"):

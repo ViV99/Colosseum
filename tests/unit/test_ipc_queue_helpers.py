@@ -1,11 +1,11 @@
 """Queue helpers live in core/ipc.py; a second Ctrl+C during the release detaches feeders (SP2 T0.1)."""
+import importlib.util
 import multiprocessing as mp
 import queue
 
 import numpy as np
 import pytest
 
-import colosseum.launcher as launcher_module
 from colosseum.core import ipc
 from colosseum.core.ipc import QueueReader, queue_depths, release_command_queues
 
@@ -58,10 +58,15 @@ class _SyncJoiner:
 
 
 def test_helpers_moved_out_of_the_launcher():
+    """SP2 moved the helpers into core/ipc.py; SP5 (T2.5) removed the launcher: the hub's pulse queues (R6) use them
+    from there."""
+    from colosseum.hub import run_sinks
+
+    assert importlib.util.find_spec("colosseum.launcher") is None
     for name in ("_QueueReader", "_release_command_queues", "_queue_depths"):
-        assert not hasattr(launcher_module, name)
-    assert launcher_module.QueueReader is QueueReader
-    assert launcher_module.release_command_queues is release_command_queues
+        assert not hasattr(run_sinks, name)
+    assert run_sinks.QueueReader is QueueReader
+    assert run_sinks.release_command_queues is release_command_queues
 
 
 def test_interrupt_while_draining_detaches_every_queue_and_reraises():

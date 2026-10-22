@@ -1,5 +1,5 @@
-"""run_state.json (SP4 spec block 5, T7.1): written by the launcher at start, normal end and failure;
-readers decide liveness by the pid (and its start time on Linux), never by timestamps."""
+"""run_state.json (SP4 spec block 5, T7.1): written by the hub (SP5; the SP4 launcher) at start, normal end and
+failure; readers decide liveness by the pid (and its start time on Linux), never by timestamps."""
 from __future__ import annotations
 
 import json
@@ -75,15 +75,15 @@ def test_training_writes_running_then_finished_after_sigint(tmp_path):
 
 
 def test_a_launch_exception_marks_the_run_failed(tmp_path, monkeypatch, restore_root_logging, restore_global_rng):
-    import colosseum.launcher as launcher
+    import colosseum.hub.hub as hub
 
     def boom(self):
         raise RuntimeError("synthetic launch failure")
 
-    monkeypatch.setattr(launcher.Launcher, "launch", boom)
+    monkeypatch.setattr(hub.Hub, "launch", boom)
     config = write_test_config(tmp_path / "cfg.yaml", "turns", run={"dir": str(tmp_path / "runs"), "name": "r"})
     with pytest.raises(RuntimeError, match="synthetic"):
-        launcher.run_training(str(config))
+        hub.run_training(str(config))
     state = read_run_state(tmp_path / "runs" / "r")
     assert (state.status, state.exit_code, state.pid) == ("failed", 1, os.getpid())
 
@@ -92,15 +92,15 @@ def test_a_ctrl_c_during_the_start_marks_the_run_stopped(tmp_path, monkeypatch, 
                                                           restore_global_rng):
     """A KeyboardInterrupt inside ``launch`` before its signal handlers exist (the CLI exits 130): ``stopped`` /
     130, not ``failed`` / 1."""
-    import colosseum.launcher as launcher
+    import colosseum.hub.hub as hub
 
     def interrupted(self):
         raise KeyboardInterrupt
 
-    monkeypatch.setattr(launcher.Launcher, "launch", interrupted)
+    monkeypatch.setattr(hub.Hub, "launch", interrupted)
     config = write_test_config(tmp_path / "cfg.yaml", "turns", run={"dir": str(tmp_path / "runs"), "name": "r"})
     with pytest.raises(KeyboardInterrupt):
-        launcher.run_training(str(config))
+        hub.run_training(str(config))
     state = read_run_state(tmp_path / "runs" / "r")
     assert (state.status, state.exit_code) == ("stopped", 130)
     status, detail = effective_status(state)

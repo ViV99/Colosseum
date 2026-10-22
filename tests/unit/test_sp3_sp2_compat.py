@@ -20,7 +20,7 @@ from colosseum.coordinator.checkpoint_manager import load_checkpoint_dir
 from colosseum.core.config import load_config
 from colosseum.core.registry import env_spec
 from colosseum.core.roles import role_signature
-from colosseum.launcher import Launcher, setup_run
+from colosseum.hub.hub import setup_run
 from game_helpers import (
     SP2_CHECKPOINT,
     SP2_CHECKPOINT_ENV_STEPS,
@@ -30,6 +30,7 @@ from game_helpers import (
     SP2_TTT_TINY,
     make_test_run_dir,
 )
+from hub_kit import make_hub
 
 SP2_META_KEYS = {"agent_id", "checkpoint_id", "config_hash", "env_steps", "final", "networks",
                  "policy_version", "role_signature", "roles", "timestamp"}
@@ -86,9 +87,9 @@ def test_eval_plays_the_sp2_checkpoint_dir_and_leaves_it_untouched(tmp_path):
 
 def test_resume_from_the_sp2_checkpoint_dir_restores_version_trainer_state_and_env_steps(tmp_path):
     config = load_config(SP2_TTT_TINY, {"training.resume_from": str(SP2_CHECKPOINT)})
-    launcher = Launcher(config, make_test_run_dir(config, tmp_path, name="resumed"))
+    hub = make_hub(config, make_test_run_dir(config, tmp_path, name="resumed"))
     setup = setup_run(config, validate=False)
-    states = launcher._resolve_resume(setup.agent_configs, setup.role_specs)
+    states = hub._resolve_resume(setup.agent_configs, setup.role_specs)
     assert states["agent_0"]["policy_version"] == SP2_CHECKPOINT_VERSION
     assert states["agent_0"]["trainer_state"] is not None
-    assert launcher.env_steps_done == SP2_CHECKPOINT_ENV_STEPS
+    assert hub.env_steps_done == SP2_CHECKPOINT_ENV_STEPS

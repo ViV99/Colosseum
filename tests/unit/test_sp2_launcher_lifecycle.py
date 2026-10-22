@@ -1,27 +1,30 @@
-"""SP2 launcher lifecycle in-process (SP1 guarantees, T7.1): validation once, partial-start teardown,
-exit codes from child exits, drains that never block on a dead producer, CLI config errors."""
+"""SP2 launcher lifecycle in-process (SP1 guarantees, T7.1), on SP5's hub (T2.5 b; the hub is the evolved
+launcher, R5): validation once, partial-start teardown, exit codes from child exits, CLI config errors, metrics
+teardown. The hub's children are the local node and the SP4 pulse (R6); processes are faked through the hub's spawn
+context (``Hub._mp``)."""
 from __future__ import annotations
 
 import logging
 import multiprocessing as mp
 import os
 import signal
-import struct
 import sys
 import threading
 import time
+from types import SimpleNamespace
 
 import pytest
 import yaml
 from click.testing import CliRunner
 from fake_wandb import FakeWandb
 
-import colosseum.launcher as launcher_module
+import colosseum.hub.hub as hub_module
+from colosseum.arena.matchlog import Commit
 from colosseum.cli import main
 from colosseum.core.config import ColosseumConfig
 from colosseum.core.types import MatchResult
-from colosseum.launcher import Launcher
-from game_helpers import make_coordinator, make_test_config, make_test_run_dir
+from game_helpers import make_test_config, make_test_run_dir, scripted_agent
+from hub_kit import make_hub
 
 TTT = "examples.tic_tac_toe"
 
@@ -39,35 +42,61 @@ class _Stop(Exception):
     pass
 
 
-def fake_process_class(started: list, fail_on_worker: bool = True):
-    """mp.Process stand-in: learners 'run' until stop_event is set; starting a worker raises."""
+class FakeContext:
+    """The hub's spawn context with ``Process`` faked: a child 'runs' until the hub's stop event (the first ``Event``
+    this context made) is set; starting a child named in ``fail`` raises ``_Stop``. Events and queues are real."""
 
-    class FakeProcess:
-        def __init__(self, target, kwargs, name=None, daemon=None):
-            self.target, self.kwargs, self.name = target, kwargs, name
-            self.joined = self.terminated = False
+    def __init__(self, started: list, fail: tuple[str, ...] = ("node",)) -> None:
+        self._real = mp.get_context("spawn")
+        self.started, self.fail = started, set(fail)
+        self.stop_event = None
 
-        def start(self):
-            if fail_on_worker and self.target is launcher_module._worker_target:
-                raise _Stop
-            started.append(self)
+    def Event(self):
+        event = self._real.Event()
+        if self.stop_event is None:
+            self.stop_event = event
+        return event
 
-        def is_alive(self):
-            return not self.kwargs["stop_event"].is_set() and not self.terminated
+    def Queue(self, *args, **kwargs):
+        return self._real.Queue(*args, **kwargs)
 
-        @property
-        def exitcode(self):
-            return None if self.is_alive() else 0
+    def Process(self, target, kwargs, name=None, daemon=None):
+        return FakeProcess(self, target, kwargs, name)
 
-        def join(self, timeout=None):
-            self.joined = True
 
-        def terminate(self):
-            self.terminated = True
+class FakeProcess:
+    def __init__(self, ctx: FakeContext, target, kwargs, name):
+        self.ctx, self.target, self.kwargs, self.name = ctx, target, kwargs, name
+        self.joined = self.terminated = False
 
-        kill = terminate
+    def start(self):
+        if self.name in self.ctx.fail:
+            raise _Stop
+        self.ctx.started.append(self)
 
-    return FakeProcess
+    def is_alive(self):
+        return not self.ctx.stop_event.is_set() and not self.terminated
+
+    @property
+    def exitcode(self):
+        return None if self.is_alive() else 0
+
+    def join(self, timeout=None):
+        self.joined = True
+
+    def terminate(self):
+        self.terminated = True
+
+    kill = terminate
+
+
+def fake_hub(config, run, started: list, fail: tuple[str, ...] = ("node",)):
+    """A ``train`` hub whose children are ``FakeProcess``es."""
+    hub = make_hub(config, run)
+    ctx = FakeContext(started, fail)
+    ctx.stop_event = hub._stop_event
+    hub._mp = ctx
+    return hub
 
 
 # ---------------------------------------------------------------------------
@@ -92,20 +121,20 @@ def count_validations(monkeypatch):
 
 def test_run_training_validates_agent_configs_once(tmp_path, monkeypatch, count_validations,
                                                    restore_root_logging, restore_global_rng):
-    monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *args, **kwargs: None)
-    monkeypatch.setattr(launcher_module.mp, "Process", fake_process_class([]))
+    ctx = FakeContext([])
+    monkeypatch.setattr(hub_module, "mp", SimpleNamespace(set_start_method=lambda *args, **kwargs: None,
+                                                          get_context=lambda *args, **kwargs: ctx))
     path = tmp_path / "cfg.yaml"
     path.write_text(yaml.safe_dump(ttt_data()))
     with pytest.raises(_Stop):
-        launcher_module.run_training(str(path), {"run.dir": str(tmp_path / "runs"), "run.name": "once"})
+        hub_module.run_training(str(path), {"run.dir": str(tmp_path / "runs"), "run.name": "once"})
     assert len(count_validations) == 1
 
 
-def test_direct_launch_still_validates(tmp_path, monkeypatch, count_validations):
-    monkeypatch.setattr(launcher_module.mp, "Process", fake_process_class([]))
+def test_direct_launch_still_validates(tmp_path, count_validations):
     cfg = ColosseumConfig.model_validate(ttt_data())
     with pytest.raises(_Stop):
-        Launcher(cfg, make_test_run_dir(cfg, tmp_path)).launch()
+        fake_hub(cfg, make_test_run_dir(cfg, tmp_path), []).launch()
     assert len(count_validations) == 1
 
 
@@ -115,143 +144,88 @@ def test_direct_launch_still_validates(tmp_path, monkeypatch, count_validations)
 
 
 def test_failed_start_stops_started_children_and_closes_metrics(tmp_path, monkeypatch, caplog):
+    """The local node starts, the pulse (R6) fails to start: the node is stopped and the sinks are closed."""
     fake_wandb = FakeWandb()
     monkeypatch.setitem(sys.modules, "wandb", fake_wandb)
     started: list = []
-    monkeypatch.setattr(launcher_module.mp, "Process", fake_process_class(started))
     data = ttt_data()
-    data["agents"] = {"alpha": None, "beta": None}
+    data["agents"] = {"alpha": None, "beta": None, "rnd": scripted_agent()}
     data["metrics"] = {"use_wandb": True}
+    data["evaluation"] = {"enabled": True}
     cfg = ColosseumConfig.model_validate(data)
     run = make_test_run_dir(cfg, tmp_path)
-    launcher = Launcher(cfg, run)
+    hub = fake_hub(cfg, run, started, fail=("pulse",))
     sigint_before, sigterm_before = signal.getsignal(signal.SIGINT), signal.getsignal(signal.SIGTERM)
 
-    with caplog.at_level(logging.ERROR, logger="colosseum.launcher"), pytest.raises(_Stop):
-        launcher.launch()
+    with caplog.at_level(logging.ERROR, logger="colosseum.hub.hub"), pytest.raises(_Stop):
+        hub.launch()
 
-    assert [p.name for p in started] == ["learner-alpha", "learner-beta"]
-    assert launcher._stop_event.is_set()  # the started learners were told to stop ...
+    assert [p.name for p in started] == ["node"]
+    assert hub._stop_event.is_set()  # the started node was told to stop ...
     assert not any(p.is_alive() for p in started)
-    assert launcher._supervisor.names == ["learner-alpha", "learner-beta"]  # ... and were supervised
-    assert "Starting the child processes failed; stopping the 2 already started" in caplog.text
-    assert launcher._metrics_writer.closed  # the hub was closed with its file
+    assert hub._supervisor.names == ["node"]  # ... and was supervised
+    assert "Starting the local node or the pulse failed; stopping the 1 already started" in caplog.text
+    assert hub._metrics_writer.closed  # the metrics hub was closed with its file
     assert '"kind": "system"' in run.metrics_path.read_text()
     assert fake_wandb.finished
     assert signal.getsignal(signal.SIGINT) == sigint_before
     assert signal.getsignal(signal.SIGTERM) == sigterm_before
 
 
-def test_stop_requested_by_the_caller_is_a_clean_exit(tmp_path, monkeypatch, caplog):
-    """scripts/bench_throughput.py stops a run by setting stop_event: children exiting then
-    is not a failure."""
-    monkeypatch.setattr(launcher_module.mp, "Process", fake_process_class([], fail_on_worker=False))
+def test_stop_requested_by_the_caller_is_a_clean_exit(tmp_path, caplog):
+    """scripts/bench_throughput.py stops a run with ``request_stop``: children exiting then is not a failure."""
     cfg = ColosseumConfig.model_validate(ttt_data())
     cfg.training.total_timesteps = 10**9
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
-    timer = threading.Timer(0.5, launcher._stop_event.set)
+    hub = fake_hub(cfg, make_test_run_dir(cfg, tmp_path), [], fail=())
+    timer = threading.Timer(0.5, hub.request_stop)
     timer.start()
     try:
-        with caplog.at_level(logging.INFO, logger="colosseum.launcher"):
-            assert launcher.launch() == 0
+        with caplog.at_level(logging.INFO, logger="colosseum.hub.hub"):
+            assert hub.launch() == 0
     finally:
         timer.cancel()
     assert "Stop requested" in caplog.text
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
 
 
-def test_signal_racing_with_the_stop_check_still_gives_its_exit_code(tmp_path, monkeypatch):
-    """stop_event and received_signal set together (a signal right after the loop's signal
-    check): the run reports 128 + signum, not a clean caller stop."""
-    monkeypatch.setattr(launcher_module.mp, "Process", fake_process_class([], fail_on_worker=False))
+def test_signal_racing_with_the_stop_check_still_gives_its_exit_code(tmp_path):
+    """A stop request and a received signal together (a signal right after the loop's signal check): the run
+    reports 128 + signum, not a clean caller stop."""
     cfg = ColosseumConfig.model_validate(ttt_data())
     cfg.training.total_timesteps = 10**9
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
+    hub = fake_hub(cfg, make_test_run_dir(cfg, tmp_path), [], fail=())
 
     def signal_arrives():
-        launcher._stop_event.set()
-        launcher._supervisor.received_signal = signal.SIGTERM
+        hub.request_stop()
+        hub._supervisor.received_signal = signal.SIGTERM
 
     timer = threading.Timer(0.5, signal_arrives)
     timer.start()
     try:
-        assert launcher.launch() == 128 + signal.SIGTERM
+        assert hub.launch() == 128 + signal.SIGTERM
     finally:
         timer.cancel()
 
 
-def test_failed_start_error_is_not_hidden_by_a_failing_teardown(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr(launcher_module.mp, "Process", fake_process_class([]))
+def test_failed_start_error_is_not_hidden_by_a_failing_teardown(tmp_path, caplog):
+    """The shutdown's drain (uploads of final snapshots, results) fails: the start's error stays the one raised."""
     cfg = ColosseumConfig.model_validate(ttt_data())
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
+    hub = fake_hub(cfg, make_test_run_dir(cfg, tmp_path), [])
+    real_drain = hub._drain_inbox
+    failed: list[bool] = []
 
-    def failing_drain():
-        raise OSError("disk full")
+    def failing_drain(timeout):
+        if hub._shutting_down and not failed:
+            failed.append(True)
+            raise OSError("disk full")
+        return real_drain(timeout)
 
-    monkeypatch.setattr(launcher, "_drain_all_checkpoints", failing_drain)
-    with caplog.at_level(logging.ERROR, logger="colosseum.launcher"), pytest.raises(_Stop) as excinfo:
-        launcher.launch()
+    hub._drain_inbox = failing_drain
+    with caplog.at_level(logging.ERROR, logger="colosseum.hub.hub"), pytest.raises(_Stop) as excinfo:
+        hub.launch()
     assert "Shutdown afterwards also failed: OSError('disk full')" in getattr(excinfo.value, "__notes__", [])
     assert "Shutdown after _Stop failed too" in caplog.text and "disk full" in caplog.text
-    assert launcher._metrics_writer.closed
-
-
-def test_launch_closes_and_releases_its_queues(tmp_path, monkeypatch):
-    """After launch() every queue it created is closed and released, not left to the cyclic GC
-    (gh-109629): also the command queues, which the main process writes."""
-    created: list = []
-    real_queue = mp.Queue
-
-    def recording_queue(*args, **kwargs):
-        q = real_queue(*args, **kwargs)
-        created.append(q)
-        return q
-
-    monkeypatch.setattr(launcher_module.mp, "Queue", recording_queue)
-    monkeypatch.setattr(launcher_module.mp, "Process", fake_process_class([]))
-    data = ttt_data()
-    data["rollout"]["num_workers"] = 2
-    cfg = ColosseumConfig.model_validate(data)
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
-    with pytest.raises(_Stop):
-        launcher.launch()
-    # 1 agent x (trajectory + checkpoint + 2 weight queues) + metrics + results + 2 command queues
-    assert len(created) == 8
-    assert all(q._closed for q in created)
-    assert launcher._all_queues == [] and launcher._command_queues == []
-    assert launcher._trajectory_queues == {} and launcher._checkpoint_queues == {}
-    assert launcher._results_queue is None and launcher._metrics_queue is None
-
-
-def _live_feeder_threads() -> set[threading.Thread]:
-    return {t for t in threading.enumerate() if t.name == "QueueFeederThread" and t.is_alive()}
-
-
-def test_launch_leaves_no_queue_feeder_thread_running(tmp_path, monkeypatch):
-    """A worker command still unread when the run ends (the workers stopped first) must not keep
-    the main process's feeder thread alive after launch() returns: at interpreter exit that
-    daemon thread would free the queue's semaphores ("leaked semaphore objects" warning)."""
-    feeders_before = _live_feeder_threads()
-    started: list = []
-    monkeypatch.setattr(launcher_module.mp, "Process", fake_process_class(started, fail_on_worker=False))
-    data = ttt_data(total_timesteps=1000)
-    data["rollout"]["num_workers"] = 2
-    data["rollout"]["match_refresh_interval_sec"] = 0.01
-    cfg = ColosseumConfig.model_validate(data)
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
-    refresh = launcher._refresh_worker_matches
-
-    def refresh_then_reach_budget(*args):
-        refresh(*args)  # one command per worker, never read: the fake workers do not run
-        launcher._env_step_counter.add(cfg.training.total_timesteps)
-
-    launcher._refresh_worker_matches = refresh_then_reach_budget
-    assert launcher.launch() == 0
-    command_queues = [p.kwargs["command_queue"] for p in started if p.target is launcher_module._worker_target]
-    assert len(command_queues) == 2
-    assert all(q._thread is not None for q in command_queues)  # the main process fed each of them
-    assert not _live_feeder_threads() - feeders_before
-    assert all(q._closed for q in command_queues)
+    assert hub._metrics_writer.closed
 
 
 # ---------------------------------------------------------------------------
@@ -271,162 +245,57 @@ def _ignore_stop(ready) -> None:
     time.sleep(120)
 
 
-def _launcher_with(tmp_path, children: dict) -> Launcher:
-    """A launcher supervising real children; returns once every child reported it is ready."""
+def _hub_with(tmp_path, children: dict):
+    """A hub supervising real children; returns once every child reported it is ready."""
     cfg = make_test_config("turns")
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
+    hub = make_hub(cfg, make_test_run_dir(cfg, tmp_path))
     ctx = mp.get_context("spawn")
     ready_events = []
     for name, (target, args) in children.items():
         ready = ctx.Event()
         ready_events.append(ready)
-        args = (*(launcher._stop_event if a == "stop" else a for a in args), ready)
+        args = (*(hub._stop_event if a == "stop" else a for a in args), ready)
         proc = ctx.Process(target=target, args=args, name=name, daemon=True)
         proc.start()
-        launcher._supervisor.add(name, proc)
+        hub._supervisor.add(name, proc)
     assert all(ready.wait(60) for ready in ready_events), "children did not start"
-    return launcher
+    return hub
 
 
 def test_nonzero_child_exit_fails_a_run_that_reached_its_budget(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr(launcher_module, "SHUTDOWN_GRACE_SEC", 1.5)
-    launcher = _launcher_with(tmp_path, {
+    monkeypatch.setattr(hub_module, "LOCAL_SHUTDOWN_GRACE_SEC", 1.5)
+    hub = _hub_with(tmp_path, {
         "learner-a": (_exit_after_stop, ("stop", 0)),
         "worker-0": (_exit_after_stop, ("stop", 3)),
         "worker-1": (_ignore_stop, ()),
     })
     start = time.monotonic()
-    with caplog.at_level(logging.INFO, logger="colosseum.launcher"):
-        killed = launcher._shutdown()
-        code = launcher._exit_code_after_shutdown(0, killed)
-    # The main process waits SHUTDOWN_GRACE_SEC (patched here), then terminates and kills.
+    with caplog.at_level(logging.INFO, logger="colosseum.hub.hub"):
+        killed = hub._shutdown()
+        code = hub._exit_code_after_shutdown(0, killed)
+    # The hub waits its shutdown grace (patched here), then terminates and kills.
     assert time.monotonic() - start < 1.5 + 5.0
     assert killed == ["worker-1"]
     assert code == 1
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert errors == [f"worker-0 died (exit 3), see {launcher._run_dir.logs / 'worker-0.log'}"]
+    assert errors == [f"worker-0 died (exit 3), see {hub._run_dir.logs / 'worker-0.log'}"]
     assert "worker-1" in caplog.text and "did not stop within" in caplog.text  # killed: a warning only
 
 
 def test_signal_exit_code_stays_when_a_child_exits_nonzero(tmp_path, caplog):
-    launcher = _launcher_with(tmp_path, {"worker-0": (_exit_after_stop, ("stop", 2))})
-    killed = launcher._shutdown()
-    with caplog.at_level(logging.WARNING, logger="colosseum.launcher"):
-        assert launcher._exit_code_after_shutdown(130, killed) == 130
+    hub = _hub_with(tmp_path, {"worker-0": (_exit_after_stop, ("stop", 2))})
+    killed = hub._shutdown()
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
+        assert hub._exit_code_after_shutdown(130, killed) == 130
     assert not [r for r in caplog.records if r.levelno >= logging.ERROR]
     assert "worker-0 died (exit 2)" in caplog.text
 
 
 def test_clean_children_keep_exit_code_zero(tmp_path, caplog):
-    launcher = _launcher_with(tmp_path, {"learner-a": (_exit_after_stop, ("stop", 0))})
-    with caplog.at_level(logging.INFO, logger="colosseum.launcher"):
-        assert launcher._exit_code_after_shutdown(0, launcher._shutdown()) == 0
+    hub = _hub_with(tmp_path, {"learner-a": (_exit_after_stop, ("stop", 0))})
+    with caplog.at_level(logging.INFO, logger="colosseum.hub.hub"):
+        assert hub._exit_code_after_shutdown(0, hub._shutdown()) == 0
     assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
-
-
-# ---------------------------------------------------------------------------
-# A learner killed mid-message never blocks the main process (carried T5.3 item)
-# ---------------------------------------------------------------------------
-
-
-def _die_mid_message(q) -> None:
-    """Send one complete item, then write a message header announcing 1 MiB plus a few bytes
-    into the queue's pipe and die (as a learner OOM-killed while its feeder thread flushes
-    the final checkpoint)."""
-    from multiprocessing.reduction import ForkingPickler
-
-    q._sem.acquire()  # as put() does, then the feeder's write
-    q._writer.send_bytes(ForkingPickler.dumps({"agent_id": "agent_0", "policy_version": 1}))
-    os.write(q._writer.fileno(), struct.pack("!i", 1 << 20) + b"x" * 1000)
-    os.kill(os.getpid(), signal.SIGKILL)
-
-
-def test_drain_skips_checkpoint_queue_of_a_learner_killed_mid_message(tmp_path, monkeypatch, caplog):
-    monkeypatch.setattr(launcher_module, "SHUTDOWN_GRACE_SEC", 1.0)
-    cfg = make_test_config("turns")
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
-    launcher._coordinator = make_coordinator(cfg, tmp_path / "ckpt")
-    ctx = mp.get_context("spawn")
-    cq = ctx.Queue()
-    launcher._checkpoint_queues = {"agent_0": cq}
-    launcher._all_queues = [cq]
-    saved: list[dict] = []
-    launcher._save_checkpoint = saved.append
-    proc = ctx.Process(target=_die_mid_message, args=(cq,), daemon=True)
-    proc.start()
-    launcher._supervisor.add("learner-agent_0", proc)
-    proc.join(60)
-    assert proc.exitcode == -signal.SIGKILL
-
-    done = threading.Event()
-    repoll_seconds = []
-
-    def drain_and_shutdown():
-        launcher._drain_all_checkpoints()  # starts the read, which gets stuck
-        t0 = time.monotonic()
-        launcher._drain_all_checkpoints()  # an in-progress read is only checked, not waited for
-        repoll_seconds.append(time.monotonic() - t0)
-        launcher._shutdown()
-        done.set()
-
-    start = time.monotonic()
-    with caplog.at_level(logging.ERROR):
-        threading.Thread(target=drain_and_shutdown, daemon=True).start()
-        assert done.wait(20), "the main process blocked on a partial checkpoint payload"
-    assert time.monotonic() - start < 1.0 + 3.0  # given up at the (patched) grace deadline
-    assert repoll_seconds and repoll_seconds[0] < 0.05
-    assert ("An incomplete item on the checkpoint-agent_0 queue was never completed "
-            "(learner-agent_0 died while sending)") in caplog.text
-    assert saved == [{"agent_id": "agent_0", "policy_version": 1}]  # the complete item is kept
-    caplog.clear()
-    with caplog.at_level(logging.DEBUG):
-        launcher._release_queues()
-    # Every producer is gone, so closing this process's write end ends the stuck read (EOF): the
-    # reader thread finishes and the queue is closed and released now, not at interpreter exit.
-    assert not [t for t in threading.enumerate() if t.name == "drain-checkpoint-agent_0"]
-    assert cq._closed
-    assert launcher._all_queues == [] and launcher._readers == {}
-    assert not [r for r in caplog.records if r.levelno >= logging.WARNING], caplog.text
-
-
-def _slow_to_unpickle() -> dict:
-    time.sleep(4.0)  # far longer than the old fixed 1 s give-up
-    return {"slow": True}
-
-
-class SlowToUnpickle:
-    def __reduce__(self):
-        return (_slow_to_unpickle, ())
-
-
-def _send_slow_payload_and_exit(q) -> None:
-    q.put({"agent_id": "agent_0", "policy_version": 2, "payload": SlowToUnpickle()})
-    q.close()
-    q.join_thread()  # flushed into the pipe; exit 0 before the main process finished reading
-
-
-def test_slow_read_from_an_exited_learner_is_kept_until_the_deadline(tmp_path, monkeypatch, caplog):
-    """A complete final payload still being read/unpickled when its learner has exited is
-    not dropped: the shutdown waits for it until its deadline."""
-    monkeypatch.setattr(launcher_module, "SHUTDOWN_GRACE_SEC", 6.0)
-    cfg = make_test_config("turns")
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
-    ctx = mp.get_context("spawn")
-    cq = ctx.Queue()
-    launcher._checkpoint_queues = {"agent_0": cq}
-    launcher._all_queues = [cq]
-    saved: list[dict] = []
-    launcher._save_checkpoint = saved.append
-    proc = ctx.Process(target=_send_slow_payload_and_exit, args=(cq,), daemon=True)
-    proc.start()
-    launcher._supervisor.add("learner-agent_0", proc)
-    proc.join(60)
-    assert proc.exitcode == 0
-    with caplog.at_level(logging.ERROR):
-        assert launcher._drain(cq, "checkpoint-agent_0", lambda: ["learner-agent_0"]) == []  # read in progress
-        launcher._shutdown()
-    assert saved == [{"agent_id": "agent_0", "policy_version": 2, "payload": {"slow": True}}]
-    assert "never completed" not in caplog.text
 
 
 # ---------------------------------------------------------------------------
@@ -452,7 +321,7 @@ def bad_key_config(tmp_path):
     ["eval", "-a", "x:{out}", "-a", "y:{out}"],
 ], ids=lambda a: a[0])
 def test_cli_config_error_is_one_line_and_exit_1(args, bad_key_config, tmp_path, monkeypatch, restore_root_logging):
-    monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *a, **k: None)
+    monkeypatch.setattr(hub_module.mp, "set_start_method", lambda *a, **k: None)
     data = tmp_path / "data.pt"
     data.write_bytes(b"")
     args = [a.format(data=data, out=tmp_path / "out.pt") for a in args]
@@ -541,19 +410,33 @@ def test_cli_exits_with_the_run_exit_code(args, target, tmp_path, monkeypatch):
 # ---------------------------------------------------------------------------
 
 
-def test_launcher_closes_metrics_file_when_final_drain_fails(tmp_path):
-    import queue
+class _CommittedWriter:
+    """A journal writer stand-in with one committed node batch to account (``take_commits``, R8)."""
 
+    def __init__(self, results: list) -> None:
+        self._commits = [Commit(("node", "session", 1), list(results), 0, len(results))]
+        self.dead = False
+        self.stats = SimpleNamespace(as_dict=lambda: {})
+
+    def take_commits(self) -> list:
+        out, self._commits = self._commits, []
+        return out
+
+    def stop(self, timeout):
+        return SimpleNamespace(written=1, duplicates=0, dropped=0)
+
+
+def test_the_hub_closes_metrics_file_when_final_drain_fails(tmp_path):
     from colosseum.metrics.hub import MetricsHub
     from colosseum.metrics.jsonl import MetricsWriter
 
     config = make_test_config("turns")
     run = make_test_run_dir(config, tmp_path)
-    launcher = Launcher(config, run)
+    hub = make_hub(config, run)
     writer = MetricsWriter(run.metrics_path)
-    launcher._metrics_writer = writer
-    launcher._hub = MetricsHub(writer=writer, ratings_path=run.ratings_path, agent_ids=["agent_0"],
-                               total_timesteps=10, log_interval=1, console_interval_sec=10.0)
+    hub._metrics_writer = writer
+    hub._hub = MetricsHub(writer=writer, ratings_path=run.ratings_path, agent_ids=["agent_0"],
+                          total_timesteps=10, log_interval=1, console_interval_sec=10.0)
 
     class FailingCoordinator:
         def report_match_result(self, result):
@@ -562,18 +445,15 @@ def test_launcher_closes_metrics_file_when_final_drain_fails(tmp_path):
         def ratings_snapshot(self):
             return {}
 
-    results = queue.Queue()
-    results.put([MatchResult("w0_e0_ep0", "2p", "wdl", [], [], 1)])   # a worker's batch; stamped with env_steps
-    launcher._coordinator = FailingCoordinator()
-    launcher._results_queue, launcher._metrics_queue = results, queue.Queue()
+    # a node's batch, committed by the journal writer: accounted in the final drain (R8)
+    hub._match_log_writer = _CommittedWriter([MatchResult("w0_e0_ep0", "2p", "wdl", [], [], 1)])
+    hub._coordinator = FailingCoordinator()
     with pytest.raises(RuntimeError, match="boom"):
-        launcher._finish_metrics()
+        hub._finish_metrics()
     assert writer.closed
 
 
-def test_launcher_finishes_wandb_when_final_metrics_fail(monkeypatch, tmp_path):
-    import queue
-
+def test_the_hub_finishes_wandb_when_final_metrics_fail(monkeypatch, tmp_path):
     from colosseum.core.config import MetricsConfig
     from colosseum.metrics.hub import MetricsHub
     from colosseum.metrics.jsonl import MetricsWriter
@@ -583,19 +463,18 @@ def test_launcher_finishes_wandb_when_final_metrics_fail(monkeypatch, tmp_path):
     monkeypatch.setitem(sys.modules, "wandb", fake)
     config = make_test_config("turns")
     run = make_test_run_dir(config, tmp_path)
-    launcher = Launcher(config, run)
-    launcher._wandb = WandBLogger(MetricsConfig(use_wandb=True))
-    launcher._metrics_writer = MetricsWriter(run.metrics_path)
-    launcher._hub = MetricsHub(writer=launcher._metrics_writer, ratings_path=run.ratings_path,
-                               agent_ids=["agent_0"], total_timesteps=10, log_interval=1,
-                               console_interval_sec=10.0, wandb_logger=launcher._wandb)
+    hub = make_hub(config, run)
+    hub._wandb = WandBLogger(MetricsConfig(use_wandb=True))
+    hub._metrics_writer = MetricsWriter(run.metrics_path)
+    hub._hub = MetricsHub(writer=hub._metrics_writer, ratings_path=run.ratings_path,
+                          agent_ids=["agent_0"], total_timesteps=10, log_interval=1,
+                          console_interval_sec=10.0, wandb_logger=hub._wandb)
 
     class FailingCoordinator:
         def ratings_snapshot(self):
             raise RuntimeError("boom")
 
-    launcher._coordinator = FailingCoordinator()
-    launcher._results_queue, launcher._metrics_queue = queue.Queue(), queue.Queue()
+    hub._coordinator = FailingCoordinator()
     with pytest.raises(RuntimeError, match="boom"):
-        launcher._finish_metrics()
-    assert launcher._metrics_writer.closed and fake.finished
+        hub._finish_metrics()
+    assert hub._metrics_writer.closed and fake.finished

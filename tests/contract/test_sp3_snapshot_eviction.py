@@ -1,17 +1,19 @@
-"""Snapshot eviction (SP3 T2.2, spec blocks 3-4): coordinator -> launcher -> worker, unload when unused."""
+"""Snapshot eviction (SP3 T2.2, spec blocks 3-4): coordinator -> hub -> every node (SP5 T2.5 b: ``Announce.evictions``;
+the node's ``WorkerEvict`` is ``test_sp5_node_agent.py``'s) -> worker, unload when unused."""
 from __future__ import annotations
 
 import logging
-import multiprocessing as mp
 import queue
 
 import numpy as np
 
 from colosseum.core.types import SeatAssignment, WorkerCommand, state_dict_to_numpy
-from colosseum.launcher import Launcher
+from colosseum.hub.server import SessionClosed
+from colosseum.net.messages import lineup_from_proto
 from colosseum.worker.rollout_worker import _drain_commands
 from game_harness import GameFactory, lineup, make_loop, run_steps
 from game_helpers import Tick, TickGame, make_coordinator, make_test_config, make_test_model
+from hub_kit import accept_version, lineup_hub, open_node, request_cells
 
 ROLE2 = TickGame([Tick(acting={0})], 2).spec.roles["player"]
 
@@ -96,24 +98,23 @@ def test_the_worker_unloads_an_evicted_snapshot_once_no_lineup_uses_it(caplog):
     assert ("w0_e0_ep4", ["latest", "latest"]) in by_episode
 
 
-def test_the_launcher_sends_evictions_to_every_worker_and_retries_a_full_queue(tmp_path):
+def test_the_hub_sends_evictions_to_every_node_and_keeps_them_for_one_whose_stream_is_down(tmp_path):
     cfg = make_test_config("turns", checkpoint={"keep_last": 1, "keep_every": 0},
                            matchmaking={"mode": "self_play", "latest_prob": 0.0})
-    coord = make_coordinator(cfg, tmp_path / "ckpt")
-    coord.checkpoint_manager.save("agent_0", 10, sd(10))
-    coord.checkpoint_manager.save("agent_0", 20, sd(20))           # evicts ckpt_v10
-    launcher = Launcher.__new__(Launcher)                          # _refresh_worker_matches needs only _config
-    launcher._config = cfg
-    ctx = mp.get_context("spawn")
-    q0, q1 = ctx.Queue(maxsize=1), ctx.Queue(maxsize=1)
-    q1.put("occupied")
-    sent = [{"agent_0": {"ckpt_v10"}}, {"agent_0": {"ckpt_v10"}}]
-    pending: list[dict[str, set[str]]] = [{}, {}]
-    launcher._refresh_worker_matches(coord, ["agent_0"], [q0, q1], sent, pending)
-    first = q0.get(timeout=5)
-    assert first.evict == {"agent_0": ["ckpt_v10"]} and sent[0]["agent_0"] == {"ckpt_v20"}
-    assert all(s.network_id != "ckpt_v10" for lu in first.lineups for s in lu.seats)
-    assert q1.get(timeout=5) == "occupied" and pending[1] == {"agent_0": {"ckpt_v10"}}   # kept for the retry
-    launcher._refresh_worker_matches(coord, ["agent_0"], [q0, q1], sent, pending)
-    assert q1.get(timeout=5).evict == {"agent_0": ["ckpt_v10"]} and pending[1] == {"agent_0": set()}
-    assert q0.get(timeout=5).evict == {}
+    hub = lineup_hub(cfg, tmp_path)
+    up = open_node(hub, name="up")
+    down = open_node(hub, name="down", cpu_learners=0)
+    hub._on_session_closed(SessionClosed(down.node_id, down.session_id, "stream cut", down))
+    accept_version(hub, "agent_0")
+    hub._coordinator.checkpoint_manager.save("agent_0", 10, sd(10))
+    hub._coordinator.checkpoint_manager.save("agent_0", 20, sd(20))           # evicts ckpt_v10
+    hub._broadcast_announce()
+    first = up.of("announce")[-1]
+    assert [(e.agent_id, e.checkpoint_id) for e in first.evictions] == [("agent_0", "ckpt_v10")]
+    grants = request_cells(hub, up, [(w, e, 0, 0) for w in range(2) for e in range(cfg.rollout.envs_per_worker)])
+    assert grants and all(s.network_id != "ckpt_v10" for g in grants for s in lineup_from_proto(g.lineup).seats)
+    assert hub._pending_evictions[down.node_id] == [("agent_0", "ckpt_v10")]    # kept for the node's return
+    back = open_node(hub, node_id=down.node_id, session_id=down.session_id, cpu_learners=0)
+    assert [(e.agent_id, e.checkpoint_id) for e in back.of("welcome")[0].evictions] == [("agent_0", "ckpt_v10")]
+    hub._broadcast_announce()
+    assert not up.of("announce")[-1].evictions and not back.of("announce")[-1].evictions   # handed out once

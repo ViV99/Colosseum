@@ -1,10 +1,11 @@
 """Batching keeps the results queue's item count far below its cap (SP4 FX1): a burst of results five times the
-cap is put without a drop and in order, while per-item puts of the same burst against the same cap overflow it.
+cap is put without a drop and in order, while per-item puts of the same burst against the same cap overflow it; and the
+hub (SP5 T2.5 b) takes a node's burst of 2 000 results in 8 batches without a drop.
 
-Two spawned producers put the same 5 000 results at once, each on its own queue of the launcher's size
-(``_RESULTS_QUEUE_SIZE`` = 1 000 items), and both queues are read by the launcher's ``QueueReader`` every 0.2 s, as
-the monitor loop does. The control puts one result per item and must drop; the other goes through
-``ResultBatcher`` (about 20 items) and must lose nothing.
+Two spawned producers put the same 5 000 results at once, each on its own queue of the SP4 launcher's size
+(``_RESULTS_QUEUE_SIZE`` = 1 000 items; the queue worker ``rollout_worker_process`` lives until T7.2), and both queues
+are read by a ``QueueReader`` every 0.2 s, as the SP4 monitor loop did. The control puts one result per item and must
+drop; the other goes through ``ResultBatcher`` (about 20 items) and must lose nothing.
 
 What this does not show: the mechanism of the drops before FX1. The control drops because an instant burst of
 5 000 items meets a 1 000-item cap, whatever the reader does (the old cap was 10 000, against which this burst does
@@ -19,9 +20,11 @@ import time
 
 from colosseum.core.ipc import QueueReader
 from colosseum.core.types import MatchResult, SeatResult, TeamResult
-from colosseum.launcher import _RESULTS_QUEUE_SIZE
 from colosseum.worker.rollout_worker import ResultBatcher
+from game_helpers import make_test_config, scripted_agent
+from hub_kit import hub_results, lineup_hub, open_node, result_event
 
+_RESULTS_QUEUE_SIZE = 1_000   # the SP4 launcher's results queue (batches of up to RESULTS_BATCH_MAX results)
 N = 5000                 # five times the queue's 1000 slots
 PASS_SEC = 0.2           # the monitor loop's sleep between passes
 MODES = ("per_item", "batched")
@@ -99,3 +102,28 @@ def test_a_burst_above_the_queue_cap_is_dropped_per_item_but_not_in_batches():
     assert dropped["batched"] == 0 and all(isinstance(batch, list) for batch in batches)
     assert [r.uid for batch in batches for r in batch] == [f"RUN/train/w0_e0_ep{i}" for i in range(N)]
     assert len(batches) < _RESULTS_QUEUE_SIZE / 10
+
+
+def test_the_hub_takes_a_burst_of_node_batches_without_a_drop(tmp_path):
+    """2 000 results in 8 node batches at once: every one is journaled, accounted once and its batch acked (R8); no
+    drop is counted anywhere."""
+    hub = lineup_hub(make_test_config("turns", agents={"a": {}, "random": scripted_agent()}), tmp_path, sinks=True)
+    try:
+        node = open_node(hub)
+        accounted: list[str] = []
+        original = hub._coordinator.report_match_result
+        hub._coordinator.report_match_result = lambda r: (accounted.append(r.uid), original(r))[1]
+        sent = hub_results(hub, 1, 2000)
+        for seq in range(1, 9):
+            hub._on_message(result_event(hub, sent[(seq - 1) * 250:seq * 250], seq=seq))
+        deadline = time.monotonic() + 30
+        while len(accounted) < len(sent) and time.monotonic() < deadline:
+            hub._drain_commits()
+            time.sleep(0.01)
+        assert accounted == [r.uid for r in sent]
+        assert sorted(node.acks()) == list(range(1, 9))
+        assert not [k for k in hub._book.totals() if k.startswith("dropped_match_results_by_reason.")]
+        stats = hub._match_log_writer.stats
+        assert (stats.written, stats.dropped, stats.duplicates) == (2000, 0, 0)
+    finally:
+        hub._finish_metrics()

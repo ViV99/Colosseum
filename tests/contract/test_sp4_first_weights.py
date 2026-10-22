@@ -2,7 +2,7 @@
 before that agent's first weights arrived from its learner. ``RolloutLoop(wait_for_first_weights=stop)`` waits for
 them before any env is reset (in short slices, stopping on the predicate, one INFO line after a few seconds); the
 default (None) keeps the single non-blocking poll for in-process loops and tests that never push weights. The worker
-processes (the launcher's and the distributed one) turn the wait on."""
+processes (the node's, which ``train`` runs since SP5, and the distributed one) turn the wait on."""
 from __future__ import annotations
 
 import logging
@@ -183,22 +183,23 @@ def _recorded_worker_kwargs(monkeypatch) -> dict:
     return recorded
 
 
-def test_the_launcher_worker_waits_for_the_first_weights(monkeypatch):
-    from colosseum.launcher import _worker_main, setup_run
+def test_the_node_worker_waits_for_the_first_weights(monkeypatch):
+    """``train``'s worker (the node's, SP5 T2.5 b) turns the wait on: its loop plays nothing until the node's
+    ``WeightsReady`` (or the stop)."""
+    from node_kit import run_worker_play
 
-    recorded = _recorded_worker_kwargs(monkeypatch)
     cfg = make_test_config("turns")
-    setup = setup_run(cfg, validate=False)
     lineups = [Lineup("2p", [SeatAssignment("agent_0"), SeatAssignment("agent_0")])] * cfg.rollout.envs_per_worker
-    _worker_main(worker_id=0, config=cfg, agent_ids=["agent_0"], agent_roles=setup.agent_roles,
-                 agent_configs=setup.agent_configs, role_specs=setup.role_specs, trajectory_queues={},
-                 weight_queues={}, stop_event=None, lineups=lineups)
-    assert recorded["wait_for_first_weights"] is True
+    recorded, io = run_worker_play(monkeypatch, cfg, lineups)
+    wait = recorded["wait_for_first_weights"]
+    assert callable(wait) and wait() is False                       # no WeightsReady yet: keep waiting
+    io.weights_ready = True
+    assert wait() is True
 
 
 def test_the_distributed_worker_waits_for_the_first_weights(monkeypatch):
     from colosseum.distributed import _dist_worker_main
-    from colosseum.launcher import setup_run
+    from colosseum.hub.hub import setup_run
 
     recorded = _recorded_worker_kwargs(monkeypatch)
     cfg = make_test_config("turns")

@@ -1,6 +1,6 @@
 """The SP4 run sinks of the hub (SP5 T2.5; rulings R5, R6; controller ruling R27): the metrics hub, the journal and
 its writer, the live ratings, snapshot retention, resume / init / league state, checkpoint saving and the SP4 pulse
-child's queues. The code moved here unchanged from ``colosseum.launcher.Launcher`` (through ``hub.py``); ``Hub``
+child's queues. The code moved here unchanged from the SP4 ``Launcher`` (``launcher.py``, through ``hub.py``); ``Hub``
 inherits ``RunSinks``, so every method keeps its name on ``Hub`` (A6, R5) and reads the hub's attributes (built in
 ``Hub.__init__`` / ``Hub._prepare``)."""
 

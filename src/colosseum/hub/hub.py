@@ -75,14 +75,14 @@ from colosseum.hub.server import (
     build_server,
     hello_from_proto,
 )
-from colosseum.hub.state import CellKey, restrict_collecting
-from colosseum.launcher import (  # one definition until T2.5(b) moves them here
+from colosseum.hub.setup import (  # re-exported: the contract names colosseum.hub.hub.setup_run etc. (R27)
     RunSetup,
     _record_run_state,
     setup_run,
     validate_run_config,
     warn_static_ownership_skew,
 )
+from colosseum.hub.state import CellKey, restrict_collecting
 from colosseum.metrics.counters import CounterBook
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.net.messages import lineup_to_proto, version_from_proto, version_to_proto

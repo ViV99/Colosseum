@@ -639,3 +639,126 @@ def hub_results(hub, number: int, n: int, *, first: int = 0, agents: Sequence[st
     """``n`` results of node ``number`` with uids under the hub's run id (``make_result``)."""
     return [make_result(node=number, worker=0, env=k % 4, epoch=1, k=k, run_id=hub.run_id, agents=agents)
             for k in range(first, first + n)]
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# Ports of the SP2-SP4 launcher tests (T2.5 b)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+def make_hub(config, run_dir: RunDir, **options: Any):
+    """A ``train``-mode ``Hub`` of ``config`` on ``run_dir`` with its local node options
+    (``LocalNodeOptions.from_config``; nothing started). ``options``: ``HubOptions`` fields to override, plus
+    ``validated``."""
+    from colosseum.hub.hub import Hub, HubOptions, LocalNodeOptions
+
+    validated = bool(options.pop("validated", False))
+    fields: dict[str, Any] = {"mode": "train", "local_node": LocalNodeOptions.from_config(config, run_dir)}
+    fields.update(options)
+    return Hub(config, run_dir, options=HubOptions(**fields), validated=validated)
+
+
+def hub_with_coordinator(config, tmp_path: Path, *, name: str = "hub-run", metrics: bool = False):
+    """A ``train``-mode ``Hub`` whose ``_setup``, ``_coordinator`` and ``_budget`` (a resume's start point included) are
+    set as ``launch`` sets them (``Hub._prepare``), without a port, a child or a thread; ``metrics``: the metrics hub
+    ``_hub`` too (``_open_metrics``; the caller closes it with ``hub._finish_metrics()``)."""
+    from game_helpers import make_test_run_dir
+
+    hub = make_hub(config, make_test_run_dir(config, tmp_path, name=name))
+    hub._prepare()
+    if metrics:
+        hub._open_metrics(hub._resume_states)
+    return hub
+
+
+def _session_of(hub, node_id: str | None):
+    if node_id is None:
+        node_id = next(iter(hub._sessions))
+    return hub._sessions[node_id]
+
+
+def result_event(hub, results: Sequence, *, seq: int, node_id: str | None = None) -> NodeMessageIn:
+    """A ``NodeMessageIn`` with a ``ResultBatch`` of ``results`` (``MatchResult``) on the current session of ``node_id``
+    (default: the hub's first session), as the servicer puts it on the inbox (for ``Hub._on_message`` /
+    ``_on_result_batch``)."""
+    from colosseum.net.messages import results_from_batch, results_to_batch
+
+    handle = _session_of(hub, node_id)
+    message = pb.NodeMessage(results=results_to_batch(seq, results))
+    return NodeMessageIn(handle.node_id, handle.session_id, message, results=results_from_batch(message.results),
+                         serial=handle.serial)
+
+
+def upload_event(hub, payload: dict, kind: str = "checkpoint", *, node_id: str | None = None) -> UploadIn:
+    """A spooled ``UploadIn`` of a learner's snapshot (``learner.make_checkpoint_payload``) as the servicer puts it on
+    the inbox: ``kind`` ``checkpoint`` (periodic) or ``final``, the agent's current generation, from the node of the
+    agent's learner (default) or ``node_id``. ``reply`` is the Future ``Hub._on_upload`` resolves."""
+    import uuid
+
+    from colosseum.net.chunks import encode_checkpoint
+
+    agent = str(payload["agent_id"])
+    generation = int(hub._versions.generation(agent))
+    if node_id is None:
+        number = hub._learner_node[agent]
+        node_id = next(e.node_id for e in hub._registry.all() if e.number == number)
+    data = encode_checkpoint(payload, kind="final" if kind == "final" else "periodic", generation=generation)
+    hub._blobs.incoming.mkdir(parents=True, exist_ok=True)
+    path = hub._blobs.incoming / f"{uuid.uuid4().hex}.part"
+    path.write_bytes(data)
+    header = pb.UploadHeader(kind=kind, agent_id=agent, generation=generation,
+                             version=int(payload["policy_version"]), total_size=len(data))
+    return UploadIn(header, path, node_id, Future())
+
+
+def local_node_spawns(config, tmp_path: Path, *, name: str = "spawns", timeout: float = 60.0):
+    """What ``train`` spawns, without spawning: a ``train``-mode ``Hub`` (launched in a thread) and its local node run
+    in a thread of this process exactly as ``Hub._start_local_node`` configures it (node 0 with the hub's credentials,
+    the plain loopback port, logs in the run dir), with ``ChildSupervisor.start`` recording each ``ChildSpec`` instead
+    of starting a process. Returns ``(specs, run_dir)`` (specs in start order) once a learner per trainable agent and
+    every worker was started; both are stopped first."""
+    from unittest import mock
+
+    from colosseum.hub.hub import Hub, HubOptions
+    from colosseum.hub.server import LOOPBACK_KEY
+    from colosseum.node.agent import NodeOptions
+    from colosseum.node.hardware import machine_id
+    from colosseum.node.procs import ChildSupervisor
+    from game_helpers import make_test_run_dir
+    from node_kit import NodeThread
+
+    run_dir = make_test_run_dir(config, tmp_path, name=name)
+    hub = Hub(config, run_dir, options=HubOptions(mode="train", local_node=None,
+                                                  identity_dir=Path(tmp_path) / "hub-identity"))
+    specs: list = []
+
+    def recording_start(self, spec):
+        incarnation = self._incarnations.get(spec.name, 0) + 1
+        self._incarnations[spec.name] = incarnation
+        specs.append(spec)
+        return incarnation
+
+    learners = len(config.get_trainable_agent_ids())
+    workers = int(config.rollout.num_workers)
+    codes: list[int] = []
+    with mock.patch.object(ChildSupervisor, "start", recording_start):
+        thread = threading.Thread(target=lambda: codes.append(hub.launch()), name=f"hub-{name}", daemon=True)
+        thread.start()
+        node = None
+        try:
+            poll_until(lambda: LOOPBACK_KEY in hub.ports or not thread.is_alive(), timeout)
+            assert LOOPBACK_KEY in hub.ports, "the hub did not start"
+            record, secret = hub.identity.nodes.add_ephemeral("local", machine_id())
+            node = NodeThread(NodeOptions(hub_address=f"127.0.0.1:{hub.ports[LOOPBACK_KEY]}",
+                                          token=hub.identity.token, loopback_plain=True, workers=workers,
+                                          evaluators=0, local=True, credentials=(record.node_id, 0, secret),
+                                          log_dir=Path(run_dir.logs)))
+            poll_until(lambda: (sum(s.role == "learner" for s in specs) >= learners
+                                and sum(s.role == "worker" for s in specs) >= workers), timeout)
+        finally:
+            hub.request_stop()
+            thread.join(timeout)
+            if node is not None:
+                node.stop(timeout)
+    assert not thread.is_alive() and codes == [0], codes
+    return list(specs), run_dir

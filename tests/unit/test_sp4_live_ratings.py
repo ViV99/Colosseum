@@ -252,17 +252,17 @@ def test_the_hub_takes_the_stored_snapshots_for_the_compact_best(tmp_path):
     assert record["bt"]["main"]["2p"]["best"]["entity"] == "main@v100"
 
 
-def test_the_launcher_gives_the_hub_the_stored_snapshot_versions(tmp_path):
-    from colosseum.launcher import Launcher
+def test_the_hub_gives_the_metrics_hub_the_stored_snapshot_versions(tmp_path):
     from game_helpers import make_test_run_dir
+    from hub_kit import make_hub
 
     config = make_test_config("turns")
-    launcher = Launcher(config, make_test_run_dir(config, tmp_path))
-    assert launcher._stored_snapshot_versions() is None                      # no coordinator yet
-    launcher._coordinator = make_coordinator(config, tmp_path / "ckpt")
+    hub = make_hub(config, make_test_run_dir(config, tmp_path))
+    assert hub._stored_snapshot_versions() is None                           # no coordinator yet
+    hub._coordinator = make_coordinator(config, tmp_path / "ckpt")
     for version in (20, 40):
-        launcher._coordinator.checkpoint_manager.save("agent_0", version, {"w": np.zeros(2, np.float32)})
-    assert launcher._stored_snapshot_versions() == {"agent_0": {20, 40}}
+        hub._coordinator.checkpoint_manager.save("agent_0", version, {"w": np.zeros(2, np.float32)})
+    assert hub._stored_snapshot_versions() == {"agent_0": {20, 40}}
 
 
 def test_the_console_line_rounds_the_bt_field():

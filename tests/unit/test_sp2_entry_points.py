@@ -65,42 +65,42 @@ def test_distributed_roles_reject_the_config_before_serving_or_spawning(tmp_path
 
 def test_train_rejects_an_invalid_config_without_creating_a_run_dir(tmp_path, monkeypatch, restore_root_logging,
                                                                      restore_global_rng):
-    import colosseum.launcher as launcher_module
+    import colosseum.hub.hub as hub_module
 
-    monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hub_module.mp, "set_start_method", lambda *args, **kwargs: None)
     launched = []
 
-    class FakeLauncher:
-        def __init__(self, config, run_dir, validated=False):
-            assert validated
+    class FakeHub:
+        def __init__(self, config, run_dir, *, options, validated=False):
+            assert validated and options.mode == "train" and options.local_node is not None
             launched.append(run_dir)
 
         def launch(self):
             return 0
 
-    monkeypatch.setattr(launcher_module, "Launcher", FakeLauncher)
+    monkeypatch.setattr(hub_module, "Hub", FakeHub)
     runs = tmp_path / "runs"
     overrides = {"run.dir": str(runs), "run.name": "retry"}
     with pytest.raises(ConfigError, match="time-major values"):
-        launcher_module.run_training(str(_bad_policy_config(tmp_path)), overrides)
+        hub_module.run_training(str(_bad_policy_config(tmp_path)), overrides)
     assert not runs.exists() and not launched
     fixed = {**overrides, "networks.model_class": "game_helpers.GameTestModel"}
-    assert launcher_module.run_training(str(_bad_policy_config(tmp_path)), fixed) == 0
+    assert hub_module.run_training(str(_bad_policy_config(tmp_path)), fixed) == 0
     [run_dir] = launched
     assert run_dir.root == runs / "retry" and run_dir.resolved_config_path.is_file()
 
 
 def test_train_rejects_a_missing_resume_source_without_creating_a_run_dir(tmp_path, monkeypatch,
                                                                          restore_root_logging):
-    import colosseum.launcher as launcher_module
+    import colosseum.hub.hub as hub_module
 
-    monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *args, **kwargs: None)
-    monkeypatch.setattr(launcher_module, "Launcher", _fail("Launcher"))
+    monkeypatch.setattr(hub_module.mp, "set_start_method", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hub_module, "Hub", _fail("Hub"))
     cfg = write_test_config(tmp_path / "cfg.yaml", "turns")
     overrides = {"run.dir": str(tmp_path / "runs"), "run.name": "resumed",
                  "training.resume_from": str(tmp_path / "no_such_run")}
     with pytest.raises(ConfigError, match="resume_from"):
-        launcher_module.run_training(str(cfg), overrides)
+        hub_module.run_training(str(cfg), overrides)
     assert not (tmp_path / "runs").exists()
 
 
@@ -109,21 +109,21 @@ def test_seed_is_applied_after_overrides(tmp_path, monkeypatch, restore_root_log
 
     import torch
 
-    import colosseum.launcher as launcher_module
+    import colosseum.hub.hub as hub_module
 
     # run_training forces the spawn start method; keep the test free of global side effects.
-    monkeypatch.setattr(launcher_module.mp, "set_start_method", lambda *args, **kwargs: None)
+    monkeypatch.setattr(hub_module.mp, "set_start_method", lambda *args, **kwargs: None)
 
-    class FakeLauncher:
+    class FakeHub:
         def __init__(self, *args, **kwargs):
             pass
 
         def launch(self):
             return 0
 
-    monkeypatch.setattr(launcher_module, "Launcher", FakeLauncher)
+    monkeypatch.setattr(hub_module, "Hub", FakeHub)
     cfg = write_test_config(tmp_path / "cfg.yaml", "turns", training={"seed": 1})
-    launcher_module.run_training(str(cfg), {"training.seed": 123, "run.dir": str(tmp_path / "runs")})
+    hub_module.run_training(str(cfg), {"training.seed": 123, "run.dir": str(tmp_path / "runs")})
     assert torch.initial_seed() == 123
     assert random.random() == random.Random(123).random()
 
@@ -144,11 +144,11 @@ def test_cli_validate_malformed_set_value_exits_1(tmp_path):
     (1, 3, 1, 0.0, False),   # single agent owns everything
 ])
 def test_static_ownership_skew_warning(workers, envs, agents, refresh, warns, caplog):
-    from colosseum.launcher import warn_static_ownership_skew
+    from colosseum.hub.hub import warn_static_ownership_skew
 
     cfg = make_test_config("turns", agents={f"a{i}": {} for i in range(agents)},
                            rollout={"num_workers": workers, "envs_per_worker": envs,
                                     "match_refresh_interval_sec": refresh})
-    with caplog.at_level(logging.WARNING, logger="colosseum.launcher"):
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.setup"):
         warn_static_ownership_skew(cfg)
     assert any("match_refresh_interval_sec" in r.getMessage() for r in caplog.records) == warns

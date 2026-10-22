@@ -430,3 +430,157 @@ def pid_alive(pid: int) -> bool:
     except OSError:
         return False
     return state != "Z"
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The node's process bodies in this process (ports of the SP2-SP4 launcher tests, T2.5 b)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+class _NullConn:
+    """A connection / listener / channel stand-in: accepts sends, closes."""
+
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        self.sent: list = []
+        self.stop_flag = threading.Event()
+        self.env_steps = 0
+
+    def send(self, item: Any) -> None:
+        self.sent.append(item)
+
+    def close(self) -> None:
+        pass
+
+
+def run_learner_main(monkeypatch: Any, config: Any, agent_id: str = "agent_0", **kwargs: Any) -> None:
+    """``node.learner_main._learner_main`` of ``config``'s ``agent_id`` in this process, with the node side stubbed (no
+    listener, no control connection, no weight cache: ``net.local`` / ``node.weights`` stand-ins). The body seeds, sets
+    the torch threads, builds the algorithm (``teacher`` resolved like the hub does, ``init_state``) and calls
+    ``learner.learner.learner_process``, which the caller monkeypatches to see what it gets. ``kwargs`` override the
+    spawn kwargs (``seed``, ``num_learners``, ``init_state``, ...)."""
+    import colosseum.net.local as local
+    import colosseum.node.weights as weights
+    from colosseum.core.registry import env_spec
+    from colosseum.core.roles import agent_role_spec
+    from colosseum.learner.factory import resolve_teacher
+    from colosseum.node.learner_main import _learner_main
+    from colosseum.players.registry import resolve_player_roles
+
+    for name in ("connect", "listener", "ControlChannel", "ConnectionIntake", "NodeOutputs"):
+        monkeypatch.setattr(local, name, _NullConn)
+    monkeypatch.setattr(weights, "WeightCacheWriter", _NullConn)
+    spec = env_spec(config)
+    role = agent_role_spec(spec, resolve_player_roles(config, spec)[agent_id])
+    fields: dict[str, Any] = dict(
+        name=f"learner-{agent_id}", incarnation=1, node=0, agent_id=agent_id, generation=1, listener_name="unused",
+        node_address="unused", authkey=b"unused", config=config.get_agent_config(agent_id), role_spec=role, spec=spec,
+        seed=None, teacher=resolve_teacher(config, agent_id, spec), init_state=None, resume_state=None,
+        version_floor=0, env_steps=0, num_learners=1, cache_root="", cache_prefix="",
+        checkpoint_interval=int(config.checkpoint.interval), total_timesteps=int(config.training.total_timesteps),
+        cap_bytes=1 << 26)
+    fields.update(kwargs)
+    _learner_main(**fields)
+
+
+class PlayIO:
+    """The ``WorkerIO`` side a node worker's body (``node.worker_main._play``) reads before it builds its loop: the
+    first lineup of every env (``lineups``), never stopped; ``ready`` is the first weights' flag (``WeightsReady``)."""
+
+    def __init__(self, lineups: list[Lineup]) -> None:
+        from colosseum.net.local import CellLineup
+
+        self._first = {e: CellLineup(e, lineup, {}) for e, lineup in enumerate(lineups)}
+        self.weights_ready = False
+        self.stats_fn = None
+
+    def stopped(self) -> bool:
+        return False
+
+    def ready(self) -> bool:
+        return self.weights_ready
+
+    def take_lineups(self) -> dict:
+        out, self._first = self._first, {}
+        return out
+
+    def note_snapshot(self, agent_id: str, checkpoint_id: str) -> None:
+        pass
+
+    def loop_io(self) -> Any:
+        return self
+
+    def idle(self) -> None:
+        pass
+
+    def close(self) -> None:
+        pass
+
+    def counters(self) -> dict:
+        return {}
+
+
+def run_worker_play(monkeypatch: Any, config: Any, lineups: list[Lineup], *, worker: int = 0,
+                    run_id: str = "RUN") -> tuple[dict, PlayIO]:
+    """``node.worker_main._play`` of ``config`` (its trainable agents, scripted bots and teachers as the node passes
+    them; no frozen agents) with the first ``lineups``, ``RolloutLoop`` replaced by a recorder: returns the
+    ``RolloutLoop`` keyword arguments and the io."""
+    import colosseum.worker.rollout_loop as rollout_loop
+    from colosseum.hub.setup import setup_run
+    from colosseum.node.agent import _scripted_teachers
+    from colosseum.node.worker_main import _play
+
+    recorded: dict = {}
+
+    class RecordingLoop:
+        stats: dict = {}
+
+        def __init__(self, **kwargs: Any) -> None:
+            recorded.update(kwargs)
+
+        def run(self, should_stop: Callable[[], bool]) -> None:
+            pass
+
+        def close(self) -> None:
+            pass
+
+    monkeypatch.setattr(rollout_loop, "RolloutLoop", RecordingLoop)
+    setup = setup_run(config, validate=False)
+    teachers = _scripted_teachers(config)
+    io = PlayIO(lineups)
+    _play(io, cache=None, node=0, worker=worker, incarnation=1, config=config,
+          agent_ids=config.get_trainable_agent_ids(), agent_roles=setup.agent_roles,
+          agent_configs=setup.agent_configs, role_specs=setup.role_specs, bots=dict(setup.fixed.bots),
+          frozen_keys={}, fixed_roles=dict(setup.fixed.roles), teachers=teachers, run_id=run_id)
+    return recorded, io
+
+
+def train_on_node(tmp_path: Path, config: Any, *, learners: list[str], lineup: Callable[[int, int], Lineup | None],
+                  frozen: dict[str, Path] | None = None, **node_options: Any) -> tuple[FakeHub, NodeThread]:
+    """A ``FakeHub`` of ``config`` that places the learners of ``learners`` (generation 1, CPU) on a node run in a
+    thread of this process (``toy_node_options``; ``node_options`` override, e.g. ``workers``) and grants
+    ``lineup(worker, env)`` once each of them announced its first version; ``frozen``: frozen agents' weights served as
+    fixed blobs (``FakeHub.serve_frozen``). Returns both; the caller stops them (``node.stop()``, ``hub.stop()``)."""
+    hub = FakeHub(tmp_path, config)
+    for agent, path in (frozen or {}).items():
+        hub.serve_frozen(agent, path)
+    hub.welcome(learners=[pb.LearnerAssignment(agent_id=a, generation=1, version_floor=0, device="cpu", env_steps=0)
+                          for a in learners])
+    hub.grant(lambda worker, env: lineup(worker, env) if all(hub.versions(a) for a in learners) else None)
+    return hub, run_node_in_thread(toy_node_options(tmp_path, hub, **node_options))
+
+
+def train_steps(hub: FakeHub, agent: str) -> int:
+    """The highest train step ``agent``'s learner reported (0: none)."""
+    return max((t.train_step for m in hub.messages("metrics") for t in m.train if t.agent_id == agent), default=0)
+
+
+def intake_drops(hub: FakeHub, agent: str) -> dict[str, int]:
+    """The chunk drops ``agent``'s learner intake reported last (``IntakeStats.dropped``, by reason)."""
+    reports = [i for m in hub.messages("metrics") for i in m.intake if i.agent_id == agent]
+    return dict(reports[-1].dropped) if reports else {}
+
+
+def worker_counters(hub: FakeHub, worker: int = 0) -> dict[str, int]:
+    """The cumulative counters worker ``worker`` reported last (``WorkerStats.counters``)."""
+    stats = [w for m in hub.messages("metrics") for w in m.workers if w.worker == worker]
+    return dict(stats[-1].counters) if stats else {}

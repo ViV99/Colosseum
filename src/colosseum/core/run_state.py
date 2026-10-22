@@ -1,9 +1,9 @@
 """``runs/<name>/run_state.json``: whether a training run is running, finished or failed (SP4 spec block 5).
 
-The launcher (``run_training``) writes ``running`` with its pid when the run dir exists, ``finished`` when
-``launch`` returns 0 / 130 / 143 (budget reached, SIGINT, SIGTERM: final checkpoints were saved),
+The hub (``colosseum.hub.hub.run_training`` / ``run_hub``) writes ``running`` with its pid when the run dir exists,
+``finished`` when ``launch`` returns 0 / 130 / 143 (budget reached, SIGINT, SIGTERM: final checkpoints were saved),
 ``stopped`` with exit code 130 for a Ctrl-C (``KeyboardInterrupt``) that reaches ``run_training`` (during the
-start, before the launcher's signal handlers: nothing was saved) and ``failed`` for any other exit code or an
+start, before the hub's signal handlers: nothing was saved) and ``failed`` for any other exit code or an
 exception. Readers (report, dashboard) decide whether a
 ``running`` run is alive by its pid (``os.kill(pid, 0)``) and, on Linux, by the process start time from
 ``/proc/<pid>/stat`` recorded with it (a reused pid is not the run) — never by wall-clock timestamps.

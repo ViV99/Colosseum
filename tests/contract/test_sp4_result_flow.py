@@ -1,9 +1,11 @@
-"""Result flow (SP4 T0.1 on SP3 behaviour, extended by T1.1 and FX1; spec section 6, §7 P0 and block 1): every
-finished episode is reported exactly once with a unique match id and uid, with the weights versions of every seat at
-the episode's start and end; workers put their results in batches (lists), and the launcher flattens them in arrival
-order, stamps env_steps and feeds each result to the coordinator, the hub and the journal writer once; anything else
-on the results queue fails loudly; a full results queue never blocks a worker, and every drop is counted (a WARNING
-on the first), also the drops of the last flush on exit."""
+"""Result flow (SP4 T0.1 on SP3 behaviour, extended by T1.1 and FX1; spec section 6, §7 P0 and block 1; SP5 T2.5 b):
+every finished episode is reported exactly once with a unique match id and uid, with the weights versions of every
+seat at the episode's start and end; workers put their results in batches (lists); the hub (SP5's evolved launcher,
+R5) takes a node's batches in arrival order, stamps env_steps at intake and feeds each result to the coordinator, the
+metrics hub and the journal writer once, after its commit (R8); a batch that cannot be decoded is counted, acked and
+feeds nothing; a full results queue never blocks a worker, and every drop is counted (a WARNING on the first), also
+the drops of the last flush on exit. The worker-side tests run on ``rollout_worker_process`` (the SP4 queue worker,
+kept until T7.2)."""
 from __future__ import annotations
 
 import logging
@@ -15,21 +17,20 @@ from functools import partial
 import pytest
 import torch
 
+from colosseum.arena.matchlog import Commit
 from colosseum.core.types import (
     Lineup,
     MatchResult,
     SeatAssignment,
-    SeatResult,
-    TeamResult,
     WeightPayload,
     WorkerCommand,
     state_dict_to_numpy,
 )
-from colosseum.launcher import Launcher
 from colosseum.worker import rollout_worker
 from colosseum.worker.rollout_worker import ResultBatcher, rollout_worker_process
 from game_harness import Collected, GameFactory, lineup, make_loop, run_steps
-from game_helpers import NumpyOnlyQueue, Tick, TickGame, make_test_config, make_test_model, make_test_run_dir
+from game_helpers import NumpyOnlyQueue, Tick, TickGame, make_test_config, make_test_model, scripted_agent
+from hub_kit import hub_results, lineup_hub, open_node, result_event
 
 ROLE2 = TickGame([Tick(acting={0})], 2).spec.roles["player"]
 SOLO = [Tick(acting={0}), Tick(acting={0}, rewards={0: 1.0}), Tick(over=True, rewards={0: 1.0})]
@@ -101,15 +102,8 @@ def test_lineup_changes_keep_one_result_per_episode_with_the_lineup_that_played_
     assert {("a", "b"), ("b", "a")} <= played
 
 
-def _result(i: int) -> MatchResult:
-    return MatchResult(f"w0_e0_ep{i}", "2p", "wdl",
-                       [SeatResult(0, "player", 0, "agent_0", "latest", 1.0),
-                        SeatResult(1, "player", 1, "agent_0", "latest", -1.0)],
-                       [TeamResult(0, 1.0, 1.0), TeamResult(1, 2.0, -1.0)], 4)
-
-
 class _CoordinatorRecorder:
-    """Only the coordinator's method: a call meant for the hub fails with AttributeError."""
+    """Only the coordinator's method: a call meant for the metrics hub fails with AttributeError."""
 
     def __init__(self) -> None:
         self.results: list[MatchResult] = []
@@ -119,7 +113,7 @@ class _CoordinatorRecorder:
 
 
 class _HubRecorder:
-    """Only the hub's method: a call meant for the coordinator fails with AttributeError."""
+    """Only the metrics hub's method: a call meant for the coordinator fails with AttributeError."""
 
     def __init__(self) -> None:
         self.results: list[MatchResult] = []
@@ -129,59 +123,69 @@ class _HubRecorder:
 
 
 class _WriterRecorder:
-    """Only the journal writer's method."""
+    """Only the journal writer's tokened ``submit`` and ``take_commits`` (R8): each submit is committed whole."""
+
+    dead = False
 
     def __init__(self) -> None:
         self.results: list[MatchResult] = []
+        self._commits: list[Commit] = []
 
-    def submit(self, results: list[MatchResult]) -> None:
+    def submit(self, results: list[MatchResult], *, token=None) -> int:
         self.results.extend(results)
+        self._commits.append(Commit(token, list(results), 0, len(self.results)))
+        return 0
+
+    def take_commits(self) -> list[Commit]:
+        out, self._commits = self._commits, []
+        return out
 
 
-def _launcher_with_recorders(tmp_path, results_queue):
-    config = make_test_config("turns")
-    launcher = Launcher(config, make_test_run_dir(config, tmp_path))
-    coordinator, hub, writer = _CoordinatorRecorder(), _HubRecorder(), _WriterRecorder()
-    launcher._results_queue, launcher._coordinator, launcher._hub = results_queue, coordinator, hub
-    launcher._match_log_writer = writer
-    return launcher, coordinator, hub, writer
+def _hub_with_recorders(tmp_path):
+    """A hub with one node session (number 1, ``a``'s learner) whose coordinator, metrics hub and journal writer are
+    recorders."""
+    config = make_test_config("turns", agents={"a": {}, "random": scripted_agent()})
+    hub = lineup_hub(config, tmp_path)
+    node = open_node(hub)
+    coordinator, metrics, writer = _CoordinatorRecorder(), _HubRecorder(), _WriterRecorder()
+    hub._coordinator, hub._hub, hub._match_log_writer = coordinator, metrics, writer
+    return hub, node, coordinator, metrics, writer
 
 
-def test_the_launcher_flattens_batches_and_feeds_each_result_to_the_coordinator_hub_and_writer_once(tmp_path):
-    results_queue: queue.Queue = queue.Queue()
-    sent = [_result(i) for i in range(7)]
-    sent[4].env_steps = 77                                      # a pulse result arrives with its snapshot's
-    for batch in (sent[:3], sent[3:4], sent[4:7]):              # three workers' batches, in arrival order
-        results_queue.put(list(batch))
-    launcher, coordinator, hub, writer = _launcher_with_recorders(tmp_path, results_queue)
-    launcher._env_step_counter.add(1234)
-    launcher._drain_results()
-    late = [_result(i) for i in range(7, 9)]
-    results_queue.put(late)                                     # a batch arriving at a later pass
-    launcher._env_step_counter.add(1000)
-    launcher._drain_results()
-    launcher._drain_results()                                   # nothing new: nothing fed twice
-    expected = [r.match_id for r in sent + late]
-    for recorder in (coordinator, hub, writer):
-        assert [r.match_id for r in recorder.results] == expected
-    assert [r.env_steps for r in coordinator.results] == [1234] * 4 + [77] + [1234] * 2 + [2234] * 2
-    assert launcher._results_received == len(expected)
+def test_the_hub_accounts_each_result_once_after_its_commit(tmp_path):
+    hub, node, coordinator, metrics, writer = _hub_with_recorders(tmp_path)
+    sent = hub_results(hub, 1, 7)
+    hub._budget.add(1234)
+    for seq, batch in enumerate((sent[:3], sent[3:4], sent[4:7]), 1):     # a node's batches, in arrival order
+        hub._on_message(result_event(hub, batch, seq=seq))
+    assert coordinator.results == metrics.results == []                    # not before the commit (R8)
+    hub._drain_commits()
+    late = hub_results(hub, 1, 2, first=7)
+    hub._budget.add(1000)
+    hub._on_message(result_event(hub, late, seq=4))                        # a batch arriving at a later pass
+    hub._drain_commits()
+    hub._drain_commits()                                                   # nothing new: nothing fed twice
+    expected = [r.uid for r in sent + late]
+    for recorder in (coordinator, metrics, writer):
+        assert [r.uid for r in recorder.results] == expected
+    # stamped with the hub's env steps at intake (spec 4.3; node results always, P-PF2-13)
+    assert [r.env_steps for r in coordinator.results] == [1234] * 7 + [2234] * 2
+    assert hub._results_received == len(expected)
+    assert node.acks() == [1, 2, 3, 4]
 
 
-@pytest.mark.parametrize("item, what", [
-    (_result(0), "is a MatchResult"),                           # a bare result: not a batch
-    ([_result(0), {"kind": "worker_stats"}], "item 1 of the batch is a dict"),
-    ((_result(0),), "is a tuple"),
-])
-def test_a_results_queue_item_that_is_not_a_batch_of_match_results_fails_loudly(tmp_path, item, what):
-    results_queue: queue.Queue = queue.Queue()
-    results_queue.put([_result(5)])
-    results_queue.put(item)
-    launcher, coordinator, hub, writer = _launcher_with_recorders(tmp_path, results_queue)
-    with pytest.raises(TypeError, match="results queue") as info:
-        launcher._drain_results()
-    assert what in str(info.value) and "list of MatchResult" in str(info.value)
-    assert coordinator.results == hub.results == writer.results == []      # nothing fed from a broken drain
+def test_an_undecodable_result_batch_is_counted_acked_and_feeds_nothing(tmp_path):
+    hub, node, coordinator, metrics, writer = _hub_with_recorders(tmp_path)
+    good = hub_results(hub, 1, 1, first=5)
+    hub._on_message(result_event(hub, good, seq=1))
+    broken = result_event(hub, hub_results(hub, 1, 2), seq=2)
+    broken.results, broken.error = None, "ValueError: malformed seat"      # as the servicer's conversion fails
+    hub._on_message(broken)
+    hub._drain_commits()
+    assert [r.uid for r in coordinator.results] == [r.uid for r in good]   # nothing fed from the broken batch
+    assert [r.uid for r in metrics.results] == [r.uid for r in writer.results] == [r.uid for r in good]
+    assert hub._book.get("dropped_match_results_by_reason.invalid") == 2
+    assert sorted(node.acks()) == [1, 2]                                    # acked: no poison resend
 
 
 def test_a_full_results_queue_never_blocks_the_worker_and_every_drop_is_counted(restore_torch_threads, caplog,

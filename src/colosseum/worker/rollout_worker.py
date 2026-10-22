@@ -187,8 +187,8 @@ def rollout_worker_process(
     about every 0.5 s and once more on exit. ``fixed_players``: scripted and frozen agents, built
     inside this process (served under ``FIXED_NETWORK_ID``; they never collect). ``teachers``: scripted
     kickstart teachers by student agent (``BotSpec``, never instances; DAgger labels in the chunks).
-    ``run_id`` prefixes the match uids (``<run_id>/train/...``). ``wait_for_first_weights`` (on in the launcher's and
-    the distributed worker processes; off by default for in-process callers that never push weights): no env is reset
+    ``run_id`` prefixes the match uids (``<run_id>/train/...``). ``wait_for_first_weights`` (on in the distributed
+    worker processes; off by default for in-process callers that never push weights): no env is reset
     and no match played before every agent's first weight payload arrived (``RolloutLoop``, "First weights"; the wait
     ends on ``stop_event``). On exit the pending results are put, then a final
     stats report is sent (it counts the drops of that last put), and the results and stats queues are flushed

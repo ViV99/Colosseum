@@ -147,7 +147,7 @@ def test_global_namespaces_match_the_reserved_agent_ids(monkeypatch):
 def test_package_imports_without_wandb_installed():
     code = (
         "import sys; sys.modules['wandb'] = None; "
-        "import colosseum.cli, colosseum.launcher, colosseum.metrics.wandb_logger"
+        "import colosseum.cli, colosseum.hub.hub, colosseum.metrics.wandb_logger"
     )
     result = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stderr

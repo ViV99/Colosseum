@@ -189,44 +189,44 @@ class _Recorder:
         return lambda *args, **kwargs: self.calls.append((name, args))
 
 
-def test_the_launcher_offers_saved_snapshots_and_journals_pulse_results_only(tmp_path, monkeypatch):
+def test_the_hub_offers_saved_snapshots_and_journals_pulse_results_only(tmp_path, monkeypatch):
     """Contract amendment A20: pulse results reach the journal writer only, never the coordinator (online ELO,
     PFSP, matchmaker) or the hub's episode stats; the counters reach the system record; pulse_state.json."""
     import json
 
-    from colosseum.launcher import Launcher
     from game_helpers import make_coordinator, make_match_result, make_test_run_dir
+    from hub_kit import make_hub
 
     cfg = _cfg()
     run = make_test_run_dir(cfg, tmp_path)
-    launcher = Launcher(cfg, run)
-    launcher._coordinator = make_coordinator(cfg, run.checkpoints)
-    launcher._env_step_counter.add(70)
-    launcher._pulse_feeder = PulseFeeder(["main"], every=1, max_backlog=4)
-    launcher._pulse_requests = requests = queue.Queue(maxsize=1)
-    launcher._pulse_results = "pulse results queue"
+    hub = make_hub(cfg, run)
+    hub._coordinator = make_coordinator(cfg, run.checkpoints)
+    hub._budget.add(70)
+    hub._pulse_feeder = PulseFeeder(["main"], every=1, max_backlog=4)
+    hub._pulse_requests = requests = queue.Queue(maxsize=1)
+    hub._pulse_results = "pulse results queue"
     _roles, role = agent_role_of(cfg, "main")
     model = build_model(cfg.get_agent_config("main"), role)
     state = {k: v.detach().numpy().copy() for k, v in model.state_dict().items()}
-    launcher._save_checkpoint({"agent_id": "main", "policy_version": 7, "final": False, "model_state": state,
+    hub._save_checkpoint({"agent_id": "main", "policy_version": 7, "final": False, "model_state": state,
                                "trainer_state_bytes": None})
     assert (run.checkpoints / "main" / "ckpt_v7" / "model.pt").is_file()
 
     result = make_match_result([(0, "main", "ckpt_v7", "player", 7, 7), (1, "rnd", "fixed")], source="pulse",
                                uid="pulse-x/P/2p/main@v7/rnd/0/r0", env_steps=70)
     sent: list = []
-    monkeypatch.setattr(launcher, "_drain", lambda q, label, producers: list(sent) if label == "pulse-results" else [])
-    launcher._match_log_writer = writer = _Recorder("submit")
-    launcher._hub = hub = _Recorder("set_system_value")
-    launcher._coordinator = _Recorder()                           # any coordinator call fails the test
-    launcher._pump_pulse()
+    monkeypatch.setattr(hub, "_drain", lambda q, label, producers: list(sent) if label == "pulse-results" else [])
+    hub._match_log_writer = writer = _Recorder("submit")
+    hub._hub = metrics = _Recorder("set_system_value")
+    hub._coordinator = _Recorder()                           # any coordinator call fails the test
+    hub._pump_pulse()
     taken = requests.get_nowait()
     assert (taken.agent_id, taken.checkpoint_id, taken.version, taken.env_steps) == ("main", "ckpt_v7", 7, 70)
     assert not any(hasattr(v, "detach") for v in taken.state_dict.values())  # numpy only crosses processes
     sent.append(PulseResults("main", "ckpt_v7", 7, [result], True))
-    launcher._pump_pulse()
+    hub._pump_pulse()
     assert writer.calls == [("submit", ([result],))]
-    values = {args[0]: args[1] for name, args in hub.calls}
+    values = {args[0]: args[1] for name, args in metrics.calls}
     assert values == {"pulse_skipped_snapshots": 0, "pulse_evaluated_snapshots": 1, "pulse_pending_snapshots": 0}
     state_file = json.loads(run.pulse_state_path.read_text())
     assert state_file["evaluated"] == {"main": [7]} and state_file["offered"] == {"main": [7]}
@@ -324,27 +324,27 @@ def test_play_lineups_ends_early_when_asked_to_stop():
 
 
 def test_a_failing_pulse_state_write_is_logged_and_training_goes_on(tmp_path, monkeypatch, caplog):
-    from colosseum.launcher import Launcher
     from colosseum.metrics import jsonl
     from game_helpers import make_test_run_dir
+    from hub_kit import make_hub
 
     cfg = _cfg()
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
-    launcher._pulse_feeder = PulseFeeder(["main"], every=1, max_backlog=4)
-    launcher._pulse_requests = queue.Queue(maxsize=1)
+    hub = make_hub(cfg, make_test_run_dir(cfg, tmp_path))
+    hub._pulse_feeder = PulseFeeder(["main"], every=1, max_backlog=4)
+    hub._pulse_requests = queue.Queue(maxsize=1)
 
     def broken(path, data):
         raise OSError("disk full on purpose")
 
     monkeypatch.setattr(jsonl, "write_json_atomic", broken)
-    launcher._pulse_feeder.offer("main", "ckpt_v1", 1, 10, {}, final=False)
-    with caplog.at_level(logging.ERROR, logger="colosseum.launcher"):
-        launcher._pump_pulse()                                             # no exception
-        launcher._pulse_feeder.offer("main", "ckpt_v2", 2, 20, {}, final=False)
-        launcher._pump_pulse()
+    hub._pulse_feeder.offer("main", "ckpt_v1", 1, 10, {}, final=False)
+    with caplog.at_level(logging.ERROR, logger="colosseum.hub.hub"):
+        hub._pump_pulse()                                             # no exception
+        hub._pulse_feeder.offer("main", "ckpt_v2", 2, 20, {}, final=False)
+        hub._pump_pulse()
     errors = [r for r in caplog.records if r.levelno == logging.ERROR and "disk full on purpose" in r.getMessage()]
     assert len(errors) == 2 and errors[0].exc_info and not errors[1].exc_info   # traceback only the first time
-    assert not launcher._pulse_feeder.changed and launcher._pulse_requests.get_nowait().version == 1
+    assert not hub._pulse_feeder.changed and hub._pulse_requests.get_nowait().version == 1
 
 
 class _StopAfter:
@@ -387,20 +387,20 @@ def test_the_texts_about_the_final_snapshot_say_a_local_run_never_evaluates_it(t
     line and the schema say so, and the end-of-run INFO gives the real reason (the stop, or the backlog: T6.1
     deferred)."""
     from colosseum.core.config import EvaluationConfig
-    from colosseum.launcher import Launcher
     from game_helpers import make_test_run_dir
+    from hub_kit import make_hub
 
     (line,) = [x for x in validate_config(_cfg()).lines if x.startswith("pulse:")]
     assert "the final one always" not in line and "evaluate it with colosseum tournament" in line
     every = EvaluationConfig.model_fields["every"].description
     assert "always" not in every and "colosseum tournament" in every
     cfg = _cfg()
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
-    launcher._pulse_feeder = feeder = PulseFeeder(["main", "b"], every=1, max_backlog=1)
+    hub = make_hub(cfg, make_test_run_dir(cfg, tmp_path))
+    hub._pulse_feeder = feeder = PulseFeeder(["main", "b"], every=1, max_backlog=1)
     feeder.offer("main", "ckpt_v5", 5, 50, {}, final=True)
     feeder.offer("b", "ckpt_v7", 7, 70, {}, final=True)                     # pushes main's final out
-    with caplog.at_level(logging.INFO, logger="colosseum.launcher"):
-        launcher._finish_pulse()
+    with caplog.at_level(logging.INFO, logger="colosseum.hub.hub"):
+        hub._finish_pulse()
     messages = sorted(r.getMessage() for r in caplog.records if "final snapshot" in r.getMessage())
     assert messages == [
         "pulse: the final snapshot ckpt_v5 of main was not evaluated (the backlog skipped it); evaluate it with "

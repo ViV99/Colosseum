@@ -8,11 +8,10 @@ from colosseum.coordinator.coordinator import Coordinator
 from colosseum.core.errors import ConfigError
 from colosseum.core.registry import env_spec, validate_config
 from colosseum.core.types import LATEST_NETWORK_ID, Lineup, MatchResult, SeatAssignment, SeatResult, TeamResult
-from colosseum.launcher import Launcher, setup_run
 from colosseum.league.base import BaseMatchmaker
 from colosseum.league.mixture import MixtureMatchmaker
 from colosseum.players.registry import resolve_player_roles
-from game_helpers import StepCounter, make_coordinator, make_test_config, make_test_run_dir
+from game_helpers import StepCounter, make_coordinator, make_test_config
 
 BOT = {"kind": "scripted", "class": "colosseum.players.RandomBot"}
 SCHEDULED = {"opponents": {"latest": {0: 1.0, 1000: 0.0}, "snapshots": 0.0, "rivals": 0.0,
@@ -129,11 +128,13 @@ def test_share_schedules_follow_the_coordinators_env_steps(tmp_path):
     assert opposing() == {("anchors", "bot")}
 
 
-def test_the_launchers_coordinator_reads_the_global_env_step_counter(tmp_path):
+def test_the_hubs_coordinator_reads_the_global_env_step_counter(tmp_path):
+    from hub_kit import hub_with_coordinator
+
     cfg = make_test_config("turns", agents={"agent_0": {}, "bot": BOT}, matchmaking=SCHEDULED)
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
-    coord = launcher._build_coordinator(setup_run(cfg, validate=False))
+    hub = hub_with_coordinator(cfg, tmp_path)          # its coordinator built by Hub._build_coordinator, as launch does
+    coord = hub._coordinator
     assert coord.context.env_steps() == 0
-    launcher._env_step_counter.add(5000)
+    hub._budget.add(5000)
     assert coord.context.env_steps() == 5000
     assert {s.agent_id for s in coord.generate_lineups(1, 0)[0].seats if s.source != "owner"} == {"bot"}

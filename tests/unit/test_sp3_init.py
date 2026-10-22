@@ -187,12 +187,12 @@ def test_the_sp2_checkpoint_fixture_works_as_init():
 
 
 def test_resume_takes_precedence_over_init(tmp_path, caplog):
-    from colosseum.launcher import Launcher
+    from hub_kit import make_hub
 
     cfg = make_test_config("turns", agents={"a": {}, "b": {}}, init={"from": str(_pt(tmp_path, _model()))})
-    launcher = Launcher(cfg, make_test_run_dir(cfg, tmp_path))
-    with caplog.at_level(logging.INFO, logger="colosseum.launcher"):
-        states = launcher._resolve_init(env_spec(cfg), {"a": {"source": "old/checkpoints/a/ckpt_v3"}, "b": None})
+    hub = make_hub(cfg, make_test_run_dir(cfg, tmp_path))
+    with caplog.at_level(logging.INFO, logger="colosseum.hub.hub"):
+        states = hub._resolve_init(env_spec(cfg), {"a": {"source": "old/checkpoints/a/ckpt_v3"}, "b": None})
     assert states["a"] is None and isinstance(states["b"], InitState)
     assert any("'a'" in r.getMessage() and "init.from" in r.getMessage() and "ignored" in r.getMessage()
                for r in caplog.records)
@@ -200,7 +200,7 @@ def test_resume_takes_precedence_over_init(tmp_path, caplog):
 
 def test_the_learner_starts_from_the_init_weights_at_version_zero(tmp_path, monkeypatch, restore_global_rng):
     import colosseum.learner.learner as learner_module
-    from colosseum.launcher import _learner_main
+    from node_kit import run_learner_main
 
     source = _model(seed=11)
     cfg = make_test_config("turns", learner={"device": "cpu", "torch_threads": 1},
@@ -209,12 +209,9 @@ def test_the_learner_starts_from_the_init_weights_at_version_zero(tmp_path, monk
     monkeypatch.setattr(learner_module, "learner_process", lambda *, algorithm_factory, **kw: built.append(
         algorithm_factory()))
     monkeypatch.setattr(sys, "path", list(sys.path))
-    _roles, role = agent_role_of(cfg, "agent_0")
     before = torch.get_num_threads()
     try:
-        _learner_main(agent_id="agent_0", config=cfg.get_agent_config("agent_0"), role_spec=role,
-                      spec=env_spec(cfg), init_state=_resolve(cfg), trajectory_queue=None, weight_queues=[],
-                      stop_event=None, metrics_queue=None)
+        run_learner_main(monkeypatch, cfg, "agent_0", init_state=_resolve(cfg))   # the node's learner body
     finally:
         torch.set_num_threads(before)
     (algo,) = built
@@ -222,37 +219,12 @@ def test_the_learner_starts_from_the_init_weights_at_version_zero(tmp_path, monk
     assert algo.policy_version == 0 and algo.state_dict()["optimizer"]["state"] == {}
 
 
-def test_the_launcher_passes_init_states_to_learners(tmp_path, monkeypatch, restore_global_rng):
-    import colosseum.launcher as launcher_module
+def test_the_local_node_passes_init_states_to_learners(tmp_path, restore_global_rng):
+    from hub_kit import local_node_spawns
 
     cfg = make_test_config("turns", init={"from": str(_pt(tmp_path, _model()))})
-    learner_kwargs: list[dict] = []
-
-    class _Stop(Exception):
-        pass
-
-    class FakeProcess:
-        exitcode = 0
-
-        def __init__(self, target, kwargs, name=None, daemon=None):
-            self.target, self.kwargs = target, kwargs
-
-        def start(self):
-            if self.target is launcher_module._learner_target:
-                learner_kwargs.append(self.kwargs)
-            else:
-                raise _Stop
-
-        def is_alive(self):
-            return False
-
-        def join(self, timeout=None):
-            pass
-
-    monkeypatch.setattr(launcher_module.mp, "Process", FakeProcess)
-    with pytest.raises(_Stop):
-        launcher_module.Launcher(cfg, make_test_run_dir(cfg, tmp_path)).launch()
-    (kwargs,) = learner_kwargs
+    specs, _run = local_node_spawns(cfg, tmp_path)
+    (kwargs,) = [s.kwargs for s in specs if s.role == "learner"]
     assert isinstance(kwargs["init_state"], InitState) and kwargs["init_state"].strict
 
 
