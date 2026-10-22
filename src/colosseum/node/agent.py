@@ -40,7 +40,8 @@
    ``max(ttl, LINEUP_WAIT_SEC)`` is given up the same way (P-PF2-12). A worker gets its routes and ``WeightsReady``
    when its control connection opens, before its first ``WorkerLineups``. Snapshots no cell references any more
    leave the cache after ``CACHE_DROP_DELAY_SEC`` (safe by an ordering invariant, see ``_prune_cache``).
-7. **Announces.** ``evictions`` -> ``WorkerEvict`` to every worker; ``env_steps`` -> ``LearnerEnvSteps`` to every
+7. **Announces.** ``evictions`` -> ``WorkerEvict`` to every worker; ``env_steps`` (plus this node's own env steps
+   since, refreshed at every ``WorkerProgress``; ruling R28) -> ``LearnerEnvSteps`` to every
    learner (LR progress).
 8. **Heartbeat** every ``distributed.heartbeat_sec``: env steps, ``dropped_results``, processes, load, cached keys
    and the node counters (``lineup_fetch_failed``, ``dropped_results_node_buffer``, ``worker_restarts``: A2).
@@ -912,7 +913,7 @@ class NodeAgent:
         from colosseum.net.local import WorkerEvict
         from colosseum.node.weights import CacheKey
 
-        self.learners.forward_env_steps(int(announce.env_steps))
+        self.learners.forward_env_steps(int(announce.env_steps), self._env_steps())
         keys = [CacheKey("snapshot", ev.agent_id, ev.checkpoint_id) for ev in announce.evictions]
         if keys and self._run is not None:
             for name, conn in list(self._control.items()):
@@ -1178,6 +1179,7 @@ class NodeAgent:
             self._progress[key] = max(self._progress.get(key, 0), int(message.env_steps))
             self._worker_stats[key] = dict(message.counters)
             self._stats_changed.add(key)
+            self.learners.advance(self._env_steps())                 # R28: the learners' LR progress between Announces
         elif isinstance(message, ChildError):
             self._reported.add(name)
             log_path = "" if run is None else str(run.log_dir / f"{name}.log")

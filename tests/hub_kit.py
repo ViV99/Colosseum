@@ -681,12 +681,9 @@ def result_event(hub, results: Sequence, *, seq: int, node_id: str | None = None
     """A ``NodeMessageIn`` with a ``ResultBatch`` of ``results`` (``MatchResult``) on the current session of ``node_id``
     (default: the hub's first session), as the servicer puts it on the inbox (for ``Hub._on_message`` /
     ``_on_result_batch``)."""
-    from colosseum.net.messages import results_from_batch, results_to_batch
+    from colosseum.net.messages import results_to_batch
 
-    handle = _session_of(hub, node_id)
-    message = pb.NodeMessage(results=results_to_batch(seq, results))
-    return NodeMessageIn(handle.node_id, handle.session_id, message, results=results_from_batch(message.results),
-                         serial=handle.serial)
+    return node_message(_session_of(hub, node_id), results=results_to_batch(seq, results))
 
 
 def upload_event(hub, payload: dict, kind: str = "checkpoint", *, node_id: str | None = None) -> UploadIn:
@@ -711,25 +708,69 @@ def upload_event(hub, payload: dict, kind: str = "checkpoint", *, node_id: str |
     return UploadIn(header, path, node_id, Future())
 
 
+class _NodeThreadProcess:
+    """A stand-in for the local node's ``Process`` (target ``node.agent.local_node_target``): ``start`` runs the node
+    the hub configured (``kwargs["options"]``) in a thread of this process (``node_kit.NodeThread``)."""
+
+    def __init__(self, target: Callable, kwargs: dict, name: str | None = None, daemon: bool | None = None) -> None:
+        from colosseum.node.agent import local_node_target
+
+        assert target is local_node_target, target
+        self.kwargs, self.name, self.node = kwargs, name, None
+
+    def start(self) -> None:
+        from node_kit import NodeThread
+
+        self.node = NodeThread(self.kwargs["options"])
+
+    def is_alive(self) -> bool:
+        return self.node is not None and self.node.thread.is_alive()
+
+    @property
+    def exitcode(self) -> int | None:
+        return None if self.node is None or self.is_alive() else self.node.exit_code
+
+    def terminate(self) -> None:
+        if self.node is not None:
+            self.node.agent.request_stop()
+
+    kill = terminate
+
+    def join(self, timeout: float | None = None) -> None:
+        if self.node is not None:
+            self.node.thread.join(timeout)
+
+
+class _ThreadNodeContext:
+    """The hub's spawn context with the local node run in a thread (``_NodeThreadProcess``); the rest is real."""
+
+    def __init__(self, real: Any) -> None:
+        self._real = real
+        self.processes: list[_NodeThreadProcess] = []
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(self._real, name)
+
+    def Process(self, target: Callable, kwargs: dict, name: str | None = None, daemon: bool | None = None):
+        proc = _NodeThreadProcess(target, kwargs, name, daemon)
+        self.processes.append(proc)
+        return proc
+
+
 def local_node_spawns(config, tmp_path: Path, *, name: str = "spawns", timeout: float = 60.0):
-    """What ``train`` spawns, without spawning: a ``train``-mode ``Hub`` (launched in a thread) and its local node run
-    in a thread of this process exactly as ``Hub._start_local_node`` configures it (node 0 with the hub's credentials,
-    the plain loopback port, logs in the run dir), with ``ChildSupervisor.start`` recording each ``ChildSpec`` instead
-    of starting a process. Returns ``(specs, run_dir)`` (specs in start order) once a learner per trainable agent and
-    every worker was started; both are stopped first."""
+    """What ``train`` spawns, without spawning: a ``train`` hub (``make_hub``, launched in a thread) whose local node
+    (``Hub._start_local_node``: its own ``NodeOptions``) runs in a thread of this process instead of a child, with
+    ``ChildSupervisor.start`` recording each ``ChildSpec`` instead of starting a process. Returns ``(specs, run_dir)``
+    (specs in start order) once a learner per trainable agent and every worker was started; the hub is stopped first
+    (its exit code 0 and the node's end asserted)."""
     from unittest import mock
 
-    from colosseum.hub.hub import Hub, HubOptions
-    from colosseum.hub.server import LOOPBACK_KEY
-    from colosseum.node.agent import NodeOptions
-    from colosseum.node.hardware import machine_id
     from colosseum.node.procs import ChildSupervisor
     from game_helpers import make_test_run_dir
-    from node_kit import NodeThread
 
     run_dir = make_test_run_dir(config, tmp_path, name=name)
-    hub = Hub(config, run_dir, options=HubOptions(mode="train", local_node=None,
-                                                  identity_dir=Path(tmp_path) / "hub-identity"))
+    hub = make_hub(config, run_dir, identity_dir=Path(tmp_path) / "hub-identity")
+    ctx = hub._mp = _ThreadNodeContext(hub._mp)
     specs: list = []
 
     def recording_start(self, spec):
@@ -744,21 +785,16 @@ def local_node_spawns(config, tmp_path: Path, *, name: str = "spawns", timeout: 
     with mock.patch.object(ChildSupervisor, "start", recording_start):
         thread = threading.Thread(target=lambda: codes.append(hub.launch()), name=f"hub-{name}", daemon=True)
         thread.start()
-        node = None
         try:
-            poll_until(lambda: LOOPBACK_KEY in hub.ports or not thread.is_alive(), timeout)
-            assert LOOPBACK_KEY in hub.ports, "the hub did not start"
-            record, secret = hub.identity.nodes.add_ephemeral("local", machine_id())
-            node = NodeThread(NodeOptions(hub_address=f"127.0.0.1:{hub.ports[LOOPBACK_KEY]}",
-                                          token=hub.identity.token, loopback_plain=True, workers=workers,
-                                          evaluators=0, local=True, credentials=(record.node_id, 0, secret),
-                                          log_dir=Path(run_dir.logs)))
             poll_until(lambda: (sum(s.role == "learner" for s in specs) >= learners
-                                and sum(s.role == "worker" for s in specs) >= workers), timeout)
+                                and sum(s.role == "worker" for s in specs) >= workers) or not thread.is_alive(),
+                       timeout)
         finally:
             hub.request_stop()
             thread.join(timeout)
-            if node is not None:
-                node.stop(timeout)
+            for proc in ctx.processes:
+                proc.terminate()
+                proc.join(timeout)
     assert not thread.is_alive() and codes == [0], codes
+    assert [p.name for p in ctx.processes] == ["node"] and not ctx.processes[0].is_alive()
     return list(specs), run_dir

@@ -1002,8 +1002,10 @@ class Hub(RunSinks):
     def _on_upload(self, ev: Any) -> None:
         """A learner's snapshot (``checkpoint`` / ``final``): checked (P-PF2-9 (b): a trainable agent of the run whose
         learner runs on the uploading node, its current generation, a matching frame), saved with the hub's env
-        steps (R9) and answered. The spool file may have vanished (the servicer's timeout or a cancel deleted it
-        and told the node so): then nothing is saved (carried item of T2.3)."""
+        steps (R9) and answered. A refused upload is counted and answered; a snapshot that passes the checks but
+        cannot be saved (a full disk) is answered and fails the run (``_fail_run``, as in SP4). The spool file may have
+        vanished (the servicer's timeout or a cancel deleted it and told the node so): then nothing is saved (carried
+        item of T2.3)."""
         from colosseum.net.chunks import decode_checkpoint
         from colosseum.net.frame import payload_byte_cap
 
@@ -1053,7 +1055,17 @@ class Hub(RunSinks):
                                  f"match the header ({', '.join(mismatch)})")
                 reply(False, f"invalid: {', '.join(mismatch)}")
                 return
-            checkpoint_id = self._save_checkpoint(payload)
+            try:
+                checkpoint_id = self._save_checkpoint(payload)
+            except Exception as e:  # noqa: BLE001 - the node is answered; the run fails after its teardown
+                logger.error(f"Saving the {header.kind} snapshot v{header.version} of {agent!r} from node {number} "
+                             f"failed ({type(e).__name__}: {e})", exc_info=True)
+                reply(False, f"error: {type(e).__name__}")
+                # SP4: a snapshot that cannot be saved (e.g. a full disk) fails the run; the snapshots arriving within
+                # the shutdown's grace are still saved (a failure reported during the shutdown fails the run too)
+                self._fail_run(f"the {header.kind} snapshot v{header.version} of {agent!r} could not be saved "
+                               f"({type(e).__name__}: {e})")
+                return
             reply(True, checkpoint_id=checkpoint_id)
         except Exception as e:  # noqa: BLE001 - one bad upload never stops the hub
             logger.error(f"Saving the {header.kind} snapshot v{header.version} of {header.agent_id!r} from node "
@@ -1171,7 +1183,8 @@ class Hub(RunSinks):
         """Stop every node and child within the grace (``LOCAL_SHUTDOWN_GRACE_SEC`` for ``train``,
         ``distributed.shutdown_grace_sec`` otherwise); returns the children that had to be terminated.
 
-        ``stop_run`` goes to every live session and the pulse is told to stop; meanwhile the inbox, the commits and
+        A last ``Announce`` (the budget's env steps, R28) and then ``stop_run`` go to every live session and the pulse
+        is told to stop; meanwhile the inbox, the commits and
         the pulse are drained (final snapshots arrive as uploads, the last results as batches), until every node
         that has a session finished its stop (``run_stopped``) and every child exited, or the grace passed. Then the
         rest is terminated and killed, and the pulse queues' reads get until the deadline (at least 1 s after the
@@ -1180,6 +1193,10 @@ class Hub(RunSinks):
         deadline = time.monotonic() + grace
         self._shutting_down = True
         self._stop_event.set()
+        # R28 (b): a last Announce first, so the final env-step count reaches the learners (LR progress) before their
+        # final snapshots and trainer states; the session's order keeps it ahead of stop_run.
+        if self._sessions and self._coordinator is not None:
+            self._broadcast_announce()
         for handle in list(self._sessions.values()):
             self._send_stop_run(handle)
         first_error: Exception | None = None

@@ -14,7 +14,8 @@ from colosseum.core.run_dir import RunDir
 from colosseum.envs.game import GameSpec, RoleSpec
 from colosseum.players.registry import FixedPlayers
 
-logger = logging.getLogger(__name__)
+# The hub's logger (as run_sinks, R27): these lines read as before the move ("colosseum.hub.hub" in main.log).
+logger = logging.getLogger("colosseum.hub.hub")
 
 __all__ = ["RunSetup", "setup_run", "validate_run_config", "warn_static_ownership_skew"]
 

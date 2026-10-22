@@ -14,7 +14,7 @@ from colosseum.core.config import ColosseumConfig, load_config
 from colosseum.core.types import Lineup, SeatAssignment
 from game_helpers import make_test_run_dir
 from hub_kit import make_hub
-from node_kit import intake_drops, train_on_node, train_steps, wait_for, worker_counters
+from node_kit import intake_drops, intake_reports, train_on_node, train_steps, wait_for, worker_counters
 
 
 def example_config(name: str):
@@ -44,11 +44,12 @@ def test_worker_produces_chunks(tmp_path):
     try:
         wait_for(lambda: worker_counters(hub).get("chunks_sent", 0) >= 5 and train_steps(hub, agent_id) >= 5,
                  timeout=120)
-        wait_for(lambda: any(m.intake for m in hub.messages("metrics")), timeout=30)
+        # a report sent after those chunks: every chunk was full-length and its own
+        drops = intake_drops(hub, agent_id, after=len(intake_reports(hub, agent_id)))
     finally:
         node.stop()
         hub.stop()
-    assert not intake_drops(hub, agent_id)                              # every chunk was full-length and its own
+    assert not drops
 
 
 def test_worker_multi_agent_routing(tmp_path):
@@ -64,14 +65,14 @@ def test_worker_multi_agent_routing(tmp_path):
                                                                 SeatAssignment(agent_ids[1])]))
     try:
         wait_for(lambda: min(train_steps(hub, aid) for aid in agent_ids) >= 2, timeout=120)
-        wait_for(lambda: all(any(i.agent_id == aid for m in hub.messages("metrics") for i in m.intake)
-                             for aid in agent_ids), timeout=30)
+        seen = {aid: len(intake_reports(hub, aid)) for aid in agent_ids}
+        drops = {aid: intake_drops(hub, aid, after=seen[aid]) for aid in agent_ids}   # reports after those chunks
     finally:
         node.stop()
         hub.stop()
     for aid in agent_ids:
         assert train_steps(hub, aid) >= 2, f"agent {aid} received too few chunks"
-        assert not intake_drops(hub, aid)                               # nothing misrouted (dropped by reason)
+        assert not drops[aid]                                           # nothing misrouted (dropped by reason)
 
 
 @pytest.mark.timeout(900)
@@ -142,9 +143,6 @@ def test_multi_agent_learners_both_train_until_the_budget(tmp_path):
         rollout={"num_workers": 1, "envs_per_worker": 2, "chunk_length": 8},
         learner={"batch_chunks": 2, "queue_size": 16, "device": "cpu"},
         metrics={"log_interval": 1},
-        # the learners' LR progress follows the hub's env-step counter, which moves with the node's heartbeats and
-        # reaches them with the hub's Announce (spec 4.4): quarter-second beats for this three-second run
-        distributed={"heartbeat_sec": 0.25},
     )
     run = make_test_run_dir(config, tmp_path)
     hub = make_hub(config, run)

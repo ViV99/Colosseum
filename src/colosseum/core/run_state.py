@@ -8,8 +8,8 @@ exception. Readers (report, dashboard) decide whether a
 ``running`` run is alive by its pid (``os.kill(pid, 0)``) and, on Linux, by the process start time from
 ``/proc/<pid>/stat`` recorded with it (a reused pid is not the run) — never by wall-clock timestamps.
 Other keys of the file are preserved on every rewrite. The run id is not here: it lives in ``run.json``
-(``colosseum.core.run_dir.RUN_INFO_FILE``, contract amendment A2). Only ``run_training`` writes this file (not the
-benchmark's in-process ``Launcher`` nor the distributed roles: their run dirs read as "unknown").
+(``colosseum.core.run_dir.RUN_INFO_FILE``, contract amendment A2). Only ``run_training`` / ``run_hub`` write this
+file (not the benchmark's in-process ``Hub`` nor the distributed roles: their run dirs read as "unknown").
 """
 
 from __future__ import annotations

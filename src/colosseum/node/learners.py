@@ -6,9 +6,10 @@ A learner assignment (``Welcome.learners`` or ``Command(start_learner)``) downlo
 (teacher and ``init`` weights come from there) and is spawned from the main-loop thread (PDEATHSIG). At its first
 ``VersionPublished`` (after its intake runs) the workers are routed to its listener; every ``VersionPublished``
 becomes a ``VersionAnnounce`` (the latest one kept while the hub is away), ``LearnerMetrics`` / ``IntakeReport``
-feed ``MetricsBatch``, the hub's env steps are forwarded (``LearnerEnvSteps``). ``stop_learner`` sends ``Stop`` (the
-final snapshot is uploaded by the agent); a learner that ends without being stopped is ``learner_failed`` (until
-T4.2: the hub stops the run).
+feed ``MetricsBatch``, the global env steps are forwarded (``LearnerEnvSteps``; ruling R28: the hub's last announced
+count plus this node's own env steps since its receipt, a lower bound of the global count that never decreases).
+``stop_learner`` sends ``Stop`` (the final snapshot is uploaded by the agent); a learner that ends without being
+stopped is ``learner_failed`` (until T4.2: the hub stops the run).
 
 ``NodeLearners`` talks to the agent only through ``LearnerHost`` (the agent's ``_LearnerHost`` adapter): the
 supervisor, posting into the inbox, sending to a child, setting a worker route, events, a connected-only send, the
@@ -94,7 +95,9 @@ class NodeLearners:
         self._pending_versions: dict[str, pb.NodeMessage] = {}   # agent -> VersionAnnounce not sent yet (hub away)
         self.train_metrics: deque = deque(maxlen=TRAIN_METRICS_KEPT)
         self.intake_stats: dict[str, pb.IntakeStats] = {}
-        self.hub_env_steps = 0                               # Announce.env_steps (forwarded to the learners)
+        self.hub_env_steps = 0                               # the estimate forwarded to the learners (R28)
+        self._announced = 0                                  # the hub's last Announce.env_steps
+        self._own_at_announce = 0                            # this node's own env steps when it arrived
 
     # ---- books --------------------------------------------------------------------------------------------------
 
@@ -119,6 +122,7 @@ class NodeLearners:
         self._entries.clear()
         self._pending_versions.clear()
         self.intake_stats.clear()
+        self.hub_env_steps = self._announced = self._own_at_announce = 0   # the next run's counter starts anew
 
     def resend_pending(self) -> None:
         """After ``SessionUp``: the version announcements kept while the hub was away."""
@@ -126,12 +130,23 @@ class NodeLearners:
             if self._host.send(message):
                 del self._pending_versions[agent]
 
-    def forward_env_steps(self, env_steps: int) -> None:
-        """``Announce.env_steps``: ``LearnerEnvSteps`` to every learner when the hub's counter grew."""
+    def forward_env_steps(self, env_steps: int, own: int = 0) -> None:
+        """``Announce.env_steps`` (the hub's global counter) received while this node's workers had taken ``own`` env
+        steps in total: it becomes the base of the estimate (R28) when it grew; then ``advance(own)``."""
+        if env_steps and int(env_steps) > self._announced:
+            self._announced, self._own_at_announce = int(env_steps), int(own)
+        self.advance(own)
+
+    def advance(self, own: int) -> None:
+        """Ruling R28: ``LearnerEnvSteps`` to every learner when the estimate grew. The estimate is the last announced
+        count plus this node's own env steps since that announce arrived (``own``: the workers' cumulative total), and
+        never decreases: own steps after the receipt are not in the announced value, so it is never ahead of the
+        global count; the hub's next ``Announce`` catches up with the other nodes' steps."""
         from colosseum.net.local import LearnerEnvSteps
 
-        if env_steps and int(env_steps) > self.hub_env_steps:
-            self.hub_env_steps = int(env_steps)
+        estimate = self._announced + max(0, int(own) - self._own_at_announce) if self._announced else 0
+        if estimate > self.hub_env_steps:
+            self.hub_env_steps = estimate
             for entry in self._entries.values():
                 self._host.send_child(entry.name, LearnerEnvSteps(self.hub_env_steps))
 

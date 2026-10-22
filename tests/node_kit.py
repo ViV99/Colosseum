@@ -574,10 +574,16 @@ def train_steps(hub: FakeHub, agent: str) -> int:
     return max((t.train_step for m in hub.messages("metrics") for t in m.train if t.agent_id == agent), default=0)
 
 
-def intake_drops(hub: FakeHub, agent: str) -> dict[str, int]:
-    """The chunk drops ``agent``'s learner intake reported last (``IntakeStats.dropped``, by reason)."""
-    reports = [i for m in hub.messages("metrics") for i in m.intake if i.agent_id == agent]
-    return dict(reports[-1].dropped) if reports else {}
+def intake_reports(hub: FakeHub, agent: str) -> list:
+    """Every ``IntakeStats`` of ``agent``'s learner received so far, in arrival order (cumulative drops)."""
+    return [i for m in hub.messages("metrics") for i in m.intake if i.agent_id == agent]
+
+
+def intake_drops(hub: FakeHub, agent: str, *, after: int = 0) -> dict[str, int]:
+    """The chunk drops ``agent``'s learner intake reported last (``IntakeStats.dropped``, by reason), from a report
+    received after the first ``after`` ones: waits for one (so a report sent before the chunks cannot answer)."""
+    reports = wait_for(lambda: intake_reports(hub, agent)[after:], timeout=30)
+    return dict(reports[-1].dropped)
 
 
 def worker_counters(hub: FakeHub, worker: int = 0) -> dict[str, int]:

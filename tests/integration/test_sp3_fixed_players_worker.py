@@ -8,7 +8,7 @@ import torch
 from colosseum.core.registry import build_model
 from colosseum.core.types import FIXED_NETWORK_ID, Lineup, SeatAssignment
 from game_helpers import agent_role_of, frozen_agent, make_test_config, scripted_agent
-from node_kit import intake_drops, train_on_node, train_steps, wait_for, worker_counters
+from node_kit import intake_drops, intake_reports, train_on_node, train_steps, wait_for, worker_counters
 
 WIDE_KWARGS = {"core": "none", "hidden": 32}
 
@@ -30,10 +30,11 @@ def test_a_spawned_worker_seats_scripted_and_frozen_players_that_never_collect(t
                  and train_steps(hub, "agent_0") >= 1, timeout=120)
         got = hub.results()
         counters = worker_counters(hub)
+        drops = intake_drops(hub, "agent_0", after=len(intake_reports(hub, "agent_0")))   # a report after the chunks
     finally:
         node.stop()
         hub.stop()
     assert {(s.agent_id, s.network_id) for r in got for s in r.seats} == {
         ("agent_0", "latest"), ("rnd", FIXED_NETWORK_ID), ("wide", FIXED_NETWORK_ID)}
     # every chunk is agent_0's: none went without a learner (fixed seats never record), none dropped by its learner
-    assert counters.get("dropped_chunks_no_learner", 0) == 0 and not intake_drops(hub, "agent_0")
+    assert counters.get("dropped_chunks_no_learner", 0) == 0 and not drops

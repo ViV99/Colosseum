@@ -514,6 +514,19 @@ def test_a_learner_trains_on_the_node_and_uploads_its_snapshots(hub_factory, nod
     assert not list(shm_dir().glob(f"{prefix}*")) and not list(shm_dir().glob(f".{prefix}*"))
 
 
+def test_between_announces_the_learners_progress_grows_with_the_nodes_own_steps(hub_factory, node_factory):
+    """Ruling R28 (a): one Announce of 1000 env steps, then none; the learner's LR progress keeps growing past
+    1000 / total with this node's own env steps (forwarded at every WorkerProgress)."""
+    hub = _learner_hub(hub_factory)
+    node = node_factory(hub)
+    wait_for(lambda: max(_train_steps(hub), default=0) >= 1, timeout=60)
+    hub.announce(env_steps=1000)
+    floor = 1000 / hub.config.training.total_timesteps
+    wait_for(lambda: any(t.values["progress"] > floor for m in hub.messages("metrics") for t in m.train
+                         if t.agent_id == "a"), timeout=60)
+    assert node.stop() == 0
+
+
 def test_a_killed_learner_blocks_neither_the_worker_nor_the_node(hub_factory, node_factory):
     hub = _learner_hub(hub_factory)
     node = node_factory(hub)

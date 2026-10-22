@@ -149,6 +149,6 @@ def test_static_ownership_skew_warning(workers, envs, agents, refresh, warns, ca
     cfg = make_test_config("turns", agents={f"a{i}": {} for i in range(agents)},
                            rollout={"num_workers": workers, "envs_per_worker": envs,
                                     "match_refresh_interval_sec": refresh})
-    with caplog.at_level(logging.WARNING, logger="colosseum.hub.setup"):
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
         warn_static_ownership_skew(cfg)
     assert any("match_refresh_interval_sec" in r.getMessage() for r in caplog.records) == warns

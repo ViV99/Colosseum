@@ -218,11 +218,13 @@ def test_an_upload_that_fails_to_save_is_refused_and_the_next_one_is_saved(tmp_p
     assert not first.accepted and "OSError" in first.reason and second.accepted   # the node is told
     assert "Saving the checkpoint snapshot v1 of 'agent_0'" in caplog.text and "disk full" in caplog.text
     assert "Traceback" in caplog.text
+    assert "disk full" in hub._failure                                  # the run fails (exit 1, as in SP4)
 
 
 def test_shutdown_tears_children_down_even_if_a_save_fails(tmp_path):
-    """Every save fails: each upload is refused (``accepted`` false, the hub goes on: R8 / P-PF2-9) and the shutdown
-    still stops the node."""
+    """Every save fails: the shutdown still stops the node and the run fails. SP4 raised the save's ``OSError`` out of
+    the teardown; the hub answers the node (``accepted`` false) and fails the run (``_failure``: ``launch`` returns
+    1, ``test_a_failure_reported_during_the_shutdown_fails_the_run``)."""
     cfg = make_test_config("solo")
     hub, node, proc = _hub_with_node(tmp_path, cfg)
     calls: list[int] = []
@@ -240,11 +242,12 @@ def test_shutdown_tears_children_down_even_if_a_save_fails(tmp_path):
     hub._shutdown()
     assert calls == [1, 2] and not proc.is_alive() and proc.exitcode is not None
     assert not queued.reply.result(1).accepted and not last.reply.result(1).accepted
+    assert "disk full" in hub._failure and "v1" in hub._failure          # the first failure wins
 
 
 def test_shutdown_keeps_draining_after_a_failed_save(tmp_path):
     """A save failure does not end the grace window: a second learner's final snapshot, delivered later, is still
-    saved."""
+    saved, and the run fails (SP4: the error after the teardown; the hub: ``_failure``, exit 1)."""
     cfg = make_test_config("solo", agents={"a0": {}, "a1": {}})
     hub, node, proc = _hub_with_node(tmp_path, cfg)
     real_save = hub._save_checkpoint
@@ -266,6 +269,31 @@ def test_shutdown_keeps_draining_after_a_failed_save(tmp_path):
     assert time.monotonic() - start < 10.0
     assert not proc.is_alive() and proc.exitcode == 0
     assert not failing.reply.result(1).accepted
+    assert "disk full" in hub._failure
     mgr = hub._coordinator.checkpoint_manager
     assert [c.meta["final"] for c in mgr.list_checkpoints("a1")] == [True]
     assert [c.meta["final"] for c in mgr.list_checkpoints("a0")] == [True]
+
+
+def test_a_snapshot_that_cannot_be_saved_fails_the_run(tmp_path):
+    """The exit code (SP4: a save error failed the run after the teardown): a final snapshot whose save fails during
+    the shutdown makes ``launch`` return 1 although the budget was reached."""
+    from colosseum.hub.hub import Hub, HubOptions
+
+    cfg = make_test_config("solo", training={"total_timesteps": 10**12})
+    hub = Hub(cfg, make_test_run_dir(cfg, tmp_path), options=HubOptions(
+        mode="hub", listen="127.0.0.1", port=0, insecure=True, identity_dir=tmp_path / "hub-identity"))
+
+    def failing_save(payload):
+        raise OSError("disk full")
+
+    def main_loop() -> int:                             # the budget is reached; the final arrives while stopping
+        node = open_node(hub)
+        hub._save_checkpoint = failing_save
+        hub._inbox.put(upload_event(hub, _payloads()[1], "final"))
+        hub._inbox.put(node_message(node, event=pb.Event(kind="run_stopped")))
+        return 0
+
+    hub._main_loop = main_loop
+    assert hub.launch() == 1
+    assert "could not be saved" in hub._failure and "disk full" in hub._failure
