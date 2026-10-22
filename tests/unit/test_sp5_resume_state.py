@@ -3,6 +3,8 @@ learner table's ``hub_state.json`` state, and the run-level worker / journal dro
 (P-PF3-5), so the counters of the ``system`` record stay monotonic across the resume."""
 from __future__ import annotations
 
+import json
+
 from colosseum.hub.placement import LearnerSlot, LearnerTable
 from colosseum.metrics.aggregator import SystemStats
 
@@ -35,21 +37,28 @@ def test_a_lost_slot_of_a_local_node_is_not_kept():
 
 
 def test_system_drop_totals_continue_after_a_resume():
+    """P-PF3-5 (review round 1): a remote worker that outlives the hub reports its cumulative counters again under
+    the same (node, worker, incarnation) key and is not counted twice; a fresh local node's workers (the old one died
+    with the hub) count from zero under the same keys and still add to the restored totals."""
     clock = iter(float(t) for t in range(100))
     before = SystemStats(clock=lambda: next(clock))
     before.on_worker_stats({"worker_id": 0, "node": 1, "incarnation": 1, "dropped_results": 4,
                             "dropped_reward_episodes": 2})
+    before.on_worker_stats({"worker_id": 0, "node": 0, "incarnation": 1, "dropped_results": 3})
     last = before.snapshot(100, {}, match_log={"dropped": 3})
-    assert (last["dropped_match_results"], last["dropped_reward_episodes"]) == (7, 2)
+    assert (last["dropped_match_results"], last["dropped_reward_episodes"]) == (10, 2)
     after = SystemStats(clock=lambda: next(clock))
-    after.restore(before.state())
+    after.restore(json.loads(json.dumps(before.state(local_nodes={0}))))     # through hub_state.json
     first = after.snapshot(100, {}, match_log={"dropped": 0})
-    assert (first["dropped_match_results"], first["dropped_reward_episodes"]) == (7, 2)
-    after.on_worker_stats({"worker_id": 0, "node": 0, "incarnation": 1, "dropped_results": 1})
+    assert (first["dropped_match_results"], first["dropped_reward_episodes"]) == (10, 2)
+    after.on_worker_stats({"worker_id": 0, "node": 1, "incarnation": 1, "dropped_results": 5,
+                           "dropped_reward_episodes": 2})                    # the same remote worker: +1, not +5
+    after.on_worker_stats({"worker_id": 0, "node": 0, "incarnation": 1, "dropped_results": 1})   # a new local node
     later = after.snapshot(200, {}, match_log={"dropped": 2})
-    assert later["dropped_match_results"] == 10 and after.cumulative("dropped_results") == 5
+    assert after.cumulative("dropped_results") == 9 and after.cumulative("dropped_reward_episodes") == 2
+    assert later["dropped_match_results"] == 9 + 3 + 2
     after.restore(None)                                            # an SP4 run dir: nothing to continue
-    assert after.cumulative("dropped_results") == 1
+    assert after.cumulative("dropped_results") == 0
 
 
 def test_prepare_restores_hub_state_and_relays_restored_versions_until_their_node_confirms(tmp_path):
@@ -72,7 +81,8 @@ def test_prepare_restores_hub_state_and_relays_restored_versions_until_their_nod
     registry.new_generation("agent_0")
     assert registry.announce(VersionInfo("agent_0", 2, 7, 1, "d", 3, addresses=("10.0.0.5:5000",))) == "accepted"
     counters = {"book": CounterBook({"lineup_redraw_failed": 3}).state(), "intake_book": {},
-                "system_stats": {"cumulative": {"dropped_results": 4}, "match_log_dropped": 1}, "future": {"k": 1}}
+                "system_stats": {"base": {"dropped_results": 4}, "workers": {}, "match_log_dropped": 1},
+                "future": {"k": 1}}
     learners = {"version": 1, "agents": {"agent_0": {"status": "running", "node": 3, "device": "cpu",
                                                      "generation": 2, "reason": "", "local": False}}}
     save_hub_state(run_dir.root / HUB_STATE_FILE, HubStateData(
@@ -91,3 +101,33 @@ def test_prepare_restores_hub_state_and_relays_restored_versions_until_their_nod
     saved = json.loads((run_dir.root / HUB_STATE_FILE).read_text())
     assert saved["counters"]["future"] == {"k": 1} and saved["counters"]["system_stats"] == counters["system_stats"]
     assert saved["epoch_reserved_until"] == 2048 and saved["env_steps"] == 500
+
+
+def test_an_unreadable_journal_with_the_journal_off_replays_nothing_and_keeps_the_watermark(tmp_path, caplog):
+    """Review round 1 (T4.3(b)): with ``match_log.enabled: false`` (the hint for an unusable journal) an unreadable
+    ``matches.db`` is a WARNING, nothing is replayed and the loaded watermark is kept; with the journal on it is a
+    ConfigError with that hint."""
+    import logging
+
+    import pytest
+
+    from colosseum.coordinator.coordinator import LEAGUE_STATE_FILE
+    from colosseum.core.errors import ConfigError
+    from game_helpers import make_coordinator, make_test_config, make_test_run_dir
+    from hub_kit import make_hub
+
+    config = make_test_config("turns", match_log={"enabled": False})
+    run_dir = make_test_run_dir(config, tmp_path)
+    run_dir.ensure_run_id()
+    make_coordinator(config, tmp_path / "c").save_league_state(run_dir.root / LEAGUE_STATE_FILE, env_steps=5,
+                                                               journal_row=17)
+    (run_dir.root / "matches.db").write_bytes(b"this is not an sqlite database" * 100)
+    hub = make_hub(config, run_dir, resume=True, validated=True)
+    hub._prepare()
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
+        hub._replay_journal()
+    assert hub._journal_row == 17 and "nothing is replayed" in caplog.text
+    on = make_hub(make_test_config("turns"), run_dir, resume=True, validated=True)
+    on._prepare()
+    with pytest.raises(ConfigError, match="match_log.enabled: false"):
+        on._replay_journal()

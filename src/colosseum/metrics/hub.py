@@ -174,9 +174,10 @@ class MetricsHub:
         """A value merged at the top level of every later ``system`` record (SP4 T6.1: the pulse counters)."""
         self._system_values[key] = value
 
-    def system_state(self) -> dict[str, Any]:
-        """The run-level worker / journal drop totals (``SystemStats.state``; ``hub_state.json``, P-PF3-5)."""
-        return self._system.state()
+    def system_state(self, local_nodes: Collection[int] = ()) -> dict[str, Any]:
+        """The run-level worker / journal drop totals (``SystemStats.state``; ``hub_state.json``, P-PF3-5);
+        ``local_nodes``: nodes that die with the hub (their workers start over under the same keys)."""
+        return self._system.state(local_nodes)
 
     def restore_cumulative(self, state: Mapping[str, Any] | None) -> None:
         """An in-place resume continues ``system_state()`` of the previous hub incarnation (SP5 T4.3)."""

@@ -592,8 +592,11 @@ class Hub(RunSinks, HubLearners):
         writer thread can compact; then seed the watermark (``_journal_row``) with the journal's last row (every
         row up to it is accounted now), so a league state saved before this incarnation's first commit never asks
         the next resume to replay them again. Read only (also with the journal off)."""
-        from colosseum.arena.matchlog import MatchLogReader
+        import sqlite3
+
+        from colosseum.arena.matchlog import MatchLogError, MatchLogReader
         from colosseum.coordinator.coordinator import league_replay_window
+        from colosseum.core.errors import ConfigError
 
         info = self._coordinator.loaded_league_state
         after, min_steps = league_replay_window(info)
@@ -602,11 +605,21 @@ class Hub(RunSinks, HubLearners):
             self._journal_row = 0
             logger.info("Resume: no journal; nothing to replay into the ratings and PFSP statistics")
             return
-        with MatchLogReader(path) as reader:
-            replayed, skipped = self._coordinator.replay_results(
-                result for _, result in reader.results_after(after, min_env_steps=min_steps))
-            folded = reader.folded_after(after) if after is not None else None
-            last = reader.last_row()
+        try:
+            with MatchLogReader(path) as reader:
+                replayed, skipped = self._coordinator.replay_results(
+                    result for _, result in reader.results_after(after, min_env_steps=min_steps))
+                folded = reader.folded_after(after) if after is not None else None
+                last = reader.last_row()
+        except (MatchLogError, sqlite3.Error, OSError) as e:
+            if self._config.match_log.enabled:
+                raise ConfigError(f"Match log {path} cannot be read for the league replay ({type(e).__name__}: {e}); "
+                                  f"move it away or set match_log.enabled: false") from e
+            # The journal is off (the hint above): nothing is replayed, the loaded watermark is kept (review round 1).
+            self._journal_row = None if info is None else info.journal_row
+            logger.warning(f"Resume: the journal {path} cannot be read ({type(e).__name__}: {e}); with the journal "
+                           f"off nothing is replayed into the ratings and PFSP statistics")
+            return
         self._journal_row = max(int(after or 0), int(last or 0))
         window = (f"after row {after}" if after is not None
                   else f"stamped after env step {min_steps}" if min_steps is not None else "all rows")
@@ -1794,18 +1807,19 @@ class Hub(RunSinks, HubLearners):
         reserved = max(int(self._epochs.reserved_until) if self._epochs is not None else 0,
                        int(epoch_reserved_until or 0))
         state = self._budget.state()
+        local_nodes = ({e.number for e in self._registry.all() if e.data_path == "local"}
+                       if self._registry is not None else set())
         counters = {**self._counters_saved, "book": self._book.state()}     # unknown keys survive (A3, D16)
         if self._hub is not None:
             counters["intake_book"] = self._hub.intake_book.state()
-            counters["system_stats"] = self._hub.system_state()            # P-PF3-5
+            counters["system_stats"] = self._hub.system_state(local_nodes)  # P-PF3-5
         counters.setdefault("intake_book", {})
         data = HubStateData(version=HUB_STATE_VERSION, run_id=self._run_id or "", env_steps=int(state["env_steps"]),
                             sessions=dict(state["sessions"]), epoch_reserved_until=reserved,
                             versions=self._versions.state() if self._versions is not None else {},
                             counters=counters,
                             nodes_lost=int(self._nodes_lost),
-                            learners={} if self._learners is None else self._learners.state(
-                                local_nodes={e.number for e in self._registry.all() if e.data_path == "local"}))
+                            learners={} if self._learners is None else self._learners.state(local_nodes=local_nodes))
         path = self._run_dir.root / HUB_STATE_FILE
         if fsync:
             save_hub_state(path, data, fsync=True)

@@ -198,15 +198,22 @@ def start_env_steps(root: str | Path) -> int:
 
 
 def _hub_state_env_steps(root: Path) -> int | None:
-    """``hub_state.json``'s env-step count (None: no file, an SP4 / SP3 run dir); a malformed file is a ConfigError
-    (the hub writes it atomically)."""
+    """``hub_state.json``'s env-step count (None: no file, an SP4 / SP3 run dir); a malformed file, or one of another
+    run id than ``run.json``'s, is a ConfigError (the hub writes it atomically)."""
     path = root / HUB_STATE_FILE
     try:
         data = load_hub_state(path)
     except ValueError as e:
         raise ConfigError(f"Cannot read {path} ({e}); the hub writes it atomically, so it was edited: restore it, or "
                           f"move it away to continue with the counters of metrics.jsonl and the journal") from e
-    return None if data is None else int(data.env_steps)
+    if data is None:
+        return None
+    run_id = read_run_id(root)
+    if data.run_id and run_id is not None and data.run_id != run_id:     # checked before anything is written
+        raise ConfigError(f"{path} belongs to run {data.run_id}; this dir's run.json names {run_id}: restore the "
+                          f"run's own hub_state.json, or move it away to continue with the counters of metrics.jsonl "
+                          f"and the journal")
+    return int(data.env_steps)
 
 
 def prepare_resume(run: str | Path, config_path: str | Path | None,

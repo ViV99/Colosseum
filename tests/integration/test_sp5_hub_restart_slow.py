@@ -78,9 +78,9 @@ def test_kill_the_hub_and_resume_in_place_with_a_live_node(tmp_path, monkeypatch
         assert wait_for(lambda: (root / "hub_state.json").exists()
                         and (read_hub_state(root)["versions"].get(AGENT) or {}).get("max_version", -1) >= 2
                         and len(journal_rows(root)) >= 200, 180), (tmp_path / "hub1.stderr").read_text()[-3000:]
-        before_state = read_hub_state(root)
-        generation = before_state["learners"]["agents"][AGENT]["generation"]
         _kill(first)                                          # the node lives on
+        before_state = read_hub_state(root)                   # after the kill: the last state it wrote (atomic)
+        generation = before_state["learners"]["agents"][AGENT]["generation"]
         rows_before = journal_rows(root)
         accepted_before = max(_latest_versions(rows_before) + [before_state["versions"][AGENT]["max_version"]])
         epochs_before = _epochs(rows_before)

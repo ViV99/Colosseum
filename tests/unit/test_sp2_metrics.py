@@ -183,13 +183,16 @@ def test_hub_forwards_layout_namespaces_to_wandb(tmp_path):
         def log_global(self, metrics, env_steps):
             calls.append(("global", env_steps, dict(metrics)))
 
-    hub = MetricsHub(writer=MetricsWriter(tmp_path / "m.jsonl"), ratings_path=tmp_path / "r.json",
-                     agent_ids=["a"], total_timesteps=10, log_interval=1, console_interval_sec=0.0,
-                     wandb_logger=FakeWandB())
-    hub.on_train_metrics({"agent_id": "a", "train_step": 1, "total_loss": 0.5})
-    hub.on_match_result(duel("a", "a", 1, 2))
-    hub.on_worker_stats({"kind": "worker_stats", "worker_id": 0, "dropped_reward_episodes": 2})
-    hub.maybe_tick(env_steps=5, ratings=RATINGS, queue_depths={"a": 0})
+    writer = MetricsWriter(tmp_path / "m.jsonl")
+    try:
+        hub = MetricsHub(writer=writer, ratings_path=tmp_path / "r.json", agent_ids=["a"], total_timesteps=10,
+                         log_interval=1, console_interval_sec=0.0, wandb_logger=FakeWandB())
+        hub.on_train_metrics({"agent_id": "a", "train_step": 1, "total_loss": 0.5})
+        hub.on_match_result(duel("a", "a", 1, 2))
+        hub.on_worker_stats({"kind": "worker_stats", "worker_id": 0, "dropped_reward_episodes": 2})
+        hub.maybe_tick(env_steps=5, ratings=RATINGS, queue_depths={"a": 0})
+    finally:
+        writer.close()                                 # never leaked (ResourceWarning under -W error)
     assert calls[0] == ("train", "a", 1, {"total_loss": 0.5})
     row = calls[1][2]
     assert calls[1][0] == "global" and calls[1][1] == 5

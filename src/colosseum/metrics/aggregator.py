@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import time
 from collections import Counter, defaultdict
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -201,7 +201,8 @@ class EpisodeAggregator:
 
 
 # Worker stats that are cumulative per worker: the run-level value is the sum over every worker ever seen of the
-# largest value it reported, so it never decreases (SP4 spec block 7.2).
+# largest value it reported, so it never decreases (SP4 spec block 7.2; SP5: the per-worker maxima are saved by an
+# in-place resume, P-PF3-5).
 CUMULATIVE_WORKER_KEYS = ("dropped_results", "dropped_reward_episodes")
 
 # A worker's key: (node number or None, worker id, incarnation).
@@ -241,26 +242,43 @@ class SystemStats:
         self._worker_timeout = float(worker_timeout_sec)
         self._workers: dict[WorkerKey, tuple[float, dict]] = {}
         self._cumulative: dict[str, dict[WorkerKey, int]] = {key: {} for key in CUMULATIVE_WORKER_KEYS}
-        # An in-place resume (SP5 T4.3, P-PF3-5): the run-level totals of the previous hub incarnations.
+        # An in-place resume (SP5 T4.3, P-PF3-5): the counts of workers of the previous hub incarnations whose keys
+        # can come back from zero (train's local node died with the hub); every other worker's maximum is restored
+        # under its key, so a remote worker that outlives the hub and reports again is not counted twice.
         self._base: dict[str, int] = {key: 0 for key in CUMULATIVE_WORKER_KEYS}
         self._match_log_base = 0              # the journal writers' drops of the previous incarnations
         self._match_log_dropped = 0           # this incarnation's writer drops (the last snapshot's)
 
-    def state(self) -> dict[str, Any]:
+    def state(self, local_nodes: Collection[int] = ()) -> dict[str, Any]:
         """The run-level cumulative counters (``hub_state.json`` ``counters["system_stats"]``, P-PF3-5): per
-        ``CUMULATIVE_WORKER_KEYS`` key its total, and the journal writers' dropped results; ``restore`` continues
-        them, so ``dropped_reward_episodes`` and ``dropped_match_results`` stay monotonic across an in-place
-        resume."""
-        return {"cumulative": {key: self.cumulative(key) for key in CUMULATIVE_WORKER_KEYS},
+        ``CUMULATIVE_WORKER_KEYS`` key the maximum of every worker (``[node, worker, incarnation, value]``) and a
+        ``base``, and the journal writers' dropped results; ``restore`` continues them, so
+        ``dropped_reward_episodes`` and ``dropped_match_results`` stay monotonic across an in-place resume. The
+        workers of ``local_nodes`` (train's local node: it dies with the hub, and the next one's workers count from
+        zero under the same keys) are folded into ``base``."""
+        local = {int(n) for n in local_nodes}
+        base = dict(self._base)
+        workers: dict[str, list[list]] = {}
+        for key, per_worker in self._cumulative.items():
+            rows = workers.setdefault(key, [])
+            for (node, worker, incarnation), value in sorted(per_worker.items(), key=lambda kv: str(kv[0])):
+                if node is not None and node in local:
+                    base[key] += int(value)
+                else:
+                    rows.append([node, worker, incarnation, int(value)])
+        return {"base": base, "workers": workers,
                 "match_log_dropped": self._match_log_base + self._match_log_dropped}
 
     def restore(self, state: Mapping[str, Any] | None) -> None:
-        """Continue the totals of ``state()`` of a previous hub incarnation (unknown keys are ignored)."""
+        """Continue ``state()`` of a previous hub incarnation (unknown keys are ignored)."""
         state = state or {}
-        self._base = {key: 0 for key in CUMULATIVE_WORKER_KEYS}
-        for key, value in (state.get("cumulative") or {}).items():
-            if key in self._base:
-                self._base[key] = int(value)
+        self._base = {key: int((state.get("base") or {}).get(key, 0)) for key in CUMULATIVE_WORKER_KEYS}
+        self._cumulative = {key: {} for key in CUMULATIVE_WORKER_KEYS}
+        for key, rows in (state.get("workers") or {}).items():
+            if key in self._cumulative:
+                for node, worker, incarnation, value in rows:
+                    wkey = (None if node is None else int(node), int(worker), int(incarnation))
+                    self._cumulative[key][wkey] = max(self._cumulative[key].get(wkey, 0), int(value))
         self._match_log_base = int(state.get("match_log_dropped") or 0)
 
     def on_train_step(self, agent_id: str, train_step: int) -> None:

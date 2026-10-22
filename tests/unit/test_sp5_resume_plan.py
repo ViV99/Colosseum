@@ -165,6 +165,18 @@ def test_hub_state_counts_win_and_a_malformed_one_is_refused(tmp_path):
         prepare_resume(root, None)
 
 
+def test_a_hub_state_of_another_run_is_refused_before_anything_is_written(tmp_path):
+    """Review round 1 (T4.3(b)): the run-id check runs in prepare_resume, before commit_resume writes anything."""
+    root = copy_sp4_run(tmp_path)
+    save_hub_state(root / HUB_STATE_FILE, HubStateData(version=1, run_id="other", env_steps=5, sessions={},
+                                                       epoch_reserved_until=0, versions={}, counters={},
+                                                       nodes_lost=0), fsync=False)
+    before = (root / "config.resolved.yaml").read_text()
+    with pytest.raises(ConfigError, match="belongs to run other"):
+        prepare_resume(root, None, {"training.total_timesteps": 10**7})
+    assert (root / "config.resolved.yaml").read_text() == before and not (root / "config.resolved.1.yaml").exists()
+
+
 def test_not_a_run_dir(tmp_path):
     with pytest.raises(ConfigError, match="not a run dir"):
         prepare_resume(tmp_path / "missing", None)
