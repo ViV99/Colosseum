@@ -17,6 +17,11 @@ server).
   logging to stderr) for the signal and exit-code tests; ``node_options_json`` / ``start_node_main`` build and start
   one (``python -c``, its own session).
 - ``wait_for(pred, timeout)``: poll a predicate.
+- Evaluation (T5.1): ``FakeHub.lease(lease_id, tasks)`` sends a ``BlockLease``; every ``BlockResult`` is acked
+  (``BlockAck``) unless ``block_acks`` is False (``ack_blocks()`` acks the ones received so far); eval blobs are
+  served by the real ``BlobStore.register_weights`` (``eval_kit.gauntlet_tasks(..., blobs=hub.blobs)``);
+  ``refuse_downloads()`` answers every eval download NOT_FOUND; ``eval_downloads()``, ``block_results()``,
+  ``lease_requests()`` read what the hub saw.
 """
 from __future__ import annotations
 
@@ -72,12 +77,13 @@ class GatedBlobs(BlobStore):
         super().__init__(run_dir)
         self.gates: dict[tuple[str, str, str], threading.Event] = {}
         self.missing: set[tuple[str, str, str]] = set()
+        self.refuse_eval = False                          # every Download(kind="eval") NOT_FOUND (T5.1)
         self.timeline = timeline
 
     def frame_path(self, kind: str, agent_id: str, ident: str) -> Path | None:
         triple = (kind, agent_id, ident)
         self.timeline.append(("download", triple))
-        if triple in self.missing:
+        if triple in self.missing or (kind == "eval" and self.refuse_eval):
             return None
         gate = self.gates.get(triple)
         if gate is not None:
@@ -132,6 +138,7 @@ class FakeHub:
         self.lineup_for: Callable[[int, int], Lineup | None] = lambda worker, env: None
         self.grants_sent: list[tuple[int, int, int]] = []     # (worker, env, epoch) of every grant sent
         self.hold_acks = False
+        self.block_acks = True                 # T5.1: every BlockResult is acked at once
         self.refuse_once: set[int] = set()     # result seqs refused once (as a full journal writer does: no ack)
         self.paused = False
         self.cells = CellTable(EpochAllocator(first_epoch - 1, lambda until: None))
@@ -261,6 +268,39 @@ class FakeHub:
                                                                         kind="fixed"))
         return blob_id
 
+    # ---- evaluation (T5.1) -------------------------------------------------------------------------------------
+
+    def lease(self, lease_id: str, tasks: list, lease_sec: float = 600.0) -> None:
+        """One ``BlockLease`` of ``tasks`` (``BlockTask``s) to every live session."""
+        from colosseum.net.messages import lease_to_proto
+
+        self.send(lease=lease_to_proto(lease_id, lease_sec, tasks))
+
+    def ack_blocks(self) -> None:
+        """Ack every ``BlockResult`` received so far (``block_acks`` False holds them)."""
+        def ack():
+            for ev in self.node_messages("block_result"):
+                handle = self.sessions.get(ev.node_id)
+                if handle is not None:
+                    r = ev.message.block_result
+                    handle.send(pb.HubMessage(block_ack=pb.BlockAck(lease_id=r.lease_id, block_ids=[r.block_id])))
+        self.call(ack)
+
+    def refuse_downloads(self) -> None:
+        self.blobs.refuse_eval = True
+
+    def eval_downloads(self, ident: str | None = None) -> list[tuple[str, str, str]]:
+        return [t for t in self.blobs.requests() if t[0] == "eval" and (ident is None or t[2] == ident)]
+
+    def block_results(self, lease_id: str | None = None) -> list[pb.BlockResult]:
+        return [r for r in self.messages("block_result") if lease_id is None or r.lease_id == lease_id]
+
+    def lease_requests(self) -> list[int]:
+        return [int(m.free_slots) for m in self.messages("lease_request")]
+
+    def sessions_opened(self) -> list[pb.Hello]:
+        return [e.hello for e in self.events(SessionOpened)]
+
     def versions(self, agent: str | None = None) -> list[pb.VersionInfo]:
         """Every ``VersionAnnounce``'s info received (of ``agent``), in arrival order."""
         return [m.info for m in self.messages("version") if agent is None or m.info.agent_id == agent]
@@ -367,6 +407,10 @@ class FakeHub:
                                        ttl_sec=self.ttl_sec, lineup=lineup_to_proto(lineup)))
             if grants:
                 handle.send(pb.HubMessage(grants=pb.LineupGrants(grants=grants)))
+        elif kind == "block_result":
+            if self.block_acks:
+                r = ev.message.block_result
+                handle.send(pb.HubMessage(block_ack=pb.BlockAck(lease_id=r.lease_id, block_ids=[r.block_id])))
         elif kind == "results":
             seq = int(ev.message.results.seq)
             if seq in self.refuse_once:

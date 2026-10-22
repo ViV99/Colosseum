@@ -59,8 +59,8 @@
 9. **Commands.** ``stop_run`` stops (item 10; its ``reason`` ``grace=<sec>`` is the hub's stop grace, A1);
    ``start_learner`` / ``stop_learner`` start or stop one learner (stopped, it sends its final snapshot, which is
    uploaded); ``release`` stops like item 10, then forgets the run (its children, cache files, lock and listener) and
-   keeps the session (``once``: the node then exits 0; serving another run is T6.3's); ``set_evaluators`` /
-   ``update_code`` (T5.1 / T8.3) are logged and ignored.
+   keeps the session (``once``: the node then exits 0; serving another run is T6.3's); ``set_evaluators`` and
+   ``cancel_leases`` go to the evaluation section (item 15); ``update_code`` (T8.3) is logged and ignored.
 10. **Stop** (spec 7.4; T4.4): ``stop_run``, ``release``, or the node's own stop (``request_stop``, SIGINT / SIGTERM
     through ``install_stop_signals``: an ``Event(node_leaving)`` first, W04-24). ``Stop`` goes to the workers and
     evaluators (they flush their results), to the learners once the workers are gone or half the children's window
@@ -123,6 +123,12 @@
     put or tried to put into the cache (blobs, fetched latest weights; never the learners' checkpoint frames, which go
     only to the hub) ``+ SPACE_MARGIN_BYTES`` and the state ends (INFO). A learner's own publish that does not fit is
     skipped in the learner (``NodeOutputs.publish_weights``: one ERROR per episode).
+15. **Evaluation** (spec 5.3; SP5 T5.1; ``node.evaluators``): evaluator children (``evaluator-<i>``, as many as the
+    hub wants up to ``Hello.slots.evaluators``: ``Welcome.evaluators``, ``Command(set_evaluators)``), block leases
+    (``BlockLease`` -> eval blobs fetched into the cache -> ``EvalTask``), block outcomes (``BlockResult``, kept until
+    ``BlockAck``, resent after a reconnect before any new ``BlockLeaseRequest``; ``Hello.leases`` names the leases
+    held), ``cancel_leases``. Evaluators stopped because the hub wants fewer are neither restarts nor deaths; a dead
+    one is restarted by the rule of item 4.
 
 Threads besides the loop: the session reader (``HubSession``), the listener's ``Acceptor``, the transfer pool, the
 data port's servicers, the chunk router's readers and senders and the short threads that open the node's chunk
@@ -158,6 +164,7 @@ import grpc
 from colosseum.net.proto import colosseum_v1_pb2 as pb
 from colosseum.net.security import Token
 from colosseum.node.books import CellTracker, ResultBuffer
+from colosseum.node.evaluators import EVALUATOR_PREFIX, NodeEvaluators, is_eval_key
 from colosseum.node.fetch import BlobFetched, LatestFetched, LatestFetchFailed, NodeFetcher, rpc_text
 from colosseum.node.learners import LearnerBlobsDone, NodeLearners
 from colosseum.node.lineups import CACHE_DROP_DELAY_SEC, FIXED_RETRY_SEC, LINEUP_WAIT_SEC, NodeLineups  # noqa: F401
@@ -378,7 +385,7 @@ class NodeAgent:
         self._events: deque = deque()
         self._events_dropped = 0
         self._hello_lock = threading.Lock()
-        self._hello_state: tuple = ("", (), 0, 0, 0, ())
+        self._hello_state: tuple = ("", (), 0, 0, 0, (), ())
         self._next_heartbeat = 0.0
         self._next_metrics = 0.0
         self._next_prune = 0.0
@@ -397,6 +404,7 @@ class NodeAgent:
         self._published_counters: dict[str, int] = {}
         self._published_history: dict[str, list[int]] = {}
         self.routing = NodeRouting(_RoutingHost(self))   # chunks between machines (node.routing, item 12)
+        self.evaluators = NodeEvaluators(_EvaluatorHost(self))   # evaluators and block leases (item 15, T5.1)
         self._published_paths: dict[int, str] = {}
         self._published_env_steps = 0
         self._credentials: grpc.ChannelCredentials | None = None
@@ -675,13 +683,23 @@ class NodeAgent:
                 logger.warning(f"node: --gpus {dropped} are not usable by torch in this environment (usable: "
                                f"{usable or 'none'}); no learner slot on them")
         if opts.local:
-            return pb.Slots(workers=int(opts.workers or 0), evaluators=int(opts.evaluators or 0), cpu_learners=-1,
+            return pb.Slots(workers=int(opts.workers or 0), evaluators=self._evaluator_slots(), cpu_learners=-1,
                             gpus=gpus, no_learners=opts.no_learners, envs_per_worker=envs)
         d = default_slots(self._hw)
         return pb.Slots(workers=int(opts.workers if opts.workers is not None else d["workers"]),
-                        evaluators=int(opts.evaluators if opts.evaluators is not None else d["evaluators"]),
+                        evaluators=self._evaluator_slots(),
                         cpu_learners=int(opts.cpu_learners if opts.cpu_learners is not None else d["cpu_learners"]),
                         gpus=gpus, no_learners=opts.no_learners, envs_per_worker=envs)
+
+    def _evaluator_slots(self) -> int:
+        """``Hello.slots.evaluators``: ``--evaluators`` (train's local node: its option, else 0), else the hardware
+        default (spec 2.6)."""
+        from colosseum.node.hardware import default_slots
+
+        opts = self.options
+        if opts.evaluators is not None or opts.local:
+            return max(0, int(opts.evaluators or 0))
+        return int(default_slots(self._hw)["evaluators"])
 
     def _hardware(self) -> pb.Hardware:
         from colosseum.net.security import cache_home
@@ -711,7 +729,7 @@ class NodeAgent:
         from colosseum.net.messages import PROTOCOL_VERSION
 
         with self._hello_lock:
-            run_id, live, env_steps, last_acked, _envs, learners = self._hello_state
+            run_id, live, env_steps, last_acked, _envs, learners, leases = self._hello_state
         return pb.Hello(node_id=self._node_id, session_id=self.session_id, protocol_major=PROTOCOL_VERSION[0],
                         protocol_minor=PROTOCOL_VERSION[1], code_hash="", hardware=self._hardware(),
                         slots=self._slots(), data_addresses=list(self._data_addresses), run_id=run_id,
@@ -719,13 +737,13 @@ class NodeAgent:
                         env_steps=env_steps, last_acked_seq=last_acked,
                         learners=[pb.RunningLearner(agent_id=a, generation=g, version=v) for a, g, v in learners],
                         name=self._name,
-                        tags=list(self.options.tags))
+                        tags=list(self.options.tags), leases=list(leases))
 
     def _update_hello_state(self) -> None:
         run = self._run
         state = ("" if run is None else run.run_id, tuple(self.cells.live()), self._env_steps(),
                  0 if run is None else run.results.last_acked, 0 if run is None else run.envs,
-                 self.learners.hello_entries())
+                 self.learners.hello_entries(), tuple(self.evaluators.held()))
         with self._hello_lock:
             self._hello_state = state
 
@@ -799,7 +817,11 @@ class NodeAgent:
                 self._on_child_hello(item.conn, item.hello)
             elif isinstance(item, BlobFetched):
                 self._note_frame(item.size)
-                self.lineups.on_fetch_done(item)
+                if is_eval_key(item.key):           # item 15: an evaluation blob
+                    self.fetches.blob_done(item)
+                    self.evaluators.on_fetch_done(item)
+                else:
+                    self.lineups.on_fetch_done(item)
             elif isinstance(item, LatestFetched):
                 if item.fetched is not None:
                     self._note_frame(len(item.fetched.frame))
@@ -841,6 +863,7 @@ class NodeAgent:
                     self._send(message)
                 if resend:
                     logger.info(f"node: resent {len(resend)} unacknowledged result batches after the reconnect")
+                self.evaluators.on_session_up()      # item 15: block outcomes before any new lease request
             while self._events:
                 if not self._send(pb.NodeMessage(event=self._events[0])):
                     break
@@ -875,6 +898,8 @@ class NodeAgent:
                 self.routing.update_routes(run)
                 self.routing.sync_relay_inbox(run)
             self.routing.sync_delivery(run, now)
+            if self._dormant != "stopping":         # item 15 (no spawn while the hub is away)
+                self.evaluators.tick(run, now, spawn=not self._dormant)
             if now >= self._next_prune:
                 self._next_prune = now + CACHE_PRUNE_SEC
                 self.lineups.prune_cache(run, now)
@@ -917,6 +942,11 @@ class NodeAgent:
             self._on_command(msg.command)
         elif kind == "announce":
             self._on_announce(msg.announce)
+        elif kind == "lease":
+            if self._run is not None and not self._stopping:
+                self.evaluators.on_lease(msg.lease)
+        elif kind == "block_ack":
+            self.evaluators.on_ack(msg.block_ack)
         else:
             logger.debug(f"node: ignored a {kind} message (not handled by this node yet)")
 
@@ -938,6 +968,7 @@ class NodeAgent:
                 return
             self.learners.forward_env_steps(int(welcome.env_steps), self._env_steps())   # R28's first base (FX3)
             self._absorb(welcome.versions, welcome.agents, welcome.evictions, welcome.banned_node_ids, welcome=True)
+            self.evaluators.set_wanted(int(welcome.evaluators))
             return
         if welcome.run_id != run.run_id:
             logger.warning(f"node: the hub now runs {welcome.run_id[:8]}, this node serves {run.run_id[:8]}; "
@@ -971,6 +1002,7 @@ class NodeAgent:
             self.learners.assign(run, la)
         self.learners.forward_env_steps(int(welcome.env_steps), self._env_steps())
         self._absorb(welcome.versions, welcome.agents, welcome.evictions, welcome.banned_node_ids, welcome=True)
+        self.evaluators.set_wanted(int(welcome.evaluators))
         if woke:
             self._maybe_start_workers(run)
 
@@ -1171,6 +1203,10 @@ class NodeAgent:
                 self.learners.assign(self._run, cmd.learner)
         elif cmd.kind == "stop_learner":                # only the generation it names (T4.1)
             self.learners.stop(cmd.learner.agent_id, cmd.reason or "stop_learner", int(cmd.learner.generation))
+        elif cmd.kind == "set_evaluators":             # item 15 (T5.1)
+            self.evaluators.set_wanted(int(cmd.evaluators))
+        elif cmd.kind == "cancel_leases":
+            self.evaluators.on_cancel(list(cmd.lease_ids))
         else:
             logger.info(f"node: command {cmd.kind!r} is not handled by this node yet; ignored")
 
@@ -1209,6 +1245,8 @@ class NodeAgent:
                 self._on_worker_connected(name, conn)
             elif self.supervisor.role(name) == "learner":
                 self.learners.on_connected(name)
+            elif self.supervisor.role(name) == "evaluator":
+                self.evaluators.on_connected(name)
         elif hello.channel == "route":              # frames for other machines: the router reads them (item 12)
             if (exited or self._stopping or self._dormant or self.supervisor.role(name) != "worker"
                     or not self.routing.add_worker(conn, _slot_index(name))):
@@ -1374,6 +1412,8 @@ class NodeAgent:
             self._event("child_error", proc=name, error_kind=message.kind, message=message.message,
                         context=f"node {self._number} ({self._name}), {message.context}", log_path=log_path,
                         log_tail=tail_for_event(log_path))
+        elif name.startswith(EVALUATOR_PREFIX):
+            self.evaluators.on_message(name, message)
         else:
             self.learners.on_message(name, message)
 
@@ -1415,6 +1455,9 @@ class NodeAgent:
             return
         self._exit_waits.pop(name, None)
         self._drain_to_eof(name)
+        if self.supervisor.role(name) == "evaluator" and \
+                self.evaluators.on_exit(name, code, final=self._stopping or bool(self._dormant)):
+            return                                   # item 15: stopped with the node or while the hub is away
         if self._stopping:
             return
         run = self._run
@@ -1856,6 +1899,7 @@ class NodeAgent:
         self.supervisor = ChildSupervisor()
         self.cells = CellTracker(retry_sec=LINEUP_RETRY_SEC, clock=time.monotonic)
         self.learners.clear()
+        self.evaluators.close()
         self.fetches.clear_run()
         self.lineups.clear()
         for book in (self._learner_routes, self._upload_futures, self._control, self._child_conns):
@@ -1891,6 +1935,7 @@ class NodeAgent:
         self.routing.stop()
         if self.supervisor.alive():
             self.supervisor.stop_all(0.0)
+        self.evaluators.close()
         if self._session is not None:
             self._session.close()
         for channel in (*self._old_channels, self._channel):
@@ -2045,6 +2090,61 @@ class _RoutingHost:
         """``train`` without ``--listen`` has a loopback hub and one node: no other machine can send it chunks."""
         options = self._agent.options
         return not (options.local and options.data_port is None)
+
+
+class _EvaluatorHost:
+    """``node.evaluators.EvaluatorHost`` over the agent: the narrow interface ``NodeEvaluators`` uses."""
+
+    def __init__(self, agent: NodeAgent) -> None:
+        self._agent = agent
+
+    @property
+    def supervisor(self) -> ChildSupervisor:
+        return self._agent.supervisor
+
+    @property
+    def fetches(self) -> NodeFetcher:
+        return self._agent.fetches
+
+    @property
+    def connected(self) -> bool:
+        return self._agent._connected
+
+    @property
+    def cache_full(self) -> bool:
+        return self._agent._cache_full
+
+    @property
+    def stopping(self) -> bool:
+        return self._agent._stopping
+
+    @property
+    def dormant(self) -> bool:
+        return bool(self._agent._dormant)
+
+    @property
+    def slots(self) -> int:
+        return self._agent._evaluator_slots()
+
+    def current_run(self) -> Any:
+        return self._agent._run
+
+    def send(self, message: pb.NodeMessage) -> bool:
+        return self._agent._send(message)
+
+    def send_child(self, name: str, message: Any) -> bool:
+        conn = self._agent._control.get(name)
+        return conn is not None and self._agent._child_send(name, conn, message)
+
+    def close_child(self, name: str) -> None:
+        """Close every connection of ``name`` and forget a pending exit of it (a retired evaluator)."""
+        agent = self._agent
+        agent._exit_waits.pop(name, None)
+        for conn in [c for c, n in agent._child_conns.items() if n == name]:
+            agent._close_conn(conn)
+
+    def disabled(self, name: str) -> bool:
+        return name in self._agent._disabled
 
 
 class _LearnerHost:

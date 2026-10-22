@@ -101,6 +101,7 @@ HELLO_TIMEOUT_SEC = 10.0              # a Session stream must send its Hello wit
 RELAY_UPLOAD_KIND = "relay_latest"                               # T3.2: handled in the servicer (LatestRelay)
 RELAY_ITEM_POLL_SEC = 0.25
 REGISTERED_KINDS = ("fixed", "teacher", "init")
+EVAL_KIND = "eval"                   # evaluation blobs (T5.1): weights files registered by the main loop
 START_IDENT_RE = re.compile(r"resume|recovery|ckpt_v[0-9]{1,18}")   # Download(kind="start") idents (T4.1, A28)
 PARKED_IDENT = "parked"
 BLOB_IDENT_RE = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,159}")  # A18's blob id
@@ -769,7 +770,16 @@ class BlobStore:
     ``checkpoints/<agent>/ckpt_v<N>/model.pt``, else the held copy of an evicted one in
     ``checkpoints/.evicted/<agent>/ckpt_v<N>/`` (SP5 T3.1, spec 4.2). ``forget`` (main loop) removes the converted
     frame of an evicted snapshot that is not (or no longer) held; a conversion that started before ``forget`` writes
-    nothing (a per-key forget count is compared under the lock before the frame is put in place)."""
+    nothing (a per-key forget count is compared under the lock before the frame is put in place).
+
+    Evaluation blobs (SP5 T5.1, spec 5.3): ``register_weights`` (main loop) names a weights file (a snapshot's
+    ``model.pt``, a frozen agent's file) under a blob id; ``Download(kind="eval", agent_id, ident=blob_id)`` serves it
+    as an ``encode_weights`` frame (``WeightsMeta(kind="fixed", architecture=networks, roles=roles)``) converted on
+    first use by the servicer thread into ``blobs/<blob_file_name("eval", agent, blob_id)>`` (the agent id only as
+    its digest: tournament agent ids such as ``a/main`` or ``name#hash`` are never path components, P-PF4-3). The
+    request's agent id must be the registration's. ``unregister`` removes the record and the frame; a conversion
+    racing a re-registration or ``unregister`` puts no frame in place (a per-blob generation compared under the
+    lock). Eval frames an earlier hub process left are removed at construction (P-PF4-15)."""
 
     def __init__(self, run_dir: RunDir) -> None:
         self.run_dir = run_dir
@@ -778,6 +788,12 @@ class BlobStore:
         self._lock = threading.Lock()
         self._convert_locks: dict[tuple[str, str], threading.Lock] = {}
         self._forgets: dict[tuple[str, str, str], int] = {}     # (kind, agent, ident) -> times forgotten
+        self._eval: dict[str, tuple[Path, str, dict, tuple[str, ...], int]] = {}   # blob id -> (file, agent, ..., gen)
+        self._eval_gen = itertools.count(1)
+        self._eval_warned: set[tuple[str, int]] = set()  # (blob id, generation) whose file could not be read
+        if self.dir.is_dir():
+            for path in self.dir.glob(f"{EVAL_KIND}-*.frame"):
+                path.unlink(missing_ok=True)
 
     @property
     def dir(self) -> Path:
@@ -793,6 +809,8 @@ class BlobStore:
         any path is formed (P-PF2-9 (c))."""
         if not (isinstance(kind, str) and isinstance(agent_id, str) and isinstance(ident, str)):
             return None
+        if kind == EVAL_KIND:                          # agent ids of tournament players need not be config ids
+            return self._eval_frame(agent_id, ident)
         if not _valid_agent_id(agent_id):
             return None
         if kind == "snapshot":
@@ -864,6 +882,81 @@ class BlobStore:
                     f.write(frame)
                 with self._lock:                      # forgotten meanwhile (released by the main loop): no frame
                     if self._forgets.get(key, 0) != forgets:
+                        return None
+                    os.replace(tmp, path)
+            finally:
+                tmp.unlink(missing_ok=True)
+            return path
+
+    # ---- evaluation blobs (T5.1) ----------------------------------------------------------------------------------
+
+    def register_weights(self, blob_id: str, weights_file: Path | str, *, agent_id: str, networks: Any,
+                         roles: Sequence[str]) -> None:
+        """Serve ``weights_file`` as the eval blob ``blob_id`` of ``agent_id`` (main loop; class docstring).
+        Registering an id again with the same record is a no-op; with another record it replaces it and removes the
+        old converted frame. ValueError for an invalid id or an empty agent id."""
+        if not isinstance(blob_id, str) or not BLOB_IDENT_RE.fullmatch(blob_id):
+            raise ValueError(f"invalid eval blob id {blob_id!r}")
+        if not isinstance(agent_id, str) or not agent_id:
+            raise ValueError(f"invalid agent id {agent_id!r} for an eval blob")
+        record = (Path(weights_file), agent_id, dict(networks or {}), tuple(roles))
+        with self._lock:
+            old = self._eval.get(blob_id)
+            if old is not None and old[:4] == record:
+                return
+            self._eval[blob_id] = (*record, next(self._eval_gen))
+            if old is not None:
+                (self.dir / blob_file_name(EVAL_KIND, old[1], blob_id)).unlink(missing_ok=True)
+
+    def unregister(self, blob_id: str) -> None:
+        """Stop serving the eval blob ``blob_id`` and remove its converted frame (unknown ids are ignored)."""
+        with self._lock:
+            old = self._eval.pop(blob_id, None) if isinstance(blob_id, str) else None
+            if old is not None:
+                (self.dir / blob_file_name(EVAL_KIND, old[1], blob_id)).unlink(missing_ok=True)
+
+    def eval_blobs(self) -> list[str]:
+        """The registered eval blob ids (any thread)."""
+        with self._lock:
+            return sorted(self._eval)
+
+    def _eval_frame(self, agent_id: str, blob_id: str) -> Path | None:
+        """Servicer threads: the converted frame of a registered eval blob (made on first use), or None."""
+        if not BLOB_IDENT_RE.fullmatch(blob_id):
+            return None
+        with self._lock:
+            record = self._eval.get(blob_id)
+        if record is None or record[1] != agent_id:
+            return None
+        weights_file, _agent, networks, roles, gen = record
+        path = self.dir / blob_file_name(EVAL_KIND, agent_id, blob_id)
+        if _is_file(path):
+            return path
+        with self._lock:
+            lock = self._convert_locks.setdefault((EVAL_KIND, blob_id), threading.Lock())
+        with lock:                                    # two concurrent downloads convert once
+            if _is_file(path):
+                return path
+            try:
+                state = read_weights_file(weights_file)
+            except (OSError, ValueError) as e:
+                with self._lock:
+                    first = (blob_id, gen) not in self._eval_warned
+                    self._eval_warned.add((blob_id, gen))
+                if first:
+                    log.error("eval blob %s cannot be served: its weights file %s cannot be read (%s)", blob_id,
+                              weights_file, e)
+                return None
+            frame = encode_weights(state, WeightsMeta(agent_id=agent_id, kind="fixed", generation=0, policy_version=0,
+                                                      architecture=dict(networks), roles=tuple(roles)))
+            self.dir.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+            try:
+                with open(tmp, "xb") as f:
+                    f.write(frame)
+                with self._lock:                      # unregistered or replaced meanwhile: no frame survives it
+                    current = self._eval.get(blob_id)
+                    if current is None or current[4] != gen:
                         return None
                     os.replace(tmp, path)
             finally:

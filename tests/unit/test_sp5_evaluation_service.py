@@ -294,3 +294,24 @@ def test_an_unknown_failure_kind_is_invalid(caplog):
                                                  error_kind=kind))
     assert ev.invalid_results == 2 and ev.queue.queued() == 2 and rec.sink == []
     assert len([r for r in caplog.records if "failure kind" in r.getMessage()]) == 1
+
+
+def test_accepted_results_carry_only_trusted_labels():
+    """The fields no check pins are the hub's: node, match id (= uid), env steps (None; the pulse sets its
+    snapshot's), seat generations (None) and seat sources (the lineup's)."""
+    rec = Recorder()
+    ev = _service(rec)
+    ev.add_owner(OWNER, lambda *a: rec.sink.append(a))
+    ev.node_joined(1, slots=1, held_leases=[], fresh=True)
+    ev.submit(_tasks(1))
+    ev.on_lease_request(1, 1)
+    ((_n, lease),) = rec.of("lease")
+    msg = _result_msg(lease.lease_id, lease.blocks[0])
+    for p in msg.results:
+        p.match_id, p.env_steps, p.node = "w7_e0_forged", 123, 9
+        for seat in p.seats:
+            seat.generation, seat.source = 5, "forged"
+    ev.on_block_result(1, msg)
+    ((_kind, _block, results),) = rec.sink
+    assert all(r.match_id == r.uid and r.env_steps is None and r.node == 1 for r in results)
+    assert {(s.generation, s.source) for r in results for s in r.seats} == {(None, "")}

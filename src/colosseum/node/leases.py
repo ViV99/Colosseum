@@ -165,6 +165,10 @@ class NodeLeases:
             self._evaluators[index] = None
         return self._abandon(lease_id, kind, message)
 
+    def abandon(self, lease_id: str, kind: str, error: str) -> list[BlockOutcome]:
+        """Give a lease back with ``kind`` per block (e.g. ``abandoned``: no evaluator will play it)."""
+        return self._abandon(lease_id, kind, error)
+
     def _abandon(self, lease_id: str, kind: str, error: str) -> list[BlockOutcome]:
         lease = self._leases.pop(lease_id, None)
         if lease is None:
@@ -207,16 +211,34 @@ class NodeLeases:
     def on_reconnect(self) -> tuple[list[str], list[BlockOutcome]]:
         """A new session: the leases to name in ``Hello.leases`` and the outcomes to send again."""
         self._asked = 0
-        held = sorted({*self._leases, *(lease_id for lease_id, _ in self._unacked)})
-        return held, list(self._unacked.values())
+        return self.held(), list(self._unacked.values())
+
+    def held(self) -> list[str]:
+        """The leases this node holds (playing or waiting, or with unacked outcomes): ``Hello.leases``."""
+        return sorted({*self._leases, *(lease_id for lease_id, _ in self._unacked)})
+
+    @property
+    def asked(self) -> int:
+        """Slots asked for that no lease answered yet."""
+        return self._asked
+
+    def reset_asked(self) -> None:
+        """Forget the asked slots (the next ``request`` asks again): the hub caps a node's held plus waiting leases
+        at its evaluator slots, so asking again never grants more than the node can play."""
+        self._asked = 0
+
+    def missing(self) -> set[CacheKey]:
+        """The cache keys leases still wait for (the agent fetches those not in flight)."""
+        return {k for lease in self._leases.values() if lease.state == "fetching" for k in lease.missing}
 
     # --- the machine cache ---
     def keys_in_use(self) -> set[CacheKey]:
         return {k for lease in self._leases.values() for k in lease.keys}
 
-    def drop_candidates(self) -> list[CacheKey]:
-        """Evaluation blobs to remove from the cache: unused by every lease, beyond the newest ``EVAL_BLOBS_KEPT``."""
-        used = self.keys_in_use()
+    def drop_candidates(self, busy: Callable[[CacheKey], bool] | None = None) -> list[CacheKey]:
+        """Evaluation blobs to remove from the cache: unused by every lease, beyond the newest ``EVAL_BLOBS_KEPT``
+        (``busy``: keys kept anyway, e.g. a fetch of them in flight)."""
+        used = self.keys_in_use() | {k for k in self._eval_keys if busy is not None and busy(k)}
         unused = [k for k in self._eval_keys if k not in used]
         drop = unused[:max(0, len(unused) - EVAL_BLOBS_KEPT)]
         for key in drop:

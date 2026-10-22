@@ -414,6 +414,21 @@ def _check_block_results(task: BlockTask, results: Sequence[MatchResult], spec: 
     return None
 
 
+def _trusted(task: BlockTask, results: list[MatchResult], node: int) -> list[MatchResult]:
+    """Accepted results with every field the checks do not pin set by the hub: ``node`` (the reporter), ``match_id`` =
+    ``uid`` (the journal derives nothing from a node's text), ``env_steps`` None (the pulse sets its snapshot's, T5.1
+    (b)), each seat's ``generation`` None (snapshot and fixed seats have none) and ``source`` the lineup seat's."""
+    lineups = {lu.uid: lu for lu in task.lineups}
+    for result in results:
+        result.node = int(node)
+        result.match_id = result.uid
+        result.env_steps = None
+        for seat, assignment in zip(result.seats, lineups[result.uid].seats, strict=True):
+            seat.generation = None
+            seat.source = assignment.source
+    return results
+
+
 class EvalBlobs(Protocol):
     """``BlobStore``'s evaluation blobs (T5.1 (b)): served by ``Download(kind="eval", ident=blob_id)``."""
 
@@ -548,9 +563,7 @@ class HubEvaluation:
             return
         if self.queue.complete(msg.lease_id, msg.block_id, results, self._clock(), node=node) != "accepted":
             return
-        for result in results:
-            result.node = node
-        self._deliver(task, results)
+        self._deliver(task, _trusted(task, results, node))
         self._after_change()
 
     def _invalid(self, node: int, msg: pb.BlockResult, reason: str) -> None:
