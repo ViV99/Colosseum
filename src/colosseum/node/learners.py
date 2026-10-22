@@ -7,7 +7,8 @@ A learner assignment (``Welcome.learners`` or ``Command(start_learner)``) downlo
 ``VersionPublished`` (after its intake runs) the workers are routed to its listener; every ``VersionPublished``
 becomes a ``VersionAnnounce`` (the latest one kept while the hub is away), ``LearnerMetrics`` / ``IntakeReport``
 feed ``MetricsBatch``, the global env steps are forwarded (``LearnerEnvSteps``; ruling R28: the hub's last announced
-count plus this node's own env steps since its receipt, a lower bound of the global count that never decreases).
+count plus this node's own env steps since its receipt, a lower bound of the global count that never decreases; the
+run's ``Welcome`` is the first such count, FX3).
 ``stop_learner`` sends ``Stop`` (the final snapshot is uploaded by the agent); a learner that ends without being
 stopped is ``learner_failed`` (until T4.2: the hub stops the run).
 
@@ -98,6 +99,7 @@ class NodeLearners:
         self.hub_env_steps = 0                               # the estimate forwarded to the learners (R28)
         self._announced = 0                                  # the hub's last Announce.env_steps
         self._own_at_announce = 0                            # this node's own env steps when it arrived
+        self._based = False                                  # a count arrived this run (the Welcome's at the latest)
 
     # ---- books --------------------------------------------------------------------------------------------------
 
@@ -128,6 +130,7 @@ class NodeLearners:
         self._pending_versions.clear()
         self.intake_stats.clear()
         self.hub_env_steps = self._announced = self._own_at_announce = 0   # the next run's counter starts anew
+        self._based = False
 
     def resend_pending(self) -> None:
         """After ``SessionUp``: the version announcements kept while the hub was away."""
@@ -136,10 +139,12 @@ class NodeLearners:
                 del self._pending_versions[agent]
 
     def forward_env_steps(self, env_steps: int, own: int = 0) -> None:
-        """``Announce.env_steps`` (the hub's global counter) received while this node's workers had taken ``own`` env
-        steps in total: it becomes the base of the estimate (R28) when it grew; then ``advance(own)``."""
-        if env_steps and int(env_steps) > self._announced:
-            self._announced, self._own_at_announce = int(env_steps), int(own)
+        """``Welcome.env_steps`` / ``Announce.env_steps`` (the hub's global counter) received while this node's
+        workers had taken ``own`` env steps in total: it becomes the base of the estimate (R28) when it is the run's
+        first count (the Welcome's, 0 for a new run: own steps count from the run's start, FX3) or it grew; then
+        ``advance(own)``."""
+        if not self._based or int(env_steps) > self._announced:
+            self._announced, self._own_at_announce, self._based = int(env_steps), int(own), True
         self.advance(own)
 
     def advance(self, own: int) -> None:
@@ -149,7 +154,7 @@ class NodeLearners:
         global count; the hub's next ``Announce`` catches up with the other nodes' steps."""
         from colosseum.net.local import LearnerEnvSteps
 
-        estimate = self._announced + max(0, int(own) - self._own_at_announce) if self._announced else 0
+        estimate = self._announced + max(0, int(own) - self._own_at_announce) if self._based else 0
         if estimate > self.hub_env_steps:
             self.hub_env_steps = estimate
             for entry in self._entries.values():

@@ -85,6 +85,52 @@ def test_a_cleared_run_starts_the_estimate_anew():
     assert learners.hub_env_steps == 10 and _forwarded(host)[-1] == 10
 
 
+def test_the_first_count_is_a_base_even_at_zero():
+    """FX3: the first count a node receives (the run's ``Welcome``: 0 for a new run) is a base like any Announce, so
+    the learners' progress follows the node's own steps from the run's start; before FX3 a zero count was no base and
+    nothing moved until the first Announce with steps (one heartbeat for the hub to hear of them, up to one more for
+    its Announce: the whole of a short run). Own steps before the receipt (an earlier run of the session) never
+    count."""
+    learners, host = _learners("a", "b")
+    learners.forward_env_steps(0, own=300)                  # the Welcome; 300 steps of an earlier run
+    assert host.sent == []
+    learners.advance(450)                                   # 150 own steps of this run
+    assert _forwarded(host) == _forwarded(host, "learner-b") == [150]
+    learners.forward_env_steps(0, own=460)                  # a later zero count is no newer base (160, not 0)
+    learners.advance(470)
+    assert _forwarded(host) == [150, 160, 170]
+    learners.forward_env_steps(1000, own=500)               # the first Announce with steps: a newer base
+    learners.advance(510)
+    assert _forwarded(host) == [150, 160, 170, 1000, 1010]
+
+
+def test_a_count_the_learner_received_before_its_spawn_value_was_set_is_kept(monkeypatch):
+    """FX3: the intake's reader thread runs from its construction and may read the node's ``LearnerEnvSteps`` (sent
+    at the learner's control hello) before the learner body sets the spawn-time value: that value is a floor, never
+    written over the newer count."""
+    import colosseum.core.threads as threads_module
+    import colosseum.learner.learner as learner_module
+    from node_kit import _NullConn, run_learner_main
+
+    class EarlyCount(_NullConn):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.env_steps = 700                            # read by the reader thread at once
+
+        @property
+        def value(self):                                    # ``ConnectionIntake.value``
+            return self.env_steps
+
+    seen = []
+    monkeypatch.setattr(learner_module, "learner_process",
+                        lambda *, progress_counter, **kw: seen.append(progress_counter.value))
+    monkeypatch.setattr(threads_module, "configure_torch_threads", lambda *a, **k: None)
+    config = make_test_config("turns")
+    run_learner_main(monkeypatch, config, intake_stub=EarlyCount, env_steps=300)
+    run_learner_main(monkeypatch, config, intake_stub=EarlyCount, env_steps=900)
+    assert seen == [700, 900]
+
+
 def test_the_hub_announces_the_budgets_env_steps_before_stop_run(tmp_path):
     hub = lineup_hub(make_test_config("turns"), tmp_path)
     node = open_node(hub)

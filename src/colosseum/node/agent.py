@@ -43,9 +43,9 @@
    when its control connection opens, before its first ``WorkerLineups``. Snapshots no cell references any more
    leave the cache after ``CACHE_DROP_DELAY_SEC`` (safe by an ordering invariant, see ``node.lineups``).
 7. **Announces.** ``evictions`` -> ``WorkerEvict`` to every worker; ``env_steps`` (plus this node's own env steps
-   since, refreshed at every ``WorkerProgress``; ruling R28) -> ``LearnerEnvSteps`` to every
-   learner (LR progress); ``versions`` (where each agent's newest weights are) -> the fetch planner (item 11);
-   ``banned_node_ids`` (when present) -> the data port's refusals.
+   since, refreshed at every ``WorkerProgress``; ruling R28; the ``Welcome``'s count is the first base, FX3) ->
+   ``LearnerEnvSteps`` to every learner (LR progress); ``versions`` (where each agent's newest weights are) -> the
+   fetch planner (item 11); ``banned_node_ids`` (when present) -> the data port's refusals.
 8. **Heartbeat** every ``distributed.heartbeat_sec``: env steps, ``dropped_results``, processes, load, cached keys
    and the node counters (``lineup_fetch_failed``, ``dropped_results_node_buffer``, ``worker_restarts``, the fetch
    counters ``weight_fetch*`` and the data port's ``data_port.*``: A2), cumulative for the node process.
@@ -782,6 +782,7 @@ class NodeAgent:
                 self._exit_code = 1
                 self._begin_stop("the run could not start on this node")
                 return
+            self.learners.forward_env_steps(int(welcome.env_steps), self._env_steps())   # R28's first base (FX3)
             self._absorb(welcome.versions, welcome.agents, welcome.evictions, welcome.banned_node_ids, welcome=True)
             return
         if welcome.run_id != run.run_id:
@@ -794,6 +795,7 @@ class NodeAgent:
             self.learners.stop(agent, "the hub no longer assigns it here")
         for la in welcome.learners:
             self.learners.assign(run, la)
+        self.learners.forward_env_steps(int(welcome.env_steps), self._env_steps())
         self._absorb(welcome.versions, welcome.agents, welcome.evictions, welcome.banned_node_ids, welcome=True)
 
     def _absorb(self, versions: Any, agents: Any, evictions: Any, banned: Any, *, welcome: bool) -> None:

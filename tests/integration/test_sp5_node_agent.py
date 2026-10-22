@@ -545,6 +545,16 @@ def test_between_announces_the_learners_progress_grows_with_the_nodes_own_steps(
     assert node.stop() == 0
 
 
+def test_before_any_announce_the_learners_progress_grows_with_the_nodes_own_steps(hub_factory, node_factory):
+    """FX3: the Welcome's count (0) is the base: with no Announce at all the learner's LR progress still moves with
+    this node's own env steps (the hub's first Announce with steps comes one or two heartbeats late)."""
+    hub = _learner_hub(hub_factory)
+    node = node_factory(hub)
+    wait_for(lambda: any(t.values["progress"] > 0 for m in hub.messages("metrics") for t in m.train
+                         if t.agent_id == "a"), timeout=60)
+    assert node.stop() == 0
+
+
 def test_a_killed_learner_blocks_neither_the_worker_nor_the_node(hub_factory, node_factory):
     hub = _learner_hub(hub_factory)
     node = node_factory(hub)

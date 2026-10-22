@@ -84,12 +84,12 @@ def _learner_main(*, name: str, incarnation: int, node: int, agent_id: str, gene
         intake = ConnectionIntake(lst, channel, validator, authkey=authkey, agent_id=agent_id, generation=generation,
                                   version_floor=version_floor, capacity=config.learner.queue_size,
                                   cap_bytes=cap_bytes, max_policy_lag=config.learner.max_policy_lag)
-        intake.env_steps = int(env_steps)
         outputs = NodeOutputs(channel, WeightCacheWriter(Path(cache_root), cache_prefix), agent_id=agent_id,
                               generation=generation, cap_bytes=cap_bytes)
         learner_process(agent_id=agent_id, algorithm_factory=lambda: algorithm, intake=intake, outputs=outputs,
                         config=config.learner, stop_event=intake.stop_flag, checkpoint_interval=checkpoint_interval,
-                        resume_state=resume_state, progress_counter=intake, total_timesteps=total_timesteps,
+                        resume_state=resume_state, progress_counter=_ProgressFloor(intake, env_steps),
+                        total_timesteps=total_timesteps,
                         weight_sync_interval=config.rollout.weight_sync_interval_sec, version_floor=version_floor)
     except Exception as e:
         error = ChildError("crash", f"{type(e).__name__}: {e}", f"learner {agent_id} (generation {generation})")
@@ -107,6 +107,21 @@ def _learner_main(*, name: str, incarnation: int, node: int, agent_id: str, gene
             lst.close()
         if channel is not None:
             channel.close()
+
+
+class _ProgressFloor:
+    """``learner_process``'s ``progress_counter``: the count the node forwards (``ConnectionIntake.value``), at least
+    the spawn-time ``env_steps``. The intake's reader thread runs from its construction and may already hold a newer
+    count (the node sends one at the control hello), so the spawn value is a floor, never written into the intake
+    (FX3)."""
+
+    def __init__(self, intake: Any, floor: int) -> None:
+        self._intake = intake
+        self._floor = int(floor)
+
+    @property
+    def value(self) -> int:
+        return max(self._floor, int(self._intake.value))
 
 
 # ---------------------------------------------------------------------------------------------------------------

@@ -452,12 +452,14 @@ class _NullConn:
         pass
 
 
-def run_learner_main(monkeypatch: Any, config: Any, agent_id: str = "agent_0", **kwargs: Any) -> None:
+def run_learner_main(monkeypatch: Any, config: Any, agent_id: str = "agent_0", *, intake_stub: Any = None,
+                     **kwargs: Any) -> None:
     """``node.learner_main._learner_main`` of ``config``'s ``agent_id`` in this process, with the node side stubbed (no
     listener, no control connection, no weight cache: ``net.local`` / ``node.weights`` stand-ins). The body seeds, sets
     the torch threads, builds the algorithm (``teacher`` resolved like the hub does, ``init_state``) and calls
     ``learner.learner.learner_process``, which the caller monkeypatches to see what it gets. ``kwargs`` override the
-    spawn kwargs (``seed``, ``num_learners``, ``init_state``, ...)."""
+    spawn kwargs (``seed``, ``num_learners``, ``init_state``, ...); ``intake_stub``: the ``ConnectionIntake`` stand-in
+    (default ``_NullConn``)."""
     import colosseum.net.local as local
     import colosseum.node.weights as weights
     from colosseum.core.registry import env_spec
@@ -468,6 +470,8 @@ def run_learner_main(monkeypatch: Any, config: Any, agent_id: str = "agent_0", *
 
     for name in ("connect", "listener", "ControlChannel", "ConnectionIntake", "NodeOutputs"):
         monkeypatch.setattr(local, name, _NullConn)
+    if intake_stub is not None:
+        monkeypatch.setattr(local, "ConnectionIntake", intake_stub)
     monkeypatch.setattr(weights, "WeightCacheWriter", _NullConn)
     spec = env_spec(config)
     role = agent_role_spec(spec, resolve_player_roles(config, spec)[agent_id])
