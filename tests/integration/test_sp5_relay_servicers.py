@@ -178,3 +178,24 @@ def test_relay_off_refuses_relay_streams(relay_hub):
     assert e.value.code() == grpc.StatusCode.FAILED_PRECONDITION
     inbox = Inbox(n2)
     assert _wait(lambda: inbox.error == [grpc.StatusCode.FAILED_PRECONDITION])
+
+
+def test_a_cancelled_latest_download_frees_its_thread_at_once(relay_hub, monkeypatch):
+    """Review round 1 of T3.2(b): a ``Download(kind="latest")`` waiting for a pull ends with its RPC, not after
+    ``RELAY_PULL_WAIT_SEC`` (the module's lifecycle rule)."""
+    import time
+
+    hub, relay, latest, (n1, n2, *_rest) = relay_hub()
+    latest.publish_versions({"main": VersionInfo(agent_id="main", generation=1, version=5, size=1, digest="d",
+                                                 node=n2.number, relay_only=True)})
+    inbox = Inbox(n2)                                                    # never answers the pull
+    returned = []
+    original = latest.open_newer
+    monkeypatch.setattr(latest, "open_newer", lambda *a, **k: (original(*a, **k), returned.append(time.monotonic()))[0])
+    with pytest.raises(grpc.RpcError) as e:
+        list(n1.stub().Download(pb.BlobRequest(kind="latest", agent_id="main", since_version=-1),
+                                metadata=n1._node_md(), timeout=0.5))
+    assert e.value.code() == grpc.StatusCode.DEADLINE_EXCEEDED
+    ended = time.monotonic()
+    assert _wait(lambda: returned, timeout=5.0) and returned[0] - ended < 3.0   # not after the 10 s pull wait
+    inbox.close()

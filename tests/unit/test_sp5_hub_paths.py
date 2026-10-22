@@ -39,7 +39,8 @@ def test_a_remote_learners_seats_collect_only_where_a_direct_path_was_reported(t
     assert hub._learner_node == {"a": a}
     accept_version(hub, "a")
     cells = [(0, e, 0, 0) for e in range(4)]
-    assert _collecting(request_cells(hub, second, cells)) == [set()] * 4      # no path reported yet: nothing collects
+    assert request_cells(hub, second, cells) == []                            # R37: no path, no snapshot: nothing
+    assert hub._cells.live() == []                                            # ... and nothing allocated
     assert _collecting(request_cells(hub, first, cells)) == [{"a"}] * 4       # the learner's own node
 
     _paths(hub, second, **{f"n{a}": "direct"})
@@ -50,11 +51,29 @@ def test_a_remote_learners_seats_collect_only_where_a_direct_path_was_reported(t
     with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
         for _ in range(2):
             _paths(hub, second, **{f"n{a}": "down"})
-    grants = request_cells(hub, second, cells)
-    assert _collecting(grants) == [set()] * 4
+    assert request_cells(hub, second, cells) == []
     said = [r.getMessage() for r in caplog.records if "cannot reach the data port" in r.getMessage()]
     assert len(said) == 1 and f"node {b} " in said[0] and f"node {a}" in said[0] and "['a']" in said[0]
-    assert "relay is off (distributed.relay: false)" in said[0]
+    assert "relay is off (distributed.relay: false)" in said[0] and "only from their stored snapshots" in said[0]
+    assert "distributed.relay: true" in said[0]
+
+
+def test_relay_off_an_unreachable_learners_seats_play_its_newest_snapshot_outside_the_rotation(tmp_path):
+    """Controller ruling R37: a node that cannot reach A's learner plays A only from A's newest stored snapshot (no
+    collecting); its cells own nothing, so the rotation's shares on other nodes are unchanged."""
+    hub = _hub(tmp_path)
+    first = open_node(hub, name="learner-node", workers=1)
+    second = open_node(hub, name="worker-node", workers=1, cpu_learners=0, no_learners=True)
+    b = second.of("welcome")[0].node_number
+    hub._newest_snapshot = lambda agent: "ckpt_v40"                           # a stored snapshot of a
+    grants = request_cells(hub, second, [(0, e, 0, 0) for e in range(4)])
+    assert len(grants) == 4
+    for grant in grants:
+        seats = lineup_from_proto(grant.lineup).seats
+        assert {(s.agent_id, s.network_id, s.collect) for s in seats} == {("a", "ckpt_v40", False)}
+    assert all(c.owner is None for c in hub._cells.live() if c.key.node == b)
+    assert hub._cells.owners() == {}                                          # outside the owner rotation
+    assert _collecting(request_cells(hub, first, [(0, e, 0, 0) for e in range(4)])) == [{"a"}] * 4
 
 
 def test_with_the_hub_relay_on_a_remote_learners_seats_collect_on_every_node(tmp_path, caplog):
@@ -132,3 +151,26 @@ def test_the_relay_follows_the_online_nodes_and_versions_and_its_counters_reach_
     hub._registry.remove(second.node_id)
     hub._on_node_lost(hub._registry.by_id(second.node_id), reason="removed")
     assert hub._relay.number_of(second.node_id) is None
+
+
+def test_relay_off_an_unreachable_learner_never_owns_a_cell_and_its_seats_need_a_snapshot(tmp_path):
+    """R37 with a reachable agent: ``b``'s learner runs on the requesting node, ``a``'s elsewhere (unreachable).
+    ``b`` owns every cell; ``a`` is seated only from a stored snapshot; without one no lineup seating ``a`` is
+    granted (rivals 1.0: every draw seats it) and the cells ask again."""
+    rivals = {"opponents": {"latest": 0.0, "snapshots": 0.0, "rivals": 1.0, "anchors": 0.0}}
+    config = make_test_config("turns", agents={"a": {}, "b": {}}, matchmaking=rivals, rollout={"envs_per_worker": 4},
+                              distributed={"relay": False})
+    hub = lineup_hub(config, tmp_path)
+    open_node(hub, name="learner-node", workers=1)
+    second = open_node(hub, name="worker-node", workers=1, cpu_learners=0, no_learners=True)
+    hub._learner_node["b"] = second.of("welcome")[0].node_number            # b's learner runs on node 2
+    cells = [(0, e, 0, 0) for e in range(4)]
+    assert request_cells(hub, second, cells) == []                            # a has no snapshot: no lineup
+    hub._newest_snapshot = lambda agent: {"a": "ckpt_v7"}.get(agent)
+    grants = request_cells(hub, second, cells)
+    assert len(grants) == 4
+    for grant in grants:
+        seats = lineup_from_proto(grant.lineup).seats
+        assert {(s.agent_id, s.network_id, s.collect) for s in seats} == {("b", "latest", True),
+                                                                           ("a", "ckpt_v7", False)}
+    assert set(hub._cells.owners().values()) == {"b"}

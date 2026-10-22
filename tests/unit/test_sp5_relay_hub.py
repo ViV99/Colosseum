@@ -175,3 +175,45 @@ def test_latest_relay_gives_up_without_a_learner_inbox(tmp_path):
     relay.publish_versions({"main": _vi(3)})
     assert relay.open_newer("main", -1) is None                      # node 2 has no RelayInbox: no wait
     assert relay.open_newer("other", -1) is None
+
+
+def test_a_vanished_relayed_file_is_pulled_again_never_spun_on(tmp_path):
+    """Review round 1 of T3.2(b): a served file removed outside the hub (a tmp cleaner) is forgotten and pulled again
+    within the timeout; ``stats()`` / ``publish_versions`` are never blocked by a spinning ``open_newer``."""
+    hub = _hub()
+    inbox = hub.attach(2)
+    relay = LatestRelay(tmp_path / "relay", hub, wait_sec=5.0)
+    relay.publish_versions({"main": _vi(7)})
+    spool = tmp_path / "spool"
+    spool.write_bytes(b"w7")
+    assert relay.complete("main", 7, 1, spool) == "accepted"
+    [path] = (tmp_path / "relay").iterdir()
+    path.unlink()                                                   # removed outside the hub
+    out = []
+    started = time.monotonic()
+    worker = threading.Thread(target=lambda: out.append(relay.open_newer("main", -1, timeout=1.0)), daemon=True)
+    worker.start()
+    kind, pull = hub.next_item(inbox, timeout=2.0)                  # pulled again
+    assert kind == "control" and pull[0] == "main"
+    assert relay.stats()["relay_files_lost"] == 1                   # not blocked meanwhile
+    relay.publish_versions({"main": _vi(7)})
+    worker.join(5)
+    assert out == [None] and time.monotonic() - started < 4.0       # within its timeout, no spin
+
+
+def test_open_newer_ends_when_its_caller_stops_waiting(tmp_path):
+    """Review round 1 of T3.2(b): the wait for a pull ends with the RPC (``should_stop``), not after ``wait_sec``."""
+    hub = _hub()
+    hub.attach(2)
+    relay = LatestRelay(tmp_path / "relay", hub, wait_sec=30.0)
+    relay.publish_versions({"main": _vi(7)})
+    stop = threading.Event()
+    out = []
+    worker = threading.Thread(target=lambda: out.append(relay.open_newer("main", -1, should_stop=stop.is_set)),
+                              daemon=True)
+    worker.start()
+    time.sleep(0.2)
+    stop.set()
+    started = time.monotonic()
+    worker.join(5)
+    assert out == [None] and time.monotonic() - started < 2.0

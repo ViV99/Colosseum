@@ -334,21 +334,29 @@ class LatestRelay:
         with self._cond:
             self._counters["relay_bytes"] += int(n)
 
-    def open_newer(self, agent_id: str, since_version: int, *,
-                   timeout: float | None = None) -> tuple[RelayedVersion, BinaryIO] | None:
+    def open_newer(self, agent_id: str, since_version: int, *, timeout: float | None = None,
+                   should_stop: Callable[[], bool] = lambda: False) -> tuple[RelayedVersion, BinaryIO] | None:
         """An open file of the newest relayed version above ``since_version``, pulling it from the learner node
         when the hub holds none (one pull in flight per agent; a pull unanswered for ``wait_sec`` is resent).
-        None after ``timeout`` (default ``wait_sec``), or at once when the learner node has no relay inbox."""
+        None after ``timeout`` (default ``wait_sec``), when ``should_stop()`` (the RPC ended; checked every
+        ``_WAIT_SLICE_SEC``), or at once when the learner node has no relay inbox. A served file that vanished
+        (removed outside the hub) is forgotten (``relay_files_lost``) and pulled again."""
         timeout = self._wait if timeout is None else float(timeout)
         deadline = self._clock() + timeout
         with self._cond:
             while True:
+                if should_stop():
+                    return None
                 cached = self._cached.get(agent_id)
                 if cached is not None and cached.version > since_version:
                     try:
                         return cached, open(cached.path, "rb")
-                    except FileNotFoundError:     # replaced between the lookup and the open: look again
-                        continue
+                    except FileNotFoundError:     # removed outside the hub: never spin on it, pull it again
+                        if self._cached.get(agent_id) is cached:
+                            del self._cached[agent_id]
+                            self._pending.pop(agent_id, None)
+                            self._counters["relay_files_lost"] += 1
+                        cached = None
                 info = self._versions.get(agent_id)
                 if info is None or info.version <= since_version:
                     return None

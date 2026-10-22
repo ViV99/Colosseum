@@ -3,8 +3,8 @@ plane): a cut of the direct path moves the chunks to the hub relay and back, wit
 learner reachable only through the relay survives the loss of its relay inbox.
 
 ``cluster_kit``: the hub and both nodes in threads of the test process; node a runs the learner (no worker), node b
-one worker (2 loaded processes). Node a's data port is announced behind a ``TcpFaultProxy``. Slow: each test runs
-for tens of seconds."""
+one worker (2 loaded processes; the relay-off test gives node a a worker too: 3). Node a's data port is announced
+behind a ``TcpFaultProxy``. Slow: each test runs for tens of seconds."""
 from __future__ import annotations
 
 import contextlib
@@ -12,7 +12,7 @@ import time
 
 import pytest
 
-from cluster_kit import cluster_config, hub_version, start_hub, start_node, wait_until
+from cluster_kit import cluster_config, hub_version, journal_rows, start_hub, start_node, wait_until
 from colosseum.node import router as router_mod
 from colosseum.node.router import SENDER_QUEUE_FRAMES, STREAM_ROTATE_FRAMES, STREAM_ROTATE_SEC
 from fault_proxy import TcpFaultProxy
@@ -26,15 +26,15 @@ def _drops(counters: dict) -> int:
 
 
 @contextlib.contextmanager
-def _cluster(tmp_path, *, stalled: bool):
-    config = cluster_config(tmp_path, {"agents.main": {}, "training.total_timesteps": 10**9})
+def _cluster(tmp_path, *, stalled: bool, overrides=None, a_workers=0):
+    config = cluster_config(tmp_path, {"agents.main": {}, "training.total_timesteps": 10**9, **(overrides or {})})
     proxy = TcpFaultProxy()
     if stalled:
         proxy.stall()
     hub = start_hub(tmp_path, config)
     nodes = []
     try:
-        a = start_node(tmp_path, hub, "a", cpu_learners=1, workers=0, data_addresses=[proxy.address])
+        a = start_node(tmp_path, hub, "a", cpu_learners=1, workers=a_workers, data_addresses=[proxy.address])
         nodes.append(a)
         assert wait_until(lambda: a.agent.data_port() is not None and hub_version(hub, "main") is not None, 120)
         proxy.set_target(("127.0.0.1", a.agent.data_port()))
@@ -98,4 +98,22 @@ def test_a_relay_only_learner_survives_a_cut_of_the_hub_relay_stream(tmp_path):
         assert wait_until(lambda: relay._dest(number).inbox not in (None, old), 30)   # a's inbox reattached
         version = hub_version(hub, "main")
         assert wait_until(lambda: hub_version(hub, "main") >= version + 2, 120)      # training goes on
+        assert hub.stop() == 0
+
+
+def test_relay_off_an_unreachable_node_plays_the_learners_snapshots_and_sends_nothing(tmp_path):
+    """Controller ruling R37 (spec 4.8): with ``distributed.relay: false`` node b, which cannot reach the learner's data
+    port, plays ``main`` only from its newest stored snapshot (node a's own worker trains it and its snapshots reach
+    the hub): b's results are journaled, every ``main`` seat of b is a snapshot, b sends no chunk and no lineup of b
+    waits for weights it cannot get."""
+    with _cluster(tmp_path, stalled=True, overrides={"distributed.relay": False}, a_workers=1) as (hub, a, b, _p):
+        assert wait_until(lambda: b.agent.paths() == {a.agent.number: "down"}, 60)
+
+        def b_rows():
+            return [r for r in journal_rows(hub) if f"/n{b.agent.number}/" in r.uid]
+        assert wait_until(lambda: len(b_rows()) >= 20, 240), "node b never played"
+        seats = [s for r in b_rows() for s in r.seats if s.agent_id == "main"]
+        assert seats and all(s.network_id.startswith("ckpt_v") for s in seats)
+        counters = b.agent.counters()
+        assert counters.get("chunks_routed", 0) == 0 and counters.get("lineup_fetch_failed", 0) == 0
         assert hub.stop() == 0

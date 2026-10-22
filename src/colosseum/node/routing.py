@@ -117,6 +117,8 @@ class RoutingHost(Protocol):
     def hub_channel(self) -> Any: ...                 # grpc.Channel to the hub (None before the session)
     def hub_metadata(self) -> tuple: ...              # the node's R1 credentials
     def submit(self, fn: Any, *args: Any) -> Any: ... # the transfer pool
+    @property
+    def remote_nodes(self) -> bool: ...               # other machines' nodes may exist (not train w/o --listen)
 
 
 class NodeRouting:
@@ -253,7 +255,9 @@ class NodeRouting:
             timeout = float(run.config.distributed.connect_timeout_sec)
             text = f"the data port of node {ev.target} is unreachable ({where}) within {timeout:g} s; "
             text += ("chunks go through the hub" if ev.path == "relay"
-                     else f"the hub relay is off (distributed.relay: false): this node stops collecting for {agents}")
+                     else f"the hub relay is off (distributed.relay: false): this node plays {agents} only from "
+                          f"their stored snapshots and sends their learners no data. Open node {ev.target}'s data "
+                          f"port to this machine (the direct path) or set distributed.relay: true")
             logger.warning(f"node: {text}")
             self._host.event("warning", proc="node", message=text)
         elif ev.path == "direct":
@@ -310,11 +314,12 @@ class NodeRouting:
     # ---- the hub relay: inbox and weight pulls ---------------------------------------------------------------------
 
     def sync_relay_inbox(self, run: Any) -> None:
-        """The relay inbox runs while this node runs a learner and the relay is on (pre-flight-accepted W03-7)."""
+        """The relay inbox runs while this node runs a learner, the relay is on and the hub accepts nodes of other
+        machines (W03-7; not for ``train`` without ``--listen``, whose local node is the only node)."""
         from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
         from colosseum.node.router import RelayReceiver
 
-        want = (self.router is not None and self._relay and not self._host.stopping
+        want = (self.router is not None and self._relay and self._host.remote_nodes and not self._host.stopping
                 and bool(self._host.local_learners()) and self._host.hub_channel() is not None)
         if not want:
             self._stop_receiver()

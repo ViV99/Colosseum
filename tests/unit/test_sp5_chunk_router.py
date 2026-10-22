@@ -246,3 +246,22 @@ def test_the_relay_receiver_never_dies_of_one_item_and_returns_credits(monkeypat
     halted.set()
     receiver.stop()
     receiver.join(3)
+
+
+def test_the_relay_inbox_opens_only_when_other_machines_nodes_may_exist():
+    """Review round 1 of T3.2(b): ``train`` without ``--listen`` (one local node) opens no idle relay inbox; a node of
+    a hub that accepts other machines does, while it runs a learner and the relay is on."""
+    from types import SimpleNamespace
+
+    from colosseum.node.routing import NodeRouting
+
+    channel = grpc.insecure_channel("127.0.0.1:1")
+    for remote, expected in ((False, False), (True, True)):
+        host = SimpleNamespace(number=0, stopping=False, remote_nodes=remote, node_id="n", post=lambda item: None,
+                               local_learners=lambda: ["main"], hub_channel=lambda: channel, hub_metadata=lambda: ())
+        routing = NodeRouting(host)
+        routing.router, routing._relay = SimpleNamespace(delivery=None, counters_obj=Counters()), True
+        routing.sync_relay_inbox(SimpleNamespace(serial=1))
+        assert (routing._receiver is not None) is expected
+        routing._stop_receiver()
+    channel.close()

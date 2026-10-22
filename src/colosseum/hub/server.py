@@ -533,12 +533,13 @@ class HubServicer(pb_grpc.HubServicer):
 
     def _download_latest(self, request: pb.BlobRequest, context: grpc.ServicerContext):
         """``Download(kind="latest")``: the newest relayed weights above ``since_version`` (the same metadata as
-        ``NodeData.GetLatest``), ``not_modified`` when none is newer, ``UNAVAILABLE`` while the hub has none yet."""
+        ``NodeData.GetLatest``), ``not_modified`` when none is newer, ``UNAVAILABLE`` while the hub has none yet. The
+        wait for a pull ends as soon as the RPC does (module lifecycle rule)."""
         latest = self._latest
         if not _valid_agent_id(request.agent_id):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "invalid agent id")
         since = int(request.since_version)
-        got = latest.open_newer(request.agent_id, since)
+        got = latest.open_newer(request.agent_id, since, should_stop=lambda: not context.is_active())
         if got is None:
             info = latest.latest(request.agent_id)
             if info is not None and int(info.version) <= since:

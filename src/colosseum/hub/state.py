@@ -59,7 +59,8 @@ __all__ = [
     "CellEntry", "CellKey", "CellTable", "EpochAllocator", "HubStateData", "NodeEntry", "NodeHello", "NodeRegistry",
     "OwnerRotation", "ResultIntake", "VersionInfo", "VersionRegistry", "load_hub_state", "restrict_collecting",
     "save_hub_state", "version_source", "SnapshotHolds", "snapshot_refs", "check_data_addresses",
-    "DATA_ADDRESSES_MAX", "DATA_ADDRESS_CHARS_MAX", "collect_allowed", "strip_collect", "visible_version",
+    "DATA_ADDRESSES_MAX", "DATA_ADDRESS_CHARS_MAX", "collect_allowed", "seat_snapshots", "strip_collect",
+    "visible_version",
     "PATH_STATES",
 ]
 
@@ -308,8 +309,9 @@ class CellTable:
             out.append(entry)
         return out
 
-    def grant(self, key: CellKey, owner: str, ttl_sec: float, now: float) -> CellEntry:
-        """Record the lineup just granted: ``owner`` becomes the owner (the old one the previous owner)."""
+    def grant(self, key: CellKey, owner: str | None, ttl_sec: float, now: float) -> CellEntry:
+        """Record the lineup just granted: ``owner`` becomes the owner (the old one the previous owner); None: a cell
+        outside the owner rotation (R37: a node that plays only stored snapshots of learners it cannot reach)."""
         entry = self._cells[key]
         if entry.owner is not None:
             entry.previous = entry.owner
@@ -415,6 +417,24 @@ def restrict_collecting(lineup: Lineup, collecting: Collection[str]) -> Lineup:
     if all(not s.collect or s.agent_id in can for s in lineup.seats):
         return lineup
     seats = [s if not s.collect or s.agent_id in can else replace(s, collect=False) for s in lineup.seats]
+    return replace(lineup, seats=seats)
+
+
+def seat_snapshots(lineup: Lineup, snapshots: Mapping[str, str | None]) -> Lineup | None:
+    """Controller ruling R37 (spec 4.8): ``lineup`` for a node that cannot reach the learners of ``snapshots``' agents
+    (``distributed.relay: false``, no direct path): their ``latest`` seats play the agent's newest stored snapshot
+    (``snapshots[agent]``, a ``ckpt_v<N>`` the hub serves) and do not collect; None when such an agent has no stored
+    snapshot (the lineup cannot be played there). Seats keep their team's ``source``; nothing else changes."""
+    if not any(s.agent_id in snapshots and s.network_id == LATEST_NETWORK_ID for s in lineup.seats):
+        return lineup
+    seats = []
+    for seat in lineup.seats:
+        if seat.agent_id in snapshots and seat.network_id == LATEST_NETWORK_ID:
+            snapshot = snapshots[seat.agent_id]
+            if snapshot is None:
+                return None
+            seat = replace(seat, network_id=snapshot, collect=False)
+        seats.append(seat)
     return replace(lineup, seats=seats)
 
 

@@ -134,14 +134,15 @@ def test_agents_collect_from_their_learners_placement_without_a_first_version(tm
 
 def test_a_node_without_a_path_to_the_learner_plays_without_collecting(tmp_path):
     """T3.2 (spec 4.7, 4.8): with ``distributed.relay: false`` a remote learner's seats collect only on a node that
-    reported a direct path to it (``test_sp5_hub_paths.py``); before that the node still gets lineups, none
-    collecting."""
+    reported a direct path to it (``test_sp5_hub_paths.py``); before that the node plays the learner's newest stored
+    snapshot, none collecting (R37)."""
     hub = lineup_hub(_config(("a",), distributed={"relay": False}), tmp_path)
     first = open_node(hub, name="learner-node", workers=1)
     second = open_node(hub, name="worker-node", workers=1, cpu_learners=0, no_learners=True)
     assert hub._learner_node == {"a": first.of("welcome")[0].node_number}
     assert [la.agent_id for la in first.of("welcome")[0].learners] == ["a"] and not second.of("welcome")[0].learners
     accept_version(hub, "a")
+    hub._newest_snapshot = lambda agent: "ckpt_v4"                        # R37: snapshot seats there
     elsewhere = request_cells(hub, second, [(0, e, 0, 0) for e in range(4)])
     assert len(elsewhere) == 4                                            # granted, but nothing collects
     assert all(not _collecting(lineup_from_proto(g.lineup)) for g in elsewhere)

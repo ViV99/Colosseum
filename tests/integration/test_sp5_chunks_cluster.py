@@ -24,7 +24,6 @@ from cluster_kit import (
     start_node,
     wait_until,
 )
-from colosseum.node.router import SENDER_QUEUE_FRAMES, STREAM_ROTATE_FRAMES
 from fault_proxy import TcpFaultProxy
 
 NODES = [dict(name="a", cpu_learners=1, workers=0), dict(name="b", workers=1, no_learners=True)]
@@ -113,18 +112,25 @@ def test_relay_carries_chunks_and_weights_when_the_data_port_is_unreachable(tmp_
         assert hub.stop() == 0
 
 
-def test_relay_off_keeps_an_unreachable_node_from_collecting(tmp_path, caplog):
-    """``distributed.relay: false``: node b reports ``down``, the hub names it once and grants it no collecting seat;
-    b cannot fetch the learner's weights either (W03-10: its lineups wait, ``lineup_fetch_failed``), so the learner,
-    with no worker of its own, never trains."""
+def test_relay_off_without_a_snapshot_an_unreachable_node_waits_quietly(tmp_path, caplog):
+    """Controller ruling R37 (spec 4.8), ``distributed.relay: false``: node b cannot reach the learner's data port, so
+    ``main`` plays there only from a stored snapshot; it has none yet (node a has no worker: the learner never trains),
+    so b's cells get no lineup and ask again quietly: no collecting seat, no chunk, no ``lineup_fetch_failed``; the
+    hub and the node name the pair once, with the remedy. (Playing from a snapshot: the slow suite.)"""
     with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"), \
             proxied_cluster(tmp_path, {"distributed.relay": False}) as (hub, a, b, _proxy):
         assert wait_until(lambda: b.agent.paths() == {a.agent.number: "down"}, 60)
-        assert wait_until(lambda: b.agent.counters().get("lineup_fetch_failed", 0) >= 2, 120)
         assert wait_until(lambda: [r for r in caplog.records if r.name == "colosseum.hub.hub"
                                    and "cannot reach the data port" in r.getMessage()], 30)
+        # time passes by counters: b retries the learner's weights every sync interval (and fails: unreachable)
+        assert wait_until(lambda: b.agent.counters().get("weight_fetch_failed", 0) >= 4, 60)
+        counters = b.agent.counters()
+        assert counters.get("lineup_fetch_failed", 0) == 0 and counters.get("chunks_routed", 0) == 0
+        assert not [r for r in journal_rows(hub) if f"/n{b.agent.number}/" in r.uid]
         assert hub_version(hub, "main") == 0                                     # nothing collects anywhere
-        assert b.agent.counters().get("dropped_chunks.disconnect", 0) <= SENDER_QUEUE_FRAMES + STREAM_ROTATE_FRAMES
-        said = [r.getMessage() for r in caplog.records if "cannot reach the data port" in r.getMessage()]
-        assert len(said) == 1 and f"node {a.agent.number}" in said[0] and "distributed.relay: false" in said[0]
+        said = [r.getMessage() for r in caplog.records if r.name == "colosseum.hub.hub"
+                and "cannot reach the data port" in r.getMessage()]
+        assert len(said) == 1 and f"node {a.agent.number}" in said[0] and "distributed.relay: true" in said[0]
+        node_said = [r.getMessage() for r in caplog.records if r.name == "colosseum.node.routing"]
+        assert len(node_said) == 1 and "only from their stored snapshots" in node_said[0]
         assert hub.stop() == 0

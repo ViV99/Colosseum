@@ -39,3 +39,20 @@ def test_loopback_data_addresses_reach_only_the_learner_nodes_machine():
     assert seen.addresses == () and seen.relay_only
     parked = VersionInfo(agent_id="main", generation=0, version=3, size=4, digest="d", node=-1, relay_only=True)
     assert visible_version(parked, same_machine=False) is parked
+
+
+def test_seats_of_unreachable_learners_play_their_newest_snapshot_or_the_lineup_is_impossible():
+    """Controller ruling R37: with the relay off a node that cannot reach A's learner plays A only from stored
+    snapshots (no collecting); without one the lineup cannot be played there."""
+    from colosseum.hub.state import seat_snapshots
+
+    lineup = Lineup("2p", [SeatAssignment("b", "latest", True, "owner"), SeatAssignment("a", "latest", True, "rivals")],
+                       seed=None, epoch=3)
+    out = seat_snapshots(lineup, {"a": "ckpt_v40"})
+    assert [(s.agent_id, s.network_id, s.collect, s.source) for s in out.seats] == [
+        ("b", "latest", True, "owner"), ("a", "ckpt_v40", False, "rivals")]
+    assert out.epoch == 3 and lineup.seats[1].network_id == "latest"
+    assert seat_snapshots(lineup, {"a": None}) is None
+    assert seat_snapshots(lineup, {"c": None}) is lineup                    # no seat of the agent: unchanged
+    snapshot_seat = Lineup("2p", [SeatAssignment("b"), SeatAssignment("a", "ckpt_v2", False, "snapshots")], seed=None)
+    assert seat_snapshots(snapshot_seat, {"a": None}) is snapshot_seat      # a stored snapshot already

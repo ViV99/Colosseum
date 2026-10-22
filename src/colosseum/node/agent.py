@@ -1529,6 +1529,12 @@ class _RoutingHost:
     def submit(self, fn: Any, *args: Any) -> Any:
         return self._agent._pool.submit(fn, *args)
 
+    @property
+    def remote_nodes(self) -> bool:
+        """``train`` without ``--listen`` has a loopback hub and one node: no other machine can send it chunks."""
+        options = self._agent.options
+        return not (options.local and options.data_port is None)
+
 
 class _LearnerHost:
     """``node.learners.LearnerHost`` over the agent: the narrow interface ``NodeLearners`` uses."""

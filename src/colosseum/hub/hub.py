@@ -33,7 +33,11 @@ node do not collect (``hub.state.collect_allowed``, spec 4.7, 4.8; T3.2): an age
 accepted latest version and a running learner on that node, or on another node that the requesting node reaches:
 through the hub relay (``hub.relay``, unless ``distributed.relay: false``), or directly, as the node's
 ``Heartbeat.paths`` report (``_paths``; a node that cannot reach a learner's data port while the relay is off is named
-once in a WARNING). No cell is requested while no agent can collect (P-PF2-3). The versions a node is told about
+once in a WARNING). Controller ruling R37 (spec 4.8, relay off): an agent whose learner a node cannot reach never owns
+that node's cells, and its ``latest`` seats there play its newest stored snapshot (``seat_snapshots``; a draw needing
+an agent without one is drawn again, and a cell with no playable lineup gets none and asks again); a node that can
+reach no learner plays only such snapshots, in cells outside the owner rotation. No cell is requested while no agent
+can collect (P-PF2-3). The versions a node is told about
 (``Welcome`` / ``Announce``) carry the learner node's loopback data addresses only when both nodes share a machine
 (``visible_version``).
 
@@ -101,6 +105,7 @@ from colosseum.hub.state import (
     SnapshotHolds,
     check_data_addresses,
     collect_allowed,
+    seat_snapshots,
     snapshot_refs,
     strip_collect,
     version_source,
@@ -136,6 +141,7 @@ _CHECKPOINT_KIND = {"checkpoint": "periodic", "final": "final"}   # UploadHeader
 _LOOPBACK_OF = {"[::]": "[::1]", "0.0.0.0": "127.0.0.1", "127.0.0.1": "127.0.0.1", "localhost": "localhost",
                 "[::1]": "[::1]"}
 PENDING_EVICTIONS_MAX = 10_000            # evictions kept per node while its stream is down (oldest dropped)
+UNREACHABLE_REDRAWS = 16                  # R37: draws for a lineup without unreachable agents' latest seats
 
 
 @dataclass(frozen=True)
@@ -918,7 +924,9 @@ class Hub(RunSinks):
                 self._warn_once(("path_down", entry.number, target),
                                 f"node {entry.number} ({entry.name}) cannot reach the data port of node {target} and "
                                 f"the hub relay is off (distributed.relay: false): node {entry.number} plays {agents} "
-                                f"without collecting")
+                                f"only from their stored snapshots and sends their learners no data. Open node "
+                                f"{target}'s data port to node {entry.number} (the direct path) or set "
+                                f"distributed.relay: true")
 
     def _relay_on(self) -> bool:
         """Whether chunks can go through the hub (the relay exists and ``distributed.relay`` is on)."""
@@ -967,27 +975,62 @@ class Hub(RunSinks):
             self._count_drop(entry.number, "node_messages", "invalid", "requested cells outside its slots", bad)
         if not requested:
             return
+        here = self._collecting_on(entry.number)     # T3.2: else this node plays without collecting
+        # R37 (spec 4.8): with the relay off, agents whose learner this node cannot reach directly never own its cells
+        # and play there only from their newest stored snapshot (no data flows to their learners).
+        unreachable = [] if self._relay_on() else [a for a in collecting if a not in here]
+        pool = here or [a for a in collecting if a not in unreachable]
+        snapshots = {a: self._newest_snapshot(a) for a in unreachable}
+        playable = [a for a in unreachable if snapshots[a] is not None]
+        if not pool and not playable:                # nothing this node can play yet: nothing allocated
+            logger.debug(f"node {entry.number}: no agent it can reach and no stored snapshot of {unreachable} yet; "
+                         f"{len(requested)} cells wait")
+            return
         for key, _epoch, incarnation in requested:   # a new incarnation: the dead one's lineups name nothing any more
             known = self._cells.get(key)
             if known is not None and known.incarnation != incarnation:
                 self._holds.drop_cell(key)
         cells = self._cells.request(entry.number, requested, now)
         keys = [c.key for c in cells]
-        here = self._collecting_on(entry.number)     # T3.2: else this node plays without collecting
-        owners = self._rotation.assign(keys, collecting=here or collecting, owners=self._cells.owners(exclude=keys),
-                                       previous={c.key: c.owner if c.owner is not None else c.previous
-                                                 for c in cells})                     # P-PF2-2
+        if pool:
+            owners = self._rotation.assign(keys, collecting=pool, owners=self._cells.owners(exclude=keys),
+                                           previous={c.key: c.owner if c.owner is not None else c.previous
+                                                     for c in cells})                 # P-PF2-2
+        else:   # R37: only unreachable agents' snapshots play here; such cells own nothing (outside the rotation)
+            owners = {c.key: None for c in cells}
         ttl = float(self._config.rollout.match_refresh_interval_sec)
         grants = []
         for cell in cells:
             owner = owners[cell.key]
-            lineup = strip_collect(self._coordinator.lineup_for(owner), here)
+            drawer = owner if owner is not None else playable[cell.epoch % len(playable)]
+            lineup = self._lineup_on_node(drawer, here, snapshots)
+            if lineup is None:                       # R37: no playable lineup there yet; the cell asks again
+                continue
             lineup = dataclasses.replace(lineup, epoch=cell.epoch)
             self._cells.grant(cell.key, owner, ttl, now)
             self._holds.grant(cell.key, snapshot_refs(lineup))       # evicted snapshots it names stay servable
             grants.append(pb.Grant(worker=cell.key.worker, env=cell.key.env, epoch=cell.epoch, ttl_sec=ttl,
                                    lineup=lineup_to_proto(lineup)))
-        handle.send(pb.HubMessage(grants=pb.LineupGrants(grants=grants)))
+        if grants:
+            handle.send(pb.HubMessage(grants=pb.LineupGrants(grants=grants)))
+        elif unreachable:
+            logger.debug(f"node {entry.number}: no lineup without {unreachable} (no stored snapshot yet); its cells "
+                         f"ask again")
+
+    def _lineup_on_node(self, owner: str, here: list[str], snapshots: Mapping[str, str | None]) -> Any:
+        """The matchmaker's lineup for ``owner`` as a node sees it: seats of agents it cannot collect for do not
+        collect; with ``snapshots`` (R37) those agents' latest seats play their newest stored snapshot. A draw that
+        seats such an agent without a snapshot is drawn again, up to ``UNREACHABLE_REDRAWS`` times (None then)."""
+        for _ in range(UNREACHABLE_REDRAWS if snapshots else 1):
+            lineup = seat_snapshots(strip_collect(self._coordinator.lineup_for(owner), here), snapshots)
+            if lineup is not None:
+                return lineup
+        return None
+
+    def _newest_snapshot(self, agent: str) -> str | None:
+        """The checkpoint id of ``agent``'s newest stored snapshot (R37), None without one."""
+        info = self._coordinator.checkpoint_manager.latest(agent)
+        return None if info is None else info.checkpoint_id
 
     def _on_metrics_batch(self, entry: Any, metrics: Any) -> None:
         """Learners' train records, workers' stats (keyed by (node, worker, incarnation)) and learners' intake
