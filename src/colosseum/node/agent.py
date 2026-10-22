@@ -93,6 +93,24 @@
     unless ``distributed.relay`` is false. The router's counters join ``Heartbeat.counters``; it is stopped before the
     children are killed.
 
+13. **The hub away** (spec 4.5, 7.1; SP5 T4.4; ``_hub_away``), from ``HubSession.away_for()``: no ``LineupRequest``
+    while the session is down (cells past their TTL keep their lineups and are all requested in the first pass after
+    the ``Welcome``); results wait in the buffer and are resent after the reconnect; other machines' learners are
+    reached directly (``GetLatest`` polls, item 11). Past ``distributed.hub_lost_collect_sec`` the agents whose learner
+    this node reaches only through the hub relay are cut off (``NodeRouting.cut_relay``: their chunks are dropped and
+    counted ``no_learner``; one WARNING per agent) until the next ``Welcome``. Past ``distributed.hub_lost_timeout_sec``
+    every child gets ``Stop("hub_lost")`` (learners send no final, P-PF3-19; workers flush their results), the rest
+    is killed after ``distributed.shutdown_grace_sec``, cells and routes are cleared, the results buffer and the
+    upload queue are kept, the session retries every ``HUB_LOST_RETRY_SEC`` (one WARNING); with ``--once`` the agent
+    then returns 1 (ruling P17); otherwise the next ``Welcome`` of the run starts the workers and the learners it
+    lists as at the first one.
+14. **A full cache** (spec 7.1; T4.4; ``_on_cache_full``): a ``CacheFullError`` of any cache write of the node (a
+    fetched version, a snapshot or ``Welcome.fixed`` blob) is an ERROR with the hint and an ``Event(warning,
+    error_kind="cache_full")``, once per episode; while it lasts no lineup request, no fetch and no learner start
+    (kept until space returns); the free space is checked every heartbeat against ``2 x`` the largest frame the node
+    handled ``+ SPACE_MARGIN_BYTES`` and the state ends (INFO). A learner's own publish that does not fit is skipped
+    in the learner (``NodeOutputs.publish_weights``).
+
 Threads besides the loop: the session reader (``HubSession``), the listener's ``Acceptor``, the transfer pool, the
 data port's servicers, the chunk router's readers and senders and the short threads that open the node's chunk
 connections to its learners (item 12); they only post into the inbox (a ``SimpleQueue`` plus a non-blocking wake pipe
@@ -307,7 +325,8 @@ class NodeAgent:
         self._gpus_warned = False                  # an unusable --gpus index was named once (P-PF3-4)
         self._connected = False
         self._pool = ThreadPoolExecutor(max_workers=TRANSFER_THREADS, thread_name_prefix="node-transfer")
-        self.fetches = NodeFetcher(submit=self._pool.submit, post=self._post)   # downloads (node.fetch, A25)
+        self.fetches = NodeFetcher(submit=self._pool.submit, post=self._post,      # downloads (node.fetch, A25)
+                                   on_cache_full=self._on_cache_full)
         self.lineups = NodeLineups(_LineupHost(self), self.fetches)   # lineups and the cache (node.lineups, R31)
         self._control: dict[str, mpc.Connection] = {}
         self._child_conns: dict[mpc.Connection, str] = {}
@@ -350,6 +369,13 @@ class NodeAgent:
         self._published_history: dict[str, list[int]] = {}
         self.routing = NodeRouting(_RoutingHost(self))   # chunks between machines (node.routing, item 12)
         self._published_paths: dict[int, str] = {}
+        self._published_env_steps = 0
+        self._dormant = ""                          # item 13: "stopping" / "stopped" after hub_lost_timeout_sec
+        self._dormant_deadline = 0.0
+        self._wake_welcome: pb.Welcome | None = None   # a Welcome that came while the processes were stopping
+        self._cache_full = False                    # item 14
+        self._largest_frame = 0                     # bytes of the largest frame this node handled (the space check)
+        self._next_space_check = 0.0
 
     # ---- public ---------------------------------------------------------------------------------------------
 
@@ -367,6 +393,11 @@ class NodeAgent:
     @property
     def number(self) -> int:
         return self._number
+
+    @property
+    def env_steps(self) -> int:
+        """The env steps this node's workers took (cumulative; a copy the loop publishes every pass; any thread)."""
+        return self._published_env_steps
 
     @property
     def cache_prefix(self) -> str | None:
@@ -677,6 +708,7 @@ class NodeAgent:
         """Copies other threads read: the counters and fetch history (accessors), the agents whose learner runs here
         (the data port)."""
         self._published_counters = self._node_counters(self._run)
+        self._published_env_steps = self._env_steps()
         self._published_paths = self.routing.paths()
         history = self.fetches.stats.history
         if sum(map(len, history.values())) != sum(map(len, self._published_history.values())):
@@ -701,8 +733,11 @@ class NodeAgent:
             elif isinstance(item, _Accepted):
                 self._on_child_hello(item.conn, item.hello)
             elif isinstance(item, BlobFetched):
+                self._note_frame(item.size)
                 self.lineups.on_fetch_done(item)
             elif isinstance(item, LatestFetched):
+                if item.fetched is not None:
+                    self._note_frame(len(item.fetched.frame))
                 self.lineups.on_latest_fetched(item)
             elif isinstance(item, LatestFetchFailed):
                 self.lineups.on_latest_fetch_failed(item)
@@ -752,10 +787,12 @@ class NodeAgent:
             if self._run is not run:                 # released in this pass: nothing of the old run is sent
                 return
         elif run is not None:
+            self._hub_away(run, now)
+            self._check_space(run, now)
             self.lineups.fetch_fixed(run, now)
-            if not run.started:
+            if not run.started and not self._dormant:
                 self._maybe_start_workers(run)
-            self.learners.start_pending(run)
+            self.learners.start_pending(run, spawn=not (self._dormant or self._cache_full))
             self.lineups.request_lineups()
             self.lineups.expire_waiting()
             self.lineups.deliver(run)
@@ -832,7 +869,18 @@ class NodeAgent:
             logger.warning(f"node: the hub now runs {welcome.run_id[:8]}, this node serves {run.run_id[:8]}; "
                            f"ignored (switching runs is the join command's, T6.3)")
             return
-        logger.info(f"node: session resumed for run {run.run_id[:8]} (node {run.number})")
+        if self._dormant == "stopping":              # item 13: handled once the processes are gone
+            self._wake_welcome = welcome
+            return
+        woke = self._dormant == "stopped"
+        if woke:
+            self._dormant = ""
+            self._reported.clear()
+            self._disabled.clear()
+            logger.info(f"node: the hub is back: run {run.run_id[:8]} starts its processes on this node again")
+        else:
+            logger.info(f"node: session resumed for run {run.run_id[:8]} (node {run.number})")
+        self.routing.restore_relay(run)              # item 13: routes cut by the hub-lost collect rule come back
         # Welcome.learners is the node's desired learner set (T4.1): a learner not listed with its generation is
         # superseded (no final); a listed one this node does not run starts; the same generation keeps running.
         listed = {la.agent_id: int(la.generation) for la in welcome.learners}
@@ -846,6 +894,8 @@ class NodeAgent:
             self.learners.assign(run, la)
         self.learners.forward_env_steps(int(welcome.env_steps), self._env_steps())
         self._absorb(welcome.versions, welcome.agents, welcome.evictions, welcome.banned_node_ids, welcome=True)
+        if woke:
+            self._maybe_start_workers(run)
 
     def _absorb(self, versions: Any, agents: Any, evictions: Any, banned: Any, *, welcome: bool) -> None:
         """What a ``Welcome`` or an ``Announce`` says beyond its own fields: versions (where each agent's newest
@@ -1070,12 +1120,14 @@ class NodeAgent:
             self._child_conns[conn] = name
             if self._stopping:
                 self._child_send(name, conn, Stop("the node stops"))
+            elif self._dormant and self.supervisor.role(name) != "learner":   # learners: NodeLearners sends it
+                self._child_send(name, conn, Stop("hub_lost"))
             elif self.supervisor.role(name) == "worker":
                 self._on_worker_connected(name, conn)
             elif self.supervisor.role(name) == "learner":
                 self.learners.on_connected(name)
         elif hello.channel == "route":              # frames for other machines: the router reads them (item 12)
-            if self._stopping or self.supervisor.role(name) != "worker" or not self.routing.add_worker(
+            if self._stopping or self._dormant or self.supervisor.role(name) != "worker" or not self.routing.add_worker(
                     conn, _slot_index(name)):
                 conn.close()
         else:
@@ -1211,6 +1263,9 @@ class NodeAgent:
         if role == "learner":
             self.learners.on_exit(name, code, log_path, self._learner_routes)
             return
+        if self._dormant:                            # item 13: stopped while the hub is away, never restarted
+            logger.info(f"node: {name} stopped (exit {code}) while the hub is away")
+            return
         if name in self._reported:
             logger.info(f"node: {name} exited (code {code}) after reporting its error; not restarted")
             return
@@ -1264,6 +1319,7 @@ class NodeAgent:
         if entry is None or header.kind not in _UPLOAD_KINDS or header.agent_id != entry.agent_id:
             logger.warning(f"node: dropped a {header.kind!r} checkpoint of {header.agent_id!r} from {name}")
             return
+        self._note_frame(len(frame))
         replaced = self.uploads.replaced
         self.uploads.offer(header.agent_id, header.kind, int(header.generation), int(header.version), frame)
         if self.uploads.replaced > replaced:
@@ -1343,6 +1399,98 @@ class NodeAgent:
         if upload.kind == FINAL or ("upload", upload.agent_id, why) not in self._warned:
             self._warned.add(("upload", upload.agent_id, why))
             logger.log(level, f"node: the hub did not take {what} (refused: {why})")
+
+    # ---- the hub away, a full cache (items 13, 14) ---------------------------------------------------------------
+
+    def _hub_away(self, run: _Run, now: float) -> None:
+        """Item 13, every pass of a running run: the hub-lost collect rule, the hub-lost timeout, and the end of the
+        processes' stop once they are gone."""
+        if self._dormant == "stopping":
+            self._finish_hub_lost_stop(run, now)
+            return
+        if self._session is None or self._dormant:
+            return
+        away = 0.0 if self._connected else self._session.away_for()
+        dist = run.config.distributed
+        if away >= float(dist.hub_lost_timeout_sec):
+            self._begin_hub_lost_stop(run, now)
+        elif away >= float(dist.hub_lost_collect_sec):
+            for agent in self.routing.cut_relay(run):
+                logger.warning(f"node: the hub is away {float(dist.hub_lost_collect_sec):g} s: chunks for {agent} "
+                               f"(its learner is reachable only through the hub) are not collected")
+
+    def _begin_hub_lost_stop(self, run: _Run, now: float) -> None:
+        """``distributed.hub_lost_timeout_sec`` passed without the hub: ``Stop("hub_lost")`` to every child (learners
+        send no final: nobody receives it; the hub restarts them from their recovery points); the session retries
+        slowly."""
+        from colosseum.net.local import Stop
+        from colosseum.node import session as node_session
+
+        dist = run.config.distributed
+        low, high = node_session.HUB_LOST_RETRY_SEC
+        then = ("the node exits (--once)" if self.options.once
+                else f"reconnecting every {low:g}–{high:g} s (Ctrl+C to stop)")
+        logger.warning(f"node: the hub is away {float(dist.hub_lost_timeout_sec):g} s: processes stopped; {then}")
+        self._dormant, self._dormant_deadline = "stopping", now + float(dist.shutdown_grace_sec)
+        self.learners.stop_every("hub_lost")
+        for name, conn in list(self._control.items()):
+            if self.supervisor.role(name) != "learner":
+                self._child_send(name, conn, Stop("hub_lost"))
+        self._session.slow_retry(True)
+
+    def _finish_hub_lost_stop(self, run: _Run, now: float) -> None:
+        """Every child exited (or the grace passed: the rest is killed): the cells and routes are cleared (the results
+        buffer and the upload queue stay); ``--once`` ends the agent with 1 (ruling P17); a ``Welcome`` that came
+        meanwhile starts the run's processes again."""
+        if self.supervisor.alive() and now < self._dormant_deadline:
+            return
+        if self.supervisor.alive():
+            self.supervisor.stop_all(0.0)
+        for name, code in self.supervisor.exited():
+            self._on_exit(name, code)
+        for worker in range(run.workers):
+            self.cells.drop_worker(worker)
+        self._learner_routes.clear()
+        run.started = False
+        self._dormant = "stopped"
+        logger.info("node: every process of the run is stopped; the results wait for the hub")
+        if self.options.once:
+            self._exit_code, self._done = 1, True
+            return
+        welcome, self._wake_welcome = self._wake_welcome, None
+        if welcome is not None:
+            self._on_welcome(welcome)
+
+    def _note_frame(self, size: int) -> None:
+        self._largest_frame = max(self._largest_frame, int(size or 0))
+
+    def _on_cache_full(self, error: Exception) -> None:
+        """Item 14 (main loop): a cache write of this node found no room."""
+        self._note_frame(getattr(error, "size", 0))
+        if self._cache_full:
+            return
+        self._cache_full = True
+        self._next_space_check = time.monotonic()
+        logger.error(f"node: {error}; this node takes no new work (lineups, fetches, learner starts) until space "
+                     f"returns")
+        self._event("warning", proc="node", error_kind="cache_full", message=str(error))
+
+    def _check_space(self, run: _Run, now: float) -> None:
+        """Item 14: while the cache is full, every heartbeat interval: enough free space again ends the state."""
+        from colosseum.node.weights import SPACE_MARGIN_BYTES, free_bytes
+
+        if not self._cache_full or now < self._next_space_check:
+            return
+        self._next_space_check = now + run.heartbeat_sec
+        need = 2 * self._largest_frame + SPACE_MARGIN_BYTES
+        try:
+            free = free_bytes(run.root)
+        except OSError:
+            return
+        if free >= need:
+            self._cache_full = False
+            logger.info(f"node: space is back in the weight cache ({free / 2**20:.0f} MiB free, {need / 2**20:.0f} MiB "
+                        f"needed); taking work again")
 
     # ---- heartbeats and metrics -------------------------------------------------------------------------------
 
@@ -1563,6 +1711,10 @@ class _LineupHost:
     @property
     def connected(self) -> bool:
         return self._agent._connected
+
+    @property
+    def cache_full(self) -> bool:
+        return self._agent._cache_full
 
     def current_run(self) -> Any:
         return self._agent._run

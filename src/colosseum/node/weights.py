@@ -92,7 +92,17 @@ FULL_HINT = ("the shared-memory weight cache is full: free space in {root} (Dock
 
 
 class CacheFullError(RuntimeError):
-    """Not enough space for a segment (message: the hint)."""
+    """Not enough space for a segment (message: the hint); ``size``: the segment's bytes."""
+
+    def __init__(self, message: str, size: int = 0) -> None:
+        super().__init__(message)
+        self.size = int(size)
+
+
+def free_bytes(path: Path | str) -> int:
+    """The free bytes of the file system holding ``path``: the cache's free-space probe (every space check of this
+    module and of the node goes through it; tests replace it)."""
+    return int(shutil.disk_usage(path).free)
 
 
 class CacheLockedError(RuntimeError):
@@ -234,13 +244,13 @@ class WeightCacheWriter:
 
     def has_space(self, size: int) -> bool:
         """Whether a segment of ``size`` bytes would pass the free-space check now."""
-        return shutil.disk_usage(self.root).free >= 2 * int(size) + SPACE_MARGIN_BYTES
+        return free_bytes(self.root) >= 2 * int(size) + SPACE_MARGIN_BYTES
 
     def _check_space(self, size: int) -> None:
-        free = shutil.disk_usage(self.root).free
+        free = free_bytes(self.root)
         if free < 2 * size + SPACE_MARGIN_BYTES:
             raise CacheFullError(f"{size / 2**20:.1f} MiB segment, {free / 2**20:.1f} MiB free: "
-                                 + FULL_HINT.format(root=self.root))
+                                 + FULL_HINT.format(root=self.root), size)
 
     def _latest_segments(self, agent_id: str, exclude: str = "") -> list[tuple[int, str]]:
         """``(version, name)`` of ``agent_id``'s latest segments on disk, newest first."""

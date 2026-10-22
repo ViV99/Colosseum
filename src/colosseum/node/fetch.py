@@ -226,6 +226,8 @@ class BlobFetched:
     key: Any
     error: str | None
     serial: int                        # the run this fetch belongs to (a fetch of an older run is ignored)
+    size: int = 0                      # the frame's bytes (when it was downloaded)
+    full: Any = None                   # the CacheFullError when the cache had no room for it (T4.4)
 
 
 @dataclass
@@ -262,9 +264,11 @@ class NodeFetcher:
     which run in the transfer pool (``submit``) and report through ``post``. ``stats`` (the planner's counters) and
     ``fetch_bytes`` are cumulative for the node process."""
 
-    def __init__(self, *, submit: Callable[..., Future], post: Callable[[object], None]) -> None:
+    def __init__(self, *, submit: Callable[..., Future], post: Callable[[object], None],
+                 on_cache_full: Callable[[Exception], None] | None = None) -> None:
         self._submit = submit
         self._post = post
+        self._on_cache_full = on_cache_full or (lambda error: None)   # main loop: a cache write found no room
         self.stats = FetchStats()
         self.fetch_bytes = 0
         self.planner: FetchPlanner | None = None
@@ -356,17 +360,27 @@ class NodeFetcher:
         serial = run.serial
 
         def done(f: Future) -> None:
-            error = None
+            from colosseum.node.weights import CacheFullError
+
+            error, size, full = None, 0, None
             if f.cancelled():
                 error = "cancelled"
             elif f.exception() is not None:
-                error = rpc_text(f.exception())
-            self._post(BlobFetched(key, error, serial))
+                e = f.exception()
+                error = rpc_text(e)
+                if isinstance(e, CacheFullError):
+                    full, size = e, e.size
+            else:
+                size = int(f.result() or 0)
+            self._post(BlobFetched(key, error, serial, size, full))
 
         future.add_done_callback(done)
 
     def blob_done(self, done: BlobFetched) -> None:
+        """Main loop: a blob download ended (a full cache is reported to ``on_cache_full``)."""
         self._blobs.pop(done.key, None)
+        if done.full is not None:
+            self._on_cache_full(done.full)
 
     def download_bytes(self, run: Any, kind: str, agent_id: str, ident: str) -> bytes:
         """A transfer-pool thread: one hub ``Download`` (checked: size, offsets, digest; capped)."""
@@ -382,8 +396,8 @@ class NodeFetcher:
             raise ValueError("the hub answered not_modified")
         return data
 
-    def _blob_job(self, run: Any, key: Any) -> None:
-        """A transfer-pool thread: ``Download`` the key's frame, check it, put it into the cache."""
+    def _blob_job(self, run: Any, key: Any) -> int:
+        """A transfer-pool thread: ``Download`` the key's frame, check it, put it into the cache; returns its size."""
         from colosseum.net.chunks import decode_weights
         from colosseum.node.weights import split_blob_key
 
@@ -398,6 +412,7 @@ class NodeFetcher:
         if run.closed:
             raise RuntimeError("the run was torn down (stopped or released) meanwhile")
         run.writer.put(key, data)
+        return len(data)
 
     # ---- latest weights of other machines' learners ----------------------------------------------------------
 
@@ -539,8 +554,9 @@ class NodeFetcher:
     def latest_done(self, run: Any, ev: LatestFetched) -> Literal["published", "kept", "failed"]:
         """Main loop: a latest transfer of the current run ended. A newer version is published into the cache
         (byte for byte the learner's frame, with its ``teacher_active``); ``kept``: not modified or not newer;
-        ``failed``: it could not be published (cache full: ERROR with the hint, once per run, and that version is not
-        fetched again until space frees or a newer one is announced; a frame the cache refuses: WARNING)."""
+        ``failed``: it could not be published (cache full: reported to ``on_cache_full``, which logs the ERROR with the
+        hint (T4.4), and that version is not fetched again until space frees or a newer one is announced; a frame the
+        cache refuses: WARNING)."""
         from colosseum.node.weights import CacheFullError
 
         self._latest.pop(ev.agent_id, None)
@@ -559,9 +575,7 @@ class NodeFetcher:
         except CacheFullError as e:
             planner.failed(ev.agent_id)
             self._full[ev.agent_id] = (int(fetched.version), len(fetched.frame))
-            if ("cache_full", "") not in self._warned:
-                self._warned.add(("cache_full", ""))
-                logger.error(f"node: the weights of agent {ev.agent_id} v{fetched.version} do not fit: {e}")
+            self._on_cache_full(e)
             return "failed"
         except (OSError, ValueError) as e:
             planner.failed(ev.agent_id)

@@ -280,9 +280,10 @@ class NodeLearners:
         entry.resume_state = done.resume_state
         entry.state = "ready"
 
-    def start_pending(self, run: Any) -> None:
-        """Main loop, every pass: fetch start points again that are due, spawn the learners that are ready, and
-        terminate a stopping learner past its grace (``stop``)."""
+    def start_pending(self, run: Any, *, spawn: bool = True) -> None:
+        """Main loop, every pass: fetch start points again that are due, spawn the learners that are ready (not while
+        ``spawn`` is False: the node's cache is full or its processes are stopped while the hub is away, T4.4; they
+        start once it is True again), and terminate a stopping learner past its grace (``stop``)."""
         now = time.monotonic()
         for entry in list(self._entries.values()):
             if entry.state == "fetching" and entry.retry_at is not None and now >= entry.retry_at:
@@ -290,7 +291,7 @@ class NodeLearners:
             elif entry.state == "stopping":
                 self._enforce_stop(entry, now)
         ready = [e for e in self._entries.values() if e.state == "ready"]
-        if not ready or not self._host.fixed_cached(run):
+        if not spawn or not ready or not self._host.fixed_cached(run):
             return                                   # teacher / init weights come from the fixed blobs
         for entry in ready:
             try:
@@ -399,6 +400,14 @@ class NodeLearners:
         self._host.send_child(entry.name, Stop(reason))
         self._host.set_route(LearnerRoute(agent, None, False, 0))
         logger.info(f"node: stopping learner {agent} ({reason})")
+
+    def stop_every(self, reason: str) -> None:
+        """Stop every learner of this node with ``reason`` and drop the successors queued behind them (the hub away
+        past ``distributed.hub_lost_timeout_sec``, T4.4: ``hub_lost`` sends no final snapshot, P-PF3-19; the hub's next
+        ``Welcome`` names the learners to start again)."""
+        for entry in list(self._entries.values()):
+            entry.successor = None
+            self.stop(entry.agent_id, reason, entry.generation)
 
     def _enforce_stop(self, entry: LearnerEntry, now: float) -> None:
         """A stopping learner still alive after ``distributed.shutdown_grace_sec`` is terminated (spec 7.2 / Step

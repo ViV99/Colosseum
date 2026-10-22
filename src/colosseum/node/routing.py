@@ -25,6 +25,11 @@ weights pull (the hub needs the newest weights of a learner here for nodes that 
 "relay_latest")`` in the transfer pool (``on_relay_pull``; at most one upload in flight per agent: a pull meanwhile is
 ignored, the running upload sends the newest anyway).
 
+The hub away (spec 4.5, SP5 T4.4, pre-flight ruling P18): past ``distributed.hub_lost_collect_sec`` without the hub,
+``cut_relay`` takes every agent whose learner this node reaches only through the hub relay out of the router's routes
+and gives the workers ``LearnerRoute(agent, None, via_node=False)`` for it (their chunks for it are dropped and counted
+``no_learner``; the matches are still played); ``restore_relay`` (the next ``Welcome``) brings the routes back.
+
 The router's counters (``chunks_*``, ``dropped_chunks.*``) are cumulative per node process: a stopped router's values
 are carried (``counters``). ``stop`` (before the node kills its children, at a release and at the end) stops every
 router thread; frames still queued are counted ``disconnect``.
@@ -135,6 +140,7 @@ class NodeRouting:
         self._receiver: Any = None                  # router.RelayReceiver (relay inbox) of the run
         self._relay = False                         # distributed.relay of the run
         self._uploading: set[str] = set()           # agents with a relay upload in flight
+        self._cut: set[str] = set()                 # agents cut off by the hub-lost collect rule (cut_relay)
 
     @property
     def delivery(self) -> Any:
@@ -184,6 +190,7 @@ class NodeRouting:
         self._host.set_delivery(None)
         self._links.clear()
         self._remote, self._paths = {}, {}
+        self._cut.clear()
 
     def add_worker(self, conn: Any, worker: int) -> bool:
         """A worker's ``route`` connection; False (the caller closes it) when no router runs."""
@@ -219,13 +226,16 @@ class NodeRouting:
         if self.router is None or planner is None or self._host.stopping:
             return
         local = set(self._host.local_learners())
-        remote = {}
+        remote, cut = {}, {}
         for agent in run.agent_ids:
             info = planner.known(agent)
             if agent in local or info is None or int(info.node) in (self._host.number, -1):
                 continue
-            remote[agent] = RemoteRoute(int(info.node), int(info.generation), tuple(info.addresses),
-                                        bool(info.relay_only))
+            route = RemoteRoute(int(info.node), int(info.generation), tuple(info.addresses), bool(info.relay_only))
+            if agent in self._cut:
+                cut[agent] = route                   # the hub-lost collect rule: no route, chunks not collected
+            else:
+                remote[agent] = route
         if remote != self._remote:
             self.router.set_routes(remote)
             self._remote = remote
@@ -233,12 +243,39 @@ class NodeRouting:
             if agent in local:
                 continue
             route = remote.get(agent)
-            if route is None:
+            if agent in cut:
+                want = LearnerRoute(agent, None, False, cut[agent].generation)
+            elif route is None:
                 want = LearnerRoute(agent, None, False, 0)
             else:                                    # via the node unless the path is known to be down
                 want = LearnerRoute(agent, None, self._paths.get(route.node) != "down", route.generation)
             if (self._host.worker_route(agent) or LearnerRoute(agent, None, False, 0)) != want:
                 self._host.set_route(want)
+
+    def through_relay(self) -> list[str]:
+        """The agents whose current route goes through the hub relay: their target's path is ``relay``, or it is not
+        known to be ``direct`` and the learner announced no reachable data address (``relay_only`` / none)."""
+        out = []
+        for agent, route in self._remote.items():
+            path = self._paths.get(route.node)
+            if path == "relay" or (path != "direct" and (route.relay_only or not route.addresses)):
+                out.append(agent)
+        return sorted(out)
+
+    def cut_relay(self, run: Any) -> list[str]:
+        """``distributed.hub_lost_collect_sec`` passed without the hub (module docstring): the agents reachable only
+        through the relay are cut off; returns the newly cut ones."""
+        agents = [a for a in self.through_relay() if a not in self._cut]
+        if agents:
+            self._cut.update(agents)
+            self.update_routes(run)
+        return agents
+
+    def restore_relay(self, run: Any) -> None:
+        """The hub is back (``Welcome``): the agents cut off by ``cut_relay`` get their routes again."""
+        if self._cut:
+            self._cut.clear()
+            self.update_routes(run)
 
     def on_path_changed(self, ev: PathChanged) -> None:
         """A sender's path changed: the workers' routes follow; ``relay`` / ``down`` is one WARNING per target per node

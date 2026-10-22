@@ -7,10 +7,18 @@ the ``Hello``; the next message is the ``Welcome``) and ``SessionLost`` after ea
 ``reason`` names the gRPC status). ``send`` puts a message on the current stream (False while no stream is up: the
 caller keeps it, e.g. the result buffer resends after the next ``SessionUp``).
 
+The hub away (SP5 T4.4, spec 7.1): ``away_for()`` is 0 while a stream is up, else the seconds (monotonic) since the
+last one went down (or since the session started, before the first). The pause between attempts is the backoff
+(``RECONNECT_MIN_SEC`` -> ``RECONNECT_MAX_SEC``, doubling, jitter <= 20 %), or, after ``slow_retry(True)`` (the node
+stopped its processes at ``distributed.hub_lost_timeout_sec``), ``random.uniform(*HUB_LOST_RETRY_SEC)``; every stream
+that comes up switches back to the backoff. The session id stays the node process's (spec 4.1).
+
 Channels: ``grpc.secure_channel`` with the pinned hub CA (``hub_channel_credentials``) and the fixed server name
 ``colosseum-hub``, or a plain channel with ``credentials=None`` (``--insecure`` and the local loopback port); the node
 id and node secret go in the call metadata in every mode (R1). A new channel per attempt (a broken one is never
-reused).
+reused), with its own subchannel pool: a subchannel shared with the node's other channels to the hub would carry
+gRPC's own reconnect backoff (1 s, growing to 120 s) from one attempt to the next, so a node would come back late
+after a cut or a hub restart whatever this module's pauses say (SP5 T4.4).
 """
 
 from __future__ import annotations
@@ -42,6 +50,7 @@ CLOSE_TIMEOUT_SEC = 5.0              # close(): the stream ends by itself, else 
 POLL_SEC = 0.25
 _JITTER = 0.2
 _END = object()
+_OWN_POOL = [("grpc.use_local_subchannel_pool", 1)]   # module docstring: no gRPC backoff carried across attempts
 
 
 @dataclass
@@ -110,6 +119,8 @@ class HubSession:
         self._rng = rng or random.Random()
         self._closing = threading.Event()
         self._stream: _Stream | None = None
+        self._last_connected = time.monotonic()    # while a stream is up: refreshed at every message (away_for)
+        self._slow = False                         # slow_retry: HUB_LOST_RETRY_SEC pauses instead of the backoff
         self._thread = threading.Thread(target=self._run, name="hub-session", daemon=True)
 
     def start(self) -> None:
@@ -120,6 +131,17 @@ class HubSession:
         """A stream is up and its first response arrived."""
         stream = self._stream
         return stream is not None and stream.connected
+
+    def away_for(self) -> float:
+        """0.0 while connected, else the seconds since the last stream went down (any thread)."""
+        if self.connected:
+            return 0.0
+        return max(0.0, time.monotonic() - self._last_connected)
+
+    def slow_retry(self, on: bool) -> None:
+        """Pause ``random.uniform(*HUB_LOST_RETRY_SEC)`` between attempts (True) or the backoff (False); a stream that
+        comes up switches it off."""
+        self._slow = bool(on)
 
     def send(self, msg: pb.NodeMessage) -> bool:
         """Queue ``msg`` on the current stream; False while no stream is up (or its queue is full)."""
@@ -168,9 +190,10 @@ class HubSession:
 
     def _channel(self) -> grpc.Channel:
         if self._credentials is None:
-            return grpc.insecure_channel(self._address, options=channel_options(self._max_message_mb))
+            return grpc.insecure_channel(self._address, options=channel_options(self._max_message_mb) + _OWN_POOL)
         return grpc.secure_channel(self._address, self._credentials,
-                                   options=channel_options(self._max_message_mb, server_name=HUB_SERVER_NAME))
+                                   options=channel_options(self._max_message_mb, server_name=HUB_SERVER_NAME)
+                                   + _OWN_POOL)
 
     def _run(self) -> None:
         delays = backoff_delays(self._rng)
@@ -180,7 +203,11 @@ class HubSession:
                 break
             if up_for >= RECONNECT_MAX_SEC:
                 delays = backoff_delays(self._rng)
-            self._closing.wait(next(delays))
+            if self._slow:
+                low, high = HUB_LOST_RETRY_SEC
+                self._closing.wait(self._rng.uniform(low, high))
+            else:
+                self._closing.wait(next(delays))
 
     def _run_stream(self) -> float:
         """One attempt: returns how long the stream was up (0 if it never was)."""
@@ -202,8 +229,10 @@ class HubSession:
             if self._closing.is_set():
                 call.cancel()
             for msg in call:
+                self._last_connected = time.monotonic()
                 if up_since is None:
-                    up_since = time.monotonic()
+                    up_since = self._last_connected
+                    self._slow = False
                     stream.connected = not self._closing.is_set()
                     self._deliver(SessionUp())
                 self._deliver(msg)
@@ -214,6 +243,8 @@ class HubSession:
         except Exception as e:  # noqa: BLE001 - one broken stream never stops the session thread
             reason = f"{type(e).__name__}: {e}"
         finally:
+            if up_since is not None:
+                self._last_connected = time.monotonic()    # before ``connected`` turns False (away_for)
             stream.end()
             self._stream = None
             channel.close()

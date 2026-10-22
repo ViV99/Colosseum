@@ -7,6 +7,10 @@ Owned by the node agent's main loop (``colosseum.node.agent``); ``NodeLineups`` 
 ``LineupHost`` (its ``_LineupHost`` adapter): the cell tracker, the current run, whether the node stops or is
 connected, sending to the hub, a counter, the agents whose learner runs here, and sending to a worker.
 
+While the cache is full (``LineupHost.cache_full``, SP5 T4.4, spec 7.1) the node takes no new work: no lineup
+requests and no fetches (the cells keep playing the lineups they have; grants already waiting stay until their
+weights arrive or they are given up).
+
 The lineup-after-cache invariant (``prune_cache``): a cache key leaves only after the lineup replacing it was sent to
 the worker, and workers pump their control connection before every cache read.
 """
@@ -47,6 +51,8 @@ class LineupHost(Protocol):
     def stopping(self) -> bool: ...
     @property
     def connected(self) -> bool: ...
+    @property
+    def cache_full(self) -> bool: ...                 # no new work while set (T4.4)
     def current_run(self) -> Any: ...
     def send(self, message: pb.NodeMessage) -> bool: ...
     def count(self, name: str, n: int = 1) -> None: ...
@@ -80,7 +86,9 @@ class NodeLineups:
 
     def fetch_fixed(self, run: Any, now: float) -> None:
         """Fetch the needed ``Welcome.fixed`` blobs that are not cached (a failed one again after
-        ``FIXED_RETRY_SEC``)."""
+        ``FIXED_RETRY_SEC``; none while the cache is full)."""
+        if self._host.cache_full:
+            return
         for key in self.needed_fixed(run):
             if key in run.fixed_done or self.fetches.blob_in_flight(key) or now < run.fixed_retry_at.get(key, 0.0):
                 continue
@@ -146,7 +154,9 @@ class NodeLineups:
         return key in run.fixed_done or key in self.cached or run.reader.has(key)
 
     def request_lineups(self) -> None:
-        if not self._host.connected:
+        """One ``LineupRequest`` for every due cell; none while the hub is away (expired cells keep their lineups and
+        are all requested in the first pass after the ``Welcome``) or the cache is full."""
+        if not self._host.connected or self._host.cache_full:
             return
         due = self._host.cells.due()
         if due:
@@ -170,7 +180,7 @@ class NodeLineups:
         for worker, env, _lineup, keys in self._host.cells.waiting():
             missing = [k for k in set(keys.values()) if not self.has(run, k)]
             for key in missing:
-                if key.kind != "latest" and not self.fetches.blob_in_flight(key):
+                if key.kind != "latest" and not self.fetches.blob_in_flight(key) and not self._host.cache_full:
                     self.fetches.fetch_blob(run, key)     # latest weights: pump_fetches
             if missing or not self._host.worker_connected(worker):
                 continue
@@ -205,7 +215,10 @@ class NodeLineups:
 
     def pump_fetches(self, run: Any, now: float) -> None:
         """Node item 11: the latest transfers the planner wants now (the agents named by latest seats of this node's
-        live and waiting lineups are refreshed; never the agents whose learner runs here)."""
+        live and waiting lineups are refreshed; never the agents whose learner runs here; nothing while the cache is
+        full)."""
+        if self._host.cache_full:
+            return
         referenced = {k.agent_id for k in self._host.cells.referenced() if k.kind == "latest"}
         self.fetches.pump(run, now, referenced=referenced, local=self._host.learner_agents(),
                           hub_online=self._host.connected)

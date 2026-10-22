@@ -7,7 +7,10 @@ server).
   accounts results at intake with a ``ResultIntake`` (dedup by (node, session, seq)) and acks them (or holds the acks),
   and records every inbox event. Downloads are served by the real servicer from ``GatedBlobs`` (gates, NOT_FOUND).
   ``pause()`` / ``resume()`` (P-PF2-16): while paused every new session is closed before its ``Welcome`` and live
-  ones are closed, and the server keeps its port.
+  ones are closed, and the server keeps its port. ``relay=True`` (T4.4): the server has a real ``RelayHub`` and
+  serves ``Hub.RelaySend`` / ``RelayInbox`` for the nodes whose session is open (frames for other nodes are dropped
+  and counted by the relay, as the hub does for an offline target); ``blobs.write_parked(agent, frame)`` serves an
+  agent's latest weights through ``Download(kind="latest")``.
 - ``toy_node_options(tmp_path, hub, **kw)``: ``NodeOptions`` of a registered, insecure one-worker node.
 - ``run_node_in_thread(options)`` / ``stop_node(...)``: a ``NodeAgent`` in a thread of the test process.
 - ``wait_for(pred, timeout)``: poll a predicate.
@@ -26,6 +29,7 @@ from typing import Any
 
 from colosseum.core.run_dir import RunDir
 from colosseum.core.types import Lineup
+from colosseum.hub.relay import RelayHub
 from colosseum.hub.server import (
     BlobStore,
     NodeMessageIn,
@@ -102,7 +106,8 @@ class FakeHub:
     """Module docstring. ``lineup_for(worker, env) -> Lineup | None`` (None: no grant for that cell); ``first_epoch``:
     the first epoch the hub hands out; ``welcome_fields``: extra ``pb.Welcome`` fields (``fixed``, ``learners``)."""
 
-    def __init__(self, tmp_path: Path, config: Any, *, ttl_sec: float = 1.0, first_epoch: int = 5) -> None:
+    def __init__(self, tmp_path: Path, config: Any, *, ttl_sec: float = 1.0, first_epoch: int = 5,
+                 relay: bool = False) -> None:
         self.config = config
         self.ttl_sec = ttl_sec
         self.identity = HubIdentity.load_or_create(Path(tmp_path) / "hub-id")
@@ -112,9 +117,10 @@ class FakeHub:
         self.timeline: list = []
         self.blobs = GatedBlobs(self.run_dir, self.timeline)
         self.inbox: queue.SimpleQueue = queue.SimpleQueue()
+        self.relay = RelayHub() if relay else None
         self.server, ports = build_server(inbox=self.inbox, identity=self.identity, insecure=True,
                                           listen=["127.0.0.1:0"], loopback_plain=False, blobs=self.blobs,
-                                          max_message_mb=64)
+                                          max_message_mb=64, relay=self.relay)
         self.server.start()
         self.port = ports["127.0.0.1:0"]
         self.address = f"127.0.0.1:{self.port}"
@@ -314,6 +320,7 @@ class FakeHub:
             if old is not None and old is not handle:
                 old.close("superseded")
             self.sessions[handle.node_id] = handle
+            self._relay_online()
             self.intake.open(handle.node_id, ev.hello.session_id, int(ev.hello.last_acked_seq))
             handle.send(pb.HubMessage(welcome=pb.Welcome(
                 node_number=record.number, run_id=self.run_id,
@@ -321,6 +328,7 @@ class FakeHub:
         elif isinstance(ev, SessionClosed):
             if self.sessions.get(ev.node_id) is ev.handle:
                 del self.sessions[ev.node_id]
+                self._relay_online()
         elif isinstance(ev, NodeMessageIn):
             handle = self.sessions.get(ev.node_id)
             if handle is None or handle.serial != ev.serial:
@@ -331,6 +339,10 @@ class FakeHub:
             ev.path.unlink(missing_ok=True)
             self.uploads.append((ev.header, data))
             ev.reply.set_result(self.upload_reply(ev.header, data))
+
+    def _relay_online(self) -> None:
+        if self.relay is not None:
+            self.relay.set_online({node_id: self.identity.nodes.get(node_id).number for node_id in self.sessions})
 
     def _on_message(self, ev: NodeMessageIn, handle: SessionHandle) -> None:
         kind = ev.message.WhichOneof("m")
