@@ -155,7 +155,7 @@ def test_one_liner_and_join_command_text():
     assert shlex.split(I.join_command("[::1]:47100", token, insecure=False))[2] == "[::1]:47100"
 
 
-FAKE_CURL = """#!/bin/sh
+FAKE_CURL = r"""#!/bin/sh
 # Fake curl: serves a fake uv install.sh that records its environment and installs the fake uv (no network).
 echo "$*" >> "$FAKE_CURL_LOG"
 cat <<'FAKE_INSTALL_SH'
