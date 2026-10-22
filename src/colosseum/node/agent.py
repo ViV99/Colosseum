@@ -1133,10 +1133,12 @@ class NodeAgent:
                     # A blocking read of one whole frame: a learner SIGSTOPped in the middle of it stalls the loop
                     # (SIGKILL gives EOF at once); bounding it is T4.4's.
                     frame = conn.recv_bytes(cap)
-            except EOFError:
+            except (EOFError, ConnectionResetError, BrokenPipeError):
+                # The peer is gone: a clean end, or (Linux AF_UNIX) a peer that exited with data of ours unread,
+                # which reads as ECONNRESET; its exit is reported by the exit path, not as a read failure.
                 self._close_conn(conn)
                 return
-            except OSError as e:                         # not an end between messages: say what happened
+            except OSError as e:                         # not an end of the peer: say what happened
                 logger.error(f"node: reading from {name} failed ({type(e).__name__}: {e}); its connection is closed")
                 self.learners.note_failure(name, f"the node could not read its message ({e})")
                 self._close_conn(conn)
@@ -1264,8 +1266,8 @@ class NodeAgent:
         future.add_done_callback(done)
 
     def _upload(self, kind: str, header: Any, frame: bytes, token: str) -> pb.UploadReply:
-        # The transfer pool runs uploads until T4.2's node.uploads.UploadQueue (A29) replaces this path.
         """A transfer-pool thread: one ``Upload`` (header, then the frame in parts)."""
+        # The transfer pool runs uploads until T4.2's node.uploads.UploadQueue (A29) replaces this path.
         from colosseum.net.grpc_util import blob_digest, node_metadata, send_parts
         from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
 

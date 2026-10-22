@@ -5,8 +5,8 @@ The SP4 ``learner_process`` over ``net.local``: chunk frames arrive on the learn
 sender, read by ``ConnectionIntake`` with the node's key; validated with the agent's spaces, ``chunk_length`` and the
 model's state template, A17); ``LearnerEnvSteps`` (the hub's global counter, LR progress) and ``Stop`` arrive on the
 control connection to the node; weights go into the shared-memory cache with a ``VersionPublished`` to the node,
-checkpoints as ``CheckpointHeader`` + frame, metrics as ``LearnerMetrics`` (``NodeOutputs``). The listener exists
-before the control hello: the node routes workers to it only after that hello.
+checkpoints as ``CheckpointHeader`` + frame, metrics as ``LearnerMetrics`` (``NodeOutputs``). The listener and the
+intake exist before the first ``VersionPublished``: the node routes workers to the learner only at that message.
 
 Start state (built by the node, numpy only; no file is read on the node): a ``resume_state`` from the assignment's
 blobs (A28 until T4.1: a ``recovery`` weights frame plus ``trainer_state`` bytes), a teacher (a ``teacher`` blob of
@@ -67,10 +67,11 @@ def _learner_main(*, name: str, incarnation: int, node: int, agent_id: str, gene
         return ControlChannel(conn)
 
     try:
-        # Everything slow first (model, optimizer, a CUDA context): the node routes workers to this learner's
-        # listener as soon as its control hello arrives, and a worker's connection must be accepted promptly (its
-        # sender counts as broken after OPEN_TIMEOUT_SEC), so the listener, the hello and the intake's acceptor come
-        # one right after the other.
+        # Everything slow first (model, optimizer, a CUDA context); then the listener, the control hello (the node's
+        # acceptor wants it within its handshake bound) and the intake's acceptor, one right after the other. The node
+        # routes workers to this listener only at the first VersionPublished, which learner_process sends once the
+        # intake runs; a worker's connection is then accepted at once (its sender counts as broken after
+        # OPEN_TIMEOUT_SEC).
         algorithm = build_algorithm(config, role_spec, spec, device=device, teacher=teacher)
         if init_state is not None:
             apply_init(algorithm.model, init_state)          # weights only: version 0, fresh optimizer

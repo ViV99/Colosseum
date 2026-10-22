@@ -723,3 +723,22 @@ def test_a_download_in_flight_at_a_release_leaves_no_segment_behind(hub_factory,
     time.sleep(1.0)
     assert not list(shm_dir().glob(f"{prefix}*")) and not list(shm_dir().glob(f".{prefix}*"))
     assert node.stop() == 0
+
+
+def test_a_child_killed_with_an_unread_message_is_an_exit_not_a_read_failure(hub_factory, node_factory, caplog):
+    hub = _learner_hub(hub_factory)
+    with caplog.at_level(logging.WARNING):
+        node = node_factory(hub)
+        wait_for(lambda: max(_train_steps(hub), default=0) >= 2, timeout=60)
+        learner, worker = node.agent.supervisor.get("learner-a"), node.agent.supervisor.get("worker-0")
+        for proc in (learner, worker):
+            os.kill(proc.pid, signal.SIGSTOP)                       # it reads nothing from now on
+        hub.announce(env_steps=500, evictions=[pb.Eviction(agent_id="a", checkpoint_id="ckpt_v1")])
+        time.sleep(1.0)                                             # LearnerEnvSteps / WorkerEvict stay unread
+        for proc in (learner, worker):
+            os.kill(proc.pid, signal.SIGKILL)                       # (Linux: the node then reads ECONNRESET)
+        failed = wait_for(lambda: hub.node_events("learner_failed"))[0]
+        wait_for(lambda: [e for e in hub.node_events("proc_died") if e.proc == "worker-0"])
+        assert node.stop() == 0
+    assert "could not read" not in failed.message
+    assert not [r for r in caplog.records if "failed (" in r.getMessage() and "reading from" in r.getMessage()]
