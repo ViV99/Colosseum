@@ -610,6 +610,7 @@ class WorkerIO:
             sender = self._senders.pop(route.agent_id, None)
             if sender is not None:
                 sender.close()
+            self._reopen_after.pop(route.agent_id, None)   # a new route starts with the base reopen wait (R34)
 
     def ready(self) -> bool:
         self.pump()
@@ -661,13 +662,16 @@ class WorkerIO:
     def _sender(self, route: LearnerRoute) -> FrameSender:
         key = route.agent_id if not route.via_node else "<route>"
         sender = self._senders.get(key)
+        if sender is not None and not sender.broken and sender.opened:
+            self._reopen_after.pop(key, None)            # it opened: the next break waits the base value (R34)
         if sender is not None and sender.broken and not route.via_node and sender.broken_at is not None:
             wait = self._reopen_after.get(key, SENDER_REOPEN_SEC)
-            if time.monotonic() - sender.broken_at >= wait:
+            elapsed = time.monotonic() - sender.broken_at
+            if elapsed >= wait:
                 self._reopen_after[key] = (SENDER_REOPEN_SEC if sender.opened
                                            else min(2.0 * wait, SENDER_REOPEN_MAX_SEC))
                 logger.info(f"worker {self.worker}: reopening the chunk connection to the learner of "
-                            f"{route.agent_id!r} ({wait:.0f} s after it broke)")
+                            f"{route.agent_id!r} (broken for {elapsed:.1f} s; reopen wait {wait:.1f} s)")
                 sender.close(0.0)
                 del self._senders[key]
                 sender = None

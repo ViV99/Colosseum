@@ -320,3 +320,58 @@ def test_a_sender_that_never_opens_waits_longer_before_each_reopen(monkeypatch):
         time.sleep(0.02)
     assert waits[:3] == [0.1, 0.2, 0.4]
     io.close(timeout=0.5)
+
+
+def test_the_reopen_wait_resets_once_a_reopened_sender_opens_and_on_a_route_change(monkeypatch, caplog):
+    """R34 (review round 2): the wait grows while the learner is gone, goes back to the base value once a reopened
+    sender opened (the next break waits SENDER_REOPEN_SEC again), and a route change starts from the base value."""
+    monkeypatch.setattr(local, "SENDER_REOPEN_SEC", 0.2)
+    monkeypatch.setattr(local, "OPEN_TIMEOUT_SEC", 0.1)
+    real, cut = local._FrameReader.read, threading.Event()
+
+    def read(self, now):
+        if cut.is_set():
+            cut.clear()
+            raise RuntimeError("cut by the intake")
+        return real(self, now)
+    monkeypatch.setattr(local._FrameReader, "read", read)
+    name = address("abcdef12", secrets.token_hex(4), 3, "learner-a-i1")
+    io, _ = _io(routes={"a": LearnerRoute("a", name, False, 1)})
+    got, intakes = [], []
+
+    def send_until(pred, timeout=20.0):
+        """Send chunks until ``pred()``; the intake (once there) is drained on every send, so backpressure never
+        blocks the loop."""
+        version, end = 0, time.monotonic() + timeout
+        while not pred() and time.monotonic() < end:
+            version += 1
+            io.send_chunk(TrajectoryChunk.from_payload(chunk_v2_payload(version=version, agent_id="a")))
+            for intake in intakes:
+                while True:
+                    try:
+                        got.append(intake.get(timeout=0.01))
+                    except queue.Empty:
+                        break
+            time.sleep(0.02)
+        return pred()
+
+    assert send_until(lambda: io._reopen_after.get("a", 0.0) >= 0.8)      # no learner yet: 0.2 -> 0.4 -> 0.8
+    node_end, learner_end = mp.Pipe()
+    intake = ConnectionIntake(listener(name, KEY), ControlChannel(learner_end),
+                              ChunkValidator(learner_role(), agent_id="a", teacher=False),
+                              authkey=KEY, agent_id="a", generation=1, version_floor=0, capacity=64, cap_bytes=1 << 24)
+    intakes.append(intake)
+    assert send_until(lambda: bool(got))                             # a reopened sender opened ...
+    assert send_until(lambda: "a" not in io._reopen_after)           # ... so the wait is back to the base value
+    caplog.clear()
+    with caplog.at_level("INFO", logger="colosseum.net.local"):
+        cut.set()                                                    # the intake closes the connection again
+        assert send_until(lambda: any("reopening" in r.getMessage() for r in caplog.records))
+    (line,) = [r.getMessage() for r in caplog.records if "reopening" in r.getMessage()]
+    assert "reopen wait 0.2 s" in line
+    io._reopen_after["a"] = 5.0
+    io._set_route(LearnerRoute("a", name, False, 2))                 # a new learner generation
+    assert "a" not in io._reopen_after
+    io.close()
+    intake.close()
+    node_end.close()
