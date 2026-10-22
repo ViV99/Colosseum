@@ -16,14 +16,14 @@ contain ``.`` (``core.config.check_agent_id``). A ``path`` stored in
 ``meta.json`` (older layouts, copied runs) is never used (R6-06).
 
 Retention (SP4 spec block 4; the decision is ``colosseum.arena.retention.retain``), after every save, import
-and ``reapply_retention``: the newest ``keep_last``, the final snapshot of the current run (``run_id``; with no
-run id every final, as in SP3), pinned snapshots (``meta.json`` ``pinned``, re-read from disk before every
-decision, so ``colosseum pin`` works while a run trains), the snapshot just saved, every ``keep_every``-th
-version, and with ``keep_top_k > 0`` the top-k by the scores provider's lower bound plus new snapshots with
-fewer than ``top_k_min_games`` rated games; then the ``max_snapshots`` cap. Evicted ids leave the index first,
-then ``on_evict(agent_id, checkpoint_id)`` is called for each (a raising callback never leaves deleted dirs in
-the index). Only the newest ``keep_last`` keep ``trainer_state.pt``. Every new ``meta.json`` gets ``pinned``
-(false) and, with a run id, ``run_id``.
+and ``reapply_retention``: the newest ``keep_last``, the newest final snapshot of the current run (``run_id``; an
+in-place resume keeps it, SP5; with no run id every final, as in SP3), pinned snapshots (``meta.json``
+``pinned``, re-read from disk before every decision, so ``colosseum pin`` works while a run trains), the snapshot
+just saved, every ``keep_every``-th version, and with ``keep_top_k > 0`` the top-k by the scores provider's lower
+bound plus new snapshots with fewer than ``top_k_min_games`` rated games; then the ``max_snapshots`` cap. Evicted
+ids leave the index first, then ``on_evict(agent_id, checkpoint_id)`` is called for each (a raising callback never
+leaves deleted dirs in the index). Only the newest ``keep_last`` keep ``trainer_state.pt``. Every new ``meta.json``
+gets ``pinned`` (false) and, with a run id, ``run_id``.
 
 SP5 (spec 4.2): with an eviction hold set (``set_eviction_hold``) an evicted snapshot the hold callback names is
 first hard-linked (``model.pt``, ``meta.json``; copied when links fail) into
@@ -307,7 +307,7 @@ class CheckpointManager:
                  on_evict: Callable[[str, str], None] | None = None, *, run_id: str | None = None,
                  keep_top_k: int = 0, top_k_min_games: int = 200, max_snapshots: int | None = None,
                  scores_fn: Callable[[str], Mapping[str, SnapshotScore] | None] | None = None) -> None:
-        """``run_id``: the current run (only its final snapshot is protected; None keeps the SP3 rule: every
+        """``run_id``: the current run (only its newest final snapshot is protected; None keeps the SP3 rule: every
         final); ``scores_fn(agent_id)``: ``{checkpoint_id: SnapshotScore}`` of the agent's rated snapshots, or
         None while there are no ratings yet (``arena.retention``: unrated snapshots are new, the cap waits), read
         only with ``keep_top_k > 0``."""

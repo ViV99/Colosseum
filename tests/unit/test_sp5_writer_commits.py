@@ -4,11 +4,20 @@ fit is refused whole and not counted; a write error or a dead writer gives faile
 results; groups never split between appends; tokens left at the stop are counted as dropped."""
 from __future__ import annotations
 
+import logging
 import sqlite3
 import time
 from functools import partial
 
-from colosseum.arena.matchlog import MATCH_LOG_FILE, WRITE_BATCH, AppendStats, MatchLog, MatchLogWriter, RunInfo
+from colosseum.arena.matchlog import (
+    MATCH_LOG_FILE,
+    WRITE_BATCH,
+    WRITE_FAILURES_DEAD,
+    AppendStats,
+    MatchLog,
+    MatchLogWriter,
+    RunInfo,
+)
 from game_helpers import synthetic_journal_results
 
 RUN = RunInfo(run_id="R", name="run", parent_run_id=None, game="ttt", config_hash="h", checkpoint_interval=10)
@@ -111,6 +120,38 @@ def test_a_dead_writer_fails_queued_tokens_and_refuses_new_ones():
     assert commit.failed and writer.dead and writer.stats.dropped == 0
     assert writer.submit(synthetic_journal_results(2), token="u") == 2 and writer.stats.dropped == 0
     writer.stop(5.0)
+
+
+def test_a_writer_whose_appends_keep_failing_goes_dead(caplog):
+    """T2.5(a1), carried to T4.3: a journal that fails every append would fail its tokens for ever (the node resends,
+    nothing is accounted); after WRITE_FAILURES_DEAD failed appends in a row the writer is dead, so the hub accounts
+    results without the journal (its journal-off path)."""
+    assert WRITE_FAILURES_DEAD > 1
+    writer = MatchLogWriter(lambda: CommitFakeLog(fail_appends=10**6), compact_interval_sec=3600.0, window_bytes=1)
+    writer.start()
+    with caplog.at_level(logging.ERROR, logger="colosseum.arena.matchlog"):
+        for k in range(WRITE_FAILURES_DEAD):
+            assert not writer.dead
+            assert writer.submit(synthetic_journal_results(2, first=2 * k), token=k) == 0
+            (commit,) = _commits(writer, 1)
+            assert commit.failed and commit.token == k
+        assert _wait(lambda: writer.dead)
+    assert writer.submit(synthetic_journal_results(2, first=100), token="late") == 2      # refused: intake path
+    stats = writer.stop(5.0)
+    assert (stats.write_errors, stats.dropped, stats.written) == (WRITE_FAILURES_DEAD, 0, 0)
+    assert any(f"{WRITE_FAILURES_DEAD} appends in a row" in r.getMessage() for r in caplog.records)
+
+
+def test_a_success_between_failures_keeps_the_writer_alive():
+    log = CommitFakeLog(fail_appends=WRITE_FAILURES_DEAD - 1)
+    writer = MatchLogWriter(lambda: log, compact_interval_sec=3600.0, window_bytes=1)
+    writer.start()
+    for k in range(WRITE_FAILURES_DEAD):
+        writer.submit(synthetic_journal_results(2, first=2 * k), token=k)
+        _commits(writer, 1)
+    assert not writer.dead and len(log.batches) == 1
+    stats = writer.stop(5.0)
+    assert (stats.write_errors, stats.written) == (WRITE_FAILURES_DEAD - 1, 2)
 
 
 def test_a_tokened_group_is_never_split_between_two_appends():

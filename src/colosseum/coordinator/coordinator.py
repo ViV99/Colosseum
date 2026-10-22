@@ -16,7 +16,8 @@ from __future__ import annotations
 import logging
 import random
 from collections import deque
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from dataclasses import dataclass
 from pathlib import Path
 
 from colosseum.arena.retention import SnapshotScore, snapshot_scores
@@ -37,6 +38,27 @@ logger = logging.getLogger(__name__)
 # The league state of a run (SP4 spec block 7.4): ratings and PFSP statistics, restored by a run-dir resume.
 LEAGUE_STATE_FILE = "league_state.json"
 LEAGUE_STATE_VERSION = 1
+
+
+@dataclass(frozen=True)
+class LeagueStateInfo:
+    """What a loaded ``league_state.json`` says about the journal (SP5 R8)."""
+
+    env_steps: int                  # the global env-step count it was written at
+    journal_row: int | None         # the highest journal row id accounted in it (None: none yet, or an SP4 file)
+    has_watermark: bool             # False: written before SP5 (no "journal_row" key)
+
+
+def league_replay_window(info: LeagueStateInfo | None) -> tuple[int | None, int | None]:
+    """``(after_row, min_env_steps)`` of the journal rows an in-place resume replays (SP5 T4.3, R8): no league state
+    -> every detailed training match; an SP5 state -> the rows above its watermark; an SP4 state (no watermark: SP4
+    accounted at intake, before the journal) -> the matches stamped after the env-step count it was written at
+    (never one twice; a match stamped exactly at that count is not replayed)."""
+    if info is None:
+        return None, None
+    if info.has_watermark:
+        return info.journal_row, None
+    return None, info.env_steps
 
 
 class Coordinator:
@@ -85,6 +107,7 @@ class Coordinator:
         self._match_results: deque[MatchResult] = deque(maxlen=10000)
         self._refresh_round = 0
         self._seatable: Callable[[str], bool] = lambda agent_id: True     # R41: set_seatable (the hub)
+        self._league_state: LeagueStateInfo | None = None                 # what load_league_state read (R8)
         validate_matchmaking(spec, self._player_roles, config)
         self._context = MatchmakerContext.from_config(
             config, spec, self._player_roles, rng=self._rng, snapshots_fn=self._checkpoint_ids,
@@ -256,7 +279,8 @@ class Coordinator:
         """Write the ratings (``RatingBook``) and the PFSP statistics (with the forgotten snapshots) atomically to
         ``path`` (spec block 7.4). A custom matchmaker's own state (``on_result``) is not saved. ``journal_row``
         (SP5, R8): the highest journal row id whose result is accounted in this state (every row up to it is; None:
-        no journal, or nothing journaled yet); ``load_league_state`` ignores it, a resume replays the rows after it."""
+        no journal, or nothing journaled yet); ``load_league_state`` keeps it (``loaded_league_state``), an in-place
+        resume replays the rows after it."""
         from colosseum.metrics.jsonl import write_json_atomic
 
         write_json_atomic(path, {"version": LEAGUE_STATE_VERSION, "env_steps": int(env_steps),
@@ -265,7 +289,9 @@ class Coordinator:
 
     def load_league_state(self, path: str | Path) -> bool:
         """Restore a saved league state; False when ``path`` does not exist (an SP3 run dir, or a run that never saved
-        it). Entries of agents that are not in this config are dropped (INFO). An unreadable file is a ConfigError."""
+        it). Entries of agents that are not in this config are dropped (INFO). An unreadable file is a ConfigError.
+        What the file says about the journal is kept for the replay of an in-place resume (``loaded_league_state``,
+        SP5 R8)."""
         import json
 
         path = Path(path)
@@ -278,10 +304,42 @@ class Coordinator:
             players = list(self._player_roles)
             self._ratings.load_state_dict(state["ratings"], agents=players)
             self._pfsp.load_state_dict(state["pfsp"], agents=players)
+            row = state.get("journal_row")
+            info = LeagueStateInfo(env_steps=int(state.get("env_steps") or 0),
+                                   journal_row=None if row is None else int(row), has_watermark="journal_row" in state)
         except (OSError, ValueError, KeyError, TypeError, IndexError, AttributeError) as e:
             raise ConfigError(f"Cannot read the league state {path} ({type(e).__name__}: {e}); move it away to "
                               f"resume with empty ratings and PFSP statistics") from e
+        self._league_state = info
         return True
+
+    @property
+    def loaded_league_state(self) -> LeagueStateInfo | None:
+        """What ``load_league_state`` read about the journal (None: no file was loaded)."""
+        return self._league_state
+
+    def league_state_journal_row(self) -> int | None:
+        """The journal watermark of the loaded league state (None: none loaded, an SP4 file, or nothing accounted)."""
+        return None if self._league_state is None else self._league_state.journal_row
+
+    def replay_results(self, results: Iterable[MatchResult]) -> tuple[int, int]:
+        """In-place resume (SP5 T4.3, R8): account journaled results the loaded league state does not hold yet, in
+        commit order, exactly as ``report_match_result``. A result the current game cannot rate (a layout it no
+        longer has, another outcome kind: the config changed with ``-c``) is skipped and counted (one WARNING).
+        Returns ``(replayed, skipped)``."""
+        replayed = skipped = 0
+        for result in results:
+            layouts = self._spec.layouts
+            if result.layout not in layouts or result.outcome_kind != self._spec.outcome_kind(result.layout):
+                if not skipped:
+                    logger.warning(f"Resume: journaled match {result.uid} (layout {result.layout!r}, "
+                                   f"{result.outcome_kind}) cannot be replayed into the ratings of this game; such "
+                                   f"matches are skipped")
+                skipped += 1
+                continue
+            self.report_match_result(result)
+            replayed += 1
+        return replayed, skipped
 
     def save_checkpoint_payload(self, payload: dict, meta_extra: dict | None = None) -> str:
         """Persist a learner checkpoint payload (see ``learner.make_checkpoint_payload``).

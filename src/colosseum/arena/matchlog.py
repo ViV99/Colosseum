@@ -32,12 +32,19 @@ in one transaction and skips a parent already imported.
 
 Order is by row id (insertion order), never by the informational ``ts``.
 
+Schema version 2 (SP5 T4.3): ``matches.node`` (the node that played the match; NULL for SP4 rows and local
+tournaments); a version-1 journal (SP4) is migrated in place when a writer (``MatchLog``) opens it and read as it is
+by ``MatchLogReader`` (``node`` reads as None); row ids come from ``meta.next_match_id`` and are never reused, so
+``league_state.json``'s ``journal_row`` watermark stays exact after compaction deleted the newest rows.
+
 ``MatchLogWriter`` (training main process, SP4 T1.3) is a thread with its own ``MatchLog`` connection: the main
 loop submits results to its bounded queue (a full queue drops and counts them), the thread appends them in batches,
 feeds the in-memory ``ComparisonTable`` of the live ratings with what it journaled, compacts every
 ``compact_interval_sec``, and flushes its queue on ``stop``. A write error is an ERROR in the log and a count,
 never an exception in the training process. SP5 (R8): a tokened submit is all or nothing and is committed as a
-whole; the hub accounts and acks a node's batch only from its ``Commit``.
+whole; the hub accounts and acks a node's batch only from its ``Commit``. A writer whose appends fail
+``WRITE_FAILURES_DEAD`` times in a row is ``dead`` (SP5 T4.3): the hub then accounts results without the journal
+instead of failing their commits for ever.
 """
 
 from __future__ import annotations
@@ -71,7 +78,10 @@ from colosseum.core.types import MATCH_SOURCES, MatchResult, SeatResult, TeamRes
 logger = logging.getLogger(__name__)
 
 MATCH_LOG_FILE = "matches.db"
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
+# Schema versions this code opens: version 1 (SP4) is migrated in place by a writer (``MatchLog``) and read as is by
+# ``MatchLogReader`` (``node`` reads as None).
+READABLE_SCHEMA_VERSIONS = (1, 2)
 # The sources of a run's own ratings (live ratings, top-k, the report's ratings): tournaments rate only their own
 # matches (spec block 2). Defined here once (contract amendment A18).
 RUN_SOURCES = ("train", "pulse")
@@ -105,7 +115,7 @@ _SCHEMA = (
     "CREATE TABLE IF NOT EXISTS matches (id INTEGER PRIMARY KEY, uid TEXT NOT NULL UNIQUE, run INTEGER, "
     "source INTEGER NOT NULL, layout INTEGER NOT NULL, outcome_kind TEXT NOT NULL, length INTEGER NOT NULL, "
     "seed INTEGER, env_steps INTEGER, block TEXT, tournament INTEGER, worker INTEGER, ts REAL NOT NULL, "
-    "replay TEXT, size INTEGER NOT NULL)",
+    "replay TEXT, size INTEGER NOT NULL, node INTEGER)",
     "CREATE INDEX IF NOT EXISTS matches_by_source ON matches (source, id)",
     "CREATE INDEX IF NOT EXISTS matches_by_tournament ON matches (tournament, block) WHERE tournament IS NOT NULL",
     "CREATE TABLE IF NOT EXISTS seats (match INTEGER NOT NULL, seat INTEGER NOT NULL, team INTEGER NOT NULL, "
@@ -126,7 +136,12 @@ _UPSERT_COUNT = (
     "s2 = s2 + excluded.s2"
 )
 _MATCH_COLUMNS = ("uid, run, source, layout, outcome_kind, length, seed, env_steps, block, tournament, worker, "
-                  "ts, replay, size")
+                  "ts, replay, size, node")
+# The same columns of a version-1 journal (an SP4 parent read by ``import_parent``): no ``node``.
+_MATCH_COLUMNS_V1 = _MATCH_COLUMNS.replace(", node", ", NULL")
+# The head of a ``MatchRow`` (``_row``); ``{node}`` is ``m.node`` (version 2) or ``NULL`` (version 1).
+_ROW_HEAD = ("m.id, m.uid, r.run_id, m.source, m.layout, m.outcome_kind, m.length, m.seed, m.env_steps, m.block, "
+             "m.tournament, m.worker, m.ts, m.replay, {node}")
 _SEAT_COLUMNS = ("seat, team, role, agent, network, entity, version_start, version_end, rating_version, reward, "
                  "eliminated_step, category")
 
@@ -217,6 +232,7 @@ class MatchRow:
     seats: tuple[SeatRow, ...]
     teams: tuple[tuple[int, float, float], ...]     # (team, rank, score)
     replay: str | None = None                        # a replay link, when the env gave one (spec block 5)
+    node: int | None = None                          # SP5: the node that played it (None: SP4 rows, local tournaments)
 
     def to_dict(self) -> dict:
         """JSON-ready form (report, dashboard; contract amendment A7): the match's columns (no ``ts``: order is by
@@ -224,7 +240,7 @@ class MatchRow:
         return {"uid": self.uid, "run_id": self.run_id, "source": self.source, "layout": self.layout,
                 "outcome_kind": self.outcome_kind, "episode_length": self.length, "seed": self.seed,
                 "env_steps": self.env_steps, "block": self.block, "tournament": self.tournament,
-                "worker": self.worker, "replay": self.replay,
+                "worker": self.worker, "node": self.node, "replay": self.replay,
                 "seats": [{"seat": s.seat, "team": s.team, "role": s.role, "agent_id": s.agent_id,
                            "network_id": s.network_id, "entity": s.entity, "category": s.category,
                            "version_start": s.version_start, "version_end": s.version_end,
@@ -241,7 +257,7 @@ class MatchRow:
         result = MatchResult(match_id=self.uid, layout=self.layout, outcome_kind=self.outcome_kind, seats=seats,
                              teams=[TeamResult(team=t, rank=r, score=sc) for t, r, sc in self.teams],
                              episode_length=self.length, uid=self.uid, source=self.source, seed=self.seed,
-                             env_steps=self.env_steps, block=self.block)
+                             env_steps=self.env_steps, block=self.block, node=self.node)
         return result, [s.rating_version for s in self.seats]
 
 
@@ -333,6 +349,7 @@ class _Store:
         self._conn = conn
         self._ids: dict[tuple[str, str], int] = {}
         self._names: dict[int, str] = {}
+        self._schema = SCHEMA_VERSION          # the file's schema version (a reader of an SP4 file: 1)
 
     def _lookup(self, kind: str, name: str) -> int | None:
         key = (kind, name)
@@ -416,6 +433,23 @@ class _Store:
 
     def _generation(self) -> int:
         return int(self._meta("compact_generation", "0"))
+
+    @property
+    def _node_column(self) -> str:
+        return "m.node" if self._schema >= 2 else "NULL"
+
+    def last_row(self) -> int | None:
+        """The highest row id of ``matches`` (None when empty)."""
+        found = self._conn.execute("SELECT MAX(id) FROM matches").fetchone()[0]
+        return None if found is None else int(found)
+
+    def max_env_steps(self, source: str = "train") -> int | None:
+        """The largest ``env_steps`` of the detailed matches of ``source`` (an SP4 run dir resumed in place)."""
+        sid = self._lookup("source", source)
+        if sid is None:
+            return None
+        found = self._conn.execute("SELECT MAX(env_steps) FROM matches WHERE source = ?", (sid,)).fetchone()[0]
+        return None if found is None else int(found)
 
     def _consistent(self, read: Callable[[], object], what: str):
         """Run ``read`` (several queries, each its own transaction) until no compaction committed during it
@@ -576,14 +610,35 @@ class MatchLog(_Store):
             if row is None:
                 conn.executemany("INSERT INTO meta (key, value) VALUES (?, ?)",
                                  [("schema_version", str(SCHEMA_VERSION)), ("detail_train_bytes", "0"),
-                                  ("detail_train_matches", "0"), ("compact_generation", "0")])
+                                  ("detail_train_matches", "0"), ("compact_generation", "0"),
+                                  ("next_match_id", "1")])
+            elif int(row[0]) == 1:
+                self._migrate_v1(conn)
             elif int(row[0]) != SCHEMA_VERSION:
                 raise MatchLogError(f"match log {self.path} has schema version {row[0]}; this Colosseum reads "
-                                    f"version {SCHEMA_VERSION} (move the file away to start a new journal)")
+                                    f"versions {READABLE_SCHEMA_VERSIONS} (move the file away to start a new journal)")
             conn.execute("COMMIT")
         except BaseException:
             _rollback(conn)
             raise
+
+    def _migrate_v1(self, conn: sqlite3.Connection) -> None:
+        """Version 1 (SP4) -> 2 in place, inside the caller's transaction: the ``node`` column (NULL for every SP4
+        row) and ``next_match_id`` (module docstring)."""
+        conn.execute("ALTER TABLE matches ADD COLUMN node INTEGER")
+        top = conn.execute("SELECT MAX(id) FROM matches").fetchone()[0]
+        conn.execute("UPDATE meta SET value = ? WHERE key = 'schema_version'", (str(SCHEMA_VERSION),))
+        conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('next_match_id', ?)", (str((top or 0) + 1),))
+        logger.info(f"Match log {self.path}: schema version 1 migrated to {SCHEMA_VERSION} in place (column node, "
+                    f"monotonic row ids)")
+
+    def _next_id(self) -> int:
+        """The next row id of ``matches`` (inside a transaction): ``meta.next_match_id``, never below the highest row
+        id + 1."""
+        return max(int(self._meta("next_match_id", "1")), (self.last_row() or 0) + 1)
+
+    def _store_next_id(self, next_id: int) -> None:
+        self._conn.execute("INSERT OR REPLACE INTO meta (key, value) VALUES ('next_match_id', ?)", (str(next_id),))
 
     def _register_run(self, run: RunInfo) -> int:
         def register() -> int:
@@ -680,6 +735,7 @@ class MatchLog(_Store):
 
         def body() -> None:
             tid = self._id("tournament", tournament) if tournament is not None else None
+            next_id = self._next_id()
             train_bytes = train_matches = 0
             for result in results:
                 versions = self.rating_versions(result)
@@ -696,17 +752,19 @@ class MatchLog(_Store):
                     continue
                 size = estimated_size(result)
                 cur = self._conn.execute(
-                    f"INSERT OR IGNORE INTO matches ({_MATCH_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
-                    f"NULL, ?)",
-                    (result.uid, self._run_row, self._id("source", result.source), self._id("layout", result.layout),
-                     result.outcome_kind, int(result.episode_length), result.seed, result.env_steps, result.block,
-                     tid, _worker_of(result.match_id), time.time(), size))
+                    f"INSERT OR IGNORE INTO matches (id, {_MATCH_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, "
+                    f"?, NULL, ?, ?)",
+                    (next_id, result.uid, self._run_row, self._id("source", result.source),
+                     self._id("layout", result.layout), result.outcome_kind, int(result.episode_length), result.seed,
+                     result.env_steps, result.block, tid, _worker_of(result.match_id), time.time(), size,
+                     result.node))
                 if cur.rowcount == 0:
                     stats.duplicates += 1
                     stats.accepted.append(False)
                     stats.rows.append(None)
                     continue
-                match = int(cur.lastrowid)
+                match = next_id
+                next_id += 1
                 self._conn.executemany(
                     f"INSERT INTO seats (match, {_SEAT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     [(match, s.seat, s.team, self._id("role", s.role), self._id("agent", s.agent_id),
@@ -723,6 +781,7 @@ class MatchLog(_Store):
                 stats.rows.append(match)
             if train_matches:
                 self._bump_detail(train_bytes, train_matches)
+            self._store_next_id(next_id)
 
         self._transaction(body)
         return stats
@@ -868,30 +927,34 @@ class MatchLog(_Store):
         where = "1" if train is None else "(source != ? OR tournament IS NOT NULL)"
         args: tuple = () if train is None else (train,)
         run_ids = {r[0]: r[1] for r in parent._conn.execute("SELECT id, run_id FROM runs")}
+        columns = _MATCH_COLUMNS if parent._schema >= 2 else _MATCH_COLUMNS_V1
+        next_id = self._next_id()
         copied = last = 0
         while True:
             heads = parent._conn.execute(
-                f"SELECT id, {_MATCH_COLUMNS} FROM matches WHERE id > ? AND {where} ORDER BY id LIMIT ?",
+                f"SELECT id, {columns} FROM matches WHERE id > ? AND {where} ORDER BY id LIMIT ?",
                 (last, *args, READ_BATCH)).fetchall()
             if not heads:
+                self._store_next_id(next_id)
                 return copied
             last = heads[-1][0]
             for (pid, uid, run, source, layout, kind, length, seed, env_steps, block, tour, worker, ts, replay,
-                 size) in heads:
+                 size, node) in heads:
                 run_row = None
                 if run in run_ids:
                     row = self._conn.execute("SELECT id FROM runs WHERE run_id = ?", (run_ids[run],)).fetchone()
                     run_row = None if row is None else int(row[0])
                 tid = None if tour is None else self._id("tournament", parent._name(tour))
                 cur = self._conn.execute(
-                    f"INSERT OR IGNORE INTO matches ({_MATCH_COLUMNS}) "
-                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                    (uid, run_row, self._id("source", parent._name(source)),
+                    f"INSERT OR IGNORE INTO matches (id, {_MATCH_COLUMNS}) "
+                    f"VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    (next_id, uid, run_row, self._id("source", parent._name(source)),
                      self._id("layout", parent._name(layout)), kind, length, seed, env_steps, block, tid, worker,
-                     ts, replay, size))
+                     ts, replay, size, node))
                 if cur.rowcount == 0:
                     continue
-                match = int(cur.lastrowid)
+                match = next_id
+                next_id += 1
                 seats = parent._conn.execute(f"SELECT {_SEAT_COLUMNS} FROM seats WHERE match = ?", (pid,)).fetchall()
                 self._conn.executemany(
                     f"INSERT INTO seats (match, {_SEAT_COLUMNS}) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
@@ -943,9 +1006,11 @@ class MatchLogReader(_Store):
         except sqlite3.DatabaseError as e:
             self._conn.close()
             raise MatchLogError(f"{self.path} is not a match log ({e})") from e
-        if version is None or int(version) != SCHEMA_VERSION:
+        if version is None or int(version) not in READABLE_SCHEMA_VERSIONS:
             self._conn.close()
-            raise MatchLogError(f"{self.path} is a match log of schema version {version}, not {SCHEMA_VERSION}")
+            raise MatchLogError(f"{self.path} is a match log of schema version {version}, not one of "
+                                f"{READABLE_SCHEMA_VERSIONS}")
+        self._schema = int(version)
 
     def __enter__(self) -> MatchLogReader:
         return self
@@ -1022,8 +1087,7 @@ class MatchLogReader(_Store):
         page_size = READ_BATCH if limit is None else max(limit, 100)
         while limit is None or len(out) < limit:
             page = self._conn.execute(
-                f"SELECT m.id, m.uid, r.run_id, m.source, m.layout, m.outcome_kind, m.length, m.seed, m.env_steps, "
-                f"m.block, m.tournament, m.worker, m.ts, m.replay FROM matches m LEFT JOIN runs r ON r.id = m.run "
+                f"SELECT {_ROW_HEAD.format(node=self._node_column)} FROM matches m LEFT JOIN runs r ON r.id = m.run "
                 f"WHERE {where}{'' if last is None else ' AND m.id < ?'} ORDER BY m.id DESC LIMIT ?",
                 (*args, *(() if last is None else (last,)), page_size)).fetchall()
             if not page:
@@ -1038,6 +1102,39 @@ class MatchLogReader(_Store):
                     break
         return out
 
+    def results_after(self, row: int | None, *, source: str = "train", min_env_steps: int | None = None,
+                      batch: int = READ_BATCH) -> Iterator[tuple[int, MatchResult]]:
+        """``(row id, MatchResult)`` of every detailed match of ``source`` outside tournaments with a row id above
+        ``row`` (None: all) and, with ``min_env_steps``, ``env_steps`` above it, in row-id order (= commit order),
+        read in batches (SP5 T4.3: the league replay of an in-place resume, R8). Matches already folded into
+        ``counts`` are not returned (``folded_after`` tells how many rows are missing)."""
+        sid = self._lookup("source", source)
+        if sid is None:
+            return
+        last = -1 if row is None else int(row)
+        extra, args = ("", ()) if min_env_steps is None else (" AND m.env_steps > ?", (int(min_env_steps),))
+        head = _ROW_HEAD.format(node=self._node_column)
+        while True:
+            heads = self._conn.execute(
+                f"SELECT {head} FROM matches m LEFT JOIN runs r ON r.id = m.run WHERE m.id > ? AND m.source = ? "
+                f"AND m.tournament IS NULL{extra} ORDER BY m.id LIMIT ?", (last, sid, *args, int(batch))).fetchall()
+            if not heads:
+                return
+            for head_row in heads:
+                yield int(head_row[0]), self._row(head_row).to_result()[0]
+            last = int(heads[-1][0])
+
+    def folded_after(self, row: int | None) -> int | None:
+        """How many journal rows above ``row`` (None: all) are no longer detailed (folded into ``counts`` by
+        compaction): they cannot be replayed. None for a version-1 journal (no ``next_match_id``: its row ids could
+        be reused)."""
+        if self._schema < 2:
+            return None
+        after = 0 if row is None else int(row)
+        assigned = int(self._meta("next_match_id", "1")) - 1 - after
+        present = int(self._conn.execute("SELECT COUNT(*) FROM matches WHERE id > ?", (after,)).fetchone()[0])
+        return max(0, assigned - present)
+
     def _row(self, row) -> MatchRow:
         mid = row[0]
         seats = tuple(SeatRow(
@@ -1050,7 +1147,7 @@ class MatchLogReader(_Store):
         return MatchRow(id=mid, uid=row[1], run_id=row[2], source=self._name(row[3]), layout=self._name(row[4]),
                         outcome_kind=row[5], length=int(row[6]), seed=row[7], env_steps=row[8], block=row[9],
                         tournament=self._name(row[10]), worker=row[11], ts=float(row[12]), seats=seats, teams=teams,
-                        replay=row[13])
+                        replay=row[13], node=row[14])
 
     def close(self) -> None:
         self._conn.close()
@@ -1072,6 +1169,9 @@ def _outcome_for(match: MatchRow, agent: str) -> str | None:
 
 WRITER_QUEUE_SIZE = 100_000
 WRITE_BATCH = 2_000
+# A writer whose appends fail this many times in a row gives up (``dead``; SP5 T4.3): a journal that fails every
+# append would otherwise fail the tokens of the hub for ever (each node resends, nothing is accounted).
+WRITE_FAILURES_DEAD = 5
 # The parts of the file compaction does not touch (counts, tournament and pulse matches) may grow past the window:
 # one WARNING when they exceed max(window, this many bytes).
 UNTOUCHED_WARNING_FLOOR = 64 * 1024 * 1024
@@ -1163,8 +1263,9 @@ class MatchLogWriter:
     writer is abandoned: whatever the thread does afterwards no longer changes the stats or the commits. The thread's
     append of the in-flight batch may still commit, so the journal can then hold that batch's results (at most
     ``WRITE_BATCH``, or one larger tokened group) also counted as dropped (an over-count, never a loss). When the
-    journal cannot be opened or the thread dies, the writer is ``dead``: queued untokened results are counted as
-    dropped, queued tokened groups get failed commits, later submits are refused."""
+    journal cannot be opened, the thread dies or ``WRITE_FAILURES_DEAD`` appends in a row failed, the writer is
+    ``dead``: queued untokened results are counted as dropped, queued tokened groups get failed commits, later submits
+    are refused."""
 
     def __init__(self, log_factory: Callable[[], MatchLog], *, queue_size: int = WRITER_QUEUE_SIZE,
                  compact_interval_sec: float, window_bytes: int, table: ComparisonTable | None = None,
@@ -1192,6 +1293,7 @@ class MatchLogWriter:
         self._deadline = math.inf
         self._thread: threading.Thread | None = None
         self._warned_drop = self._warned_error = self._warned_untouched = False
+        self._failed_appends = 0     # appends that failed in a row (the thread)
 
     @property
     def stats(self) -> WriterStats:
@@ -1390,7 +1492,9 @@ class MatchLogWriter:
             what = (f"writing {len(batch)} results failed; {lost} are counted in dropped_match_results"
                     + (", the others go back to their senders" if lost < len(batch) else ""))
             self._error(what, e)
+            self._failed_appends += 1
             return
+        self._failed_appends = 0
         commits = []
         offset = 0
         for group in groups:
@@ -1453,16 +1557,29 @@ class MatchLogWriter:
             return
         self._thread_update(values={"sizes": sizes})
 
-    def _die(self, in_flight: Sequence[_Group] = ()) -> None:
+    def _die(self, in_flight: Sequence[_Group] = (), *, error: bool = True) -> None:
         """The thread cannot write any more: untokened in-flight and queued results are dropped, tokened groups get
-        failed commits (their senders resend them to the journal-off path); later submits are refused."""
+        failed commits (their senders resend them to the journal-off path); later submits are refused. ``error``:
+        count one more write error (False: the failures that made the writer give up are counted already)."""
         with self._lock:
             self._dead = True
             if self._abandoned:
                 return
             self._in_flight = 0
-            self._bump_locked(write_errors=1)
+            if error:
+                self._bump_locked(write_errors=1)
             self._settle_locked([*in_flight, *self._drain_locked()], failed_commits=True)
+
+    def _give_up(self) -> bool:
+        """After ``WRITE_FAILURES_DEAD`` failed appends in a row the writer is dead (one ERROR); True when it gave
+        up."""
+        if self._failed_appends < WRITE_FAILURES_DEAD:
+            return False
+        logger.error(f"Match log: {WRITE_FAILURES_DEAD} appends in a row failed; the journal writer gives up: match "
+                     f"results are no longer journaled (the hub accounts them without the journal and counts them in "
+                     f"dropped_match_results_by_reason.writer), training goes on")
+        self._die(error=False)
+        return True
 
     def _loop(self, log: MatchLog) -> None:
         self._refresh_sizes(log)
@@ -1474,6 +1591,8 @@ class MatchLogWriter:
                 self._current = groups
                 self._write(log, groups)
                 self._current = []
+                if self._give_up():
+                    return
             if not self._stop.is_set() and self._clock() - last_compact >= self._interval:
                 self._compact(log)
                 last_compact = self._clock()
@@ -1484,6 +1603,8 @@ class MatchLogWriter:
             self._current = groups
             self._write(log, groups)
             self._current = []
+            if self._give_up():
+                return
         self._refresh_sizes(log)
 
     def _run(self) -> None:

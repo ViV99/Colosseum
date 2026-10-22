@@ -2,15 +2,18 @@
 
     runs/<name>/
       config.resolved.yaml     after --set overrides and agent merging
+      config.resolved.<k>.yaml the effective config of the k-th incarnation before an in-place resume (SP5)
       run.json                 the run's id ({"run_id": <uuid4 hex>}), written once by the launcher (SP4)
       logs/<process>.log       main, learner-<agent>, worker-<i>, worker-<i>-env<k>
       metrics.jsonl            one JSON record per line (T6.3)
       ratings.json             latest ratings snapshot (T6.3)
-      matches.db               the match log (SP4: colosseum.arena.matchlog)
-      league_state.json        ratings and PFSP statistics, for a run-dir resume (SP4)
+      matches.db               the match log (SP4: colosseum.arena.matchlog; schema 2 with a node column, SP5)
+      league_state.json        ratings and PFSP statistics, for a run-dir resume (SP4; + journal_row watermark, SP5)
       pulse_state.json         pulse bookkeeping (SP4 T6.1)
       tournaments/<name>/      colosseum tournament dirs (SP4 T5.4)
       run_state.json           running / finished / failed + pid, written by run_training (SP4 T7.1)
+      hub_state.json           the hub's counters, epochs, versions, learners (SP5; restored by an in-place resume)
+      hub.json                 where the hub listens (SP5: addresses, port; a resumed hub reuses the port)
       report.html              colosseum report's default output (SP4 T7.2)
       checkpoints/<agent>/ckpt_v<N>/{model.pt, trainer_state.pt, meta.json}
       recovery/<agent>/{recovery.frame, meta.json}  newest recovery point per agent (SP5)

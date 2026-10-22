@@ -2,10 +2,11 @@
 
 Per agent, ``retain`` builds the kept set in this order:
 
-1. **always** (never evicted, not even by the cap): the newest ``keep_last``; the final snapshot of the
-   CURRENT run (``final`` and ``run_id == policy.current_run_id``; finals imported from parent runs and SP3
-   snapshots without ``run_id`` are ordinary; with ``current_run_id=None``, e.g. a manager built without a
-   run id, every final is protected as in SP3); every pinned snapshot; the snapshot just saved (``protect``);
+1. **always** (never evicted, not even by the cap): the newest ``keep_last``; the newest final snapshot of the
+   CURRENT run (``final`` and ``run_id == policy.current_run_id``; an in-place resume keeps the run id, so earlier
+   finals of the same run are ordinary (SP5), as are finals imported from parent runs and SP3 snapshots without
+   ``run_id``; with ``current_run_id=None``, e.g. a manager built without a run id, every final is protected as in
+   SP3); every pinned snapshot; the snapshot just saved (``protect``);
 2. **keep_every**: version is a multiple of ``keep_every_period`` (``interval * keep_every``; 0 = off);
 3. **top-k** (``keep_top_k > 0``): the ``keep_top_k`` rated snapshots with the highest ``lcb`` (ties: the
    newer first), chosen among ALL rated entries (a snapshot of rule 1 may hold a top-k place);
@@ -112,13 +113,17 @@ def retain(entries: Sequence[SnapshotInfo], scores: Mapping[str, SnapshotScore] 
         raise ValueError(f"retain: duplicate checkpoint ids in {ids}")
     version = {e.checkpoint_id: e.version for e in ordered}
     newest = {e.checkpoint_id for e in ordered[-policy.keep_last:]}
+    # SP5 (an in-place resume keeps the run id): only the newest final of the current run is protected, so a stop /
+    # resume cycle does not add one more protected snapshot. Without a run id every final is (SP3 rule).
+    own_finals = [e.checkpoint_id for e in ordered if e.final and e.run_id == policy.current_run_id]
+    newest_final = own_finals[-1] if own_finals else None
 
     always: dict[str, list[str]] = {}
     for e in ordered:
         why = []
         if e.checkpoint_id in newest:
             why.append(KEEP_LAST)
-        if e.final and (policy.current_run_id is None or e.run_id == policy.current_run_id):
+        if e.final and (policy.current_run_id is None or e.checkpoint_id == newest_final):
             why.append(FINAL)
         if e.pinned:
             why.append(PINNED)
