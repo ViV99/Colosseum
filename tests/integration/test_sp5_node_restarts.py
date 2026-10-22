@@ -1,10 +1,11 @@
 """A node's restart policy (SP5 T4.2, spec 7.1): a killed learner is reported with its generation and log tail and
 never blocks its siblings; the hub's new assignment brings it back from the recovery point; the learner restart
-limit; a final snapshot behind periodic ones.
+limit; workers restarted with new incarnations; a slot that keeps dying is disabled; a final snapshot behind periodic
+ones.
 
 A ``NodeAgent`` in a thread (``node_kit.NodeThread``) against ``node_kit.FakeHub`` (the real gRPC server) with the
 toy game ``turns``: one worker and one learner child (2 loaded processes). The FakeHub never restarts a learner by
-itself: the tests send its ``start_learner`` as the hub would. (Worker restarts and disabled slots: T4.2 (b).)"""
+itself: the tests send its ``start_learner`` as the hub would."""
 from __future__ import annotations
 
 import logging
@@ -24,8 +25,8 @@ from node_kit import FakeHub, run_node_in_thread, toy_node_options, wait_for
 VS_RANDOM = Lineup("2p", [SeatAssignment("a", "latest", True), SeatAssignment("random", "fixed", False)])
 
 
-def _config(checkpoint_interval=10_000, **learner):
-    return make_test_config("turns", agents={"a": {}, "random": scripted_agent()},
+def _config(checkpoint_interval=10_000, opponent="colosseum.players.RandomBot", **learner):
+    return make_test_config("turns", agents={"a": {}, "random": scripted_agent(opponent)},
                             rollout={"envs_per_worker": 2, "chunk_length": 8},
                             learner={"batch_chunks": 2, "weight_push_interval": 1, "recovery_interval_sec": 0.5,
                                      **learner},
@@ -155,3 +156,41 @@ def test_a_final_snapshot_is_never_lost_behind_periodic_ones(setup, caplog):
     assert len(warnings) == 1 and warnings[0].levelno == logging.WARNING
     assert [e.message for e in hub.node_events("warning") if e.proc == "learner-a"] == [
         "checkpoint uploads of a are slower than its checkpoint.interval; older periodic snapshots are skipped"]
+
+
+def _cells(hub):
+    return [[(c.worker, c.env, c.incarnation) for c in m.cells] for m in hub.messages("lineup_request")]
+
+
+def test_a_killed_worker_restarts_with_a_new_incarnation(setup):
+    start, logs = setup
+    hub, node = start()
+    _start(hub, 1)
+    wait_for(lambda: _of(hub, 1) and _train_steps(hub), timeout=60)
+    learner = node.agent.supervisor.get("learner-a").pid
+    os.kill(node.agent.supervisor.get("worker-0").pid, signal.SIGKILL)
+    died = wait_for(lambda: hub.node_events("proc_died"), timeout=30)[0]
+    assert (died.proc, died.exit_code, died.log_path) == ("worker-0", -signal.SIGKILL, str(logs / "worker-0.log"))
+    assert died.log_tail and (logs / "worker-0.log").read_bytes().endswith(died.log_tail)
+    wait_for(lambda: any((0, 0, 2) in cells for cells in _cells(hub)), timeout=60)   # its envs ask anew
+    announced = len(hub.versions("a"))
+    wait_for(lambda: len(hub.versions("a")) > announced, timeout=60)               # the learner trains on
+    assert node.agent.supervisor.get("learner-a").pid == learner
+    wait_for(lambda: any(h.counters["worker_restarts"] == 1 for h in hub.heartbeats()))
+    assert hub.node_events("slot_disabled") == []
+
+
+def test_a_worker_that_keeps_dying_disables_its_slot(setup):
+    start, _logs = setup
+    hub, node = start(_config(opponent="game_helpers.CrashBot"))
+    _start(hub, 1)
+    disabled = wait_for(lambda: hub.node_events("slot_disabled"), timeout=120)[0]
+    assert (disabled.proc, disabled.exit_code) == ("worker-0", 3) and disabled.log_tail
+    assert [e.proc for e in hub.node_events("proc_died")] == ["worker-0"] * 3
+    assert node.agent.supervisor.incarnation("worker-0") == 4
+    wait_for(lambda: node.agent.supervisor.get("worker-0").exitcode is not None)
+    beats = len(hub.heartbeats())
+    wait_for(lambda: len(hub.heartbeats()) >= beats + 2)                           # the node goes on
+    assert node.agent.supervisor.incarnation("worker-0") == 4
+    assert any(pb.ProcState(name="worker-0", state="disabled", restarts=3) in h.procs for h in hub.heartbeats())
+    assert node.agent.supervisor.get("learner-a").exitcode is None and node.thread.is_alive()

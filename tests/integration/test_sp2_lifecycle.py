@@ -86,25 +86,30 @@ def test_normal_finish_exit_0_and_final_checkpoint(tmp_path):
     assert any(m["final"] for m in metas)
 
 
-def test_a_killed_worker_is_restarted_by_its_node_and_the_run_goes_on(tmp_path):
-    """SP5 (amendment A12, ruling W04-25; an SP4 behaviour change listed by A15): a worker that dies without reporting
-    an error (here SIGKILL) is restarted by its node with a new incarnation, the hub logs a WARNING pointing to its
-    log and the run goes on; SIGTERM then stops every process within 10 s. (SP2-SP4: exit 1 naming the worker.)"""
+def test_a_killed_worker_is_restarted_and_its_log_named(tmp_path):
+    """SP5 (spec 7.1, amendment A12, ruling W04-25; an SP4 behaviour change listed by A15; T4.2 Step 10): a worker that
+    dies without reporting an error (here SIGKILL) is restarted by its node with a new incarnation (a new pid in its
+    log), the hub logs a WARNING naming its log in ``logs/main.log`` and the run goes on; Ctrl-C then exits 130 with a
+    final checkpoint and no process left within 10 s. (SP2-SP4: exit 1 naming the worker.)"""
     with training_process(TTT_CONFIG, tmp_path, name="killw", overrides=FOREVER) as (proc, root):
         assert wait_for(lambda: logged_pid(root, "worker-0") is not None and training_started(root), 120)
-        os.kill(logged_pid(root, "worker-0"), signal.SIGKILL)
-        node_log = root / "logs" / "node.log"
-        assert wait_for(lambda: "restarted worker-0 (incarnation 2)" in node_log.read_text(), 60)
-        assert wait_for(lambda: (root / "logs" / "worker-0.log").read_text().count("worker-0 started (pid") == 2, 60)
+        first = logged_pid(root, "worker-0")
+        os.kill(first, signal.SIGKILL)
+        worker_log = root / "logs" / "worker-0.log"
+        assert wait_for(lambda: worker_log.read_text().count("worker-0 started (pid") == 2, 60)
+        pids = [int(m) for m in re.findall(r"worker-0 started \(pid (\d+)\)", worker_log.read_text())]
+        assert pids[0] == first and pids[1] != first
+        warning = (f"worker-0 of node 0 (local) died with exit code -9; restarted (see "
+                   f"{root / 'logs' / 'worker-0.log'})")
+        assert wait_for(lambda: warning in (root / "logs" / "main.log").read_text(), 30)
         assert proc.poll() is None
         kids = descendants(proc.pid)
         t0 = time.monotonic()
-        proc.send_signal(signal.SIGTERM)
-        assert proc.wait(15) == 143
+        os.killpg(proc.pid, signal.SIGINT)                               # like Ctrl-C in a terminal
+        assert proc.wait(15) == 130
         assert wait_for(lambda: not any(pid_alive(k) for k in kids), max(0.0, 10 - (time.monotonic() - t0)))
-    stderr = (tmp_path / "killw.stderr").read_text()
-    assert (f"worker-0 of node 0 (local) died with exit code -9; restarted (see "
-            f"{root / 'logs' / 'worker-0.log'})") in stderr                  # T4.2's text (spec 7.1)
+    assert final_checkpoints(root), "final checkpoint not saved on SIGINT"
+    assert warning in (tmp_path / "killw.stderr").read_text()
 
 
 def test_learner_crash_in_train_step_gives_exit_1(tmp_path):

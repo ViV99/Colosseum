@@ -78,7 +78,10 @@ slot with a new generation (``learner_restarts``); after the node's limit it is 
 at its end; when every trainable agent failed the run stops (exit 1). A learner's ``child_error`` is a WARNING (its
 death report follows); a worker's or an evaluator's still stops the run (A12). Workers and evaluators are restarted by
 their node (a ``proc_died`` is a WARNING, the node counts ``worker_restarts``); a ``slot_disabled`` worker's cells are
-dropped.
+dropped. A lost node's cells go at once and its learners wait ``learner_relocate_after_sec`` from its last heartbeat
+(``relocating``, parked weights), then move to a matching free slot with a new generation from the newest recovery
+point (``_relocate_due``; ``strict`` placement or no free slot: ``pending``); a node that returns within the wait keeps
+its learner, one that returns later is told to stop it (T4.1's reconciliation).
 """
 
 from __future__ import annotations
@@ -726,6 +729,7 @@ class Hub(RunSinks, HubLearners):
                 self._next_lost_check = now + min(1.0, self._dist.heartbeat_sec)
                 for entry in self._registry.lost(now, self._dist.node_lost_after_sec):
                     self._on_node_lost(entry)
+                self._relocate_due(now)
             if now >= self._next_announce:
                 self._broadcast_announce()
                 self._next_announce = now + float(self._dist.heartbeat_sec)
@@ -881,7 +885,9 @@ class Hub(RunSinks, HubLearners):
     def _on_node_lost(self, entry: Any, *, reason: str = "lost", relocate_now: bool = False) -> None:
         """A node silent for ``node_lost_after_sec`` (or removed: ``reason``): its cells go (their unfinished
         matches are never reported), its stream is closed, its learners wait for it (``relocating``: they do not
-        collect and play with parked weights; T4.2 relocates them after ``learner_relocate_after_sec``)."""
+        collect and play with parked weights) and are relocated ``learner_relocate_after_sec`` after its last heartbeat
+        (``_relocate_due``, T4.2, spec 7.1); ``relocate_now`` (a node that leaves on purpose, W04-24; ``nodes
+        remove``, T6.3): at once."""
         self._cells.drop_node(entry.number)
         self._holds.drop_node(entry.number)
         self._paths.pop(entry.number, None)
@@ -890,9 +896,19 @@ class Hub(RunSinks, HubLearners):
         if handle is not None:
             handle.close(reason)
         if self._learners is not None:               # after the pop: parking announces, never to the lost stream
-            for agent in self._learners.node_lost(entry.number, entry.last_heartbeat):
+            since = float("-inf") if relocate_now else entry.last_heartbeat
+            wait = float(self._dist.learner_relocate_after_sec)
+            for agent in self._learners.node_lost(entry.number, since):
+                if relocate_now:
+                    logger.warning(f"Learner of {agent}: node {entry.number} ({entry.name}) {reason}; relocating it "
+                                   f"now")
+                else:
+                    logger.warning(f"Learner of {agent}: node {entry.number} ({entry.name}) lost; waiting up to "
+                                   f"learner_relocate_after_sec ({wait:g} s) for it")
                 self._park(agent)
             self._update_pending_value()
+            if relocate_now:
+                self._relocate_due(time.monotonic())
         self._nodes_lost += 1
         why = ""
         if reason == "lost":                          # it may come back and resend its unacked batches
@@ -901,6 +917,23 @@ class Hub(RunSinks, HubLearners):
             self._intake.forget_node(entry.node_id)
             self._pending_evictions.pop(entry.node_id, None)
         logger.warning(f"node {entry.number} ({entry.name}) {reason}{why}; its cells are dropped")
+
+    def _relocate_due(self, now: float) -> None:
+        """Learners whose node stayed away ``learner_relocate_after_sec`` since its last heartbeat (spec 7.1; T4.2)
+        become ``pending`` and a placement pass puts them on a matching free slot with a new generation, from the
+        newest recovery point or the start source (``strict`` placement may keep them pending; they play with parked
+        weights meanwhile). Main loop, every lost-node check (cheap)."""
+        if self._learners is None or self._shutting_down:
+            return
+        due = self._learners.relocation_due(now, float(self._dist.learner_relocate_after_sec))
+        if not due:
+            return
+        for agent in due:
+            logger.info(f"relocating the learner of {agent}")
+        self._tick_placement()
+        for agent in due:                            # still without a slot: pending, with its parked weights
+            if self._learners[agent].status == "pending":
+                self._park(agent)
 
     def _node_label(self, node_id: str) -> str:
         entry = self._registry.by_id(node_id)

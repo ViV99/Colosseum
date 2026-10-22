@@ -22,12 +22,12 @@
 4. **Children** run under ``ChildSupervisor``. Each pass waits on the wake pipe, the children's connections and
    their sentinels, reads the ready connections first, then the inbox, then the exits (P-PF2-11: an exited child's
    control connection is read to its end, bounded by ``EXIT_DRAIN_SEC``, before it counts as "reported" or "died").
-   A worker that reported a ``ChildError`` is not restarted (the hub stops the run, A12); one that died without a
-   report is ``proc_died`` and restarts with a new incarnation (new cells, new epochs) within ``WORKER_RESTARTS``,
-   else its slot is ``slot_disabled``. A learner that ends without being stopped is ``proc_died`` within
-   ``LEARNER_RESTARTS`` and then ``learner_failed`` (with its generation, reason and log tail; the hub assigns it
-   again: ``node.learners``, T4.2); workers are routed away from it (``LearnerRoute(agent, None)``). Events wait
-   (``PENDING_EVENTS_MAX``) while the hub is away.
+   A worker that reported a ``ChildError`` is not restarted (the hub stops the run, A12); a worker or evaluator that
+   died without a report restarts with a new incarnation (new cells, new epochs) within ``WORKER_RESTARTS``
+   (``proc_died``), else its slot is off (``slot_disabled``; T4.2, ``_restart_or_disable``). A learner that ends
+   without being stopped is ``proc_died`` within ``LEARNER_RESTARTS`` and then ``learner_failed`` (with its
+   generation, reason and log tail; the hub assigns it again: ``node.learners``, T4.2); workers are routed away from
+   it (``LearnerRoute(agent, None)``). Events wait (``PENDING_EVENTS_MAX``) while the hub is away.
 5. **Messages from children.** ``WorkerResults`` -> ``ResultBuffer``; ``WorkerProgress`` -> per (worker,
    incarnation) cumulative env steps (their sum is the session's counter: it never decreases) and counters
    (``MetricsBatch.workers``); ``ChildError`` -> ``Event(child_error)`` with ``node <n> (<name>), `` prepended to the
@@ -1214,20 +1214,39 @@ class NodeAgent:
         if name in self._reported:
             logger.info(f"node: {name} exited (code {code}) after reporting its error; not restarted")
             return
+        self._restart_or_disable(run, name, role, code, log_path)
+
+    def _restart_or_disable(self, run: _Run | None, name: str, role: str | None, code: int | None,
+                            log_path: str) -> None:
+        """Spec 7.1 (T4.2): a worker or evaluator that died without reporting an error is started again (a new
+        incarnation: new connections; a worker's envs ask for lineups with the new incarnation, so the hub gives
+        their cells new epochs) within ``WORKER_RESTARTS`` and reported as ``proc_died``, counted in the node's
+        ``worker_restarts`` (A2); after the limit its slot is off until the node process restarts
+        (``slot_disabled``, a WARNING here). Both events carry the exit code, the log path and its tail."""
+        from colosseum.node import procs
+        from colosseum.node.logs import log_tail
+
         logger.warning(f"node: {name} died (exit {code}) without reporting an error; see {log_path}")
-        self._event("proc_died", proc=name, exit_code=int(code or 0), log_path=log_path)
-        if role == "worker" and run is not None:
-            worker = _slot_index(name)
+        fields = dict(proc=name, exit_code=int(code or 0), log_path=log_path,
+                      log_tail=log_tail(Path(log_path)) if log_path else b"")
+        if run is None or role not in ("worker", "evaluator"):
+            return
+        worker = _slot_index(name) if role == "worker" else None
+        if worker is not None:
             self.cells.drop_worker(worker)
-            if self.supervisor.may_restart(name):
-                incarnation = self.supervisor.restart(name)
+        if self.supervisor.may_restart(name):
+            incarnation = self.supervisor.restart(name)
+            if worker is not None:
                 self.cells.add_worker(worker, run.envs, incarnation)
-                self._counters["worker_restarts"] += 1
-                logger.info(f"node: restarted {name} (incarnation {incarnation})")
-            else:
-                self._disabled.add(name)
-                logger.error(f"node: {name} died too often; its slot is disabled")
-                self._event("slot_disabled", proc=name, exit_code=int(code or 0), log_path=log_path)
+            self._counters["worker_restarts"] += 1
+            logger.info(f"node: restarted {name} (incarnation {incarnation})")
+            self._event("proc_died", **fields)
+            return
+        self._disabled.add(name)
+        limit, window = procs.WORKER_RESTARTS
+        logger.warning(f"node: {name} died {limit} times within {window:g} s; its slot is disabled until the node "
+                       f"restarts")
+        self._event("slot_disabled", **fields)
 
     # ---- learners (node.learners) and uploads ------------------------------------------------------------------
 

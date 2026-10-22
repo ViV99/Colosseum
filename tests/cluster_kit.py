@@ -111,10 +111,13 @@ class NodeThread:
 
 def start_node(tmp_path: Path, hub: HubThread, name: str, *, workers: int = 0, cpu_learners: int = 0,
                evaluators: int = 0, no_learners: bool = False, gpus: Sequence[int] = (), data_port: int | None = 0,
-               data_addresses: Sequence[str] | None = None, once: bool = True) -> NodeThread:
+               data_addresses: Sequence[str] | None = None, once: bool = True,
+               hub_address: str | None = None) -> NodeThread:
     """A registered node in a thread: its identity under ``tmp_path/nodes/<name>``, logs in ``tmp_path/logs/<name>``,
-    a data port on an ephemeral port (``data_port=None``: none)."""
-    options = NodeOptions(hub_address=hub.address, token=hub.token, insecure=hub.insecure, workers=workers,
+    a data port on an ephemeral port (``data_port=None``: none); ``hub_address``: reach the hub there instead (e.g.
+    through a ``fault_proxy.TcpFaultProxy``, T4.2)."""
+    options = NodeOptions(hub_address=hub_address or hub.address, token=hub.token, insecure=hub.insecure,
+                          workers=workers,
                           evaluators=evaluators, cpu_learners=cpu_learners, no_learners=no_learners, gpus=tuple(gpus),
                           name=name, once=once, identity_root=Path(tmp_path) / "nodes" / name,
                           log_dir=Path(tmp_path) / "logs" / name, data_port=data_port,

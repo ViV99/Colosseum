@@ -1,6 +1,6 @@
 """The hub's failure handling with fake nodes (SP5 T4.2, spec 5.2, 7.1, 7.2): recovery points stored and fenced,
-learner deaths re-assigned from the recovery point or the start source, failed agents, version floors. (Machine loss,
-relocation and disabled slots: T4.2 (b).)
+learner deaths re-assigned from the recovery point or the start source, failed agents, version floors, machine loss,
+relocation (after ``learner_relocate_after_sec``, to a free slot or pending, ``strict`` placement), disabled slots.
 
 An in-process hub (``cluster_kit.start_hub``: mode ``hub``, TLS on loopback, the test identity under ``tmp_path``) on
 the toy game ``turns``; ``hub_kit.FakeNode``s register, open sessions with the ``Hello`` fields each test names and
@@ -26,13 +26,14 @@ from hub_kit import FakeNode, poll_until
 HB = 0.1
 DIST = {"heartbeat_sec": HB, "node_lost_after_sec": 2.0, "learner_relocate_after_sec": 2.0,
         "shutdown_grace_sec": 1.0}
+LOSS = {**DIST, "node_lost_after_sec": 1.0, "learner_relocate_after_sec": 2.0}     # the machine-loss tests
 MIXED = {"opponents": {"latest": 0.5, "snapshots": 0.0, "rivals": 0.5, "anchors": 0.0}}
 
 
-def _config(agents=None, **sections):
+def _config(agents=None, dist=DIST, **sections):
     agents = agents if agents is not None else {"a": {}}
     sections.setdefault("metrics", {"console_interval_sec": 0.2})
-    return make_test_config("turns", agents=agents, distributed=DIST, **sections)
+    return make_test_config("turns", agents=agents, distributed=dist, **sections)
 
 
 @pytest.fixture
@@ -49,12 +50,17 @@ def hubs(tmp_path):
         hub.stop()
 
 
-def _node(hub, name, *, cpu=1, workers=1):
-    """A registered fake node with a session (``cpu`` CPU learner slots); waits for its ``Welcome``."""
-    node = FakeNode(hub.address, token=hub.token, ca_pem=hub.hub.identity.ca_pem)
-    node.register(machine_id=uuid.uuid4().hex, name=name)
+def _node(hub, name, *, cpu=1, workers=1, node=None, learners=()):
+    """A registered fake node with a session (``cpu`` CPU learner slots; ``learners``: its running ``(agent,
+    generation, version)``); ``node``: that node again on a new session. Waits for its ``Welcome``."""
+    if node is None:
+        node = FakeNode(hub.address, token=hub.token, ca_pem=hub.hub.identity.ca_pem)
+        node.register(machine_id=uuid.uuid4().hex, name=name)
+    else:
+        node.close()
     node.open(uuid.uuid4().hex, heartbeat_sec=HB, hello_fields=dict(
-        slots=pb.Slots(workers=workers, cpu_learners=cpu, envs_per_worker=4), name=name))
+        slots=pb.Slots(workers=workers, cpu_learners=cpu, envs_per_worker=4), name=name,
+        learners=[pb.RunningLearner(agent_id=a, generation=g, version=v) for a, g, v in learners]))
     node.wait_for("welcome")
     return node
 
@@ -236,3 +242,130 @@ def test_a_restarted_learner_never_reuses_a_version(hubs):
     _event(n1, "proc_died", 1, exit_code=-9)
     la = _starts(n1, 2)[1]
     assert (la.generation, la.weights_blob, la.version_floor) == (2, "start:recovery", 26)
+
+
+# ---- machine loss and relocation (T4.2 b) -------------------------------------------------------------------------
+
+
+def _lost(hub, node, config, agent="a"):
+    """``agent`` runs on ``node`` (generation 1, versions 0..4, recovery point v4); then ``node`` falls silent and is
+    lost (its learner ``relocating``). Returns the recovery frame."""
+    _announce(node, agent, 1, *range(5))
+    poll_until(lambda: hub.hub._versions.version_floor(agent) == 5)
+    frame = _frame(config, agent, 4, 1, "recovery")
+    assert _upload(node, agent, 4, 1, frame).accepted
+    node.pause_heartbeats()
+    poll_until(lambda: read_hub_state(hub).get("nodes_lost") == 1 and _learner(hub, agent).get("status") ==
+               "relocating", timeout=20)
+    return frame
+
+
+def _grants(node, cells, n):
+    node.send(lineup_request=pb.LineupRequest(cells=[pb.CellRequest(worker=w, env=e, epoch=ep) for w, e, ep in cells]))
+    return [g for batch in node.wait_for("grants", n=n)[n - 1:] for g in batch.grants]
+
+
+def test_machine_loss_drops_cells_and_parks_its_learner(hubs, caplog):
+    config = _config({"a": {}, "b": {}}, dist=LOSS, matchmaking=MIXED)
+    hub = hubs(config)
+    n1 = _node(hub, "n1", cpu=1, workers=1)
+    n2 = _node(hub, "n2", cpu=1, workers=2)
+    assert [la.agent_id for la in _starts(n1)] == ["a"] and [la.agent_id for la in _starts(n2)] == ["b"]
+    _announce(n2, "b", 1, 0)
+    _grants(n1, [(0, e, 0) for e in range(4)], 1)
+    first = _grants(n2, [(w, e, 0) for w in range(2) for e in range(4)], 1)
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
+        _lost(hub, n1, config)
+    assert "Learner of a: node 1 (n1) lost; waiting up to learner_relocate_after_sec (2 s) for it" in caplog.text
+    assert not [c for c in hub.hub._cells.live() if c.key.node == n1.number]          # its cells are gone
+    parked = poll_until(lambda: [v for m in n2.messages("announce") for v in m.versions
+                                 if v.agent_id == "a" and v.node == -1])
+    assert (parked[0].generation, parked[0].version, parked[0].relay_only) == (0, 4, True)
+    again = _grants(n2, [(g.worker, g.env, g.epoch) for g in first], 2)
+    lineups = [lineup_from_proto(g.lineup) for g in again]
+    assert len(lineups) == 8
+    assert all(s.agent_id == "b" for lu in lineups for s in lu.seats if s.source == "owner")   # a owns no cell
+    a_seats = [s for lu in lineups for s in lu.seats if s.agent_id == "a"]
+    assert a_seats and not any(s.collect for s in a_seats)
+
+
+def test_relocation_after_the_wait_moves_the_learner(hubs):
+    config = _config(dist=LOSS)
+    hub = hubs(config)
+    n1 = _node(hub, "n1")
+    _starts(n1)
+    n2 = _node(hub, "n2")
+    frame = _lost(hub, n1, config)
+    la = poll_until(lambda: [c.learner for c in n2.messages("command") if c.kind == "start_learner"], timeout=20)[0]
+    assert (la.agent_id, la.generation, la.weights_blob, la.version_floor) == ("a", 2, "start:recovery", 5)
+    assert n2.download("start", "a", "recovery")[0] == frame
+    assert _learner(hub, "a")["node"] == n2.number
+    n1 = _node(hub, "n1", node=n1, learners=[("a", 1, 4)])                      # the cut-off machine returns
+    stop = poll_until(lambda: [c for c in n1.messages("command") if c.kind == "stop_learner"])[0]
+    assert (stop.learner.agent_id, stop.learner.generation, stop.reason) == ("a", 1, "superseded")
+
+
+def test_a_node_back_before_the_wait_keeps_its_learner(hubs):
+    import time
+
+    config = _config(dist=LOSS)
+    hub = hubs(config)
+    n1 = _node(hub, "n1")
+    _starts(n1)
+    _node(hub, "n2")
+    _lost(hub, n1, config)
+    lost_at = time.monotonic()
+    n1 = _node(hub, "n1", node=n1, learners=[("a", 1, 4)])
+    welcome = n1.messages("welcome")[0]
+    assert [(la.agent_id, la.generation) for la in welcome.learners] == [("a", 1)]
+    assert [(v.generation, v.version, v.node) for v in welcome.versions if v.agent_id == "a"] == [(1, 4, n1.number)]
+    poll_until(lambda: _learner(hub, "a").get("status") == "running")
+    while time.monotonic() < lost_at + LOSS["learner_relocate_after_sec"] + 1.0:   # past the relocation deadline
+        time.sleep(0.1)
+    assert hub.hub._versions.generation("a") == 1 and hub.hub._versions.parked("a") is None
+    assert not [c for c in n1.messages("command") if c.kind in ("start_learner", "stop_learner")]
+
+
+def test_relocation_without_a_free_slot_waits_as_pending(hubs):
+    config = _config(dist=LOSS)
+    hub = hubs(config)
+    n1 = _node(hub, "n1")
+    _starts(n1)
+    n2 = _node(hub, "n2", cpu=0)
+    _lost(hub, n1, config)
+    poll_until(lambda: _learner(hub, "a").get("status") == "pending", timeout=20)
+    assert _learner(hub, "a")["reason"]
+    n3 = _node(hub, "n3")
+    la = _starts(n3)[0]
+    assert (la.agent_id, la.generation, la.weights_blob) == ("a", 2, "start:recovery")
+    assert not [c for c in n2.messages("command") if c.kind == "start_learner"]
+
+
+def test_strict_placement_waits_for_its_node(hubs):
+    config = _config({"a": {"learner": {"placement": {"node": "n1", "strict": True}}}}, dist=LOSS)
+    hub = hubs(config)
+    n1 = _node(hub, "n1")
+    _starts(n1)
+    n2 = _node(hub, "n2")
+    _lost(hub, n1, config)
+    poll_until(lambda: _learner(hub, "a").get("status") == "pending", timeout=20)
+    assert not [c for c in n2.messages("command") if c.kind == "start_learner"]
+    n1 = _node(hub, "n1", node=n1)                                             # back, without its learner
+    la = _starts(n1)[0]
+    assert (la.agent_id, la.generation, la.weights_blob) == ("a", 2, "start:recovery")
+
+
+def test_a_disabled_slot_releases_its_cells(hubs, caplog):
+    hub = hubs(_config())
+    n1 = _node(hub, "n1", workers=2)
+    _starts(n1)
+    assert len(_grants(n1, [(w, e, 0) for w in range(2) for e in range(4)], 1)) == 8
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
+        n1.send(event=pb.Event(kind="slot_disabled", proc="worker-1", exit_code=3, log_path="/logs/worker-1.log"))
+        poll_until(lambda: not [c for c in hub.hub._cells.live() if (c.key.node, c.key.worker) == (n1.number, 1)])
+    assert [c.key.worker for c in hub.hub._cells.live()] == [0] * 4
+    assert "worker-1 of node 1 (n1) is disabled after 3 restarts within 600 s (see /logs/worker-1.log)" in caplog.text
+    n1.pause_heartbeats()
+    n1.send(event=pb.Event(kind="proc_died", proc="worker-0", exit_code=-9))
+    n1.send(heartbeat=pb.Heartbeat(env_steps=0, counters={"worker_restarts": 1}))    # A2: the node counts restarts
+    poll_until(lambda: hub.hub._book.totals().get("worker_restarts") == 1)

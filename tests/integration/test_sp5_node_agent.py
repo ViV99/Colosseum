@@ -316,7 +316,8 @@ def test_a_worker_beyond_its_restart_limit_disables_its_slot(hub_factory, node_f
     wait_for(lambda: any(pb.ProcState(name="worker-0", state="disabled", restarts=1) in h.procs
                          for h in hub.heartbeats()))
     time.sleep(0.5)
-    assert node.agent.supervisor.incarnation("worker-0") == 2 and len(hub.node_events("proc_died")) == 2
+    assert node.agent.supervisor.incarnation("worker-0") == 2
+    assert len(hub.node_events("proc_died")) == 1          # T4.2: a restart; the last death is slot_disabled
     assert node.stop() == 0
 
 
