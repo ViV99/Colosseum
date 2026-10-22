@@ -138,7 +138,7 @@ class TcpFaultProxy:
             with self._lock:
                 self._conns += [client, upstream]
             for a, b in ((client, upstream), (upstream, client)):
-                threading.Thread(target=self._pipe, args=(a, b), daemon=True).start()
+                threading.Thread(target=self._pipe, args=(a, b), name="fault-proxy-pipe", daemon=True).start()
 
     def _pipe(self, src: socket.socket, dst: socket.socket) -> None:
         try:
@@ -162,7 +162,11 @@ class TcpFaultProxy:
         finally:
             with self._lock:
                 self._conns = [c for c in self._conns if c is not src and c is not dst]
-            for s in (src, dst):
+            for s in (src, dst):                       # shutdown wakes the other pipe's blocked sendall / select
+                try:
+                    s.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
                 try:
                     s.close()
                 except OSError:

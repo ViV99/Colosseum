@@ -25,6 +25,13 @@ then ``on_evict(agent_id, checkpoint_id)`` is called for each (a raising callbac
 the index). Only the newest ``keep_last`` keep ``trainer_state.pt``. Every new ``meta.json`` gets ``pinned``
 (false) and, with a run id, ``run_id``.
 
+SP5 (spec 4.2): with an eviction hold set (``set_eviction_hold``) an evicted snapshot the hold callback names is
+first hard-linked (``model.pt``, ``meta.json``; copied when links fail) into
+``base_dir/.evicted/<agent_id>/<checkpoint_id>/``, so the hub can still serve it to nodes whose granted lineups name
+it; the hub releases it (``release_held``) when no granted lineup names it any more, at the latest
+``2 x match_refresh_interval_sec`` later, and clears the dir at start (``clear_held``). ``.evicted`` starts with a
+dot: scans, ``list_snapshots`` and imports skip it. A failing hold check or copy never fails a save or an eviction.
+
 Writes go to ``.tmp-<id>-<rand>/`` and are moved into place with ``os.replace``.
 Replacing an existing id first moves it aside to ``.tmp-old-<id>-<rand>/``. Eviction
 first renames the victim to ``.tmp-evict-<id>-<rand>/`` and then deletes it, so a crash
@@ -70,6 +77,7 @@ TRAINER_FILE = "trainer_state.pt"
 META_FILE = "meta.json"
 _CKPT_RE = re.compile(r"ckpt_v(\d+)")
 _TMP_PREFIX = ".tmp-"
+EVICTED_DIR = ".evicted"          # held copies of evicted snapshots (SP5 spec 4.2)
 _OLD_TMP_RE = re.compile(r"\.tmp-old-(ckpt_v\d+)-[0-9a-f]+")
 # A ``.tmp-<id>-*`` write dir older than this is a leftover of a crashed writer and is
 # deleted on scan. Age, not the writer's pid, decides: in distributed mode learners on
@@ -314,6 +322,7 @@ class CheckpointManager:
         self._keep_every = int(keep_every)
         self._interval = int(interval)
         self._on_evict = on_evict
+        self._hold: Callable[[str, str], bool] | None = None    # SP5: keep a copy of an evicted snapshot?
         self._run_id = run_id
         self._keep_top_k = int(keep_top_k)
         self._top_k_min_games = int(top_k_min_games)
@@ -586,8 +595,49 @@ class CheckpointManager:
         self._notify_evicted(agent_id, evicted)
         return kept
 
+    def set_eviction_hold(self, hold: Callable[[str, str], bool] | None) -> None:
+        """``hold(agent_id, checkpoint_id)``: keep a copy of this snapshot when it is evicted (main loop; the hub's
+        ``SnapshotHolds.referenced``)."""
+        self._hold = hold
+
+    def held_dir(self, agent_id: str, checkpoint_id: str) -> Path:
+        """Where a held copy of an evicted snapshot lives (ConfigError for an unsafe id)."""
+        return (self._base_dir / EVICTED_DIR / check_agent_id(agent_id)
+                / check_path_component(checkpoint_id, "checkpoint id"))
+
+    def release_held(self, agent_id: str, checkpoint_id: str) -> None:
+        shutil.rmtree(self.held_dir(agent_id, checkpoint_id), ignore_errors=True)
+
+    def clear_held(self) -> None:
+        """Remove every held copy (hub start: no granted lineup survives a hub restart)."""
+        shutil.rmtree(self._base_dir / EVICTED_DIR, ignore_errors=True)
+
+    def _wants_hold(self, agent_id: str, checkpoint_id: str) -> bool:
+        if self._hold is None:
+            return False
+        try:
+            return bool(self._hold(agent_id, checkpoint_id))
+        except Exception:  # noqa: BLE001 - a hold check never fails a save or an eviction
+            logger.warning(f"Eviction hold check failed for {checkpoint_id} of {agent_id}; not held", exc_info=True)
+            return False
+
+    def _keep_copy(self, agent_id: str, checkpoint_id: str, src: Path) -> None:
+        """Hard-link (copy where a link fails) the evicted snapshot's model and meta into ``held_dir``."""
+        target = self.held_dir(agent_id, checkpoint_id)
+        tmp = target.parent / f"{_TMP_PREFIX}{checkpoint_id}-{uuid.uuid4().hex[:8]}"
+        try:
+            tmp.mkdir(parents=True)
+            for name in (MODEL_FILE, META_FILE):
+                link_or_copy(src / name, tmp / name)
+            shutil.rmtree(target, ignore_errors=True)
+            os.replace(tmp, target)
+        except OSError as e:
+            shutil.rmtree(tmp, ignore_errors=True)
+            logger.warning(f"Could not keep evicted snapshot {checkpoint_id} of {agent_id} for granted lineups: {e}")
+
     def _evict(self, agent_id: str, checkpoint_id: str) -> None:
-        """Rename the checkpoint out of the ``ckpt_v*`` namespace, then delete it."""
+        """Rename the checkpoint out of the ``ckpt_v*`` namespace, keep a held copy when the hold says so (SP5), then
+        delete it."""
         victim = self._ckpt_dir(agent_id, checkpoint_id)
         doomed = self._agent_dir(agent_id) / f"{_TMP_PREFIX}evict-{checkpoint_id}-{uuid.uuid4().hex[:8]}"
         try:
@@ -597,6 +647,10 @@ class CheckpointManager:
         except OSError as e:  # like the plain rmtree before: an eviction failure never fails the save
             logger.warning(f"Could not evict {victim}: {e}")
             return
+        if self._wants_hold(agent_id, checkpoint_id):
+            self._keep_copy(agent_id, checkpoint_id, doomed)
+        elif self._hold is not None:                  # a held copy of an earlier snapshot with this id is stale now
+            shutil.rmtree(self.held_dir(agent_id, checkpoint_id), ignore_errors=True)
         shutil.rmtree(doomed, ignore_errors=True)
 
     def load_model(self, agent_id: str, checkpoint_id: str) -> dict[str, np.ndarray]:

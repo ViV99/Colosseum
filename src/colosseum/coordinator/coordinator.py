@@ -65,7 +65,11 @@ class Coordinator:
         self._evicted: dict[str, list[str]] = {}   # evicted since the last take_evictions(), per agent
         self._evict_listeners: list[Callable[[str, str], None]] = []   # e.g. the journal writer (SP4)
         self._evict_listener_failed = False   # the first failing listener call is logged with its traceback
-        # Only the launcher's match refresh drains evictions (take_evictions); without it nothing is buffered.
+        # The hub's periodic Announce drains evictions (take_evictions) so nodes can unload them. With
+        # match_refresh_interval_sec 0 every cell's lineup is granted once for the run (TTL 0): a worker never stops
+        # playing a snapshot its lineup names, so there is nothing for a node to unload and nothing is buffered (the
+        # hub holds no evicted snapshot either: SnapshotHolds' bound is 0); a node's cache drops a snapshot as soon as
+        # none of its lineups names it (node.lineups.prune_cache). SP5 T3.1 (carried item 4b).
         self._buffer_evictions = config.rollout.match_refresh_interval_sec > 0
         self._pfsp = PfspStats({aid: config.get_agent_config(aid).matchmaking.pfsp.halflife_games
                                 for aid in trainable})
@@ -162,9 +166,9 @@ class Coordinator:
     def _on_evict(self, agent_id: str, checkpoint_id: str) -> None:
         """Storage evicted a snapshot (spec block 4): new lineups no longer draw it (the matchmaker's
         candidates come from the store), its PFSP statistics are dropped, the evict listeners are told, and
-        workers are told to unload it
-        (``take_evictions``; only with ``rollout.match_refresh_interval_sec > 0``: without a match refresh the
-        workers' lineups never change and nothing drains the buffer)."""
+        nodes are told to unload it (``take_evictions``, through the hub's ``Announce``; only with
+        ``rollout.match_refresh_interval_sec > 0``: without a match refresh every lineup is granted once for the run,
+        a snapshot it names is played to the end, and nothing would use the eviction)."""
         logger.debug(f"Snapshot {checkpoint_id} of {agent_id} evicted")
         self._pfsp.forget((agent_id, checkpoint_id))
         for listener in self._evict_listeners:

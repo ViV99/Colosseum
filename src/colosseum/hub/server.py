@@ -46,7 +46,7 @@ from typing import Any
 import grpc
 
 from colosseum.bootstrap.installer import BootstrapService
-from colosseum.coordinator.checkpoint_manager import read_weights_file
+from colosseum.coordinator.checkpoint_manager import EVICTED_DIR, read_weights_file
 from colosseum.core.config import check_agent_id
 from colosseum.core.errors import ConfigError
 from colosseum.core.run_dir import RunDir
@@ -535,15 +535,18 @@ def _write_atomic(path: Path, data: bytes) -> None:
 class BlobStore:
     """Read-only file serving and lazy snapshot conversion for ``Download`` (servicer threads) plus the registered
     blobs of the main loop (module docstring). Files: ``runs/<name>/blobs/<kind>-<agent digest>-<ident>.frame``
-    (``trainer_state``: ``.bin``; ``blob_file_name``). It never deletes snapshot frames itself (T3.1 removes those of
-    evicted snapshots after their hold). Agent ids follow the config's rule (``check_agent_id``); the snapshot source
-    ``checkpoints/<agent>/ckpt_v<N>/model.pt`` keeps the agent's directory."""
+    (``trainer_state``: ``.bin``; ``blob_file_name``). Agent ids follow the config's rule (``check_agent_id``); the
+    snapshot source is ``checkpoints/<agent>/ckpt_v<N>/model.pt``, else the held copy of an evicted one in
+    ``checkpoints/.evicted/<agent>/ckpt_v<N>/`` (SP5 T3.1, spec 4.2). ``forget`` (main loop) removes the converted
+    frame of an evicted snapshot that is not (or no longer) held; a conversion that started before ``forget`` writes
+    nothing (a per-key forget count is compared under the lock before the frame is put in place)."""
 
     def __init__(self, run_dir: RunDir) -> None:
         self.run_dir = run_dir
         self._registered: set[tuple[str, str, str]] = set()
         self._lock = threading.Lock()
         self._convert_locks: dict[tuple[str, str], threading.Lock] = {}
+        self._forgets: dict[tuple[str, str, str], int] = {}     # (kind, agent, ident) -> times forgotten
 
     @property
     def dir(self) -> Path:
@@ -572,19 +575,40 @@ class BlobStore:
         path = self.dir / blob_file_name(kind, agent_id, ident)
         return path if _is_file(path) else None
 
+    def _snapshot_source(self, agent_id: str, ident: str) -> Path | None:
+        """The snapshot's ``model.pt``: the stored one, else a held copy of an evicted one (T3.1)."""
+        for root in (self.run_dir.checkpoints, self.run_dir.checkpoints / EVICTED_DIR):
+            model = root / agent_id / ident / "model.pt"
+            if _is_file(model):
+                return model
+        return None
+
+    def forget(self, kind: str, agent_id: str, ident: str) -> None:
+        """An evicted snapshot is not (or no longer) held: its converted frame goes, and a conversion running now
+        writes none (thread-safe; main loop)."""
+        if not _valid_agent_id(agent_id) or not isinstance(ident, str) or "/" in ident:
+            return
+        key = (kind, agent_id, ident)
+        with self._lock:
+            self._forgets[key] = self._forgets.get(key, 0) + 1
+            (self.dir / blob_file_name(kind, agent_id, ident)).unlink(missing_ok=True)
+
     def _snapshot(self, agent_id: str, ident: str, version: int) -> Path | None:
         path = self.dir / blob_file_name("snapshot", agent_id, ident)
+        key = ("snapshot", agent_id, ident)
+        with self._lock:
+            forgets = self._forgets.get(key, 0)
         if _is_file(path):
             return path
-        model = self.run_dir.checkpoints / agent_id / ident / "model.pt"
-        if not _is_file(model):                       # no lock entry for a snapshot that does not exist
+        if self._snapshot_source(agent_id, ident) is None:   # no lock entry for a snapshot that does not exist
             return None
         with self._lock:
             lock = self._convert_locks.setdefault((agent_id, ident), threading.Lock())
         with lock:                                    # two concurrent downloads convert once
             if _is_file(path):
                 return path
-            if not _is_file(model):
+            model = self._snapshot_source(agent_id, ident)
+            if model is None:
                 return None
             try:
                 state = read_weights_file(model)
@@ -594,7 +618,16 @@ class BlobStore:
             frame = encode_weights(state, WeightsMeta(agent_id=agent_id, kind="snapshot", generation=0,
                                                       policy_version=version, checkpoint_id=ident))
             self.dir.mkdir(parents=True, exist_ok=True)
-            _write_atomic(path, frame)
+            tmp = path.with_name(f".{path.name}.tmp-{uuid.uuid4().hex}")
+            try:
+                with open(tmp, "xb") as f:
+                    f.write(frame)
+                with self._lock:                      # forgotten meanwhile (released by the main loop): no frame
+                    if self._forgets.get(key, 0) != forgets:
+                        return None
+                    os.replace(tmp, path)
+            finally:
+                tmp.unlink(missing_ok=True)
             return path
 
     def register_fixed(self, blob_id: str, frame: bytes, *, kind: str, agent_id: str) -> None:

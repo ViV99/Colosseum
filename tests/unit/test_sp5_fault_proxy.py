@@ -137,3 +137,46 @@ def test_a_slow_receiver_backpressures_instead_of_cutting():
     finally:
         paused.set()
         server.close()
+
+
+def _pipes_alive():
+    return [t for t in threading.enumerate() if t.name == "fault-proxy-pipe"]
+
+
+def test_a_pipe_blocked_in_sendall_ends_when_the_other_direction_ends():
+    """The target half-closes without reading while the client's bytes are stuck in the proxy's ``sendall``: the
+    reverse pipe ends at the EOF and shuts both sockets down, which wakes the blocked ``sendall`` (``close`` alone
+    does not on Linux)."""
+    server = socket.create_server(("127.0.0.1", 0))
+    accepted = []
+
+    def target():
+        conn, _ = server.accept()
+        accepted.append(conn)                                      # never reads
+
+    threading.Thread(target=target, daemon=True).start()
+    before = len(_pipes_alive())
+    with TcpFaultProxy(("127.0.0.1", server.getsockname()[1])) as proxy:
+        client = socket.create_connection(("127.0.0.1", proxy.port), timeout=10)
+
+        def flood():
+            try:
+                client.sendall(b"x" * (64 * 2**20))
+            except OSError:
+                pass
+
+        sender = threading.Thread(target=flood, daemon=True)
+        sender.start()
+        deadline = time.monotonic() + 10
+        while (not accepted or proxy.bytes_forwarded == 0) and time.monotonic() < deadline:
+            time.sleep(0.01)
+        time.sleep(0.2)                                            # the proxy's sendall is blocked by now
+        accepted[0].shutdown(socket.SHUT_WR)                       # EOF towards the client, still not reading
+        deadline = time.monotonic() + 5
+        while len(_pipes_alive()) > before and time.monotonic() < deadline:
+            time.sleep(0.02)
+        assert len(_pipes_alive()) == before                       # both pipes ended, none stuck in sendall
+        sender.join(5)
+        client.close()
+    accepted[0].close()
+    server.close()

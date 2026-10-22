@@ -19,6 +19,8 @@ appear here, only durations (``ttl_sec``).
   the largest deficit is the one that owns the fewest live collecting cells; ties go to the first tied agent after the
   cell's previous owner in config order (no previous owner: the first tied agent). With one node whose cells all
   expire together this reproduces SP4's ``trainable[(g + round) % n]``.
+- ``SnapshotHolds`` / ``snapshot_refs``: evicted snapshots a granted lineup still names stay downloadable (spec 4.2,
+  T3.1).
 - ``restrict_collecting``: seats of agents that cannot collect (no running learner) do not collect (spec 4.7).
 - ``BudgetCounter``: the one budget (spec 4.4): a saved base plus the increments of each (node, session)'s cumulative
   env-step counter since its last saved value.
@@ -51,7 +53,8 @@ __all__ = [
     "DROP_REASONS", "EPOCH_BLOCK", "EVICTED_HOLD_FACTOR", "HUB_STATE_FILE", "HUB_STATE_VERSION", "BudgetCounter",
     "CellEntry", "CellKey", "CellTable", "EpochAllocator", "HubStateData", "NodeEntry", "NodeHello", "NodeRegistry",
     "OwnerRotation", "ResultIntake", "VersionInfo", "VersionRegistry", "load_hub_state", "restrict_collecting",
-    "save_hub_state", "version_source", "check_data_addresses", "DATA_ADDRESSES_MAX", "DATA_ADDRESS_CHARS_MAX",
+    "save_hub_state", "version_source", "SnapshotHolds", "snapshot_refs", "check_data_addresses",
+    "DATA_ADDRESSES_MAX", "DATA_ADDRESS_CHARS_MAX",
 ]
 
 EPOCH_BLOCK = 1024                   # R7: epochs reserved per hub_state.json write
@@ -327,6 +330,69 @@ class CellTable:
 
     def live(self) -> list[CellEntry]:
         return [self._cells[k] for k in sorted(self._cells)]
+
+
+def snapshot_refs(lineup: Lineup) -> frozenset[tuple[str, str]]:
+    """``(agent_id, checkpoint_id)`` of every snapshot seat (``ckpt_v<N>``) of ``lineup``."""
+    return frozenset((s.agent_id, s.network_id) for s in lineup.seats if snapshot_version(s.network_id) is not None)
+
+
+class SnapshotHolds:
+    """Spec 4.2: an evicted snapshot stays downloadable while a granted lineup names it, and at most
+    ``EVICTED_HOLD_FACTOR x rollout.match_refresh_interval_sec`` after its eviction (pure; hub clock).
+
+    A cell's references are the union of its last two grants (pre-flight ruling P-PF3-16: a cell that asks again at
+    its TTL while its previous grant's snapshot is still downloading keeps that snapshot held); ``drop_cell`` /
+    ``drop_node`` when the cell or its node goes. ``referenced`` answers the checkpoint manager's question at
+    eviction time ("keep a copy?"); ``hold`` starts the hold of a snapshot that was copied; ``due`` returns (and
+    forgets) the holds to release: no longer referenced, or past their deadline. With
+    ``match_refresh_interval_sec: 0`` nothing is held (the bound is 0; a node that could not fetch re-requests)."""
+
+    def __init__(self, refresh_sec: float, *, factor: float = EVICTED_HOLD_FACTOR) -> None:
+        self.max_hold_sec = max(0.0, float(factor) * float(refresh_sec))
+        self._cells: dict[CellKey, tuple[frozenset, frozenset]] = {}   # cell -> (previous grant, last grant)
+        self._counts: Counter = Counter()                               # over the union of each cell's two
+        self._held: dict[tuple[str, str], float] = {}                   # (agent, ckpt) -> deadline
+
+    def _set(self, cell: CellKey, pair: tuple[frozenset, frozenset]) -> None:
+        old = self._cells.get(cell, (frozenset(), frozenset()))
+        self._counts.subtract(old[0] | old[1])
+        self._counts.update(pair[0] | pair[1])
+        self._counts = +self._counts                                    # drop zero entries
+        if pair[0] or pair[1]:
+            self._cells[cell] = pair
+        else:
+            self._cells.pop(cell, None)
+
+    def grant(self, cell: CellKey, refs: Iterable[tuple[str, str]]) -> None:
+        last = self._cells.get(cell, (frozenset(), frozenset()))[1]
+        self._set(cell, (last, frozenset(refs)))
+
+    def drop_cell(self, cell: CellKey) -> None:
+        self._set(cell, (frozenset(), frozenset()))
+
+    def drop_node(self, node: int) -> None:
+        for cell in [c for c in self._cells if c.node == node]:
+            self.drop_cell(cell)
+
+    def referenced(self, agent_id: str, checkpoint_id: str) -> bool:
+        """Does a granted lineup name this snapshot (and is a hold possible at all: ``max_hold_sec > 0``)?"""
+        return self.max_hold_sec > 0 and self._counts[(agent_id, checkpoint_id)] > 0
+
+    def hold(self, agent_id: str, checkpoint_id: str, now: float) -> None:
+        self._held[(agent_id, checkpoint_id)] = now + self.max_hold_sec
+
+    def is_held(self, agent_id: str, checkpoint_id: str) -> bool:
+        return (agent_id, checkpoint_id) in self._held
+
+    def held(self) -> list[tuple[str, str]]:
+        return sorted(self._held)
+
+    def due(self, now: float) -> list[tuple[str, str]]:
+        out = [key for key, deadline in self._held.items() if now >= deadline or self._counts[key] <= 0]
+        for key in out:
+            del self._held[key]
+        return sorted(out)
 
 
 def restrict_collecting(lineup: Lineup, collecting: Collection[str]) -> Lineup:

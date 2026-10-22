@@ -84,7 +84,14 @@ from colosseum.hub.setup import (  # re-exported: the contract names colosseum.h
     validate_run_config,
     warn_static_ownership_skew,
 )
-from colosseum.hub.state import CellKey, check_data_addresses, restrict_collecting, version_source
+from colosseum.hub.state import (
+    CellKey,
+    SnapshotHolds,
+    check_data_addresses,
+    restrict_collecting,
+    snapshot_refs,
+    version_source,
+)
 from colosseum.metrics.counters import CounterBook
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.net.messages import lineup_to_proto, version_from_proto, version_to_proto
@@ -190,6 +197,7 @@ class Hub(RunSinks):
         self._run_id: str | None = None
         self._identity = None
         self._blobs = None
+        self._holds: SnapshotHolds | None = None   # evicted snapshots granted lineups still name (spec 4.2, T3.1)
         self._fixed_blobs: list = []              # pb.FixedBlob of Welcome.fixed
         self._start_blobs: dict[str, tuple[str, str]] = {}   # agent -> (recovery blob id, trainer_state blob id)
         # Pure hub state (built by _prepare).
@@ -369,6 +377,7 @@ class Hub(RunSinks):
         self._identity = HubIdentity.load_or_create(self._options.identity_dir)
         self._blobs = BlobStore(self._run_dir)
         shutil.rmtree(self._blobs.incoming, ignore_errors=True)    # upload spools of a crashed hub
+        self._wire_snapshot_holds(coordinator)
         self._register_blobs(setup, self._resume_states)
         self._pulse_setup()
         self._registry = NodeRegistry()
@@ -377,6 +386,37 @@ class Hub(RunSinks):
         self._rotation = OwnerRotation(trainable)
         self._versions = VersionRegistry()
         self._intake = ResultIntake(journal=bool(cfg.match_log.enabled))
+
+    def _wire_snapshot_holds(self, coordinator: Coordinator) -> None:
+        """Spec 4.2 (T3.1): a snapshot evicted while a granted lineup names it stays downloadable from
+        ``checkpoints/.evicted/`` for at most ``EVICTED_HOLD_FACTOR x rollout.match_refresh_interval_sec``; held
+        copies of an earlier hub process are removed (no granted lineup survives a hub restart)."""
+        manager = coordinator.checkpoint_manager
+        manager.clear_held()
+        self._holds = SnapshotHolds(float(self._config.rollout.match_refresh_interval_sec))
+        manager.set_eviction_hold(self._holds.referenced)
+        coordinator.add_evict_listener(self._on_snapshot_evicted_hold)
+
+    def _on_snapshot_evicted_hold(self, agent_id: str, checkpoint_id: str) -> None:
+        """Coordinator evict listener (main loop; the copy exists when it runs): a held snapshot's hold starts and is
+        counted (``snapshot_holds``); any other evicted snapshot's converted frame is forgotten (``NOT_FOUND``)."""
+        if self._coordinator.checkpoint_manager.held_dir(agent_id, checkpoint_id).is_dir():
+            self._holds.hold(agent_id, checkpoint_id, time.monotonic())
+            self._book.add("snapshot_holds", 1)
+        else:
+            self._blobs.forget("snapshot", agent_id, checkpoint_id)
+
+    def _release_holds(self, now: float | None = None) -> None:
+        """Release the holds that are due (``now``), or every hold (None: the stop)."""
+        if self._holds is None or self._coordinator is None:
+            return
+        manager = self._coordinator.checkpoint_manager
+        released = self._holds.due(now) if now is not None else self._holds.due(float("inf"))
+        for agent_id, checkpoint_id in released:
+            manager.release_held(agent_id, checkpoint_id)
+            self._blobs.forget("snapshot", agent_id, checkpoint_id)
+        if now is None:
+            manager.clear_held()
 
     def _register_blobs(self, setup: RunSetup, resume_states: Mapping[str, dict | None]) -> None:
         """What nodes download from the hub: frozen agents' weights, neural kickstart teachers and ``init`` weights
@@ -565,6 +605,7 @@ class Hub(RunSinks):
             self._reapply_retention()   # after a new live refit; the refit thread never touches storage
             self._pump_pulse()
             now = time.monotonic()
+            self._release_holds(now)
             if now >= self._next_lost_check:
                 self._next_lost_check = now + min(1.0, self._dist.heartbeat_sec)
                 for entry in self._registry.lost(now, self._dist.node_lost_after_sec):
@@ -665,6 +706,7 @@ class Hub(RunSinks):
                                       serial=handle.serial)
         if kind == "returned":
             self._cells.drop_node(record.number)
+            self._holds.drop_node(record.number)
         self._resource_versions(self._registry.by_id(handle.node_id))     # Hello.data_addresses (T3.1)
         self._intake.open(handle.node_id, hello.session_id, int(hello.last_acked_seq))
         self._budget.report(handle.node_id, hello.session_id, int(hello.env_steps))
@@ -724,6 +766,7 @@ class Hub(RunSinks):
         """A node silent for ``node_lost_after_sec`` (or removed: ``reason``): its cells go (their unfinished
         matches are never reported), its stream is closed. T4.2 adds the relocation of its learners."""
         self._cells.drop_node(entry.number)
+        self._holds.drop_node(entry.number)
         handle = self._sessions.pop(entry.node_id, None)
         if handle is not None:
             handle.close(reason)
@@ -830,6 +873,7 @@ class Hub(RunSinks):
             lineup = restrict_collecting(self._coordinator.lineup_for(owner), local)
             lineup = dataclasses.replace(lineup, epoch=cell.epoch)
             self._cells.grant(cell.key, owner, ttl, now)
+            self._holds.grant(cell.key, snapshot_refs(lineup))       # evicted snapshots it names stay servable
             grants.append(pb.Grant(worker=cell.key.worker, env=cell.key.env, epoch=cell.epoch, ttl_sec=ttl,
                                    lineup=lineup_to_proto(lineup)))
         handle.send(pb.HubMessage(grants=pb.LineupGrants(grants=grants)))
@@ -1260,6 +1304,7 @@ class Hub(RunSinks):
             killed = self._supervisor.kill_remaining()
             if killed:
                 logger.warning(f"Terminated processes that did not stop within {grace:.0f}s: {', '.join(killed)}")
+            self._release_holds()                    # no node downloads any more: every held copy goes
             self._finish_reads(max(deadline, time.monotonic() + 1.0), poll)
             for q in (self._pulse_results,):
                 if q is not None:

@@ -25,9 +25,11 @@ Rules (``FetchPlanner.due``):
 - ``skip`` agents are left out (``NodeFetcher``: a version that did not fit into a full cache is not fetched again
   until space frees or a newer version is announced).
 
-A fetched frame of the announced version must carry the digest the hub announced (the authenticity anchor of a
-direct fetch: a peer at a data-port address cannot substitute other weights for an announced version); its header
-must agree with the reply's metadata (``dataport.check_fetched``). Refusals count as failed fetches.
+A fetched frame of the announced version must carry the digest the hub announced: the authenticity anchor of a
+direct fetch covers the announced version only (a peer at a data-port address cannot substitute other weights for
+it). A newer version that the hub has not announced yet carries no hub digest; it is anchored by the per-node
+identity check of the data port's certificate (T3.2; ruling R32). Every frame's header must agree with the reply's
+metadata (``dataport.check_fetched``). Refusals count as failed fetches.
 
 ``NodeFetcher`` runs the transfers in the node's transfer pool; its threads touch no main-loop state: they post
 ``BlobFetched`` / ``LatestFetched`` / ``LatestFetchFailed`` into the node inbox, and the main loop decides what the
