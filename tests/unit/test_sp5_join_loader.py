@@ -3,6 +3,7 @@ the bundle by hash, the uv environment (fake uv), the exec of the node agent (re
 from __future__ import annotations
 
 import ast
+import contextlib
 import dataclasses
 import fcntl
 import hashlib
@@ -436,9 +437,12 @@ def test_reexec_closes_the_inherited_in_use_locks(hub, tmp_path, monkeypatch):
     inherited = []
 
     def exec_keeping_locks(path, args, agent_env):          # what exec does: the descriptions stay locked
-        for fd in agent_env[L.IN_USE_FDS_ENV].split(","):
-            inherited.append(os.dup(int(fd)))
-        agent_env[L.IN_USE_FDS_ENV] = ",".join(map(str, inherited))
+        entries = []
+        for entry in agent_env[L.IN_USE_FDS_ENV].split(","):
+            fd, dev, ino = entry.split(":")
+            inherited.append(os.dup(int(fd)))                  # same open file: same device and inode
+            entries.append(f"{inherited[-1]}:{dev}:{ino}")
+        agent_env[L.IN_USE_FDS_ENV] = ",".join(entries)
         exec_keeping_locks.env = agent_env
 
     assert L.loader_main([f"127.0.0.1:{first_port}"], environ=env, exec_fn=exec_keeping_locks) == 0
@@ -457,15 +461,27 @@ def test_reexec_closes_the_inherited_in_use_locks(hub, tmp_path, monkeypatch):
     assert first_hash in L.prune(root, 0, root / "none")
 
 
-def test_close_inherited_locks_ignores_bad_numbers():
-    r, w = os.pipe()
+def test_close_inherited_locks_checks_the_file_and_ignores_bad_entries(tmp_path):
+    """Only a listed descriptor that still refers to the recorded file (device and inode) is closed: a stale entry
+    in a descendant's environment never closes an unrelated descriptor; malformed entries are ignored."""
+    lock = open(tmp_path / "a", "w")
+    other = open(tmp_path / "b", "w")
     try:
-        L.close_inherited_locks(f"x,,0,1,2,-3,{r},999999")
+        st = os.fstat(lock.fileno())
+        reused = f"{other.fileno()}:{st.st_dev}:{st.st_ino}"            # the number now names another file
+        L.close_inherited_locks(",".join([
+            "x", "", "0:1:2", "1:1:1", f"{lock.fileno()}", "\u00b2:1:1", f"{lock.fileno()}:\u00b2:1", "-3:1:1",
+            f"{lock.fileno()}:{st.st_dev}", "999999:1:1", reused]))
+        os.fstat(lock.fileno())                                         # nothing closed so far
+        os.fstat(other.fileno())
+        L.close_inherited_locks(f"{lock.fileno()}:{st.st_dev}:{st.st_ino}")
         with pytest.raises(OSError):
-            os.fstat(r)
-        os.fstat(w)                                                        # not listed: untouched
+            os.fstat(lock.fileno())
+        os.fstat(other.fileno())
     finally:
-        os.close(w)
+        other.close()
+        with contextlib.suppress(OSError):
+            lock.close()
 
 
 def test_token_reaches_only_the_agent(hub, tmp_path, monkeypatch):

@@ -55,10 +55,10 @@ _colosseum_install() {
         echo "colosseum: installing uv @UV@ into $cache/uv" >&2
         if command -v curl >/dev/null 2>&1; then
             curl -LsSf "https://astral.sh/uv/@UV@/install.sh" \
-                | env -u UV_INSTALL_DIR UV_UNMANAGED_INSTALL="$cache/uv" UV_NO_MODIFY_PATH=1 sh
+                | env -u UV_INSTALL_DIR -u COLOSSEUM_TOKEN UV_UNMANAGED_INSTALL="$cache/uv" UV_NO_MODIFY_PATH=1 sh
         elif command -v wget >/dev/null 2>&1; then
             wget -qO- "https://astral.sh/uv/@UV@/install.sh" \
-                | env -u UV_INSTALL_DIR UV_UNMANAGED_INSTALL="$cache/uv" UV_NO_MODIFY_PATH=1 sh
+                | env -u UV_INSTALL_DIR -u COLOSSEUM_TOKEN UV_UNMANAGED_INSTALL="$cache/uv" UV_NO_MODIFY_PATH=1 sh
         else
             echo "colosseum: neither curl nor wget is available to install uv" >&2; return 1
         fi

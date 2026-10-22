@@ -160,7 +160,7 @@ FAKE_CURL = """#!/bin/sh
 echo "$*" >> "$FAKE_CURL_LOG"
 cat <<'FAKE_INSTALL_SH'
 mkdir -p "$UV_UNMANAGED_INSTALL"
-env | grep '^UV_' > "$FAKE_INSTALL_ENV"
+env | grep '^UV_\|^COLOSSEUM_TOKEN=' > "$FAKE_INSTALL_ENV"
 cp "$FAKE_UV_SOURCE" "$UV_UNMANAGED_INSTALL/uv"
 FAKE_INSTALL_SH
 """
@@ -191,7 +191,9 @@ def test_script_installs_a_private_uv_when_none_is_usable(hub, tmp_path):
     assert "https://astral.sh/uv/0.13.1/install.sh" in (tmp_path / "curl.log").read_text()
     installed = dict(line.split("=", 1) for line in (tmp_path / "install-env").read_text().splitlines())
     assert installed["UV_UNMANAGED_INSTALL"] == str(private) and "UV_INSTALL_DIR" not in installed
-    assert (private / "uv").is_file() and (tmp_path / "record.jsonl").is_file()
+    assert "COLOSSEUM_TOKEN" not in installed                                # astral's script never sees it
+    assert (private / "uv").is_file()
+    assert json.loads((tmp_path / "record.jsonl").read_text())["env"]["COLOSSEUM_TOKEN"] == hub.token  # the agent
 
 
 def test_loader_installs_a_private_uv_when_none_is_usable(tmp_path):
@@ -204,3 +206,4 @@ def test_loader_installs_a_private_uv_when_none_is_usable(tmp_path):
     assert "https://astral.sh/uv/0.13.1/install.sh" in (tmp_path / "curl.log").read_text()
     installed = dict(line.split("=", 1) for line in (tmp_path / "install-env").read_text().splitlines())
     assert installed["UV_UNMANAGED_INSTALL"] == str(private) and "UV_INSTALL_DIR" not in installed
+    assert "COLOSSEUM_TOKEN" not in installed

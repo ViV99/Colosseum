@@ -610,18 +610,34 @@ def agent_environ(environ: Mapping[str, str], bundle_dir: Path, token: str,
     env["PYTHONNOUSERSITE"] = "1"
     env[TOKEN_ENV] = token
     if in_use_fds:
-        env[IN_USE_FDS_ENV] = ",".join(str(fd) for fd in in_use_fds)
+        env[IN_USE_FDS_ENV] = ",".join(_fd_entry(fd) for fd in in_use_fds)
     return env
 
 
+def _fd_entry(fd: int) -> str:
+    st = os.fstat(fd)
+    return f"{fd}:{st.st_dev}:{st.st_ino}"
+
+
 def close_inherited_locks(text: str | None) -> None:
-    """Close the ``.in-use`` lock descriptors a node agent inherited (``COLOSSEUM_IN_USE_FDS``) when it re-execs
-    the loader (T6.3): otherwise they pin its old bundle and environment for its lifetime (a new descriptor of the
-    same process cannot take the exclusive prune lock against them). Bad or closed numbers are ignored."""
+    """Close the ``.in-use`` lock descriptors a node agent inherited (``COLOSSEUM_IN_USE_FDS``: ``fd:dev:inode``
+    entries) when it re-execs the loader (T6.3): otherwise they pin its old bundle and environment for its lifetime
+    (a new descriptor of the same process cannot take the exclusive prune lock against them). A descriptor is closed
+    only while it still refers to the recorded file (the variable reaches every descendant of the agent through its
+    environment: a stale entry must never close an unrelated descriptor); malformed entries are ignored."""
     for item in (text or "").split(","):
-        if item.strip().isdigit() and int(item) > 2:
-            with contextlib.suppress(OSError):
-                os.close(int(item))
+        parts = item.strip().split(":")
+        if len(parts) != 3 or not all(re.fullmatch(r"[0-9]{1,20}", p) for p in parts):
+            continue
+        fd, dev, ino = (int(p) for p in parts)
+        if fd <= 2:
+            continue
+        try:
+            st = os.fstat(fd)
+            if (st.st_dev, st.st_ino) == (dev, ino):
+                os.close(fd)
+        except OSError:
+            continue
 
 
 def _in_use(make: Callable[[], Path], marker: str, locks: list, what: str) -> Path:
