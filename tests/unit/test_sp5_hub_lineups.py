@@ -7,8 +7,9 @@ import logging
 
 from colosseum.league.lineups import check_lineup
 from colosseum.net.messages import lineup_from_proto
+from colosseum.net.proto import colosseum_v1_pb2 as pb
 from game_helpers import make_test_config, owner_sequence, scripted_agent
-from hub_kit import accept_version, lineup_hub, open_node, request_cells
+from hub_kit import accept_version, lineup_hub, node_message, open_node, request_cells
 
 LATEST_ONLY = {"opponents": {"latest": 1.0, "snapshots": 0.0, "rivals": 0.0, "anchors": 0.0}}
 
@@ -92,28 +93,42 @@ def test_a_refresh_of_zero_grants_each_cell_once(tmp_path):
 
 
 def test_no_lineup_is_granted_while_no_agent_can_collect(tmp_path, caplog):
+    """P-PF2-3 under R36: nothing can collect while no learner is placed (a node without learner capacity); a placed,
+    alive learner is enough, before any first version."""
     hub = lineup_hub(_config(("a",)), tmp_path)
-    node = open_node(hub, workers=1)
+    workers_only = open_node(hub, name="worker-node", workers=1, cpu_learners=0, no_learners=True)
+    assert hub._learner_node == {}
     with caplog.at_level(logging.DEBUG, logger="colosseum.hub.hub"):
-        assert request_cells(hub, node, [(0, e, 0, 0) for e in range(4)]) == []
+        assert request_cells(hub, workers_only, [(0, e, 0, 0) for e in range(4)]) == []
     assert hub._cells.live() == [] and hub._epochs.reserved_until == 0    # P-PF2-3: no epoch allocated
     assert "no agent can collect yet" in caplog.text
-    accept_version(hub, "a")
+    node = open_node(hub, name="learner-node", workers=1)                 # a's learner is placed: no version yet
+    assert hub._versions.latest("a") is None
     grants = request_cells(hub, node, [(0, e, 0, 0) for e in range(4)])
     assert len(grants) == 4 and sorted(g.epoch for g in grants) == [1, 2, 3, 4]
+    assert all(_collecting(lineup_from_proto(g.lineup)) == {"a"} for g in grants)
 
 
-def test_seats_of_agents_without_a_learner_do_not_collect(tmp_path):
+def test_agents_collect_from_their_learners_placement_without_a_first_version(tmp_path):
+    """Ruling R36: with both learners placed and alive and only ``a``'s first version accepted, ``b``'s seats collect
+    too (the node holds a lineup until ``b``'s latest weights are cached); once ``b``'s learner failed they do not."""
     mm = {"opponents": {"latest": 0.0, "snapshots": 0.0, "rivals": 1.0, "anchors": 0.0}}
     hub = lineup_hub(_config(("a", "b"), matchmaking=mm), tmp_path)
     node = open_node(hub, workers=2)
     accept_version(hub, "a")                                              # b's learner has published nothing
+    assert hub._versions.latest("b") is None
     grants = request_cells(hub, node, [(w, e, 0, 0) for w in range(2) for e in range(4)])
+    assert len(grants) == 8
+    assert {_owner(lineup_from_proto(g.lineup)) for g in grants} == {"a", "b"}
+    assert all(_collecting(lineup_from_proto(g.lineup)) == {"a", "b"} for g in grants)
+
+    hub._on_message(node_message(node, event=pb.Event(kind="learner_failed", proc="learner-b", exit_code=1)))
+    assert hub._learner_alive == {"a": True, "b": False}
+    grants = request_cells(hub, node, [(g.worker, g.env, g.epoch, 0) for g in grants])
     assert len(grants) == 8
     for grant in grants:
         lineup = lineup_from_proto(grant.lineup)
         assert _owner(lineup) == "a" and _collecting(lineup) == {"a"}
-        assert all(not s.collect for s in lineup.seats if s.agent_id == "b")
         assert any(s.agent_id == "b" for s in lineup.seats)
 
 

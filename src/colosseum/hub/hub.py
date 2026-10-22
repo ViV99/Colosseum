@@ -881,9 +881,9 @@ class Hub(RunSinks):
         return self._relay is not None and bool(getattr(self._relay, "enabled", False))
 
     def _collecting_any(self) -> list[str]:
-        """Agents that can collect anywhere: an accepted latest version and a learner (spec 4.2, 4.7)."""
-        return [a for a in self._agent_ids
-                if self._learner_alive.get(a) and self._versions.latest(a) is not None]
+        """Agents that can collect anywhere: a placed, alive learner (spec 4.2, 4.7; ruling R36: no first version
+        needed, a lineup naming the agent waits on the node until its latest weights are cached)."""
+        return [a for a in self._agent_ids if self._learner_alive.get(a)]
 
     def _collecting_on(self, number: int) -> list[str]:
         """Agents that can collect on node ``number`` (``hub.state.collect_allowed``): their learner runs there, or
@@ -967,7 +967,8 @@ class Hub(RunSinks):
 
     def _on_version(self, entry: Any, info_proto: Any) -> None:
         """A learner's ``VersionAnnounce``: accepted only from the agent's learner node and generation (spec 4.5);
-        an accepted version makes the agent collect and goes out with the next ``Announce``."""
+        an accepted version goes out with the next ``Announce`` (the agent collects from its learner's placement on,
+        R36)."""
 
         info = version_from_proto(info_proto)
         if self._learner_node.get(info.agent_id) != entry.number or info.node != entry.number:
@@ -981,7 +982,7 @@ class Hub(RunSinks):
             if info.agent_id not in self._announced_once:
                 self._announced_once.add(info.agent_id)
                 logger.info(f"agent {info.agent_id}: first weights (v{info.version}) published on node "
-                            f"{entry.number}; its seats collect from now on")
+                            f"{entry.number}")
             return
         self._count_drop(entry.number, "dropped_announcements", outcome, f"version announcements of "
                          f"{info.agent_id!r} (v{info.version}, generation {info.generation})")
