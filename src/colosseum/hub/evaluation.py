@@ -85,7 +85,7 @@ class _Entry:
     state: Literal["queued", "leased", "done"] = "queued"
     lease: str | None = None
     attempts: int = 0
-    issued: set[str] = field(default_factory=set)
+    issued: dict[str, int] = field(default_factory=dict)      # every lease that held the block -> its node
 
 
 @dataclass
@@ -104,8 +104,9 @@ class BlockQueue:
     - ``want`` / ``dispatch``: nodes ask for slots (an increment); ``dispatch`` grants one lease per waiting node in
       turn (round robin by node number, continuing after the last node served), so blocks spread over machines.
     - ``complete``: the first complete result of any lease that held the block wins ("accepted"; also after that
-      lease expired), later ones are "late"; a cancelled block's are "cancelled"; a block (or lease) never issued
-      "unknown". Every outcome is counted.
+      lease expired), later ones are "late"; a cancelled block's are "cancelled"; a block (or lease) never issued,
+      or a lease reported by another node than the one it was issued to, "unknown". Every outcome is counted;
+      ``classify`` gives the same verdict without acting (failures and invalid results act only on "live").
     - ``release`` / ``expire`` / ``drop_node`` / ``keep_only``: a block whose lease ended without a result goes back
       to its place in the queue; ``expire`` and counted releases (an evaluator crash, missing weights, invalid
       results) use one of ``max_attempts`` attempts, after which the block fails (``take_failed``); node loss and a
@@ -177,7 +178,7 @@ class BlockQueue:
                           float(now) + float(lease_sec))
             for entry in taken:
                 entry.state, entry.lease = "leased", lease.lease_id
-                entry.issued.add(lease.lease_id)
+                entry.issued[lease.lease_id] = lease.node
             self._leases[lease.lease_id] = _LeaseState(lease, owner, set(lease.block_ids))
             self.counters["leases"] += 1
             self.counters["leased"] += len(taken)
@@ -213,23 +214,37 @@ class BlockQueue:
         entry = self._entries.get(block_id)
         return entry.task if entry is not None and entry.state != "done" else None
 
-    def complete(self, lease_id: str, block_id: str, results: Sequence[MatchResult],
-                 now: float) -> Literal["accepted", "late", "cancelled", "unknown"]:
+    def classify(self, lease_id: str, block_id: str,
+                 node: int | None = None) -> Literal["live", "late", "cancelled", "unknown"]:
+        """What a report of ``block_id`` under ``lease_id`` (from ``node``; None: any node) is, without acting or
+        counting: "live" when the lease was issued for the block (to that node) and the block is not done yet;
+        else "late" (done or failed), "cancelled", or "unknown" (never issued for it, or issued to another node)."""
         entry = self._entries.get(block_id)
-        outcome: Literal["accepted", "late", "cancelled", "unknown"]
         if entry is None:
-            outcome = self._finished.get(block_id, "unknown")  # type: ignore[assignment]
-        elif lease_id not in entry.issued:
-            outcome = "unknown"
-        elif entry.state == "done":
-            outcome = "late"
-        else:
+            return self._finished.get(block_id, "unknown")  # type: ignore[return-value]
+        holder = entry.issued.get(lease_id)
+        if holder is None or (node is not None and holder != int(node)):
+            return "unknown"
+        return "late" if entry.state == "done" else "live"
+
+    def count(self, outcome: str) -> None:
+        """Count a report that was not acted on (``classify``'s "late" / "cancelled" / "unknown")."""
+        self.counters[outcome] += 1
+
+    def complete(self, lease_id: str, block_id: str, results: Sequence[MatchResult], now: float, *,
+                 node: int | None = None) -> Literal["accepted", "late", "cancelled", "unknown"]:
+        verdict = self.classify(lease_id, block_id, node)
+        outcome: Literal["accepted", "late", "cancelled", "unknown"]
+        if verdict == "live":
+            entry = self._entries[block_id]
             if entry.state == "leased":
                 self._drop_from_lease(entry.lease, block_id)
             self._drop_from_lease(lease_id, block_id)
             entry.state, entry.lease = "done", None
             outcome = "accepted"
-        self.counters["completed" if outcome == "accepted" else outcome] += 1
+        else:
+            outcome = verdict
+        self.count("completed" if outcome == "accepted" else outcome)
         return outcome
 
     def _drop_from_lease(self, lease_id: str | None, block_id: str) -> None:
@@ -497,49 +512,66 @@ class HubEvaluation:
 
     # --- messages from nodes ---
     def on_lease_request(self, node: int, free_slots: int) -> None:
-        """``BlockLeaseRequest.free_slots`` (an increment); a node never waits for more leases than its evaluator
-        slots (node data is untrusted)."""
+        """``BlockLeaseRequest.free_slots`` (an increment); a node never holds and waits for more leases together
+        than its evaluator slots (node data is untrusted)."""
         if node in self._slots and self._dispatching:
-            room = self._slots[node] - self.queue.waiting().get(node, 0)
+            room = self._slots[node] - self.queue.waiting().get(node, 0) - len(self.queue.leases_of(node))
             self.queue.want(node, min(int(free_slots), room))
             self._dispatch()
 
     def on_block_result(self, node: int, msg: pb.BlockResult) -> None:
+        """Every ``BlockResult`` is acked. Only a report of a lease issued for the block to this node, while the
+        block is not done, acts (``BlockQueue.classify``); any other report, success or failure, is counted as
+        "late" / "cancelled" / "unknown" and dropped (a node's resend after a hub restart, a stale or foreign
+        lease id). Results go through ``check_block_results``; a failure kind outside ``RETRY_ERRORS`` and
+        ``FATAL_ERRORS`` is invalid like bad results (counted, one WARNING per node, the block replayed)."""
         self._send(node, pb.HubMessage(block_ack=pb.BlockAck(lease_id=msg.lease_id, block_ids=[msg.block_id])))
+        verdict = self.queue.classify(msg.lease_id, msg.block_id, node)
+        if verdict != "live":
+            self.queue.count(verdict)
+            return
         task = self.queue.task(msg.block_id)
+        if task is None:                                 # issued and not done, but no longer queued: not reachable
+            self.queue.count("late")
+            return
         if msg.failed:
-            if task is not None:
-                self._on_failed(node, msg, task)
+            self._on_failed(node, msg, task)
             return
         try:
             results = [result_from_proto(p) for p in msg.results]
         except Exception as e:  # noqa: BLE001 - node data is untrusted (spec 7.1): counted, never fatal
             results, reason = [], f"malformed results ({type(e).__name__})"
         else:
-            reason = check_block_results(task, results, spec=self._spec) if task is not None else None
-        if task is not None and reason is not None:
-            self.invalid_results += 1
-            if node not in self._warned_invalid:
-                self._warned_invalid.add(node)
-                logger.warning(f"evaluation: node {node} sent invalid results for block {msg.block_id} ({reason}); "
-                               f"the block is played again (further invalid results of this node are only counted)")
-            self.queue.release(msg.lease_id, msg.block_id, count=True, reason=f"invalid results ({reason})")
-            self._after_change()
+            reason = check_block_results(task, results, spec=self._spec)
+        if reason is not None:
+            self._invalid(node, msg, f"invalid results ({reason})")
             return
-        if self.queue.complete(msg.lease_id, msg.block_id, results, self._clock()) != "accepted":
+        if self.queue.complete(msg.lease_id, msg.block_id, results, self._clock(), node=node) != "accepted":
             return
         for result in results:
             result.node = node
         self._deliver(task, results)
         self._after_change()
 
+    def _invalid(self, node: int, msg: pb.BlockResult, reason: str) -> None:
+        self.invalid_results += 1
+        if node not in self._warned_invalid:
+            self._warned_invalid.add(node)
+            logger.warning(f"evaluation: node {node} sent {reason} for block {msg.block_id}; the block is played "
+                           f"again (further invalid reports of this node are only counted)")
+        self.queue.release(msg.lease_id, msg.block_id, count=True, reason=f"{reason} from node {node}")
+        self._after_change()
+
     def _on_failed(self, node: int, msg: pb.BlockResult, task: BlockTask) -> None:
         if msg.error_kind in FATAL_ERRORS:
             self._owner_failed(task.owner, msg.error_kind,
                                f"{task.source} block {task.block_id} failed on node {node}: {msg.error}")
-        else:
+        elif msg.error_kind in RETRY_ERRORS:
             self.queue.release(msg.lease_id, msg.block_id, count=msg.error_kind != "abandoned",
-                               reason=f"{msg.error_kind or 'failed'} on node {node}")
+                               reason=f"{msg.error_kind} on node {node}")
+        else:
+            self._invalid(node, msg, f"invalid results (failure kind {msg.error_kind!r})")
+            return
         self._after_change()
 
     def _owner_failed(self, owner: str, kind: str, text: str) -> None:

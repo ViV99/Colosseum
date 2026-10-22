@@ -194,3 +194,19 @@ def test_check_block_results_checks_roles_teams_and_versions():
     junk = _results(t)
     junk[0].seats[0].seat = "zero"
     assert check(junk) is not None                     # never raises on node data
+
+
+def test_leases_are_bound_to_their_node():
+    """Review round 1: a lease id counts only from the node it was issued to; ``classify`` judges without acting."""
+    q = BlockQueue(task_matches=1, new_id=_ids())
+    t = _task("t0")
+    q.submit([t])
+    (lease, _), = q.lease(1, 1, 0.0, 5.0)
+    assert q.classify(lease.lease_id, "t0", 1) == "live" and q.classify(lease.lease_id, "t0") == "live"
+    assert q.classify(lease.lease_id, "t0", 2) == "unknown" and q.classify("nope", "t0", 1) == "unknown"
+    assert q.complete(lease.lease_id, "t0", _results(t), 1.0, node=2) == "unknown"
+    assert q.stats()["unknown"] == 1 and q.leases_of(1) == [lease.lease_id]
+    assert q.complete(lease.lease_id, "t0", _results(t), 1.0, node=1) == "accepted"
+    assert q.classify(lease.lease_id, "t0", 1) == "late"
+    q.forget("tournament:t")
+    assert q.classify(lease.lease_id, "t0", 1) == "late" and q.classify("x", "never", 1) == "unknown"

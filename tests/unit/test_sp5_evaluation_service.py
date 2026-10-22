@@ -199,3 +199,98 @@ def test_stats_have_every_key():
     assert set(ev.stats()) == {"queued", "leased_now", "leases_now", "submitted", "leases", "leased", "completed",
                                "late", "cancelled", "unknown", "expired", "requeued", "failed", "cancelled_blocks",
                                "invalid_results", "evaluators", "pulse_results"}
+
+
+def _pulse_tasks(n):
+    return [BlockTask(t.block_id, "pulse", "pulse:a:ckpt_v1", t.lineups, t.players, 1, False, 1) for t in _tasks(n)]
+
+
+def test_a_fatal_failure_acts_only_on_a_lease_issued_to_that_node():
+    """Review round 1: a failed report with a never-issued or another node's lease id is counted and dropped (a
+    resend of an old hub's lease after a restart must not stop the run); the holder's own report acts."""
+    rec, stops = Recorder(), []
+    ev = _service(rec, fail_run=stops.append)
+    ev.node_joined(1, slots=1, held_leases=[], fresh=True)
+    ev.node_joined(2, slots=1, held_leases=[], fresh=True)
+    ev.queue.submit(_pulse_tasks(2))
+    ev.on_lease_request(1, 1)
+    ((_n, lease),) = rec.of("lease")
+    block = lease.blocks[0].block_id
+    for lease_id, sender in (("never-issued", 2), (lease.lease_id, 2), ("never-issued", 1)):
+        ev.on_block_result(sender, pb.BlockResult(lease_id=lease_id, block_id=block, failed=True,
+                                                  error_kind="contract", error="forged"))
+    assert stops == [] and ev.queue.stats()["unknown"] == 3 and ev.queue.live("pulse:a:ckpt_v1") == 2
+    assert len(rec.of("block_ack")) == 3                                     # acked all the same
+    ev.on_block_result(1, pb.BlockResult(lease_id=lease.lease_id, block_id=block, failed=True,
+                                         error_kind="contract", error="a real contract error"))
+    assert len(stops) == 1 and "a real contract error" in stops[0] and ev.queue.live("pulse:a:ckpt_v1") == 0
+
+
+def test_a_result_from_another_node_is_refused():
+    rec = Recorder()
+    ev = _service(rec)
+    ev.add_owner(OWNER, lambda *a: rec.sink.append(a))
+    ev.node_joined(1, slots=1, held_leases=[], fresh=True)
+    ev.node_joined(2, slots=1, held_leases=[], fresh=True)
+    ev.submit(_tasks(2))
+    ev.on_lease_request(1, 1)
+    ((_n, lease),) = rec.of("lease")
+    ev.on_block_result(2, _result_msg(lease.lease_id, lease.blocks[0]))
+    ev.on_block_result(2, _result_msg(lease.lease_id, lease.blocks[1], drop=1))     # not even counted invalid
+    assert rec.sink == [] and ev.queue.stats()["unknown"] == 2 and ev.invalid_results == 0
+    assert ev.queue.leases_of(1) == [lease.lease_id] and ev.queue.queued() == 0     # node 1's lease untouched
+    ev.on_block_result(1, _result_msg(lease.lease_id, lease.blocks[0]))
+    assert [k for k, _b, _r in rec.sink] == ["block"] and {r.node for r in rec.sink[0][2]} == {1}
+
+
+def test_a_node_holds_no_more_leases_than_its_evaluator_slots():
+    rec = Recorder()
+    ev = _service(rec)
+    ev.add_owner(OWNER, lambda *a: rec.sink.append(a))
+    ev.node_joined(1, slots=1, held_leases=[], fresh=True)
+    ev.submit(_tasks(10))
+    for _ in range(5):
+        ev.on_lease_request(1, 1)
+    ev.on_lease_request(1, 7)
+    assert len(rec.of("lease")) == 1 and ev.queue.waiting() == {}
+    ((_n, lease),) = rec.of("lease")
+    for spec in lease.blocks:                                              # the lease is done: room again
+        ev.on_block_result(1, _result_msg(lease.lease_id, spec))
+    ev.on_lease_request(1, 3)
+    assert len(rec.of("lease")) == 2
+
+
+def test_failures_of_blocks_that_are_not_live_are_counted():
+    rec = Recorder()
+    ev = _service(rec)
+    ev.add_owner(OWNER, lambda *a: rec.sink.append(a))
+    ev.node_joined(1, slots=1, held_leases=[], fresh=True)
+    ev.submit(_tasks(2))
+    ev.on_lease_request(1, 1)
+    ((_n, lease),) = rec.of("lease")
+    first, second = lease.blocks
+    ev.on_block_result(1, _result_msg(lease.lease_id, first))
+    ev.on_block_result(1, pb.BlockResult(lease_id=lease.lease_id, block_id=first.block_id, failed=True,
+                                         error_kind="crash"))                  # after its result: late
+    ev.cancel(OWNER)
+    ev.on_block_result(1, pb.BlockResult(lease_id=lease.lease_id, block_id=second.block_id, failed=True,
+                                         error_kind="player"))                 # after the cancel: cancelled
+    stats = ev.queue.stats()
+    assert (stats["late"], stats["cancelled"], stats["requeued"]) == (1, 1, 0)
+    assert [k for k, _b, _r in rec.sink] == ["block"]
+
+
+def test_an_unknown_failure_kind_is_invalid(caplog):
+    rec = Recorder()
+    ev = _service(rec)
+    ev.add_owner(OWNER, lambda *a: rec.sink.append(a))
+    ev.node_joined(1, slots=1, held_leases=[], fresh=True)
+    ev.submit(_tasks(2))
+    ev.on_lease_request(1, 1)
+    ((_n, lease),) = rec.of("lease")
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.evaluation"):
+        for spec, kind in zip(lease.blocks, ("", "garbage")):
+            ev.on_block_result(1, pb.BlockResult(lease_id=lease.lease_id, block_id=spec.block_id, failed=True,
+                                                 error_kind=kind))
+    assert ev.invalid_results == 2 and ev.queue.queued() == 2 and rec.sink == []
+    assert len([r for r in caplog.records if "failure kind" in r.getMessage()]) == 1
