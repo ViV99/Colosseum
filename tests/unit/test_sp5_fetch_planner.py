@@ -112,3 +112,13 @@ def test_announcements_never_go_back_but_a_new_address_replaces_the_source():
 def test_the_interval_must_be_positive():
     with pytest.raises(ValueError):
         FetchPlanner(node=1, sync_interval_sec=0)
+
+
+def test_a_new_digest_of_the_same_version_replaces_the_source_and_skipped_agents_wait():
+    p = _planner()
+    assert p.on_version(_info(version=5)) is True
+    assert p.on_version(VersionInfo(agent_id="main", generation=1, version=5, size=10, digest="e", node=2,
+                                    addresses=("10.0.0.2:47102",))) is True
+    assert p.known("main").digest == "e"
+    assert p.due({}, hub_online=True, now=0.0, skip={"main"}) == []      # e.g. its version did not fit
+    assert [j.agent_id for j in p.due({}, hub_online=True, now=0.0)] == ["main"]

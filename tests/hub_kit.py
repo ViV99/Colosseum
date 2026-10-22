@@ -591,7 +591,7 @@ def lineup_hub(config, tmp_path: Path, *, mode: str = "hub", sinks: bool = False
 
 def open_node(hub, *, name: str = "n", workers: int = 2, envs: int | None = None, cpu_learners: int = 1,
               no_learners: bool = False, session_id: str | None = None, last_acked: int = 0,
-              node_id: str | None = None) -> RecordingHandle:
+              node_id: str | None = None, data_addresses: Sequence[str] = ()) -> RecordingHandle:
     """Register a node in the hub's node book (unless ``node_id`` names one) and open a session on the real
     ``Hub._on_session_opened``; returns its recording handle."""
     import uuid
@@ -606,7 +606,7 @@ def open_node(hub, *, name: str = "n", workers: int = 2, envs: int | None = None
     hello = pb.Hello(node_id=node_id, session_id=handle.session_id, protocol_major=PROTOCOL_VERSION[0],
                      protocol_minor=PROTOCOL_VERSION[1], last_acked_seq=last_acked,
                      slots=pb.Slots(workers=workers, cpu_learners=cpu_learners, no_learners=no_learners,
-                                    envs_per_worker=envs))
+                                    envs_per_worker=envs), data_addresses=list(data_addresses))
     hub._on_session_opened(SessionOpened(handle, hello))
     return handle
 

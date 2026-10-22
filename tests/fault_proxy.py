@@ -13,11 +13,17 @@ bound); until then connections are closed at once. Faults:
   "unreachable within connect_timeout_sec" case of spec 4.8) until ``restore()``;
 - ``restore()``: normal forwarding (also ends a delay).
 ``connections_seen`` counts accepted connections, ``bytes_forwarded`` the bytes moved. ``close()`` stops
-everything; use it as a context manager. No wall clock, no sleeps longer than 50 ms per loop.
+everything; use it as a context manager. No wall clock, no sleeps longer than 50 ms per loop (besides ``delay``).
+
+The forwarding sockets stay blocking: a pipe waits for data with ``select`` (50 ms slices, so it notices ``close``)
+and forwards it with a blocking ``sendall``, so a slow receiver backpressures the sender through the proxy as it
+would on a direct connection (a timeout on the socket would also apply to the other direction's ``sendall`` and
+turn backpressure into a cut). ``shutdown`` in a cut unblocks a stuck ``sendall``.
 """
 
 from __future__ import annotations
 
+import select
 import socket
 import threading
 import time
@@ -111,7 +117,8 @@ class TcpFaultProxy:
                 continue
             except OSError:
                 return
-            self.connections_seen += 1
+            self.connections_seen += 1                 # only this thread writes it
+            client.settimeout(None)
             mode, _ = self._state()
             with self._lock:
                 target = self._target
@@ -124,6 +131,7 @@ class TcpFaultProxy:
                 continue
             try:
                 upstream = socket.create_connection(target, timeout=2.0)
+                upstream.settimeout(None)                # blocking from now on (module docstring)
             except OSError:
                 client.close()
                 continue
@@ -134,12 +142,11 @@ class TcpFaultProxy:
 
     def _pipe(self, src: socket.socket, dst: socket.socket) -> None:
         try:
-            src.settimeout(_POLL_SEC)                    # the socket may be closed already (a cut): OSError
             while not self._closed.is_set():
-                try:
-                    data = src.recv(_BUF)
-                except TimeoutError:
+                ready, _, _ = select.select([src], [], [], _POLL_SEC)
+                if not ready:
                     continue
+                data = src.recv(_BUF)
                 if not data:
                     break
                 mode, delay = self._state()
@@ -148,10 +155,13 @@ class TcpFaultProxy:
                 if delay > 0:
                     time.sleep(delay)
                 dst.sendall(data)
-                self.bytes_forwarded += len(data)
-        except OSError:
+                with self._lock:
+                    self.bytes_forwarded += len(data)
+        except (OSError, ValueError):                    # closed by a cut (ValueError: select on a closed socket)
             pass
         finally:
+            with self._lock:
+                self._conns = [c for c in self._conns if c is not src and c is not dst]
             for s in (src, dst):
                 try:
                     s.close()

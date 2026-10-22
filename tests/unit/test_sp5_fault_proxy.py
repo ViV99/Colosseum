@@ -94,3 +94,46 @@ def test_a_target_set_later_is_used_from_then_on(echo):
         assert not _roundtrip(proxy.port)                            # no target yet: closed at once
         proxy.set_target(("127.0.0.1", echo))
         assert _roundtrip(proxy.port) == b"ping"
+
+
+def test_a_slow_receiver_backpressures_instead_of_cutting():
+    """A target that does not read for a while (a backpressuring learner) only slows the sender down: nothing is cut,
+    every byte arrives (review round 1: a socket timeout used to turn a ``sendall`` blocked for 50 ms into a cut)."""
+    total = 16 * 2**20                                            # more than the socket buffers on the way hold
+    server = socket.socket()
+    server.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 1 << 18)
+    server.bind(("127.0.0.1", 0))
+    server.listen()
+    got = []
+    paused = threading.Event()
+
+    def sink():
+        conn, _ = server.accept()
+        with conn:
+            paused.wait(10)                                       # nothing read until the proxy is stuck a while
+            n = 0
+            while n < total:
+                data = conn.recv(1 << 16)
+                if not data:
+                    break
+                n += len(data)
+            got.append(n)
+
+    reader = threading.Thread(target=sink, daemon=True)
+    reader.start()
+    try:
+        with TcpFaultProxy(("127.0.0.1", server.getsockname()[1])) as proxy:
+            def release():
+                while proxy.bytes_forwarded == 0 and not paused.is_set():
+                    time.sleep(0.01)
+                time.sleep(0.3)                                   # the proxy's sendall waits far beyond 50 ms
+                paused.set()
+
+            threading.Thread(target=release, daemon=True).start()
+            with socket.create_connection(("127.0.0.1", proxy.port), timeout=10) as s:
+                s.sendall(b"x" * total)
+                reader.join(15)
+            assert got == [total] and proxy.bytes_forwarded == total
+    finally:
+        paused.set()
+        server.close()

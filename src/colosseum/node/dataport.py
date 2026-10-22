@@ -145,8 +145,11 @@ class DataServer(pbg.NodeDataServicer):
 
     def start(self, port: int, *, credentials: grpc.ServerCredentials | None, host: str = "0.0.0.0") -> int:
         """Bind ``port`` (or the next free one, ``DATA_PORT_TRIES`` in all; 0 = ephemeral) on ``host`` and start
-        serving. ``credentials`` None means plain (``--insecure``: the token secret is checked per call). Raises
+        serving. ``credentials`` None means plain, which only an ``insecure`` server may do (the token secret is then
+        checked per call; a TLS server without credentials would serve plain without any check: ValueError). Raises
         ``OSError`` when no port could be bound."""
+        if credentials is None and not self._insecure:
+            raise ValueError("a data port without --insecure needs TLS credentials (data_server_credentials)")
         interceptors = [] if credentials is None else [DataPortInterceptor(self._peer_allowed)]
         candidates = [0] if int(port) == 0 else range(int(port), int(port) + DATA_PORT_TRIES)
         for candidate in candidates:
@@ -232,20 +235,22 @@ class DataServer(pbg.NodeDataServicer):
 
 def open_data_port(*, port: int, hub_host: str, insecure: bool, token_secret: str, identity: Any, cache: Any,
                    own_agents: Callable[[], Collection[str]], banned: Callable[[], Collection[str]],
-                   max_message_mb: int, node: int,
-                   announced: Sequence[str] | None = None) -> tuple[DataServer, tuple[str, ...]] | None:
+                   max_message_mb: int, node: int, announced: Sequence[str] | None = None,
+                   local: bool = False) -> tuple[DataServer, tuple[str, ...]] | None:
     """A node's data port (``NodeAgent``, item 11): mutual TLS with the node's certificate (``identity``, a
     ``NodeIdentity`` with its CA in ``ca.crt``), or plain + the token secret (``insecure``); bound on loopback when the
     hub is on loopback, else on every interface (pre-flight ruling P-PF3-21), at ``port`` or the next free one.
     Returns the started server and the addresses to announce (``announced``, else ``data_addresses``); None after one
-    WARNING when it cannot be opened (no node certificate: ``train``'s local node; no free port)."""
+    WARNING when it cannot be opened (no node certificate, no free port). ``local``: ``train``'s node, which has no
+    node certificate until T3.2 (ruling R30: its learners are relay-only for remote nodes; an INFO, not a WARNING)."""
     from colosseum.net.security import data_server_credentials
 
     hint = "other machines reach this node's learners only through the hub"
     credentials = None
     if not insecure:
         if identity is None or identity.cert_pem is None:
-            logger.warning(f"node: no data port: this node has no node certificate; {hint}")
+            logger.log(logging.INFO if local else logging.WARNING,
+                       f"node: no data port: this node has no node certificate; {hint}")
             return None
         try:
             credentials = data_server_credentials(identity, (identity.path / "ca.crt").read_bytes())
@@ -315,11 +320,12 @@ class FetchedLatest:
     teacher_active: bool
     frame: bytes
     source: str            # "direct" | "relay"
+    digest: str = ""       # blake2b-16 of the frame (checked against the reply's metadata)
 
 
 def check_fetched(agent_id: str, frame: bytes, meta: dict, source: str) -> FetchedLatest:
-    """Hostile-input checks of a fetched latest frame (spec 3.4): the digest of the bytes, the frame header's agent
-    and version against the reply's metadata."""
+    """Hostile-input checks of a fetched latest frame (spec 3.4, 4.6 "checked on arrival"): the digest of the bytes,
+    the frame header's agent, kind, version, generation and ``teacher_active`` against the reply's metadata."""
     try:
         version, generation = int(meta["version"]), int(meta["generation"])
         digest, teacher_active = str(meta["digest"]), bool(meta.get("teacher_active", False))
@@ -332,10 +338,13 @@ def check_fetched(agent_id: str, frame: bytes, meta: dict, source: str) -> Fetch
     except FrameError as e:
         raise FetchError("invalid", f"frame header: {e}") from e
     if (kind != "weights" or header.get("agent_id") != agent_id or header.get("kind") != "latest"
-            or int(header.get("policy_version", -1)) != version):
-        raise FetchError("invalid", f"frame of {header.get('agent_id')!r} v{header.get('policy_version')} for "
-                                    f"{agent_id!r} v{version}")
-    return FetchedLatest(agent_id, version, generation, teacher_active, frame, source)
+            or header.get("policy_version") != version or header.get("generation") != generation
+            or bool(header.get("teacher_active")) != teacher_active):
+        raise FetchError("invalid", f"frame of {header.get('agent_id')!r} v{header.get('policy_version')} "
+                                    f"(generation {header.get('generation')}, teacher_active "
+                                    f"{header.get('teacher_active')}) for {agent_id!r} v{version} (generation "
+                                    f"{generation}, teacher_active {teacher_active})")
+    return FetchedLatest(agent_id, version, generation, teacher_active, frame, source, digest)
 
 
 def read_latest_reply(parts: Iterator[pb.BlobPart], agent_id: str, *, max_message_mb: int,

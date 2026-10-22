@@ -51,7 +51,7 @@ __all__ = [
     "DROP_REASONS", "EPOCH_BLOCK", "EVICTED_HOLD_FACTOR", "HUB_STATE_FILE", "HUB_STATE_VERSION", "BudgetCounter",
     "CellEntry", "CellKey", "CellTable", "EpochAllocator", "HubStateData", "NodeEntry", "NodeHello", "NodeRegistry",
     "OwnerRotation", "ResultIntake", "VersionInfo", "VersionRegistry", "load_hub_state", "restrict_collecting",
-    "save_hub_state", "version_source",
+    "save_hub_state", "version_source", "check_data_addresses", "DATA_ADDRESSES_MAX", "DATA_ADDRESS_CHARS_MAX",
 ]
 
 EPOCH_BLOCK = 1024                   # R7: epochs reserved per hub_state.json write
@@ -482,6 +482,20 @@ class VersionRegistry:
                 gen_max=int(s.get("gen_max", -1)), caps={int(g): int(c) for g, c in s.get("caps", {}).items()},
                 latest=None if s.get("latest") is None else VersionInfo.from_dict(s["latest"]))
         return reg
+
+
+DATA_ADDRESSES_MAX = 16                  # a node announces at most this many data-port addresses (T3.1)
+DATA_ADDRESS_CHARS_MAX = 255
+
+
+def check_data_addresses(addresses: Iterable[str]) -> tuple[str, ...] | None:
+    """A node's announced data-port addresses (``DataAddresses`` or ``Hello.data_addresses``) if they are within the
+    bounds (at most ``DATA_ADDRESSES_MAX`` non-empty strings of at most ``DATA_ADDRESS_CHARS_MAX`` characters), else
+    None: every node would probe each of them (spec 3.4: hostile input is bounded)."""
+    out = tuple(str(a) for a in addresses)
+    if len(out) > DATA_ADDRESSES_MAX or any(not a or len(a) > DATA_ADDRESS_CHARS_MAX for a in out):
+        return None
+    return out
 
 
 def version_source(info: VersionInfo, entry: NodeEntry) -> VersionInfo:

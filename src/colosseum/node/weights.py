@@ -227,6 +227,10 @@ class WeightCacheWriter:
         self.prefix = prefix
         self.root.mkdir(parents=True, exist_ok=True)
 
+    def has_space(self, size: int) -> bool:
+        """Whether a segment of ``size`` bytes would pass the free-space check now."""
+        return shutil.disk_usage(self.root).free >= 2 * int(size) + SPACE_MARGIN_BYTES
+
     def _check_space(self, size: int) -> None:
         free = shutil.disk_usage(self.root).free
         if free < 2 * size + SPACE_MARGIN_BYTES:

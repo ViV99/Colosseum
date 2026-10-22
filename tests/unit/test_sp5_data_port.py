@@ -176,3 +176,20 @@ def test_a_fetched_frame_is_checked_against_its_metadata():
     with pytest.raises(FetchError) as e:
         check_fetched("main", garbage, {**meta, "digest": frame_digest(garbage)}, "direct")
     assert e.value.reason == "invalid"
+
+
+def test_a_tls_data_port_without_credentials_is_refused(tmp_path, pki):
+    srv = DataServer(cache=_cache(tmp_path), own_agents=lambda: {"main"}, max_message_mb=MAX_MB, insecure=False,
+                     token_secret="sekret", node=1)
+    with pytest.raises(ValueError, match="TLS credentials"):
+        srv.start(0, credentials=None, host="127.0.0.1")       # would serve plain gRPC without any peer check
+    assert srv.port is None
+
+
+@pytest.mark.parametrize("field, value", [("generation", 2), ("teacher_active", True)])
+def test_a_frame_whose_header_disagrees_with_the_metadata_is_invalid(field, value):
+    f = _frame(5)                                              # generation 1, teacher_active False
+    meta = {"version": 5, "generation": 1, "digest": frame_digest(f), "teacher_active": False, field: value}
+    with pytest.raises(FetchError) as e:
+        check_fetched("main", f, meta, "direct")
+    assert e.value.reason == "invalid"

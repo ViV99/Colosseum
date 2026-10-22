@@ -877,7 +877,9 @@ class NodeAgent:
             raise
         self._run_serial += 1
         self._run = run
-        self.fetches.start_run(number=number, sync_interval_sec=float(config.rollout.weight_sync_interval_sec),
+        # rollout.weight_sync_interval_sec 0 ("every step", SP1-SP4): the planner then checks at the pump's cadence
+        sync_sec = max(float(config.rollout.weight_sync_interval_sec), FETCH_PUMP_SEC)
+        self.fetches.start_run(number=number, sync_interval_sec=sync_sec,
                                link=NodeFetcher.link(insecure=self.options.insecure,
                                                      token_secret=self.options.token.secret,
                                                      identity=self._node_identity,
@@ -910,7 +912,7 @@ class NodeAgent:
             hub_host=_split_address(opts.hub_address)[0], insecure=opts.insecure, token_secret=opts.token.secret,
             identity=self._node_identity, cache=run.reader, own_agents=lambda: self._own_learners,
             banned=lambda: self._banned, max_message_mb=int(dist.max_message_mb), node=run.number,
-            announced=opts.data_addresses)
+            announced=opts.data_addresses, local=opts.local)
         if opened is None:
             return
         self._data_server, addresses = opened

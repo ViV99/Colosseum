@@ -9,7 +9,13 @@ from __future__ import annotations
 
 import json
 
+import grpc
+
 from cluster_kit import cluster, cluster_config, hub_counter, journal_results_by_node, journal_rows, wait_until
+from colosseum.net.grpc_util import channel_options
+from colosseum.net.proto import colosseum_v1_pb2 as pb
+from colosseum.net.security import NODE_SERVER_NAME, NodeIdentity, data_channel_credentials
+from colosseum.node.dataport import FetchError, fetch_latest
 from colosseum.node.weights import WeightCacheReader, blob_key, shm_dir
 from game_helpers import write_ckpt_dir
 
@@ -66,4 +72,37 @@ def test_teacher_and_init_blobs_reach_a_second_node(tmp_path):
         assert init in b.agent._run.fixed_keys                    # listed in b's Welcome.fixed ...
         assert not _cache(b).has(init)                            # ... but fetched only by the learner's node
         assert _cache(a).has(init) and _cache(a).has(teacher)
+        assert hub.stop() == 0
+
+
+def test_a_ban_in_an_announce_closes_the_learner_nodes_data_port_to_that_node(tmp_path):
+    """``Announce.banned_node_ids`` (T6.3 fills it) reaches the data port's deny-list (review round 1)."""
+    config = cluster_config(tmp_path, {"agents.main": {},
+                                       "agents.random": {"kind": "scripted", "class": "colosseum.players.RandomBot"},
+                                       **ANCHORS_ONLY})
+    with cluster(tmp_path, config, NODES, learner_first="main") as (hub, (a, b)):
+        assert wait_until(lambda: b.agent.fetch_history() == {"main": [0]}, 120)
+        b_identity = NodeIdentity.load_or_create(hub.token.ca_fingerprint, tmp_path / "nodes" / "b")
+        credentials = data_channel_credentials(b_identity, (b_identity.path / "ca.crt").read_bytes())
+
+        def get_latest():
+            channel = grpc.secure_channel(f"127.0.0.1:{a.agent.data_port()}", credentials,
+                                          channel_options(64, server_name=NODE_SERVER_NAME))
+            try:
+                return fetch_latest(channel, "main", -1, max_message_mb=64, timeout=10)
+            finally:
+                channel.close()
+
+        def refused():
+            try:
+                get_latest()
+            except FetchError as e:
+                return "PERMISSION_DENIED" in str(e)
+            return False
+
+        assert get_latest().version == 0                       # b's certificate is served
+        a_id = hub.hub._registry.get(a.agent.number).node_id
+        hub.hub._sessions[a_id].send(pb.HubMessage(announce=pb.Announce(banned_node_ids=[b_identity.node_id])))
+        assert wait_until(refused, 30)
+        assert wait_until(lambda: a.agent.counters()["data_port.peer_refused"] >= 1, 10)
         assert hub.stop() == 0

@@ -90,3 +90,21 @@ def test_evictions_wait_for_a_lost_node_and_reach_it_with_its_welcome(tmp_path):
     assert [(e.agent_id, e.checkpoint_id) for e in back.of("welcome")[0].evictions] == [("a", "ckpt_v5")]
     hub._broadcast_announce()
     assert not back.of("announce")[-1].evictions
+
+
+def test_hello_data_addresses_have_the_same_bounds(tmp_path, caplog):
+    hub = _hub(tmp_path)
+    learner = open_node(hub, name="learner", data_addresses=["10.0.0.2:47102"])
+    other = open_node(hub, name="other", cpu_learners=0, no_learners=True)
+    number = hub._learner_node["a"]
+    _announce(hub, learner, 0, number)
+    hub._broadcast_announce()
+    assert _announced(other)[-1].addresses == ("10.0.0.2:47102",)
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):     # the learner node reconnects
+        back = open_node(hub, node_id=learner.node_id, session_id=learner.session_id,
+                         data_addresses=[f"10.0.0.{i}:1" for i in range(17)])
+    hub._broadcast_announce()
+    assert hub._registry.by_id(back.node_id).data_addresses == ()
+    assert hub._book.get("node_messages.invalid") == 1 and "node_messages.invalid" in caplog.text
+    last = _announced(other)[-1]
+    assert (last.version, last.relay_only, last.addresses) == (0, True, ())   # nothing over the bound goes out

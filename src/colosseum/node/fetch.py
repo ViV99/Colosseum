@@ -21,7 +21,13 @@ Rules (``FetchPlanner.due``):
   since_version)``) once per interval for every referenced or never-cached agent whose source has data addresses;
   a learner reachable only through the relay gets no polls (spec 4.5: weights of such a learner need the hub);
 - a result never lowers the cached version (versions only grow, R9): a version at or below the cached one is
-  recorded as redundant (counted; criterion 4 expects zero).
+  recorded as redundant (counted; criterion 4 expects zero);
+- ``skip`` agents are left out (``NodeFetcher``: a version that did not fit into a full cache is not fetched again
+  until space frees or a newer version is announced).
+
+A fetched frame of the announced version must carry the digest the hub announced (the authenticity anchor of a
+direct fetch: a peer at a data-port address cannot substitute other weights for an announced version); its header
+must agree with the reply's metadata (``dataport.check_fetched``). Refusals count as failed fetches.
 
 ``NodeFetcher`` runs the transfers in the node's transfer pool; its threads touch no main-loop state: they post
 ``BlobFetched`` / ``LatestFetched`` / ``LatestFetchFailed`` into the node inbox, and the main loop decides what the
@@ -34,7 +40,7 @@ from __future__ import annotations
 import logging
 import math
 import threading
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Literal, Protocol
@@ -57,6 +63,7 @@ class VersionLike(Protocol):        # colosseum.hub.state.VersionInfo
     agent_id: str
     generation: int
     version: int
+    digest: str
     node: int
     addresses: tuple[str, ...]
     relay_only: bool
@@ -114,13 +121,15 @@ class FetchPlanner:
 
     def on_version(self, info: VersionLike) -> bool:
         """Remember ``info`` if it is newer than what is known for its agent, or the same version from a new place
-        (new addresses after the learner node rebound its data port). Returns True when it was taken."""
+        (new addresses after the learner node rebound its data port) or with another digest. Returns True when it was
+        taken."""
         known = self._known.get(info.agent_id)
         if known is not None:
             if info.version < known.version:
                 return False
-            if info.version == known.version and (info.node, tuple(info.addresses), info.relay_only) == (
-                    known.node, tuple(known.addresses), known.relay_only):
+            if info.version == known.version and (info.node, tuple(info.addresses), info.relay_only,
+                                                  info.digest) == (known.node, tuple(known.addresses),
+                                                                   known.relay_only, known.digest):
                 return False
         self._known[info.agent_id] = info
         return True
@@ -148,12 +157,14 @@ class FetchPlanner:
     def in_flight(self, agent_id: str) -> bool:
         return agent_id in self._in_flight
 
-    def due(self, cached: Mapping[str, int], *, hub_online: bool, now: float) -> list[FetchJob]:
+    def due(self, cached: Mapping[str, int], *, hub_online: bool, now: float,
+            skip: Collection[str] = ()) -> list[FetchJob]:
         """Transfers to start now; each returned job is marked in flight (``finished`` / ``failed`` end it)."""
         jobs: list[FetchJob] = []
         for agent_id in sorted(self._known):
             info = self._known[agent_id]
-            if agent_id in self._local or info.node == self._node or agent_id in self._in_flight:
+            if (agent_id in self._local or info.node == self._node or agent_id in self._in_flight
+                    or agent_id in skip):
                 continue
             if now < self._next_try.get(agent_id, -math.inf):
                 continue
@@ -257,6 +268,7 @@ class NodeFetcher:
         self._channels_lock = threading.Lock()
         self._channels: dict[tuple, tuple[str, grpc.Channel]] = {}   # (node, addresses) -> (address, channel)
         self._warned: set[tuple[str, str]] = set()      # (agent, reason) of latest failures warned in this run
+        self._full: dict[str, tuple[int, int]] = {}     # agent -> (version, size) that did not fit into the cache
 
     # ---- setup ----------------------------------------------------------------------------------------------
 
@@ -268,6 +280,7 @@ class NodeFetcher:
         self.planner = FetchPlanner(node=number, sync_interval_sec=sync_interval_sec, stats=self.stats)
         self._link = link
         self._warned.clear()
+        self._full.clear()
 
     def clear_run(self) -> None:
         """The run was released: its transfers are forgotten (they were cancelled and waited for)."""
@@ -382,7 +395,14 @@ class NodeFetcher:
             have = run.reader.latest_version(agent)
             if have is not None:
                 cached[agent] = int(have[0])
-        for job in planner.due(cached, hub_online=hub_online, now=now):
+        skip = set()
+        for agent, (version, size) in list(self._full.items()):
+            known = planner.known(agent)
+            if (known is not None and known.version > version) or run.writer.has_space(size):
+                del self._full[agent]                   # a newer version, or space again: fetch as usual
+            else:
+                skip.add(agent)
+        for job in planner.due(cached, hub_online=hub_online, now=now, skip=skip):
             future = self._submit(self._latest_job, job, run.serial)
             self._latest[job.agent_id] = future
             serial, agent = run.serial, job.agent_id
@@ -410,12 +430,16 @@ class NodeFetcher:
         if probed is None:
             return None
         with self._channels_lock:
-            stale = [k for k in self._channels if k[0] == key[0] and k != key]
-            old = [self._channels.pop(k)[1] for k in stale]
-            self._channels[key] = probed
+            hit = self._channels.get(key)
+            if hit is None:                              # this thread's probe wins; older places of the node go
+                stale = [k for k in self._channels if k[0] == key[0] and k != key]
+                old = [self._channels.pop(k)[1] for k in stale]
+                self._channels[key] = hit = probed
+            else:                                        # another transfer probed the same place meanwhile
+                old = [probed[1]]
         for channel in old:
             channel.close()
-        return probed[1]
+        return hit[1]
 
     def _drop_channel(self, source: Any) -> None:
         key = (int(source.node), tuple(source.addresses))
@@ -452,13 +476,20 @@ class NodeFetcher:
             self._drop_channel(job.source)
             self._post(LatestFetchFailed(agent, e.reason, str(e), serial))
             return
+        source = job.source
+        if (fetched is not None and job.mode == "announced" and fetched.version == source.version
+                and source.digest and fetched.digest != source.digest):
+            self._drop_channel(source)
+            self._post(LatestFetchFailed(agent, "digest", f"v{fetched.version} from {', '.join(source.addresses)} "
+                                         f"is not the version the hub announced (digest)", serial))
+            return
         self._post(LatestFetched(agent, fetched, serial))
 
     def latest_done(self, run: Any, ev: LatestFetched) -> Literal["published", "kept", "failed"]:
         """Main loop: a latest transfer of the current run ended. A newer version is published into the cache
         (byte for byte the learner's frame, with its ``teacher_active``); ``kept``: not modified or not newer;
-        ``failed``: it could not be published (cache full: ERROR with the hint, once per run; a frame the cache
-        refuses: WARNING)."""
+        ``failed``: it could not be published (cache full: ERROR with the hint, once per run, and that version is not
+        fetched again until space frees or a newer one is announced; a frame the cache refuses: WARNING)."""
         from colosseum.node.weights import CacheFullError
 
         self._latest.pop(ev.agent_id, None)
@@ -474,6 +505,7 @@ class NodeFetcher:
                                       generation=int(fetched.generation), teacher_active=bool(fetched.teacher_active))
         except CacheFullError as e:
             planner.failed(ev.agent_id)
+            self._full[ev.agent_id] = (int(fetched.version), len(fetched.frame))
             if ("cache_full", "") not in self._warned:
                 self._warned.add(("cache_full", ""))
                 logger.error(f"node: the weights of agent {ev.agent_id} v{fetched.version} do not fit: {e}")

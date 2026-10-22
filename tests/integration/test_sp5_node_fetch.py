@@ -28,11 +28,11 @@ LEARNER_NODE = 7
 SYNC_SEC = 0.5
 
 
-def _config(tmp_path):
+def _config(tmp_path, sync_sec=SYNC_SEC):
     return cluster_config(tmp_path, {"agents.main": "{}",
                                      "agents.random": "{kind: scripted, class: colosseum.players.RandomBot}",
                                      "rollout.envs_per_worker": 2,
-                                     "rollout.weight_sync_interval_sec": SYNC_SEC})
+                                     "rollout.weight_sync_interval_sec": sync_sec})
 
 
 class LearnerNode:
@@ -55,10 +55,10 @@ class LearnerNode:
         self.writer.publish_latest("main", frame, version=version, generation=1, teacher_active=teacher_active)
         self.frames[version] = frame
 
-    def info(self, version, *, address=None, teacher_active=False):
+    def info(self, version, *, address=None, teacher_active=False, digest=None):
         return version_to_proto(VersionInfo(
             agent_id="main", generation=1, version=version, size=len(self.frames[version]),
-            digest=frame_digest(self.frames[version]), node=LEARNER_NODE,
+            digest=digest or frame_digest(self.frames[version]), node=LEARNER_NODE,
             addresses=(address or f"127.0.0.1:{self.port}",), teacher_active=teacher_active))
 
 
@@ -66,12 +66,13 @@ class LearnerNode:
 def setup(tmp_path):
     started = []
 
-    def make(*, workers=1, grant=True, address=None, first_teacher_active=False):
-        config = _config(tmp_path)
+    def make(*, workers=1, grant=True, address=None, first_teacher_active=False, sync_sec=SYNC_SEC, digest=None):
+        config = _config(tmp_path, sync_sec)
         hub = FakeHub(tmp_path, config, ttl_sec=1.0)
         learner = LearnerNode(tmp_path, config, hub.token.secret)
         learner.publish(1, teacher_active=first_teacher_active)
-        hub.welcome(versions=[learner.info(1, address=address, teacher_active=first_teacher_active)])
+        hub.welcome(versions=[learner.info(1, address=address, teacher_active=first_teacher_active,
+                                           digest=digest)])
         if grant:
             hub.grant(lambda worker, env: LINEUP)
         node = run_node_in_thread(toy_node_options(tmp_path, hub, workers=workers))
@@ -110,6 +111,18 @@ def test_one_download_per_version_whatever_the_number_of_workers(setup):
     assert learner.server.counters["latest_served"] == len(history)
     beat = wait_for(lambda: [h for h in hub.heartbeats() if h.counters["weight_fetches"] == len(history)])[-1]
     assert beat.counters["weight_fetch_redundant"] == 0 and beat.counters["weight_fetch_bytes"] > 0
+    assert node.stop() == 0
+
+
+def test_a_zero_sync_interval_fetches_at_the_pump_cadence(setup):
+    """``rollout.weight_sync_interval_sec: 0`` ("pull every step", valid since SP1) runs: the node checks versions at
+    its fetch pump's cadence (review round 1: it used to fail the run's start)."""
+    hub, learner, node = setup(workers=1, sync_sec=0)
+    wait_for(lambda: _played(hub, 1), timeout=60)
+    learner.publish(2)
+    hub.announce(versions=[learner.info(2)])
+    wait_for(lambda: _played(hub, 2), timeout=30)
+    assert node.agent.fetch_history() == {"main": [1, 2]}
     assert node.stop() == 0
 
 
@@ -154,19 +167,61 @@ def test_a_failed_first_fetch_holds_the_lineup_and_counts_lineup_fetch_failed(tm
         assert node.stop() == 0
 
 
-def test_a_full_cache_is_an_error_with_the_hint_and_counted(setup, monkeypatch, caplog):
+def test_a_full_cache_is_an_error_with_the_hint_and_waits_for_space(setup, monkeypatch, caplog):
     real = weights.shutil.disk_usage
     node_root = shm_dir()                              # the node's cache root; the learner's cache is elsewhere
+    full = {"on": True}
 
     def disk_usage(path):                              # the cache's free-space probe: 1 MiB free in the node's root
         usage = real(path)
-        return usage._replace(free=2**20) if str(path) == str(node_root) else usage
+        return usage._replace(free=2**20) if full["on"] and str(path) == str(node_root) else usage
 
     monkeypatch.setattr(weights.shutil, "disk_usage", disk_usage)
     with caplog.at_level(logging.WARNING):
         hub, learner, node = setup(workers=0, grant=False)
-        wait_for(lambda: node.agent.counters().get("weight_fetch_failed", 0) >= 2, timeout=30)
+        wait_for(lambda: node.agent.counters().get("weight_fetch_failed", 0) >= 1, timeout=30)
+        beats = len(hub.heartbeats())
+        wait_for(lambda: len(hub.heartbeats()) >= beats + 8, timeout=30)      # about four sync intervals
+        assert learner.server.counters["latest_served"] == 1                  # not downloaded again while full
+        assert node.agent.counters()["weight_fetch_failed"] == 1 and node.agent.fetch_history() == {}
+        full["on"] = False                                                      # space again
+        wait_for(lambda: _node_cache(node).latest_version("main") == (1, 1), timeout=30)
+        assert node.agent.fetch_history() == {"main": [1]} and learner.server.counters["latest_served"] == 2
         assert node.stop() == 0
     errors = [r for r in caplog.records if r.levelno == logging.ERROR and "--shm-size" in r.getMessage()]
     assert len(errors) == 1 and "emptyDir" in errors[0].getMessage()
-    assert node.agent.fetch_history() == {} and learner.server.counters["latest_served"] >= 2
+
+
+def test_a_frame_that_is_not_the_announced_version_is_refused(setup):
+    """The hub's digest is the anchor of a direct fetch: other bytes under the announced version are refused and
+    counted; the corrected announcement is fetched (review round 1)."""
+    hub, learner, node = setup(workers=1, digest="0" * 32)
+    wait_for(lambda: node.agent.counters().get("weight_fetch_failed", 0) >= 1, timeout=30)
+    assert node.agent.fetch_history() == {} and _node_cache(node).latest_version("main") is None
+    hub.announce(versions=[learner.info(1)])
+    wait_for(lambda: _played(hub, 1), timeout=60)
+    assert node.agent.fetch_history() == {"main": [1]}
+    assert node.stop() == 0
+
+
+def test_the_local_node_without_a_certificate_has_no_data_port_and_says_so_at_info(tmp_path, caplog):
+    """Ruling R30: ``train``'s local node (no node certificate until T3.2) runs without a data port; its learners are
+    relay-only for remote nodes, which is expected: an INFO, not a WARNING."""
+    from colosseum.node.agent import NodeOptions
+
+    hub = FakeHub(tmp_path, _config(tmp_path))
+    record, secret = hub.identity.nodes.add_ephemeral("local", "machine-local")
+    options = NodeOptions(hub_address=hub.address, token=hub.token, loopback_plain=True, local=True, workers=0,
+                          credentials=(record.node_id, 0, secret), data_port=0, log_dir=tmp_path / "local-logs")
+    node = None
+    try:
+        with caplog.at_level(logging.INFO, logger="colosseum.node"):
+            node = run_node_in_thread(options)
+            wait_for(lambda: node.agent.run_id is not None, timeout=30)
+            assert node.stop() == 0
+        said = [r for r in caplog.records if "no data port" in r.getMessage()]
+        assert [r.levelno for r in said] == [logging.INFO] and node.agent.data_port() is None
+    finally:
+        if node is not None and node.thread.is_alive():
+            node.stop()
+        hub.stop()

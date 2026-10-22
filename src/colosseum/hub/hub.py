@@ -84,7 +84,7 @@ from colosseum.hub.setup import (  # re-exported: the contract names colosseum.h
     validate_run_config,
     warn_static_ownership_skew,
 )
-from colosseum.hub.state import CellKey, restrict_collecting, version_source
+from colosseum.hub.state import CellKey, check_data_addresses, restrict_collecting, version_source
 from colosseum.metrics.counters import CounterBook
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.net.messages import lineup_to_proto, version_from_proto, version_to_proto
@@ -115,8 +115,6 @@ _CHECKPOINT_KIND = {"checkpoint": "periodic", "final": "final"}   # UploadHeader
 _LOOPBACK_OF = {"[::]": "[::1]", "0.0.0.0": "127.0.0.1", "127.0.0.1": "127.0.0.1", "localhost": "localhost",
                 "[::1]": "[::1]"}
 PENDING_EVICTIONS_MAX = 10_000            # evictions kept per node while its stream is down (oldest dropped)
-DATA_ADDRESSES_MAX = 16                   # a node announces at most this many data-port addresses (T3.1)
-DATA_ADDRESS_CHARS_MAX = 255
 
 
 @dataclass(frozen=True)
@@ -658,6 +656,10 @@ class Hub(RunSinks):
         self._sessions[handle.node_id] = handle
         self._run_stopped.discard(handle.node_id)
         node_hello = hello_from_proto(hello)
+        addresses = check_data_addresses(node_hello.data_addresses)
+        if addresses is None:                        # the same bound as DataAddresses (_on_data_addresses)
+            self._count_drop(record.number, "node_messages", "invalid", "data address announcements")
+            node_hello = replace(node_hello, data_addresses=())
         kind = self._registry.connect(handle.node_id, record.number, record.name, hello.session_id, node_hello,
                                       time.monotonic(), data_path="local" if record.number == 0 else "relay",
                                       serial=handle.serial)
@@ -876,10 +878,10 @@ class Hub(RunSinks):
     def _on_data_addresses(self, entry: Any, msg: Any) -> None:
         """A node's ``DataAddresses`` (its data port was bound after its ``Welcome``; spec 3.1, T3.1): kept in its
         registry entry, and the latest version of every agent whose learner runs there is announced again at once
-        with the new addresses. More than ``DATA_ADDRESSES_MAX`` entries, or an empty or overlong one, is dropped
-        (``node_messages.invalid``)."""
-        addresses = tuple(str(a) for a in msg.data_addresses)
-        if len(addresses) > DATA_ADDRESSES_MAX or any(not a or len(a) > DATA_ADDRESS_CHARS_MAX for a in addresses):
+        with the new addresses. Addresses out of ``hub.state.check_data_addresses``'s bounds are dropped
+        (``node_messages.invalid``; the same rule applies to ``Hello.data_addresses``)."""
+        addresses = check_data_addresses(msg.data_addresses)
+        if addresses is None:
             self._count_drop(entry.number, "node_messages", "invalid", "data address announcements")
             return
         entry.data_addresses = addresses
