@@ -1,8 +1,8 @@
 """The learners of the hub (SP5 T4.1; spec block 1, 2.6, 7.2; controller ruling R39): the learner table's placement
 passes, learner starts and stops with generations, version floors, reconciliation of a reconnecting node, start points
-(A28) and parked (hub-held) weights (A27). The code moved here unchanged from ``hub.py`` (the R27 pattern of
-``run_sinks``); ``Hub`` inherits ``HubLearners``, so every method keeps its name on ``Hub`` and reads the hub's
-attributes (built in ``Hub.__init__`` / ``Hub._prepare``)."""
+(A28; T4.2: the recovery point first) and parked (hub-held) weights (A27). The code moved here from ``hub.py`` (the
+R27 pattern of ``run_sinks``); ``Hub`` inherits ``HubLearners``, so every method keeps its name on ``Hub`` and reads
+the hub's attributes (built in ``Hub.__init__`` / ``Hub._prepare``)."""
 
 from __future__ import annotations
 
@@ -20,6 +20,7 @@ logger = logging.getLogger("colosseum.hub.hub")
 __all__ = ["JOURNAL_FLOOR_MATCHES", "HubLearners"]
 
 JOURNAL_FLOOR_MATCHES = 1000              # newest journaled matches per agent read for the version floor (P-PF3-3)
+RECOVERY_BLOB = "start:recovery"          # LearnerAssignment.weights_blob of a start from the recovery point (T4.2)
 
 
 class HubLearners:
@@ -119,7 +120,8 @@ class HubLearners:
             self._learners.set_pending(agent, "hub_state.json could not be written")
             raise
         blob, _version, what = self._learner_start_source(agent)
-        floor = self._version_floor(agent, start=self._start_checkpoints.get(agent) if blob else None)
+        own = blob not in ("", RECOVERY_BLOB)      # R38's exemption: only a stored checkpoint that is the start point
+        floor = self._version_floor(agent, start=self._start_checkpoints.get(agent) if own else None)
         assignment = pb.LearnerAssignment(agent_id=agent, generation=generation, version_floor=floor,
                                           device=slot.device, weights_blob=blob, trainer_state_blob="",
                                           env_steps=self._budget.value)
@@ -136,14 +138,21 @@ class HubLearners:
         self._announce_agents()
 
     def _learner_start_source(self, agent: str) -> tuple[str, int, str]:
-        """``(weights_blob, version, description)`` of ``agent``'s next learner start (A28): the hub-start source
-        (``_resume_start_sources``; T4.2 puts the newest recovery point in front)."""
-        return self._start_sources.get(agent, ("", 0, "factory weights"))
+        """``(weights_blob, version, description)`` of ``agent``'s next learner start (A28; spec 5.2, T4.2): its
+        newest recovery point (``start:recovery``) when there is one not older than the hub-start source, else the
+        hub-start source (``_resume_start_sources``: before the first recovery point a restart starts from ``init`` or
+        the resume source; versions still continue above every used one, ``_version_floor``)."""
+        hub_start = self._start_sources.get(agent, ("", 0, "factory weights"))
+        point = self._recovery.get(agent) if self._recovery is not None else None
+        if point is not None and point.version >= hub_start[1]:
+            return (RECOVERY_BLOB, point.version,
+                    f"the recovery point v{point.version} (generation {point.generation})")
+        return hub_start
 
     def _version_floor(self, agent: str, *, start: tuple[str, str | None] | None = None) -> int:
         """The first version a new learner of ``agent`` may publish (R9, W04-7, P-PF3-3): above every version the
         registry accepted, the newest stored snapshot, the journal's newest seats of the agent (read once per hub
-        start) and every learner version a node reported in a ``Hello``. T4.2 adds the recovery point.
+        start), every learner version a node reported in a ``Hello`` and the agent's recovery point (T4.2).
 
         ``start`` = the checkpoint identity ``(checkpoint_id, run_id)`` of the start point when it is a stored
         checkpoint (``_start_checkpoints``). Controller ruling R38: a start point that IS the newest stored snapshot
@@ -158,6 +167,9 @@ class HubLearners:
             stored = int(latest.policy_version)
             same = start is not None and start == (latest.checkpoint_id, latest.meta.get("run_id"))
             floors.append(stored if same else stored + 1)
+        point = self._recovery.get(agent) if self._recovery is not None else None
+        if point is not None:
+            floors.append(point.version + 1)
         return max(floors)
 
     def _journal_version_floors(self) -> dict[str, int]:
@@ -234,11 +246,13 @@ class HubLearners:
             self._broadcast_announce(agents=True)
 
     def _update_pending_value(self) -> None:
-        """``system`` value ``pending_agents``: trainable agents waiting for a slot or for their node (A26)."""
+        """``system`` values ``pending_agents`` (trainable agents waiting for a slot or for their node, A26) and
+        ``failed_agents`` (their learner's restart limit is spent, T4.2)."""
         if self._hub is None or self._learners is None:
             return
         self._hub.set_system_value("pending_agents", [e.agent_id for e in self._learners.entries()
                                                       if e.status in ("pending", "relocating")])
+        self._hub.set_system_value("failed_agents", self._learners.failed())
 
     # ---- parked weights (T4.1; A27) ---------------------------------------------------------------------------
 
@@ -249,10 +263,14 @@ class HubLearners:
         return self._learners.can_collect(agent) or self._versions.parked(agent) is not None
 
     def _park_source(self, agent: str) -> tuple[int, dict, str] | None:
-        """The newest hub-held weights of ``agent`` (``(version, numpy state_dict, description)``): its newest stored
-        snapshot, its ``training.resume_from`` state, its ``init`` weights (version 0; a partial ``init`` completed on
-        a freshly built model); None without any. T4.2 adds the recovery point."""
+        """The newest hub-held weights of ``agent`` (``(version, numpy state_dict, description)``): its recovery point
+        (T4.2; preferred at an equal version), its newest stored snapshot, its ``training.resume_from`` state, its
+        ``init`` weights (version 0; a partial ``init`` completed on a freshly built model); None without any."""
         candidates: list[tuple[int, int, Callable[[], dict], str]] = []
+        point = self._recovery.get(agent) if self._recovery is not None else None
+        if point is not None:
+            candidates.append((point.version, 3, lambda: self._recovery_weights(point),
+                               f"recovery point v{point.version}"))
         latest = self._coordinator.checkpoint_manager.latest(agent)
         if latest is not None:
             candidates.append((int(latest.policy_version), 2, lambda: self._coordinator.checkpoint_manager.load_model(
@@ -268,6 +286,15 @@ class HubLearners:
             return None
         version, _rank, load, what = max(candidates, key=lambda c: (c[0], c[1]))
         return version, load(), what
+
+    def _recovery_weights(self, point: Any) -> dict:
+        """The model weights of a recovery point (``decode_checkpoint``; the trainer-state leaf is never unpickled)."""
+        from colosseum.net.chunks import decode_checkpoint
+        from colosseum.net.frame import payload_byte_cap
+
+        data = bytearray(point.path.read_bytes())
+        payload, _meta = decode_checkpoint(data, cap=payload_byte_cap(int(self._dist.max_message_mb)))
+        return dict(payload["model_state"])
 
     def _full_init_state(self, agent: str, init: Any) -> dict:
         """``init`` weights as a full state_dict (a partial ``init`` is loaded onto a freshly built model)."""

@@ -103,21 +103,27 @@ def test_a_killed_worker_is_restarted_by_its_node_and_the_run_goes_on(tmp_path):
         assert proc.wait(15) == 143
         assert wait_for(lambda: not any(pid_alive(k) for k in kids), max(0.0, 10 - (time.monotonic() - t0)))
     stderr = (tmp_path / "killw.stderr").read_text()
-    assert (f"worker-0 died (exit -9) without reporting an error; the node restarts it; see "
-            f"{root / 'logs' / 'worker-0.log'}") in stderr
+    assert (f"worker-0 of node 0 (local) died with exit code -9; restarted (see "
+            f"{root / 'logs' / 'worker-0.log'})") in stderr                  # T4.2's text (spec 7.1)
 
 
 def test_learner_crash_in_train_step_gives_exit_1(tmp_path):
-    """train_step raising mid-training fails the run with an error naming the learner (T2.5 item b); SP5: the
-    learner reports its crash to its node, the hub fails the run with the reason and the learner's log."""
+    """train_step raising mid-training fails the run with an error naming the learner (T2.5 item b). SP5 T4.2 (spec
+    7.1, W04-25): every incarnation crashes; the hub restarts the learner (``LEARNER_RESTARTS``: 3), then the node
+    reports ``learner_failed``, the agent is ``failed`` and, as it is the only trainable one, the run stops (exit 1)
+    with the reason and the learner's log."""
     run = run_train(TTT_CONFIG, tmp_path, name="crash", overrides={
         **FOREVER, "algorithm.algorithm_class": "game_helpers.CrashingAPPO"},
         env={"PYTHONPATH": os.pathsep.join(filter(None, [str(TESTS_DIR), os.environ.get("PYTHONPATH")]))})
     assert run.returncode == 1, run.stderr[-3000:]
-    assert "learner-agent_0 failed (crash): RuntimeError: injected train_step failure" in run.stderr
+    assert "Learner of agent_0 failed (3 restarts within 1800 s on this node; last: crash: RuntimeError: injected " \
+           "train_step failure" in run.stderr
     assert f"see {run.root / 'logs' / 'learner-agent_0.log'}" in run.stderr
+    assert "every trainable agent failed" in run.stderr
+    assert run.stderr.count("Learner of agent_0 (generation") == 3                 # restarted three times
     learner_log = run.log("learner-agent_0")
-    assert "learner-agent_0 crashed" in learner_log and "injected train_step failure" in learner_log
+    assert "learner-agent_0 crashed" in learner_log
+    assert learner_log.count("RuntimeError: injected train_step failure") >= 4     # one per incarnation
 
 
 def test_sigterm_stops_all_descendants_within_10s(tmp_path):

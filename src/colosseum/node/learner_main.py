@@ -48,7 +48,7 @@ def _learner_main(*, name: str, incarnation: int, node: int, agent_id: str, gene
     """The assignment (SP5 T4.1): ``config.learner.device`` is the assigned device (the node replaced it),
     ``generation`` / ``version_floor`` / ``seed`` (``learner_seed(..., generation)``) are this incarnation's;
     ``start_point`` names the start for the log. A ``Stop`` with reason ``superseded`` or ``hub_lost`` ends the
-    learner without a final snapshot (P-PF3-19)."""
+    learner without a final snapshot (P-PF3-19). Recovery points every ``learner.recovery_interval_sec`` (T4.2)."""
     from colosseum.core.threads import configure_torch_threads, resolve_learner_threads
     from colosseum.learner.factory import apply_init, build_algorithm
     from colosseum.learner.learner import learner_process, resolve_device
@@ -99,6 +99,7 @@ def _learner_main(*, name: str, incarnation: int, node: int, agent_id: str, gene
                         resume_state=resume_state, progress_counter=_ProgressFloor(intake, env_steps),
                         total_timesteps=total_timesteps,
                         weight_sync_interval=config.rollout.weight_sync_interval_sec, version_floor=version_floor,
+                        recovery_interval_sec=config.learner.recovery_interval_sec,
                         send_final=lambda: intake.stop_reason not in NO_FINAL_REASONS)
     except Exception as e:
         error = ChildError("crash", f"{type(e).__name__}: {e}", f"learner {agent_id} (generation {generation})")

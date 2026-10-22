@@ -112,7 +112,9 @@ def test_no_lineup_is_granted_while_no_agent_can_collect(tmp_path, caplog):
 def test_agents_collect_from_their_learners_placement_without_a_first_version(tmp_path):
     """Ruling R36: with both learners placed and alive and only ``a``'s first version accepted, ``b``'s seats collect
     too (the node holds a lineup until ``b``'s latest weights are cached); once ``b``'s learner failed they do not, and
-    (T4.1) ``b`` without any weights is not seated at all: with rivals only, no lineup is granted (counted)."""
+    (T4.1) ``b`` without any weights is not seated at all: with rivals only, no lineup is granted (counted). T4.2: a
+    failed learner no longer fails the run (``a`` trains on), so the grants above are not an artefact of a failing
+    hub."""
     mm = {"opponents": {"latest": 0.0, "snapshots": 0.0, "rivals": 1.0, "anchors": 0.0}}
     hub = lineup_hub(_config(("a", "b"), matchmaking=mm), tmp_path)
     node = open_node(hub, workers=2)
@@ -123,8 +125,10 @@ def test_agents_collect_from_their_learners_placement_without_a_first_version(tm
     assert {_owner(lineup_from_proto(g.lineup)) for g in grants} == {"a", "b"}
     assert all(_collecting(lineup_from_proto(g.lineup)) == {"a", "b"} for g in grants)
 
-    hub._on_message(node_message(node, event=pb.Event(kind="learner_failed", proc="learner-b", exit_code=1)))
+    hub._on_message(node_message(node, event=pb.Event(kind="learner_failed", proc="learner-b", exit_code=1,
+                                                      generation=1)))
     assert (hub._learners["a"].status, hub._learners["b"].status) == ("starting", "failed")
+    assert hub._failure is None
     assert request_cells(hub, node, [(g.worker, g.env, g.epoch, 0) for g in grants]) == []
     assert hub._book.totals()["lineup_redraw_failed"] == 8
 

@@ -11,7 +11,9 @@ feed ``MetricsBatch``, the global env steps are forwarded (``LearnerEnvSteps``; 
 count plus this node's own env steps since its receipt, a lower bound of the global count that never decreases; the
 run's ``Welcome`` is the first such count, FX3).
 ``stop_learner`` sends ``Stop`` (the final snapshot is uploaded by the agent; ``superseded`` sends none); a learner
-that ends without being stopped is ``learner_failed`` (until T4.2: the hub stops the run).
+that ends without being stopped is reported (T4.2, spec 7.1): ``proc_died`` within ``procs.LEARNER_RESTARTS`` (the hub
+assigns it again with a new generation from its recovery point), else ``learner_failed``; both name its generation,
+exit code and reason (a ``ChildError`` it sent, ``note_failure``) and carry its log tail.
 
 Generations (SP5 T4.1, spec 7.2): at most one learner per agent; the same assignment twice (``Welcome.learners`` and
 the hub's deferred ``start_learner``) is one start; a newer generation replaces the running one (``superseded``: it
@@ -132,7 +134,8 @@ class NodeLearners:
         return next((e for e in self._entries.values() if e.name == name), None)
 
     def note_failure(self, name: str, text: str) -> None:
-        """The node closed ``name``'s connection for ``text``: its ``learner_failed`` says so."""
+        """Why ``name`` is about to end (a ``ChildError`` it sent, or the node closed its connection for ``text``):
+        its ``proc_died`` / ``learner_failed`` says so (the first reason wins)."""
         entry = self.of(name)
         if entry is not None and not entry.failure:
             entry.failure = text
@@ -441,10 +444,35 @@ class NodeLearners:
         if stopped:
             logger.info(f"node: learner {entry.agent_id} stopped")
             return
+        self._report_death(entry, code, log_path)
+
+    def _report_death(self, entry: LearnerEntry, code: int | None, log_path: str) -> None:
+        """A learner that ended without being stopped (spec 7.1; T4.2): the node never restarts it itself (the hub
+        assigns a new generation with a start point only it holds, W04-6): within ``LEARNER_RESTARTS`` (counted per
+        name on this node, across generations) it is ``proc_died``, after the limit ``learner_failed``; both carry its
+        generation, exit code, the reason it gave (a ``ChildError``, an oversized checkpoint) and the tail of its
+        log."""
+        from pathlib import Path
+
+        from colosseum.node import procs
+        from colosseum.node.logs import log_tail
+
+        name = entry.name
         why = entry.failure or "without being stopped"
-        logger.error(f"node: learner {entry.agent_id} ended (exit {code}): {why}; see {log_path}")
-        self._host.event("learner_failed", proc=name, exit_code=int(code or 0), log_path=log_path,
-                         generation=entry.generation, message=entry.failure)
+        tail = log_tail(Path(log_path)) if log_path else b""
+        fields = dict(proc=name, exit_code=int(code or 0), log_path=log_path, log_tail=tail,
+                      generation=entry.generation)
+        if self._host.supervisor.may_restart(name):
+            logger.error(f"node: learner {entry.agent_id} (generation {entry.generation}) ended (exit {code}): {why}; "
+                         f"the hub restarts it; see {log_path}")
+            self._host.event("proc_died", message=entry.failure, **fields)
+            return
+        limit, window = procs.LEARNER_RESTARTS
+        reason = f"{limit} restarts within {window:g} s on this node" + (f"; last: {entry.failure}"
+                                                                          if entry.failure else "")
+        logger.error(f"node: learner {entry.agent_id} (generation {entry.generation}) ended (exit {code}): {why}; "
+                     f"{limit} restarts within {window:g} s: it is not restarted; see {log_path}")
+        self._host.event("learner_failed", message=reason, **fields)
 
     def _release_latest(self, run: Any, agent: str) -> None:
         """The agent's learner here ended for good: remember its versions for a later floor, then the node gives the

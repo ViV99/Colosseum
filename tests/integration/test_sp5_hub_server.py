@@ -481,6 +481,28 @@ def test_an_upload_the_main_loop_does_not_answer_times_out_and_leaves_no_file(tm
         hub.stop()
 
 
+def test_an_upload_the_main_loop_claimed_is_answered_after_the_timeout(tmp_path, monkeypatch):
+    """SP5 T4.2 (the claim race of T2.5 (a2)): a main loop that took the spool file (claimed) but answers after the
+    servicer's timeout is waited for, so the node learns the real outcome instead of ``timeout`` (and does not upload
+    a frame again that the hub stored)."""
+    monkeypatch.setattr(hub_server, "UPLOAD_REPLY_TIMEOUT_SEC", 0.3)
+
+    def slow(header, data):                                      # the loop removed the spool before this
+        time.sleep(0.8)
+        return pb.UploadReply(accepted=True, checkpoint_id=f"ckpt_v{header.version}")
+
+    hub = serve(tmp_path, upload_reply=slow)
+    try:
+        node = hub.registered_node()
+        data = b"payload"
+        reply = node.upload(_header(data), data)
+        assert reply.accepted and reply.checkpoint_id == "ckpt_v20", reply
+        assert len(hub.loop.uploads) == 1
+        assert list((hub.run_dir.root / ".incoming").iterdir()) == []
+    finally:
+        hub.stop()
+
+
 @pytest.mark.parametrize("method", ["Register", "Upload", "Admin"])
 def test_server_stop_ends_a_handler_that_waits_for_the_main_loop(tmp_path, monkeypatch, method):
     """A Register / Upload / Admin call the main loop never answers (the loop stopped draining the inbox) ends

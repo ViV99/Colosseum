@@ -10,9 +10,8 @@ import torch
 
 from colosseum.coordinator.checkpoint_manager import CheckpointInfo
 from colosseum.hub.server import BlobStore, SessionClosed
-from colosseum.net.proto import colosseum_v1_pb2 as pb
 from game_helpers import agent_role_of, make_test_config
-from hub_kit import lineup_hub, node_message, open_node
+from hub_kit import lineup_hub, open_node
 
 
 def _config(agents=None, **sections):
@@ -23,8 +22,8 @@ def test_no_learner_is_placed_on_a_node_whose_stream_is_down(tmp_path):
     hub = lineup_hub(_config(), tmp_path)
     node = open_node(hub, name="n1", cpu_learners=1)
     assert hub._learner_node_of("a") is not None and hub._learners["b"].status == "pending"
-    hub._on_message(node_message(node, event=pb.Event(kind="learner_failed", proc="learner-a", generation=1)))
-    hub._on_session_closed(SessionClosed(node.node_id, node.session_id, "cut", node))     # its slot is free now
+    hub._learners.fail("a", "test")                                       # its slot is free (no placement pass)
+    hub._on_session_closed(SessionClosed(node.node_id, node.session_id, "cut", node))
     hub._place_learners()
     assert hub._learners["b"].status == "pending"                         # never started on the cut stream
     back = open_node(hub, name="n1", node_id=node.node_id, session_id=node.session_id, cpu_learners=1)

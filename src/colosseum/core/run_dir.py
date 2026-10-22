@@ -13,6 +13,7 @@
       run_state.json           running / finished / failed + pid, written by run_training (SP4 T7.1)
       report.html              colosseum report's default output (SP4 T7.2)
       checkpoints/<agent>/ckpt_v<N>/{model.pt, trainer_state.pt, meta.json}
+      recovery/<agent>/{recovery.frame, meta.json}  newest recovery point per agent (SP5)
 """
 
 from __future__ import annotations
@@ -74,6 +75,11 @@ class RunDir:
     @property
     def checkpoints(self) -> Path:
         return self.root / "checkpoints"
+
+    @property
+    def recovery_dir(self) -> Path:
+        """``recovery/``: the newest recovery point of each agent (SP5 T4.2, ``colosseum.hub.recovery``)."""
+        return self.root / "recovery"
 
     @property
     def metrics_path(self) -> Path:

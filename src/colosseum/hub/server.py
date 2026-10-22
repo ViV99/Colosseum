@@ -58,6 +58,7 @@ from colosseum.core.config import check_agent_id
 from colosseum.core.errors import ConfigError
 from colosseum.core.run_dir import RunDir
 from colosseum.core.types import MatchResult
+from colosseum.hub.recovery import RecoveryStore
 from colosseum.hub.relay import LatestRelay, RelayHub
 from colosseum.hub.state import NodeHello
 from colosseum.net.chunks import WeightsMeta, encode_weights
@@ -77,7 +78,8 @@ from colosseum.net.security import HubIdentity, SecurityError, private_dir
 
 __all__ = [
     "ADMIN_REPLY_TIMEOUT_SEC", "CLOSE_GRACE_SEC", "LOOPBACK_KEY", "OUTBOUND_QUEUE_SIZE", "REGISTER_REPLY_TIMEOUT_SEC",
-    "SERVER_THREADS", "UPLOAD_KINDS", "UPLOAD_REPLY_TIMEOUT_SEC", "AdminIn", "BlobStore", "HubServicer",
+    "SERVER_THREADS", "UPLOAD_CLAIMED_WAIT_SEC", "UPLOAD_KINDS", "UPLOAD_REPLY_TIMEOUT_SEC", "AdminIn", "BlobStore",
+    "HubServicer",
     "NodeMessageIn", "RegisterIn", "SessionClosed", "SessionHandle", "SessionOpened", "StopRequested", "UploadIn",
     "blob_file_name", "blob_ident", "build_server", "hello_from_proto",
 ]
@@ -87,6 +89,7 @@ log = logging.getLogger(__name__)
 SERVER_THREADS = 128                 # every live session and relay stream holds one thread: 20 nodes x 2 + transfers
 OUTBOUND_QUEUE_SIZE = 10_000         # per session; a full queue closes the session (the node reconnects)
 UPLOAD_REPLY_TIMEOUT_SEC = 60.0
+UPLOAD_CLAIMED_WAIT_SEC = 300.0      # an upload the main loop claimed is waited for this long more (T4.2)
 REGISTER_REPLY_TIMEOUT_SEC = 30.0
 ADMIN_REPLY_TIMEOUT_SEC = 30.0
 CLOSE_GRACE_SEC = 5.0                # a closed session whose writer is stuck (a dead peer) is cancelled after this
@@ -444,14 +447,31 @@ class HubServicer(pb_grpc.HubServicer):
                 spool.unlink(missing_ok=True)
                 return refuse("cut")
             except _NoReply:
-                spool.unlink(missing_ok=True)
-                return refuse("timeout")
+                return self._upload_timed_out(spool, reply, context)
             except Exception as e:  # noqa: BLE001 - the main loop failed this upload
                 spool.unlink(missing_ok=True)
                 return refuse(f"error: {type(e).__name__}")
         finally:
             if not handed:
                 spool.unlink(missing_ok=True)
+
+    @staticmethod
+    def _upload_timed_out(spool: Path, reply: Future, context: grpc.ServicerContext) -> pb.UploadReply:
+        """The main loop did not answer within ``UPLOAD_REPLY_TIMEOUT_SEC`` (SP5 T4.2: the claim race of T2.5 (a2)).
+        Removing the spool decides who owns the upload: removed here -> the main loop will find nothing and save
+        nothing, the node is told ``timeout`` and uploads it again; already gone -> the main loop claimed it (renamed
+        it) and is saving it, so its answer is awaited (``UPLOAD_CLAIMED_WAIT_SEC`` more at most, the node's own call
+        timeout) instead of a ``timeout`` that would make the node upload a frame the hub stored."""
+        try:
+            spool.unlink()
+        except FileNotFoundError:
+            try:
+                return _await_reply(reply, context, UPLOAD_CLAIMED_WAIT_SEC)
+            except (_Cancelled, _NoReply):
+                return pb.UploadReply(accepted=False, reason="timeout")
+            except Exception as e:  # noqa: BLE001 - the main loop failed this upload
+                return pb.UploadReply(accepted=False, reason=f"error: {type(e).__name__}")
+        return pb.UploadReply(accepted=False, reason="timeout")
 
     # ---- Download -----------------------------------------------------------------------------------------------
 
@@ -886,10 +906,13 @@ class BlobStore:
 
     def start_path(self, agent_id: str, ident: str) -> Path | None:
         """``blobs/start-<agent digest>-<ident>.frame``: a learner start point (one checkpoint frame; A28) for
-        ``Download(kind="start")``; ``ident`` is ``resume``, ``recovery`` or ``ckpt_v<N>``. None for an invalid
-        agent id or ident (checked before any path is formed)."""
+        ``Download(kind="start")``; ``ident`` is ``resume``, ``recovery`` or ``ckpt_v<N>``; ``recovery`` is the
+        agent's stored recovery point itself (``hub.recovery.RecoveryStore.path``: ``recovery/<agent>/recovery.frame``,
+        spec 5.2; T4.2). None for an invalid agent id or ident (checked before any path is formed)."""
         if not _valid_agent_id(agent_id) or not isinstance(ident, str) or not START_IDENT_RE.fullmatch(ident):
             return None
+        if ident == "recovery":
+            return RecoveryStore(self.run_dir.root).path(agent_id)
         return self.dir / blob_file_name("start", agent_id, ident)
 
     def write_start(self, agent_id: str, ident: str, frame: bytes) -> Path:
@@ -897,7 +920,7 @@ class BlobStore:
         path = self.start_path(agent_id, ident)
         if path is None:
             raise ValueError(f"invalid start blob {agent_id!r} / {ident!r}")
-        self.dir.mkdir(parents=True, exist_ok=True)
+        path.parent.mkdir(parents=True, exist_ok=True)
         _write_atomic(path, bytes(frame))
         return path
 

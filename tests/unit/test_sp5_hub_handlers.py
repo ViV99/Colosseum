@@ -147,7 +147,7 @@ def test_every_p_pf2_9_refusal_is_answered_counted_and_nothing_is_saved(tmp_path
     elif case == "stale generation":
         upload.update(generation=2, data=_frame(generation=2))
     elif case == "upload kind":
-        upload.update(kind="recovery")
+        upload.update(kind="agent_file")                               # T8.2: not handled by the main loop yet
     elif case == "garbage":
         upload.update(data=b"\0" * 64)
     handle, data = upload.pop("handle"), upload.pop("data")
@@ -183,37 +183,44 @@ def test_a_newer_stream_supersedes_the_old_one_whose_late_close_and_messages_cha
     assert old.node_id not in hub._sessions and not hub._registry.by_id(old.node_id).connected
 
 
-def test_a_crashed_learners_error_pair_is_logged_once_and_the_first_message_wins(tmp_path, caplog):
+def test_a_learners_error_is_a_warning_and_its_failure_carries_the_reason(tmp_path, caplog):
+    """T4.2 (A12): a learner's ``child_error`` no longer stops the run (its death report follows: the node restarts
+    it through the hub); its ``learner_failed`` names the reason the node kept (the ``ChildError`` text) and fails the
+    agent; with every trainable agent failed the run stops."""
     hub = lineup_hub(_config(tmp_path), tmp_path)
     node = open_node(hub)
-    with caplog.at_level(logging.ERROR, logger="colosseum.hub.hub"):
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
         hub._on_message(node_message(node, event=pb.Event(
             kind="child_error", proc="learner-a", error_kind="crash", message="RuntimeError: boom",
             context="node 1 (n), learner a (generation 1)", log_path="/logs/learner-a.log")))
-        hub._on_message(node_message(node, event=pb.Event(kind="learner_failed", proc="learner-a", exit_code=1,
-                                                          log_path="/logs/learner-a.log", generation=1)))
+        assert hub._failure is None and "learner-a reported an error (crash): RuntimeError: boom" in caplog.text
+        hub._on_message(node_message(node, event=pb.Event(
+            kind="learner_failed", proc="learner-a", exit_code=1, log_path="/logs/learner-a.log", generation=1,
+            message="3 restarts within 1800 s on this node; last: crash: RuntimeError: boom")))
     errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
-    assert len(errors) == 1 and "learner-a failed (crash): RuntimeError: boom" in errors[0]
-    assert "RuntimeError: boom" in hub._failure and hub._learners["a"].status == "failed"
+    assert any(e.startswith("Learner of a failed (3 restarts") and "RuntimeError: boom" in e for e in errors)
+    assert hub._learners["a"].status == "failed" and hub._failure == "every trainable agent failed; stopping"
 
 
-@pytest.mark.parametrize("kind", ["child_error", "learner_failed"])
-def test_a_failure_reported_during_the_shutdown_fails_the_run(tmp_path, kind):
-    """SP4 R3-08: a child that fails while the run winds down fails it (exit 1) even after the budget."""
+@pytest.mark.parametrize("kind, proc", [("child_error", "worker-0"), ("learner_failed", "learner-a")])
+def test_a_failure_reported_during_the_shutdown_fails_the_run(tmp_path, kind, proc):
+    """SP4 R3-08: a child that fails while the run winds down fails it (exit 1) even after the budget (T4.2: a
+    worker's reported error; the only trainable agent's failed learner)."""
     config = make_test_config("turns", agents={"a": {}}, training={"total_timesteps": 10**12})
     hub = Hub(config, make_test_run_dir(config, tmp_path), options=HubOptions(
         mode="hub", listen="127.0.0.1", port=0, insecure=True, identity_dir=tmp_path / "hub-identity"))
 
     def main_loop() -> int:                             # the budget is reached; the node reports while stopping
         node = open_node(hub)
-        hub._inbox.put(node_message(node, event=pb.Event(kind=kind, proc="learner-a", error_kind="crash",
-                                                         message="late", exit_code=1)))
+        hub._inbox.put(node_message(node, event=pb.Event(kind=kind, proc=proc, error_kind="crash",
+                                                         message="late", exit_code=1, generation=1)))
         hub._inbox.put(node_message(node, event=pb.Event(kind="run_stopped")))
         return 0
 
     hub._main_loop = main_loop
     assert hub.launch() == 1
-    assert "late" in hub._failure
+    assert hub._failure == ("every trainable agent failed; stopping" if kind == "learner_failed"
+                            else "worker-0 failed (crash): late [node 1 (n)]")
 
 
 def test_evictions_wait_for_a_node_whose_stream_is_down_and_reach_it_with_its_welcome(tmp_path):

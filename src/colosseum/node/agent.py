@@ -24,15 +24,20 @@
    control connection is read to its end, bounded by ``EXIT_DRAIN_SEC``, before it counts as "reported" or "died").
    A worker that reported a ``ChildError`` is not restarted (the hub stops the run, A12); one that died without a
    report is ``proc_died`` and restarts with a new incarnation (new cells, new epochs) within ``WORKER_RESTARTS``,
-   else its slot is ``slot_disabled``. A learner that ends without being stopped is ``learner_failed`` (until T4.2:
-   the hub stops the run); workers are routed away from it (``LearnerRoute(agent, None)``).
+   else its slot is ``slot_disabled``. A learner that ends without being stopped is ``proc_died`` within
+   ``LEARNER_RESTARTS`` and then ``learner_failed`` (with its generation, reason and log tail; the hub assigns it
+   again: ``node.learners``, T4.2); workers are routed away from it (``LearnerRoute(agent, None)``). Events wait
+   (``PENDING_EVENTS_MAX``) while the hub is away.
 5. **Messages from children.** ``WorkerResults`` -> ``ResultBuffer``; ``WorkerProgress`` -> per (worker,
    incarnation) cumulative env steps (their sum is the session's counter: it never decreases) and counters
    (``MetricsBatch.workers``); ``ChildError`` -> ``Event(child_error)`` with ``node <n> (<name>), `` prepended to the
    child's context. Learners (``node.learners``): their first ``VersionPublished`` -> ``LearnerRoute`` to every
    worker (and to every worker that connects later); ``VersionPublished`` -> ``VersionAnnounce`` (the latest one
    kept while the hub is away);
-   ``CheckpointHeader`` + frame -> an ``Upload`` in the transfer pool (``checkpoint`` / ``final``), its reply logged (a
+   ``CheckpointHeader`` + frame -> the upload queue (``node.uploads.UploadQueue``, T4.2: finals first and never
+   dropped, at most one waiting recovery point and periodic snapshot per agent, one upload per agent at a time,
+   ``UPLOAD_CONCURRENCY`` per node), each a ``Hub/Upload`` call in the transfer pool (``checkpoint`` / ``final`` /
+   ``recovery``) while the session is up; a broken call or a servicer timeout is tried again, a refusal is logged (a
    refused periodic one is a WARNING, a refused final an ERROR); ``LearnerMetrics`` -> ``MetricsBatch.train``;
    ``IntakeReport`` -> ``MetricsBatch.intake``.
 6. **Lineups (R11).** ``CellTracker.due()`` -> one ``LineupRequest`` per pass; a grant waits until every key of its
@@ -58,8 +63,9 @@
 10. **Stop** (``stop_run`` or ``request_stop``): ``Stop`` to every child; the loop keeps reading results until every
     child exited or the grace passed (``LOCAL_CHILD_GRACE_SEC`` for the local node, ``distributed.shutdown_grace_sec -
     5`` otherwise); the rest is killed; the result buffer is flushed and its acks awaited until the grace's deadline +
-    ``ACK_WAIT_EXTRA_SEC``, as are the uploads in flight (the learners' finals); what is still unacked then is counted
-    in ``dropped_results_node_buffer`` (P-PF2-4 b); a last ``Heartbeat``, ``Event(run_stopped)``; the transfers
+    ``ACK_WAIT_EXTRA_SEC``, as are the checkpoint uploads (the learners' finals first; what is left then is given up,
+    an ERROR per final); what is still unacked then is counted in ``dropped_results_node_buffer`` (P-PF2-4 b); a last
+    ``Heartbeat``, ``Event(run_stopped)``; the transfers
     still running are cancelled (``TRANSFER_JOIN_SEC``); the node's cache files and lock are removed; the session
     closes. Worst case of a local node (``LOCAL_CHILD_GRACE_SEC`` 5 s): 5 s grace + 2 s kill + 1 s acks / uploads +
     1 s transfer join = 9 s, plus the session's close (immediate while the hub answers; ``HubSession`` bounds it).
@@ -126,13 +132,15 @@ from colosseum.node.learners import LearnerBlobsDone, NodeLearners
 from colosseum.node.lineups import CACHE_DROP_DELAY_SEC, FIXED_RETRY_SEC, LINEUP_WAIT_SEC, NodeLineups  # noqa: F401
 from colosseum.node.procs import ChildSpec, ChildSupervisor
 from colosseum.node.routing import LearnerConnOpened, NodeRouting, PathChanged, RelayPull, RelayUploadDone
+from colosseum.node.uploads import FINAL, UploadQueue
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC
 
 logger = logging.getLogger(__name__)
 
 __all__ = [
     "ACK_WAIT_EXTRA_SEC", "CACHE_DROP_DELAY_SEC", "EXIT_DRAIN_SEC", "LINEUP_RETRY_SEC", "LINEUP_WAIT_SEC",
-    "LOCAL_CHILD_GRACE_SEC", "METRICS_FLUSH_SEC", "RESULT_RESEND_SEC", "CellTracker", "NodeAgent", "NodeOptions",
+    "LOCAL_CHILD_GRACE_SEC", "METRICS_FLUSH_SEC", "PENDING_EVENTS_MAX", "RESULT_RESEND_SEC", "UPLOAD_RETRY_SEC",
+    "CellTracker", "NodeAgent", "NodeOptions",
     "ResultBuffer", "local_node_target", "main",
 ]
 
@@ -147,11 +155,13 @@ TRANSFER_THREADS = 4
 TRANSFER_JOIN_SEC = 1.0         # at the end, cancelled transfers are waited for this long before the cache cleanup
 FETCH_PUMP_SEC = 0.1            # the fetch planner is asked for due latest transfers at most this often
 UPLOAD_TIMEOUT_SEC = 300.0
-_UPLOAD_KINDS = {"periodic": "checkpoint", "final": "final", "recovery": "recovery"}
+UPLOAD_RETRY_SEC = 1.0          # after a failed upload, the queue's uploads start again at most this soon (T4.2)
+_UPLOAD_KINDS = {"periodic": "checkpoint", "final": "final", "recovery": "recovery"}   # frame kind -> UploadHeader.kind
+_UPLOAD_RETRY_REASONS = ("timeout", "cut")   # servicer refusals that say nothing about the frame: tried again
 REGISTER_TIMEOUT_SEC = 30.0
 FETCH_CA_TIMEOUT_SEC = 10.0
 CONNECT_RETRY_SEC = (0.5, 10.0)  # registration retries while the hub is unreachable (doubling)
-PENDING_EVENTS_KEPT = 100       # events kept while the hub is away (oldest dropped)
+PENDING_EVENTS_MAX = 100        # events kept while the hub is away (oldest dropped with a WARNING; T4.2)
 LOOP_WAIT_SEC = 0.05
 CHILD_MESSAGES_PER_PASS = 256   # messages read from one child connection per pass (others get their turn)
 CACHE_PRUNE_SEC = 1.0
@@ -202,10 +212,7 @@ class _StopRequested:
 
 @dataclass
 class _UploadDone:
-    token: str                         # the upload's key in NodeAgent._uploads
-    kind: str                          # the checkpoint kind (periodic / final / recovery)
-    agent_id: str
-    version: int
+    ticket: int                        # the upload's ticket in NodeAgent.uploads (node.uploads.UploadQueue)
     reply: Any                         # pb.UploadReply, or None after a transfer error
     error: str | None
 
@@ -311,12 +318,17 @@ class NodeAgent:
         self._stats_changed: set[tuple[int, int]] = set()
         self._learner_routes: dict[str, Any] = {}   # agent -> LearnerRoute sent to every worker
         self.learners = NodeLearners(_LearnerHost(self))   # the learners this node runs (node.learners)
-        self._uploads: dict[str, tuple[Future, str, str, int]] = {}   # token -> (future, kind, agent, version)
+        self.uploads = UploadQueue()                # learner checkpoint frames to the hub (node.uploads, T4.2)
+        self._upload_futures: dict[int, Future] = {}   # ticket -> its transfer in the pool
+        self._upload_retry_at = 0.0                 # monotonic: after a failed upload, the next start not before
+        self._slow_uploads: set[str] = set()        # agents whose periodic snapshots were replaced (warned once)
+        self._warned: set[tuple] = set()            # (what, ...) logged once
         self._released: set[str] = set()            # run ids this node released (never served again)
         self._releasing = False
         self._dropped_carry = 0                     # dropped_results_node_buffer of released runs (per session)
         self._heartbeat_sec = 1.0
-        self._events: deque = deque(maxlen=PENDING_EVENTS_KEPT)
+        self._events: deque = deque()
+        self._events_dropped = 0
         self._hello_lock = threading.Lock()
         self._hello_state: tuple = ("", (), 0, 0, 0, ())
         self._next_heartbeat = 0.0
@@ -628,10 +640,18 @@ class NodeAgent:
         return self._session is not None and self._session.send(message)
 
     def _event(self, kind: str, **fields: Any) -> None:
-        """An ``Event`` to the hub; kept (up to ``PENDING_EVENTS_KEPT``) while the hub is away."""
+        """An ``Event`` to the hub; kept (up to ``PENDING_EVENTS_MAX``, the oldest dropped with one WARNING) while the
+        hub is away and sent after the next ``SessionUp``."""
         event = pb.Event(kind=kind, **fields)
-        if not (self._connected and self._send(pb.NodeMessage(event=event))):
-            self._events.append(event)
+        if self._connected and self._send(pb.NodeMessage(event=event)):
+            return
+        self._events.append(event)
+        if len(self._events) > PENDING_EVENTS_MAX:
+            dropped = self._events.popleft()
+            self._events_dropped += 1
+            if self._events_dropped == 1:
+                logger.warning(f"node: more than {PENDING_EVENTS_MAX} events wait for the hub; the oldest are dropped "
+                               f"(first: {dropped.kind} of {dropped.proc or 'the node'})")
 
     # ---- the loop ---------------------------------------------------------------------------------------------
 
@@ -748,6 +768,8 @@ class NodeAgent:
             if now >= self._next_prune:
                 self._next_prune = now + CACHE_PRUNE_SEC
                 self.lineups.prune_cache(run, now)
+        if run is not None:
+            self._pump_uploads(now)                  # also while stopping: the finals go first (spec 7.4)
         if self._done:
             return
         if run is None:                              # released (or no Welcome yet): heartbeats keep the session
@@ -1149,6 +1171,7 @@ class NodeAgent:
             self._reported.add(name)
             log_path = "" if run is None else str(run.log_dir / f"{name}.log")
             logger.error(f"node: {name} failed ({message.kind}): {message.message}")
+            self.learners.note_failure(name, f"{message.kind}: {message.message}")   # its death report names it
             self._event("child_error", proc=name, error_kind=message.kind, message=message.message,
                         context=f"node {self._number} ({self._name}), {message.context}", log_path=log_path)
         else:
@@ -1216,32 +1239,54 @@ class NodeAgent:
                 self._child_send(name, conn, route)
 
     def _on_checkpoint(self, name: str, header: Any, frame: bytes) -> None:
-        """A learner's snapshot: an ``Upload`` in the transfer pool (``checkpoint`` / ``final``)."""
+        """A learner's checkpoint frame (``periodic`` / ``final`` / ``recovery``) joins the upload queue
+        (``node.uploads``; spec 7.4: a final is never dropped behind periodic snapshots)."""
         entry = self.learners.of(name)
-        kind = _UPLOAD_KINDS.get(header.kind)
-        if entry is None or kind is None or header.agent_id != entry.agent_id:
+        if entry is None or header.kind not in _UPLOAD_KINDS or header.agent_id != entry.agent_id:
             logger.warning(f"node: dropped a {header.kind!r} checkpoint of {header.agent_id!r} from {name}")
             return
-        token = uuid.uuid4().hex
-        future = self._pool.submit(self._upload, kind, header, frame, token)
-        self._uploads[token] = (future, header.kind, header.agent_id, int(header.version))
+        replaced = self.uploads.replaced
+        self.uploads.offer(header.agent_id, header.kind, int(header.generation), int(header.version), frame)
+        if self.uploads.replaced > replaced:
+            self._warn_slow_uploads(header.agent_id)
+        self._pump_uploads(time.monotonic())
 
-        def done(f: Future) -> None:
-            error = "cancelled" if f.cancelled() else (None if f.exception() is None else _rpc_text(f.exception()))
-            self._post(_UploadDone(token, header.kind, header.agent_id, int(header.version),
-                                   None if error else f.result(), error))
+    def _warn_slow_uploads(self, agent: str) -> None:
+        """A periodic snapshot of ``agent`` was replaced before it left the node: one WARNING and one ``warning``
+        event per agent."""
+        if agent in self._slow_uploads:
+            return
+        self._slow_uploads.add(agent)
+        text = (f"checkpoint uploads of {agent} are slower than its checkpoint.interval; older periodic snapshots are "
+                f"skipped")
+        logger.warning(f"node: {text}")
+        self._event("warning", proc=f"learner-{agent}", message=text)
 
-        future.add_done_callback(done)
+    def _pump_uploads(self, now: float) -> None:
+        """Start the uploads the queue allows (``UploadQueue.take``) in the transfer pool, while the session is up and
+        not before ``UPLOAD_RETRY_SEC`` after a failed one; each posts ``_UploadDone``."""
+        if not self._connected or self._channel is None or now < self._upload_retry_at:
+            return
+        for upload in self.uploads.take():
+            future = self._pool.submit(self._upload, upload)
+            self._upload_futures[upload.ticket] = future
 
-    def _upload(self, kind: str, header: Any, frame: bytes, token: str) -> pb.UploadReply:
-        """A transfer-pool thread: one ``Upload`` (header, then the frame in parts)."""
-        # The transfer pool runs uploads until T4.2's node.uploads.UploadQueue (A29) replaces this path.
+            def done(f: Future, ticket: int = upload.ticket) -> None:
+                error = "cancelled" if f.cancelled() else (None if f.exception() is None else _rpc_text(f.exception()))
+                self._post(_UploadDone(ticket, None if error else f.result(), error))
+
+            future.add_done_callback(done)
+
+    def _upload(self, upload: Any) -> pb.UploadReply:
+        """A transfer-pool thread: one ``Hub/Upload`` (header, then the frame in parts)."""
         from colosseum.net.grpc_util import blob_digest, node_metadata, send_parts
         from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
 
+        frame = upload.frame
         digest = blob_digest(frame)
-        up = pb.UploadHeader(kind=kind, agent_id=header.agent_id, generation=int(header.generation),
-                             version=int(header.version), total_size=len(frame), digest=digest, request_id=token)
+        up = pb.UploadHeader(kind=_UPLOAD_KINDS[upload.kind], agent_id=upload.agent_id,
+                             generation=int(upload.generation), version=int(upload.version), total_size=len(frame),
+                             digest=digest, request_id=f"{self.session_id[:8]}-{upload.ticket}")
 
         def parts():
             yield pb.UploadPart(header=up)
@@ -1253,14 +1298,32 @@ class NodeAgent:
                                                      timeout=UPLOAD_TIMEOUT_SEC)
 
     def _on_upload_done(self, done: _UploadDone) -> None:
-        self._uploads.pop(done.token, None)
-        what = f"the {done.kind} snapshot v{done.version} of {done.agent_id}"
-        if done.error is None and done.reply.accepted:
-            logger.info(f"node: uploaded {what} ({done.reply.checkpoint_id})")
+        """An upload's outcome: accepted; failed (the call broke, or the servicer gave up waiting: ``timeout`` /
+        ``cut``) -> it waits again (``UPLOAD_RETRY_SEC``); refused by the hub -> not retried (a WARNING per (agent,
+        reason); an ERROR for a final)."""
+        self._upload_futures.pop(done.ticket, None)
+        reply = done.reply
+        accepted = done.error is None and bool(reply.accepted)
+        retry = done.error is not None or (not accepted and reply.reason in _UPLOAD_RETRY_REASONS)
+        upload = self.uploads.done(done.ticket, accepted, retry=retry)
+        if upload is None:
             return
-        why = done.error if done.error is not None else f"refused: {done.reply.reason}"
-        level = logging.ERROR if done.kind == "final" else logging.WARNING
-        logger.log(level, f"node: the hub did not take {what} ({why})")
+        what = f"the {upload.kind} snapshot v{upload.version} of {upload.agent_id}"
+        if upload.kind == "recovery":
+            what = f"the recovery point v{upload.version} of {upload.agent_id}"
+        if accepted:
+            note = f"; {reply.reason}" if reply.reason else ""
+            logger.info(f"node: uploaded {what} ({reply.checkpoint_id or 'stored'}{note})")
+            return
+        why = done.error if done.error is not None else reply.reason
+        if retry:
+            self._upload_retry_at = time.monotonic() + UPLOAD_RETRY_SEC
+            logger.info(f"node: uploading {what} failed ({why}); it is tried again")
+            return
+        level = logging.ERROR if upload.kind == FINAL else logging.WARNING
+        if upload.kind == FINAL or ("upload", upload.agent_id, why) not in self._warned:
+            self._warned.add(("upload", upload.agent_id, why))
+            logger.log(level, f"node: the hub did not take {what} (refused: {why})")
 
     # ---- heartbeats and metrics -------------------------------------------------------------------------------
 
@@ -1350,16 +1413,10 @@ class NodeAgent:
             self._stop_phase = "acks"
             return
         if self._stop_phase == "acks":
-            waiting = run is not None and (run.results.unacked() or self._uploads)
+            waiting = run is not None and (run.results.unacked() or self.uploads.waiting())
             if waiting and time.monotonic() < self._ack_deadline:
                 return
-            if self._uploads:
-                logger.error(f"node: {len(self._uploads)} snapshot uploads did not finish before the stop's deadline; "
-                             f"they are not waited for any longer")
-                for _future, kind, agent, version in self._uploads.values():
-                    if kind == "final":                  # the hub's log says so too (A1 "warning")
-                        self._event("warning", proc=f"learner-{agent}",
-                                    message=f"final v{version} not uploaded before the stop deadline")
+            self._give_up_uploads()
             if run is not None:
                 run.results.give_up()
                 if self._connected:
@@ -1374,6 +1431,22 @@ class NodeAgent:
                 return
             self._done = True
 
+    def _give_up_uploads(self) -> None:
+        """The stop's deadline passed: checkpoint frames not uploaded yet are given up (``UploadQueue.drop_waiting``;
+        the ones in flight are cancelled with the transfers). Every final is an ERROR here and a ``warning`` event to
+        the hub (A1)."""
+        pending = [*self.uploads.in_flight(), *self.uploads.drop_waiting()]
+        if not pending:
+            return
+        logger.error(f"node: {len(pending)} checkpoint uploads did not finish before the stop's deadline; they are not "
+                     f"waited for any longer")
+        for upload in pending:
+            if upload.kind == FINAL:
+                logger.error(f"node: the final snapshot v{upload.version} of {upload.agent_id} (generation "
+                             f"{upload.generation}) was not uploaded")
+                self._event("warning", proc=f"learner-{upload.agent_id}",
+                            message=f"final v{upload.version} not uploaded before the stop deadline")
+
     def _forget_run(self, run: _Run) -> None:
         """After ``release``: the run's resources go (``_teardown_run``) and so do its books; the session stays.
         This node serves nothing further of this run (``_released``); serving another run is T6.3's."""
@@ -1387,8 +1460,10 @@ class NodeAgent:
         self.learners.clear()
         self.fetches.clear_run()
         self.lineups.clear()
-        for book in (self._learner_routes, self._uploads, self._control, self._child_conns):
+        for book in (self._learner_routes, self._upload_futures, self._control, self._child_conns):
             book.clear()
+        self.uploads.clear()
+        self._slow_uploads.clear()
         for book in (self._reported, self._disabled):
             book.clear()
         self._stopping, self._releasing, self._stop_phase = False, False, ""
@@ -1435,7 +1510,7 @@ class NodeAgent:
         for conn in list(self._child_conns):
             self._close_conn(conn)
         run.closed = True                            # a download still running puts nothing any more
-        in_flight = [*self.fetches.futures(), *(u[0] for u in self._uploads.values())]
+        in_flight = [*self.fetches.futures(), *self._upload_futures.values()]
         for future in in_flight:
             future.cancel()                          # not started yet: never runs
         if in_flight:

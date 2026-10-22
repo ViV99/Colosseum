@@ -561,8 +561,8 @@ def test_a_killed_learner_blocks_neither_the_worker_nor_the_node(hub_factory, no
     wait_for(lambda: max(_train_steps(hub), default=0) >= 2, timeout=60)
     learner = node.agent.supervisor.get("learner-a")
     os.kill(learner.pid, signal.SIGKILL)
-    failed = wait_for(lambda: hub.node_events("learner_failed"))[0]
-    assert failed.proc == "learner-a" and failed.exit_code == -signal.SIGKILL and failed.generation == 1
+    died = wait_for(lambda: hub.node_events("proc_died"))[0]               # T4.2: the hub decides the restart
+    assert died.proc == "learner-a" and died.exit_code == -signal.SIGKILL and died.generation == 1
     results, beats = len(hub.results()), len(hub.heartbeats())
     wait_for(lambda: len(hub.results()) > results + 10 and len(hub.heartbeats()) > beats + 2)
 
@@ -642,10 +642,10 @@ def test_an_oversized_checkpoint_fails_the_learner_with_its_size_and_the_setting
     monkeypatch.setattr(agent_mod.NodeAgent, "_frame_cap", lambda self: 2048)   # the node's cap only (b)
     hub = _learner_hub(hub_factory)
     node_factory(hub)
-    failed = wait_for(lambda: hub.node_events("learner_failed"), timeout=60)[0]
-    assert "max_message_mb" in failed.message and "checkpoint v" in failed.message and failed.proc == "learner-a"
+    died = wait_for(lambda: hub.node_events("proc_died"), timeout=60)[0]
+    assert "max_message_mb" in died.message and "checkpoint v" in died.message and died.proc == "learner-a"
     (warning,) = [e for e in hub.node_events("warning") if e.proc == "learner-a"]
-    assert warning.message == failed.message
+    assert warning.message == died.message
 
 
 def test_a_learner_that_fails_to_start_reports_why_and_is_never_routed_to(hub_factory, node_factory):
@@ -659,7 +659,8 @@ def test_a_learner_that_fails_to_start_reports_why_and_is_never_routed_to(hub_fa
     node = node_factory(hub)
     error = wait_for(lambda: hub.node_events("child_error"), timeout=60)[0]
     assert error.proc == "learner-a" and error.error_kind == "crash" and "learner a (generation 1)" in error.context
-    wait_for(lambda: hub.node_events("learner_failed"))
+    died = wait_for(lambda: hub.node_events("proc_died"))[0]
+    assert died.proc == "learner-a" and died.message == f"crash: {error.message}"      # its death names the reason
     assert node.agent._learner_routes.get("a") is None                # no worker was sent to its listener
     assert node.stop() == 0
 
@@ -783,7 +784,7 @@ def test_a_child_killed_with_an_unread_message_is_an_exit_not_a_read_failure(hub
         time.sleep(1.0)                                             # LearnerEnvSteps / WorkerEvict stay unread
         for proc in (learner, worker):
             os.kill(proc.pid, signal.SIGKILL)                       # (Linux: the node then reads ECONNRESET)
-        failed = wait_for(lambda: hub.node_events("learner_failed"))[0]
+        failed = wait_for(lambda: [e for e in hub.node_events("proc_died") if e.proc == "learner-a"])[0]
         wait_for(lambda: [e for e in hub.node_events("proc_died") if e.proc == "worker-0"])
         assert node.stop() == 0
     assert "could not read" not in failed.message

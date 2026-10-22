@@ -332,6 +332,14 @@ class CellTable:
             del self._cells[entry.key]
         return dropped
 
+    def drop_worker(self, node: int, worker: int) -> list[CellEntry]:
+        """Remove and return the live cells of one worker slot of ``node`` (a disabled slot, spec 7.1; T4.2): they no
+        longer count in the owner deficit."""
+        dropped = [e for k, e in self._cells.items() if k.node == node and k.worker == worker]
+        for entry in dropped:
+            del self._cells[entry.key]
+        return dropped
+
     def drop_cells(self, keys: Iterable[CellKey]) -> list[CellEntry]:
         out = [self._cells.pop(k) for k in list(keys) if k in self._cells]
         return out

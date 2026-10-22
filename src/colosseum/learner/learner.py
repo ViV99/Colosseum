@@ -31,6 +31,10 @@ Trainer states without the key (SP2-SP4) resume from the counter alone.
 
 ``version_floor`` (SP5, R9): a learner generation starts at the hub's version floor, so versions never go back.
 
+Recovery points (SP5 T4.2, spec 5.2): every ``recovery_interval_sec`` on ``clock`` (None: off), only after a new train
+step, a checkpoint payload of kind ``recovery`` (weights + trainer state with R29's ``progress_env_steps``) is sent
+non-blocking; the hub keeps the newest one and starts the agent's next learner generation from it.
+
 Policy lag (SP5 spec 4.7, 8): ``train`` records carry the lag mean / p50 / p95 / max of the batch and
 ``dropped_stale_chunks``; with ``learner.max_policy_lag`` the intake drops chunks older than
 ``current - max_policy_lag`` before decoding them (spec 4.7).
@@ -164,6 +168,7 @@ def learner_process(
     version_floor: int = 0,
     recovery_interval_sec: float | None = None,
     send_final: Callable[[], bool] | None = None,
+    clock: Callable[[], float] = time.monotonic,
 ) -> None:
     """Main learner process function (see module docstring).
 
@@ -184,9 +189,10 @@ def learner_process(
         weight_sync_interval: the workers' ``rollout.weight_sync_interval_sec`` (``QueueOutputs.finish``)
         version_floor: the first version this learner may publish (R9: the hub's max announced + 1); the
             policy version is raised to it before the first publish
-        recovery_interval_sec: recovery points (T4.2); None: none
+        recovery_interval_sec: seconds between recovery points (T4.2; module docstring); None: none
         send_final: asked after the loop: the final snapshot is sent only when it is None or returns True (SP5
             T4.1: a superseded learner generation uploads no final)
+        clock: the monotonic clock of the recovery cadence (tests pass a fake one)
     """
     logger.info(f"Learner [{agent_id}]: starting on device={resolve_device(config.device)}")
 
@@ -212,6 +218,7 @@ def learner_process(
 
     total_chunks_received = 0
     last_ckpt_version = -1
+    last_recovery_at, last_recovery_step = clock(), train_step
 
     # Off-policy: create replay buffer if algorithm requires it
     replay_buffer = algorithm.create_replay_buffer(config.queue_size * 4)
@@ -267,6 +274,12 @@ def learner_process(
                     payload = make_checkpoint_payload(agent_id, algorithm, progress_env_steps=recorded())
                     if outputs.send_checkpoint(payload, kind="periodic", block=False):
                         last_ckpt_version = pv
+
+            if (recovery_interval_sec is not None and outputs.checkpoints and train_step > last_recovery_step
+                    and clock() - last_recovery_at >= recovery_interval_sec):
+                outputs.send_checkpoint(make_checkpoint_payload(agent_id, algorithm, progress_env_steps=recorded()),
+                                        kind="recovery", block=False)
+                last_recovery_at, last_recovery_step = clock(), train_step
 
             metrics["agent_id"] = agent_id
             metrics["train_step"] = train_step

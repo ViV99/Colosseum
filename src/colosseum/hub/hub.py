@@ -65,7 +65,19 @@ stored snapshot, its ``init`` or ``training.resume_from`` weights: a ``VersionIn
 ``Download(kind="latest")``, A27); lineups naming an agent without any weights are drawn again (``LINEUP_REDRAWS``).
 Announcements, snapshots and train metrics of a superseded generation are fenced (R16; results by
 ``ResultIntake.check``'s version cap). ``train`` without ``--listen`` stops at once when an agent cannot be placed on
-its machine (W04-26). Until T4.2 a failed learner stops the run (A12).
+its machine (W04-26).
+
+Failures (spec 5.2, 7.1, 7.2; T4.2): learners send recovery points (``hub.recovery.RecoveryStore``:
+``recovery/<agent>/``, only from the agent's current generation on its node, never older than the stored one, header
+checked, never decoded); a learner's next generation starts from the newest one (``start:recovery``) unless the
+hub-start source is newer, and its version floor is above it. A learner that died is reported by its node
+(``proc_died`` with its generation; the node counts the restarts, ``LEARNER_RESTARTS``) and assigned again on the same
+slot with a new generation (``learner_restarts``); after the node's limit it is ``learner_failed``: the agent is
+``failed`` (parked, never placed again, ``system`` value ``failed_agents``), the others train on, and the run exits 1
+at its end; when every trainable agent failed the run stops (exit 1). A learner's ``child_error`` is a WARNING (its
+death report follows); a worker's or an evaluator's still stops the run (A12). Workers and evaluators are restarted by
+their node (a ``proc_died`` is a WARNING, the node counts ``worker_restarts``); a ``slot_disabled`` worker's cells are
+dropped.
 """
 
 from __future__ import annotations
@@ -92,6 +104,7 @@ from colosseum.core.run_dir import RunDir
 from colosseum.core.types import LATEST_NETWORK_ID
 from colosseum.hub.learners import JOURNAL_FLOOR_MATCHES, HubLearners  # noqa: F401 (re-exported, R39)
 from colosseum.hub.placement import LearnerTable
+from colosseum.hub.recovery import RecoveryStore
 from colosseum.hub.run_sinks import RunSinks
 from colosseum.hub.server import (
     LOOPBACK_KEY,
@@ -252,6 +265,8 @@ class Hub(RunSinks, HubLearners):
         self._start_checkpoints: dict[str, tuple[str, str | None]] = {}   # agent -> its start point's (ckpt id, run id)
         self._hello_floors: dict[str, int] = {}   # agent -> RunningLearner.version + 1 seen in a Hello (P-PF3-3)
         self._journal_floors: dict[str, int] | None = None   # P-PF3-3: read once per hub start
+        self._recovery: RecoveryStore | None = None   # the learners' recovery points (T4.2; built by _prepare)
+        self._finals: set[tuple[str, int]] = set()   # (agent, generation) whose final snapshot the hub saved (T4.4)
         self._stops_sent: set[tuple[int, str, int]] = set()  # (stream serial, agent, generation) told to stop
         self._welcoming: int | None = None        # the node whose Welcome is being built (its commands wait)
         self._deferred: list[Any] = []            # start_learner commands for that node, sent after its Welcome
@@ -430,6 +445,7 @@ class Hub(RunSinks, HubLearners):
         self._build_relay()
         self._wire_snapshot_holds(coordinator)
         self._register_blobs(setup)
+        self._recovery = RecoveryStore(self._run_dir.root)
         self._start_sources = self._resume_start_sources()
         self._pulse_setup()
         self._registry = NodeRegistry()
@@ -1164,32 +1180,34 @@ class Hub(RunSinks, HubLearners):
         self._publish_latest()
 
     def _on_event(self, entry: Any, event: Any) -> None:
-        """A node's ``Event`` (A1 kinds). A reported child error and a failed learner stop the run (A12, until
-        T4.2: ``_fail_run``, first wins); a death without a report is a WARNING (the node restarts the worker and
-        counts ``worker_restarts`` itself, A2)."""
+        """A node's ``Event`` (A1 kinds; module docstring «Failures»). A worker's or evaluator's reported child error
+        stops the run (A12, ``_fail_run``, first wins); a learner's is a WARNING (its death report follows:
+        ``_on_learner_death``). A worker's or evaluator's death without a report is a WARNING (the node restarts it and
+        counts ``worker_restarts`` itself, A2); a disabled worker slot's cells are dropped."""
         where = f"node {entry.number} ({entry.name})"
         kind = event.kind
+        log = f" (see {event.log_path})" if event.log_path else ""
+        learner = event.proc.startswith("learner-")
         if kind == "child_error":
-            log = f"; see {event.log_path}" if event.log_path else ""
-            self._fail_run(f"{event.proc} failed ({event.error_kind}): {event.message}{log}",
-                           context=event.context or where)
-        elif kind == "learner_failed":
-            code = f" (exit {event.exit_code})" if event.exit_code else ""
-            why = f": {event.message}" if event.message else ""
-            log = f"; see {event.log_path}" if event.log_path else ""
-            agent = event.proc.removeprefix("learner-")
-            if (agent in self._learners and self._learner_node_of(agent) == entry.number
-                    and int(event.generation) in (0, self._learners[agent].generation)):
-                self._learners.fail(agent, f"{event.proc} ended{code}{why}")
-                self._update_pending_value()
-            self._fail_run(f"{event.proc} on {where} ended{code}{why}{log}")
+            if learner:
+                logger.warning(f"{where}: {event.proc} reported an error ({event.error_kind}): {event.message} "
+                               f"[{event.context or where}]{log}; the node reports its exit")
+            else:
+                see = f"; see {event.log_path}" if event.log_path else ""
+                self._fail_run(f"{event.proc} failed ({event.error_kind}): {event.message}{see}",
+                               context=event.context or where)
+        elif kind in ("proc_died", "learner_failed") and learner:
+            self._on_learner_death(entry, event)
         elif kind == "proc_died":
-            logger.warning(f"{where}: {event.proc} died (exit {event.exit_code}) without reporting an error; the node "
-                           f"restarts it; see {event.log_path}")
+            logger.warning(f"{event.proc} of {where} died with exit code {event.exit_code}; restarted{log}")
         elif kind == "slot_disabled":
-            logger.warning(f"{where}: {event.proc} died too often; its slot is disabled; see {event.log_path}")
+            from colosseum.node.procs import WORKER_RESTARTS
+
+            limit, window = WORKER_RESTARTS
+            logger.warning(f"{event.proc} of {where} is disabled after {limit} restarts within {window:g} s{log}")
             name, _, index = event.proc.rpartition("-")
-            if name == "worker" and index.isdigit():   # it never asks again: its lineups name nothing any more
+            if name == "worker" and index.isdigit():   # it never asks again: its cells and lineups go
+                self._cells.drop_worker(entry.number, int(index))
                 self._holds.drop_worker(entry.number, int(index))
         elif kind == "run_stopped":
             self._run_stopped.add(entry.node_id)
@@ -1198,6 +1216,53 @@ class Hub(RunSinks, HubLearners):
             logger.warning(f"{where}: {event.proc}: {event.message}")
         else:
             logger.debug(f"{where}: event {kind!r} ignored")
+
+    def _on_learner_death(self, entry: Any, event: Any) -> None:
+        """``proc_died`` / ``learner_failed`` of ``learner-<agent>`` (spec 7.1; T4.2). Only a report of the agent's
+        current generation on the node of its slot counts (an older incarnation's is DEBUG). ``proc_died``: a new
+        generation on the same slot from the newest recovery point (or the hub-start source), ``learner_restarts``
+        (never during the shutdown). ``learner_failed`` (the node's restart limit is spent): the agent is ``failed``
+        (parked, its slot freed for a pending agent), the others go on; every trainable agent failed -> the run
+        stops (exit 1)."""
+        agent = event.proc.removeprefix("learner-")
+        generation = int(event.generation)
+        where = f"node {entry.number} ({entry.name})"
+        log = f" (see {event.log_path})" if event.log_path else ""
+        current = (agent in self._learners and self._learner_node_of(agent) == entry.number
+                   and generation == self._learners[agent].generation)
+        if not current:
+            logger.debug(f"{where}: {event.kind} of {event.proc} generation {generation} ignored (not the current "
+                         f"learner of {agent})")
+            return
+        why = f": {event.message}" if event.message else ""
+        if event.kind == "proc_died":
+            if self._shutting_down:
+                logger.warning(f"Learner of {agent} (generation {generation}) died on {where} with exit code "
+                               f"{event.exit_code}{why} while the run stops; not restarted{log}")
+                return
+            slot = self._learners.died(agent, generation)
+            if slot is None:
+                return
+            self._book.add("learner_restarts", 1)
+            _blob, _version, source = self._learner_start_source(agent)
+            logger.warning(f"Learner of {agent} (generation {generation}) died on {where} with exit code "
+                           f"{event.exit_code}{why}; restarting it there from {source}{log}")
+            try:
+                self._start_learner(agent, slot)
+            except Exception as e:  # noqa: BLE001 - e.g. hub_state.json cannot be written: the run stops
+                logger.error(f"Restarting the learner of {agent} failed ({type(e).__name__}: {e})", exc_info=True)
+                self._fail_run(f"restarting the learner of {agent} failed ({type(e).__name__}: {e})")
+            return
+        reason = event.message or f"exit code {event.exit_code}"
+        self._learners.fail(agent, f"{reason} (on node {entry.number})")
+        logger.error(f"Learner of {agent} failed ({reason}; {where}){log}; training of {agent} stopped, the other "
+                     f"agents go on; the run will exit with code 1")
+        self._park(agent)
+        self._update_pending_value()
+        self._announce_agents()
+        self._place_learners()                   # its slot is free for a pending agent
+        if self._agent_ids and len(self._learners.failed()) == len(self._agent_ids):
+            self._fail_run("every trainable agent failed; stopping")
 
     def _fail_run(self, message: str, *, context: str = "") -> None:
         """Stop the run with exit code 1 (A6): one ERROR; the first failure wins (a crashed learner reports both
@@ -1304,7 +1369,8 @@ class Hub(RunSinks, HubLearners):
     # ---- uploads, registrations, admin ------------------------------------------------------------------------
 
     def _on_upload(self, ev: Any) -> None:
-        """A learner's snapshot (``checkpoint`` / ``final``): checked (P-PF2-9 (b): a trainable agent of the run whose
+        """A learner's recovery point (``recovery``: ``_on_recovery_upload``) or snapshot (``checkpoint`` / ``final``):
+        checked (P-PF2-9 (b): a trainable agent of the run whose
         learner runs on the uploading node, its current generation, a matching frame), saved with the hub's env
         steps (R9) and answered. A refused upload is counted and answered; a snapshot that passes the checks but
         cannot be saved (a full disk) is answered and fails the run (``_fail_run``, as in SP4). The spool file may have
@@ -1329,6 +1395,9 @@ class Hub(RunSinks, HubLearners):
             except FileNotFoundError:
                 logger.info(f"node {number}: an upload of {header.agent_id!r} v{header.version} was given up "
                             f"before the hub read it")
+                return
+            if header.kind == "recovery":
+                self._on_recovery_upload(header, claimed, number, reply)
                 return
             if header.kind not in _CHECKPOINT_KIND:
                 self._count_drop(number, "dropped_uploads", "invalid", f"{header.kind!r} uploads")
@@ -1381,6 +1450,8 @@ class Hub(RunSinks, HubLearners):
                 self._fail_run(f"the {header.kind} snapshot v{header.version} of {agent!r} could not be saved "
                                f"({type(e).__name__}: {e})")
                 return
+            if header.kind == "final":
+                self._finals.add((agent, generation))
             reply(True, checkpoint_id=checkpoint_id)
         except Exception as e:  # noqa: BLE001 - one bad upload never stops the hub
             logger.error(f"Saving the {header.kind} snapshot v{header.version} of {header.agent_id!r} from node "
@@ -1389,6 +1460,27 @@ class Hub(RunSinks, HubLearners):
         finally:
             claimed.unlink(missing_ok=True)
             ev.path.unlink(missing_ok=True)
+
+    def _on_recovery_upload(self, header: Any, claimed: Path, number: int, reply: Callable[..., None]) -> None:
+        """A learner's recovery point (spec 5.2, 7.2; T4.2): only from the agent's current generation on the node of
+        its slot, a recovery checkpoint frame of that agent, generation and version (header only: never decoded),
+        never older than the stored one (``RecoveryStore.accept``: moved into ``recovery/<agent>/``). A refusal is
+        counted in ``dropped_uploads.<reason>`` (one WARNING per node and reason) and answered."""
+        agent, generation, version = header.agent_id, int(header.generation), int(header.version)
+        if agent not in self._agent_ids or generation < 1:
+            self._count_drop(number, "dropped_uploads", "invalid", f"recovery points of {agent!r}")
+            reply(False, "invalid")
+            return
+        slot = self._learners[agent].slot
+        current = self._versions.generation(agent) if slot is not None and slot.node == number else -1
+        accepted, reason = self._recovery.accept(agent, claimed, generation=generation, version=version,
+                                                 env_steps=self._budget.value, current_generation=current)
+        if not accepted:
+            self._count_drop(number, "dropped_uploads", reason, f"recovery points of {agent!r}")
+            reply(False, reason)
+            return
+        logger.info(f"Learner of {agent}: recovery point v{version} (generation {generation}) stored")
+        reply(True, checkpoint_id="recovery")
 
     def _stored_final(self, agent_id: str, version: int) -> str | None:
         """The checkpoint id of the current run's stored final snapshot ``ckpt_v<version>`` of ``agent_id`` (its
@@ -1597,11 +1689,15 @@ class Hub(RunSinks, HubLearners):
 
     def _exit_code_after_shutdown(self, code: int, killed: list[str]) -> int:
         """A child that exited non-zero on its own (not terminated by the shutdown) fails the
-        run, even if the budget was reached (R3-08). After a signal the signal's code stays
-        and such exits are only warned about. A signal that arrived while the run was
+        run, even if the budget was reached (R3-08); so does a ``failed`` agent (T4.2). After a
+        signal the signal's code stays and such exits are only warned about. A signal that arrived while the run was
         finishing (e.g. right after the budget was reached) still gives 128 + signum."""
         if code == 0 and self._supervisor.received_signal is not None:
             code = self._signal_exit_code()
+        failed = [] if self._learners is None else self._learners.failed()
+        if code == 0 and failed:                  # spec 7.1 / 7.5: a failed agent ends the run with exit code 1 (T4.2)
+            logger.error(f"Training of {', '.join(failed)} failed (the learner restart limit was reached); exit code 1")
+            code = 1
         for failure in self._supervisor.failures(exclude=set(killed) | self._reported_failures):
             self._reported_failures.add(failure.name)
             if code in (0, 1):
