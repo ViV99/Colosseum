@@ -108,7 +108,8 @@ def test_one_download_per_version_whatever_the_number_of_workers(setup):
     wait_for(lambda: _played(hub, 5, worker=0) and _played(hub, 5, worker=1), timeout=3 * SYNC_SEC + 10)
     history = node.agent.fetch_history()["main"]
     assert history == sorted(set(history)) and history[-1] == 5   # strictly increasing: no version twice
-    assert learner.server.counters["latest_served"] == len(history)
+    # the server counts a transfer once its generator resumes after the last part: it may trail the client
+    assert wait_for(lambda: learner.server.counters["latest_served"] == len(history), timeout=10)
     beat = wait_for(lambda: [h for h in hub.heartbeats() if h.counters["weight_fetches"] == len(history)])[-1]
     assert beat.counters["weight_fetch_redundant"] == 0 and beat.counters["weight_fetch_bytes"] > 0
     assert node.stop() == 0
@@ -227,20 +228,29 @@ def test_the_local_node_without_a_certificate_has_no_data_port_and_says_so_at_in
         hub.stop()
 
 
-def test_the_local_node_with_minted_credentials_serves_mutual_tls_on_its_listen_host(tmp_path):
+@pytest.mark.parametrize("listen", ["127.0.0.1", "0.0.0.0"])
+def test_the_local_node_with_minted_credentials_serves_mutual_tls_on_its_listen_host(tmp_path, monkeypatch, listen):
     """Ruling R30 (T3.2): ``train --listen``'s local node gets a certificate the hub mints in memory; its data port
-    binds on the listen host, announces only that address, and accepts a node of the same CA that names node 0."""
+    binds on the listen host and accepts a node of the same CA that names node 0. A specific host is announced as
+    is; the default ``--listen 0.0.0.0`` announces loopback first plus the machine's LAN addresses, also when the
+    host name maps to 127.0.1.1 (review round 1)."""
+    import socket
+
     from colosseum.net.security import mint_node_credentials
+    from colosseum.node import dataport
     from colosseum.node.agent import NodeOptions
     from colosseum.node.dataport import fetch_latest, probe_direct
     from colosseum.node.fetch import NodeFetcher
     from net_kit import node_identity, register
 
+    monkeypatch.setattr(dataport, "_route_source", lambda dest: "127.0.0.1")
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(socket.AF_INET, 0, 0, "", ("127.0.1.1", 0))])
+    monkeypatch.setattr(dataport, "_interface_addresses", lambda: ["127.0.0.1", "10.1.2.3"])
     hub = FakeHub(tmp_path, _config(tmp_path))
     record, secret = hub.identity.nodes.add_ephemeral("local", "machine-local")
     minted = mint_node_credentials(hub.identity, record.node_id)
     options = NodeOptions(hub_address=hub.address, token=hub.token, loopback_plain=True, local=True, workers=0,
-                          credentials=(record.node_id, 0, secret), data_port=0, data_host="127.0.0.1",
+                          credentials=(record.node_id, 0, secret), data_port=0, data_host=listen,
                           data_credentials=(minted.key_pem, minted.cert_pem, minted.ca_pem),
                           log_dir=tmp_path / "local-logs")
     node = None
@@ -249,7 +259,8 @@ def test_the_local_node_with_minted_credentials_serves_mutual_tls_on_its_listen_
         wait_for(lambda: node.agent.data_port() is not None, timeout=30)
         port = node.agent.data_port()
         wait_for(lambda: hub.messages("addresses"), timeout=10)
-        assert list(hub.messages("addresses")[-1].data_addresses) == [f"127.0.0.1:{port}"]
+        expected = [f"127.0.0.1:{port}"] + ([f"10.1.2.3:{port}"] if listen == "0.0.0.0" else [])
+        assert list(hub.messages("addresses")[-1].data_addresses) == expected
         client = node_identity(tmp_path, hub.identity.fingerprint, "remote")
         register(hub.identity, client, name="remote", machine_id="machine-remote")
         link = NodeFetcher.link(insecure=False, token_secret="", identity=client, max_message_mb=64,

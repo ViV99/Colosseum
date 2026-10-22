@@ -182,7 +182,7 @@ class NodeOptions:
     data_addresses: tuple[str, ...] | None = None    # announced instead of the probed ones (port forwards; T3.1)
     credentials: tuple[str, int, str] | None = None   # the local node's (node_id, number, node_secret) from the hub
     data_host: str | None = None       # the data port's bind host (None: loopback for a loopback hub, else all; T3.2)
-    data_credentials: tuple[bytes, bytes, bytes] | None = None   # local node: (key, cert, CA) PEM from the hub (R30)
+    data_credentials: tuple[bytes, bytes, bytes] | None = field(default=None, repr=False)   # (key, cert, CA), R30
     shutdown_grace_sec: float | None = None           # None: LOCAL_CHILD_GRACE_SEC / shutdown_grace_sec - 5
 
 

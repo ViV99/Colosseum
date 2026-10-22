@@ -36,6 +36,7 @@ import json
 import logging
 import mmap
 import socket
+import sys
 import threading
 import time
 from collections.abc import Callable, Collection, Iterable, Iterator, Sequence
@@ -63,7 +64,8 @@ logger = logging.getLogger(__name__)
 
 __all__ = [
     "DATA_PORT_TRIES", "DATA_SERVER_THREADS", "DataServer", "FetchError", "FetchedLatest", "check_fetched",
-    "data_addresses", "fetch_latest", "frame_digest", "is_loopback", "is_wildcard", "open_data_port", "probe_direct",
+    "data_addresses", "fetch_latest", "frame_digest", "is_loopback", "is_wildcard", "machine_addresses",
+    "open_data_port", "probe_direct",
     "read_latest_reply",
 ]
 
@@ -71,36 +73,72 @@ DATA_PORT_TRIES = 16
 DATA_SERVER_THREADS = 64
 
 
+# A destination for the "default route" probe: a UDP ``connect`` sends nothing, it only picks the source address.
+_ROUTE_PROBE_DEST = ("192.0.2.1", 9)              # TEST-NET-1 (RFC 5737): never answered, never needed
+_SIOCGIFCONF = 0x8912
+_IFREQ_BYTES = 40                                 # struct ifreq on 64-bit Linux
+
+
 def data_addresses(port: int, hub_host: str) -> list[str]:
-    """``host:port`` addresses a node announces for its data port: first the local address of the route to the
-    hub (a UDP ``connect`` sends nothing), then the machine's other IPv4 addresses; loopback only when the hub
-    itself is on loopback (one-machine tests and ``train``'s local node), and then first."""
+    """``host:port`` addresses a node announces for a data port bound on every interface: the machine's non-loopback
+    IPv4 addresses (the source of the route to the hub, the source of the default route, the host name's addresses,
+    every interface's address: ``machine_addresses``); loopback only when the hub itself is on loopback (one-machine
+    tests and ``train``'s local node), and then first (the hub shows loopback addresses only to nodes of the same
+    machine, ``hub.state.visible_version``)."""
+    out = [f"{host}:{int(port)}" for host in machine_addresses(hub_host)]
+    if is_loopback(hub_host):
+        out.insert(0, f"127.0.0.1:{int(port)}")
+    return out
+
+
+def machine_addresses(hub_host: str = "") -> list[str]:
+    """This machine's non-loopback IPv4 addresses, the likeliest first: the source of the route to ``hub_host`` (when
+    it is not loopback), the source of the default route, the host name's addresses (``/etc/hosts`` often maps it to
+    127.0.1.1: skipped), then every interface's (Linux ``SIOCGIFCONF``). Stdlib only; nothing is sent."""
     hosts: list[str] = []
-    loopback_hub = is_loopback(hub_host)
+    if hub_host and not is_loopback(hub_host):
+        hosts.append(_route_source((hub_host, 9)) or "")
+    hosts.append(_route_source(_ROUTE_PROBE_DEST) or "")
     try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-            s.connect((hub_host, 9))
-            hosts.append(s.getsockname()[0])
+        hosts.extend(str(info[4][0]) for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET))
     except OSError:
         pass
-    try:
-        for info in socket.getaddrinfo(socket.gethostname(), None, socket.AF_INET):
-            hosts.append(str(info[4][0]))
-    except OSError:
-        pass
+    hosts.extend(_interface_addresses())
     out: list[str] = []
     for host in hosts:
-        if is_loopback(host) and not loopback_hub:
-            continue
-        address = f"{host}:{int(port)}"
-        if address not in out:
-            out.append(address)
-    if loopback_hub:
-        first = f"127.0.0.1:{int(port)}"
-        if first in out:
-            out.remove(first)
-        out.insert(0, first)
+        if host and not is_loopback(host) and host != "0.0.0.0" and host not in out:
+            out.append(host)
     return out
+
+
+def _route_source(dest: tuple[str, int]) -> str | None:
+    """The local address of the route to ``dest`` (a UDP ``connect`` sends no packet); None without such a route."""
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            s.connect(dest)
+            return str(s.getsockname()[0])
+    except OSError:
+        return None
+
+
+def _interface_addresses() -> list[str]:
+    """Every interface's IPv4 address (Linux ``SIOCGIFCONF``; elsewhere, or on any error, none)."""
+    if not sys.platform.startswith("linux"):
+        return []
+    try:
+        import array
+        import fcntl
+        import struct
+
+        size = _IFREQ_BYTES * 128
+        buf = array.array("B", bytes(size))
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+            got = struct.unpack("iL", fcntl.ioctl(s.fileno(), _SIOCGIFCONF,
+                                                  struct.pack("iL", size, buf.buffer_info()[0])))[0]
+        data = buf.tobytes()[:got]
+        return [socket.inet_ntoa(data[i + 20:i + 24]) for i in range(0, len(data) - _IFREQ_BYTES + 1, _IFREQ_BYTES)]
+    except Exception:  # noqa: BLE001 - discovery is best effort (struct.error, OSError, ...)
+        return []
 
 
 def is_loopback(host: str) -> bool:
@@ -292,6 +330,7 @@ def open_data_port(*, port: int, hub_host: str, insecure: bool, token_secret: st
         except Exception as e:  # noqa: BLE001 - the node runs without a data port
             logger.warning(f"node: no data port ({type(e).__name__}: {e}); {hint}")
             return None
+        _check_own_name(identity.cert_pem, node)
     server = DataServer(cache=cache, own_agents=own_agents, max_message_mb=max_message_mb, insecure=insecure,
                         token_secret=token_secret, banned=banned, node=node, delivery=delivery)
     if host is None:
@@ -305,11 +344,33 @@ def open_data_port(*, port: int, hub_host: str, insecure: bool, token_secret: st
         addresses = tuple(announced)
     elif is_wildcard(host):
         addresses = tuple(data_addresses(bound, hub_host))
+        if not any(not is_loopback(a.rpartition(":")[0]) for a in addresses):
+            logger.warning(f"node: no non-loopback address of this machine was found for the data port on {host}:"
+                           f"{bound}; other machines reach this node's learners only through the hub. Announce the "
+                           f"addresses to use (NodeOptions.data_addresses, e.g. a port forward) or listen on a "
+                           f"specific address (--listen ADDR)")
     else:
         addresses = (f"{host}:{bound}",)
     logger.info(f"node: data port {host}:{bound} ({'plain + token' if insecure else 'mutual TLS'}); announced as "
                 f"{', '.join(addresses)}")
     return server, addresses
+
+
+def _check_own_name(cert_pem: bytes, node: int) -> None:
+    """A node certificate issued before SP5 T3.2 lacks its per-node name (``security.node_server_name``): every peer
+    refuses its data port (a failed handshake, seen there as "unreachable"). Say so once, with the remedy."""
+    from colosseum.net.security import certificate_dns_names, node_server_name
+
+    if node < 0:
+        return
+    try:
+        names = certificate_dns_names(cert_pem)
+    except ValueError:
+        names = []
+    if node_server_name(node) not in names:
+        logger.warning(f"node: this node's certificate does not name it as node {node} ({node_server_name(node)}): "
+                       f"other nodes refuse its data port and reach its learners only through the hub. Re-register "
+                       f"this node (forget its node identity and join again) to get a current certificate")
 
 
 def probe_direct(addresses: Sequence[str], make_channel: Callable[[str], grpc.Channel],

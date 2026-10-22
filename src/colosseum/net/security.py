@@ -83,6 +83,19 @@ def node_server_name(number: int) -> str:
     return f"n{int(number)}.{NODE_SERVER_NAME}"
 
 
+def certificate_dns_names(cert_pem: bytes) -> list[str]:
+    """The DNS names (SAN) of a PEM certificate; ValueError when it cannot be read."""
+    try:
+        cert = x509.load_pem_x509_certificate(cert_pem)
+    except (TypeError, ValueError) as e:
+        raise ValueError(f"not a PEM certificate ({e})") from None
+    try:
+        return list(cert.extensions.get_extension_for_class(x509.SubjectAlternativeName).value.get_values_for_type(
+            x509.DNSName))
+    except x509.ExtensionNotFound:
+        return []
+
+
 class SecurityError(Exception):
     """A refusal or a broken identity (exit 1 at the CLI); the message says what to do."""
 
@@ -712,9 +725,9 @@ class MemoryNodeIdentity:
     SP5 T3.2): what ``data_server_credentials`` / ``data_channel_credentials`` read of a ``NodeIdentity``."""
 
     node_id: str
-    key_pem: bytes
-    cert_pem: bytes
-    ca_pem: bytes
+    key_pem: bytes = field(repr=False)            # never in a log line or a traceback
+    cert_pem: bytes = field(repr=False)
+    ca_pem: bytes = field(repr=False)
 
 
 def mint_node_credentials(hub: HubIdentity, node_id: str) -> MemoryNodeIdentity:

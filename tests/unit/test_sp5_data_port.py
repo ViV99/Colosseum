@@ -221,3 +221,87 @@ def test_a_client_accepts_only_the_announced_nodes_certificate(tmp_path, pki):
         honest.close()
     finally:
         impostor.stop()
+
+
+def _hosts_file_on_loopback(monkeypatch, interfaces):
+    """Debian / Ubuntu / WSL2: the host name maps to 127.0.1.1; the routes give loopback sources (a loopback hub)."""
+    import socket
+
+    from colosseum.node import dataport
+
+    monkeypatch.setattr(dataport, "_route_source", lambda dest: "127.0.0.1")
+    monkeypatch.setattr(socket, "getaddrinfo", lambda *a, **k: [(socket.AF_INET, 0, 0, "", ("127.0.1.1", 0))])
+    monkeypatch.setattr(dataport, "_interface_addresses", lambda: list(interfaces))
+
+
+def test_a_wildcard_data_port_announces_the_machines_lan_addresses_even_behind_a_loopback_hub(monkeypatch):
+    """Review round 1 of T3.2(a): ``train --listen`` (0.0.0.0) has a loopback hub address; its node still announces
+    the machine's non-loopback addresses (interfaces), never 127.0.1.1."""
+    _hosts_file_on_loopback(monkeypatch, ["127.0.0.1", "10.1.2.3", "172.31.0.9"])
+    assert data_addresses(47102, "127.0.0.1") == ["127.0.0.1:47102", "10.1.2.3:47102", "172.31.0.9:47102"]
+    assert data_addresses(47102, "10.9.9.9") == ["10.1.2.3:47102", "172.31.0.9:47102"]
+
+
+@pytest.mark.parametrize("host", ["0.0.0.0", "127.0.0.1"])
+def test_open_data_port_announces_only_bound_addresses_and_warns_without_a_lan_address(monkeypatch, caplog, host,
+                                                                                         tmp_path):
+    import logging
+
+    from colosseum.node.dataport import open_data_port
+
+    _hosts_file_on_loopback(monkeypatch, [])                              # no address but loopback anywhere
+    with caplog.at_level(logging.WARNING, logger="colosseum.node.dataport"):
+        server, addresses = open_data_port(port=0, hub_host="127.0.0.1", insecure=True, token_secret="s",
+                                           identity=None, cache=None, own_agents=set, banned=frozenset,
+                                           max_message_mb=MAX_MB, node=0, host=host)
+    try:
+        assert addresses == (f"127.0.0.1:{server.port}",)
+        warned = [r for r in caplog.records if "no non-loopback address" in r.getMessage()]
+        if host == "0.0.0.0":
+            assert len(warned) == 1 and "NodeOptions.data_addresses" in warned[0].getMessage()
+            assert "--listen" in warned[0].getMessage()
+        else:
+            assert warned == []                                           # a specific host: exactly what is bound
+    finally:
+        server.stop()
+
+
+def test_a_certificate_without_its_per_node_name_is_a_warning_with_the_remedy(tmp_path, pki, caplog):
+    """Review round 1 of T3.2(a): a node registered before T3.2 lacks ``n<number>.colosseum-node``; its data port
+    starts but every peer refuses it, so the node says so at start."""
+    import logging
+
+    from colosseum.net.security import MemoryNodeIdentity, mint_node_credentials
+    from colosseum.node.dataport import open_data_port
+
+    hub = pki["hub"]
+    current = mint_node_credentials(hub, pki["a"].node_id)                 # carries n<a>.colosseum-node
+    old = MemoryNodeIdentity(current.node_id, current.key_pem,
+                             hub.issue_node_certificate("0" * 32, _public_pem(current.key_pem)), hub.ca_pem)
+    for identity, expect in ((current, 0), (old, 1)):
+        caplog.clear()
+        with caplog.at_level(logging.WARNING, logger="colosseum.node.dataport"):
+            server, _ = open_data_port(port=0, hub_host="127.0.0.1", insecure=False, token_secret="s",
+                                       identity=identity, cache=None, own_agents=set, banned=frozenset,
+                                       max_message_mb=MAX_MB, node=pki["a"].number, host="127.0.0.1")
+        server.stop()
+        warned = [r.getMessage() for r in caplog.records if "Re-register this node" in r.getMessage()]
+        assert len(warned) == expect
+
+
+def _public_pem(key_pem):
+    from cryptography.hazmat.primitives import serialization
+
+    key = serialization.load_pem_private_key(key_pem, password=None)
+    return key.public_key().public_bytes(serialization.Encoding.PEM, serialization.PublicFormat.SubjectPublicKeyInfo)
+
+
+def test_in_memory_credentials_never_show_the_private_key_in_a_repr(tmp_path, pki):
+    from colosseum.net.security import Token, mint_node_credentials
+    from colosseum.node.agent import NodeOptions
+
+    minted = mint_node_credentials(pki["hub"], pki["a"].node_id)
+    options = NodeOptions(hub_address="127.0.0.1:1", token=Token("s" * 43, "0" * 64), local=True,
+                          data_credentials=(minted.key_pem, minted.cert_pem, minted.ca_pem))
+    assert b"PRIVATE KEY" in minted.key_pem
+    assert "PRIVATE KEY" not in repr(minted) and "PRIVATE KEY" not in repr(options)
