@@ -22,6 +22,13 @@ authority and sets ``stop_event`` at the budget, so the learner runs until ``sto
 ``consumed_samples`` counts this learner's ACT slots (decisions, not env steps), and the learner stops by
 itself once ``consumed_samples >= total_timesteps``.
 
+With a counter, the env-step value used for progress never goes backward, also across a resume (R29): the learner
+uses the largest value it has seen, records it in its trainer state (``progress_env_steps``, see
+``make_checkpoint_payload``), and a resumed learner starts from the recorded value. The hub stamps a checkpoint with
+its budget counter, which may lag a node's estimate (R28), so a resumed counter can start below the value the learner
+last trained with. The value is in env steps, so a resume with another ``total_timesteps`` follows the new budget.
+Trainer states without the key (SP2-SP4) resume from the counter alone.
+
 ``version_floor`` (SP5, R9): a learner generation starts at the hub's version floor, so versions never go back.
 """
 
@@ -58,16 +65,24 @@ logger = logging.getLogger(__name__)
 # children (SHUTDOWN_GRACE_SEC after stop_event) and starts terminating them.
 FINAL_CHECKPOINT_TIMEOUT_SEC = SHUTDOWN_GRACE_SEC - 2.0
 
+# The learner's own trainer-state key (R29): the env-step value it last used for progress.
+PROGRESS_ENV_STEPS_KEY = "progress_env_steps"
 
-def make_checkpoint_payload(agent_id: str, algorithm: BaseAlgorithm, final: bool = False) -> dict:
+
+def make_checkpoint_payload(agent_id: str, algorithm: BaseAlgorithm, final: bool = False, *,
+                            progress_env_steps: int | None = None) -> dict:
     """Checkpoint snapshot that may cross a process boundary: numpy weights + bytes.
 
     The trainer state (optimizer, LR progress, scaler, kickstart, policy_version,
     consumed_samples) is serialized with ``torch.save`` into bytes, because it
-    contains tensors (R6-02).
+    contains tensors (R6-02). ``progress_env_steps`` (R29): the env-step value the learner last used for progress,
+    stored under that key next to the algorithm's state (``apply_resume_state`` takes it out again).
     """
+    state = algorithm.state_dict()
+    if progress_env_steps is not None:
+        state[PROGRESS_ENV_STEPS_KEY] = int(progress_env_steps)
     buf = io.BytesIO()
-    torch.save(algorithm.state_dict(), buf)
+    torch.save(state, buf)
     return {
         "agent_id": agent_id,
         "policy_version": int(algorithm.policy_version),
@@ -91,11 +106,14 @@ def send_checkpoint(q, payload: dict, block: bool, timeout: float = FINAL_CHECKP
         return False
 
 
-def apply_resume_state(algorithm: BaseAlgorithm, resume_state: dict) -> None:
+def apply_resume_state(algorithm: BaseAlgorithm, resume_state: dict) -> int:
     """Load weights and trainer state produced by ``resolve_resume`` into ``algorithm``.
 
     Without a trainer state, only ``policy_version`` is restored (from meta.json), so
     checkpoint ids keep increasing after a resume.
+
+    Returns the trainer state's recorded ``progress_env_steps`` (R29; taken out before the algorithm loads the
+    state), 0 without a trainer state or without the key (SP2-SP4).
     """
     model = algorithm.model
     try:
@@ -104,13 +122,17 @@ def apply_resume_state(algorithm: BaseAlgorithm, resume_state: dict) -> None:
         device = torch.device("cpu")
     model.load_state_dict(state_dict_from_numpy(resume_state["model_state"]))
     blob = resume_state.get("trainer_state")
+    recorded = 0
     if blob is not None:
-        algorithm.load_state_dict(torch.load(io.BytesIO(blob), map_location=device, weights_only=True))
+        state = torch.load(io.BytesIO(blob), map_location=device, weights_only=True)
+        recorded = int(state.pop(PROGRESS_ENV_STEPS_KEY, 0))
+        algorithm.load_state_dict(state)
     else:
         state = algorithm.state_dict()
         state["policy_version"] = int(resume_state.get("policy_version", 0))
         algorithm.load_state_dict(state)
     logger.info(f"Resumed from {resume_state.get('source')} at policy_version {algorithm.policy_version}")
+    return recorded
 
 
 def set_policy_version(algorithm: BaseAlgorithm, version: int) -> None:
@@ -165,15 +187,21 @@ def learner_process(
 
     # On resume both counters continue: train_step from the restored policy_version,
     # consumed_samples (the distributed budget) from the trainer state.
+    # progress_env_steps (R29): the largest env-step value used for progress, carried over a resume.
     consumed_samples = 0
+    progress_env_steps = 0
     if resume_state is not None:
-        apply_resume_state(algorithm, resume_state)
+        progress_env_steps = apply_resume_state(algorithm, resume_state)
         consumed_samples = int(algorithm.state_dict().get("consumed_samples", 0))
     if version_floor > algorithm.policy_version:
         logger.info(f"Learner [{agent_id}]: policy version {algorithm.policy_version} raised to the hub's floor "
                     f"{version_floor}")
         set_policy_version(algorithm, version_floor)
     train_step = int(algorithm.policy_version)
+
+    def recorded() -> int | None:
+        """The trainer state's ``progress_env_steps`` (None without a counter: SP2's distributed progress)."""
+        return progress_env_steps if progress_counter is not None else None
 
     total_chunks_received = 0
     last_ckpt_version = -1
@@ -199,7 +227,11 @@ def learner_process(
             # Policy lag of the batch, measured before this train step bumps the version.
             lags = [algorithm.policy_version - c.policy_version for c in chunks]
 
-            progress = _progress(progress_counter, consumed_samples, total_timesteps)
+            if progress_counter is not None:
+                progress_env_steps = max(progress_env_steps, int(progress_counter.value))
+                progress = _progress(progress_env_steps, total_timesteps)
+            else:
+                progress = _progress(consumed_samples, total_timesteps)
             algorithm.set_progress(progress)
 
             # Train step: off-policy adds to buffer, on-policy trains directly
@@ -223,8 +255,8 @@ def learner_process(
             if outputs.checkpoints and checkpoint_interval > 0:
                 pv = algorithm.policy_version
                 if pv > 0 and pv % checkpoint_interval == 0 and pv != last_ckpt_version:
-                    if outputs.send_checkpoint(make_checkpoint_payload(agent_id, algorithm), kind="periodic",
-                                               block=False):
+                    payload = make_checkpoint_payload(agent_id, algorithm, progress_env_steps=recorded())
+                    if outputs.send_checkpoint(payload, kind="periodic", block=False):
                         last_ckpt_version = pv
 
             metrics["agent_id"] = agent_id
@@ -243,22 +275,19 @@ def learner_process(
 
     # Final snapshot on every stop (R3-07); the outputs deliver it (a node: header + frame on the control
     # connection; SP4: a blocking put, flushed while the main process reads it).
-    if outputs.checkpoints and outputs.send_checkpoint(make_checkpoint_payload(agent_id, algorithm, final=True),
-                                                       kind="final", block=True):
+    if outputs.checkpoints and outputs.send_checkpoint(
+            make_checkpoint_payload(agent_id, algorithm, final=True, progress_env_steps=recorded()),
+            kind="final", block=True):
         logger.info(f"Learner [{agent_id}]: sent final checkpoint v{algorithm.policy_version}")
 
     logger.info(f"Learner [{agent_id}]: finished. Total train_steps={train_step}")
 
 
-def _progress(
-    progress_counter: Any | None,
-    consumed_samples: int,
-    total_timesteps: int,
-) -> float:
-    """Share of the budget used: the global counter if given, else ``consumed_samples``."""
+def _progress(done: int, total_timesteps: int) -> float:
+    """Share of the budget used: ``done`` (env steps with a counter, else ``consumed_samples``) of
+    ``total_timesteps``; 0 without a budget."""
     if total_timesteps <= 0:
         return 0.0
-    done = progress_counter.value if progress_counter is not None else consumed_samples
     return min(1.0, done / total_timesteps)
 
 
