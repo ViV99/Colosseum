@@ -12,11 +12,13 @@
    session thread never reads the loop's books).
 3. **Welcome** (once per run; a second one after a reconnect starts nothing new): the config, the env spec, the
    agents, the shared-memory cache (``cleanup_dead``, the node lock once per run, writer and reader), the children's
-   listener (``Acceptor`` with an ``os.urandom(32)`` key), then every ``Welcome.fixed`` blob fetched into the cache;
-   then ``workers`` workers (``worker-<i>``) and the learners of ``Welcome.learners`` (``learner-<agent>``; their
-   ``recovery`` / ``trainer_state`` start blobs, A28, are downloaded first; teacher and ``init`` weights come from the
-   ``Welcome.fixed`` blobs in the cache). A second Welcome of the same run starts the learners it lists that do not
-   run here and stops the ones it no longer lists.
+   listener (``Acceptor`` with an ``os.urandom(32)`` key), the data port (item 11), then the ``Welcome.fixed`` blobs
+   fetched into the cache (frozen and teacher weights on every node; an agent's ``init`` weights only on the node
+   that runs its learner, spec 4.6); then ``workers`` workers (``worker-<i>``) once the frozen and teacher blobs are
+   cached, and the learners of ``Welcome.learners`` (``learner-<agent>``; their ``recovery`` / ``trainer_state``
+   start blobs, A28, are downloaded first; teacher and ``init`` weights come from the ``Welcome.fixed`` blobs in the
+   cache). A second Welcome of the same run starts the learners it lists that do not run here and stops the ones it
+   no longer lists. Every Welcome's versions, bans and evictions are taken like an ``Announce``'s (item 7).
 4. **Children** run under ``ChildSupervisor``. Each pass waits on the wake pipe, the children's connections and
    their sentinels, reads the ready connections first, then the inbox, then the exits (P-PF2-11: an exited child's
    control connection is read to its end, bounded by ``EXIT_DRAIN_SEC``, before it counts as "reported" or "died").
@@ -42,9 +44,11 @@
    leave the cache after ``CACHE_DROP_DELAY_SEC`` (safe by an ordering invariant, see ``_prune_cache``).
 7. **Announces.** ``evictions`` -> ``WorkerEvict`` to every worker; ``env_steps`` (plus this node's own env steps
    since, refreshed at every ``WorkerProgress``; ruling R28) -> ``LearnerEnvSteps`` to every
-   learner (LR progress).
+   learner (LR progress); ``versions`` (where each agent's newest weights are) -> the fetch planner (item 11);
+   ``banned_node_ids`` (when present) -> the data port's refusals.
 8. **Heartbeat** every ``distributed.heartbeat_sec``: env steps, ``dropped_results``, processes, load, cached keys
-   and the node counters (``lineup_fetch_failed``, ``dropped_results_node_buffer``, ``worker_restarts``: A2).
+   and the node counters (``lineup_fetch_failed``, ``dropped_results_node_buffer``, ``worker_restarts``, the fetch
+   counters ``weight_fetch*`` and the data port's ``data_port.*``: A2), cumulative for the node process.
    ``MetricsBatch`` every ``METRICS_FLUSH_SEC``; due result batches every pass, unacked ones again after
    ``RESULT_RESEND_SEC`` on a live session (P-PF2-4) and all of them after every reconnect.
 9. **Commands.** ``stop_run`` stops (item 10); ``start_learner`` / ``stop_learner`` start or stop one learner
@@ -60,9 +64,23 @@
     closes. Worst case of a local node (``LOCAL_CHILD_GRACE_SEC`` 5 s): 5 s grace + 2 s kill + 1 s acks / uploads +
     1 s transfer join = 9 s, plus the session's close (immediate while the hub answers; ``HubSession`` bounds it).
 
-Threads besides the loop: the session reader (``HubSession``), the listener's ``Acceptor`` and the transfer pool;
-they only post into the inbox (a ``SimpleQueue`` plus a non-blocking wake pipe in the loop's ``wait`` list). The
-loop never blocks on the network and reads only connections ``wait`` reported ready.
+11. **Weights of other machines' learners** (spec 4.5, 4.6; SP5 T3.1). A node started with a data port
+    (``NodeOptions.data_port``: ``-1`` the hub config's ``distributed.data_port``, ``0`` ephemeral) binds it after
+    its first ``Welcome`` (``node.dataport.DataServer``: mutual TLS with its node certificate, or plain + the token
+    secret with ``--insecure``; on loopback when the hub is on loopback, else on every interface) and announces its
+    addresses (``DataAddresses``, then in every ``Hello``); its ``GetLatest`` serves this node's own learners'
+    newest frames from the cache, without the hub. ``node.fetch.FetchPlanner`` decides every 0.1 s which other
+    agents' latest weights to fetch (first weights at once, then the newest announced version at most once per
+    ``rollout.weight_sync_interval_sec`` for agents a lineup of this node names; without the hub, ``GetLatest``
+    polls); the transfer pool fetches each from the learner node's data port, the frame is checked and published into
+    the cache as is (one network download per (machine, agent, version) whatever the number of workers, criterion
+    4). A failed first fetch keeps the waiting lineups' old ones (``lineup_fetch_failed``); a full cache is an ERROR
+    with the hint. ``counters()`` and ``fetch_history()`` are copies the loop publishes every pass.
+
+Threads besides the loop: the session reader (``HubSession``), the listener's ``Acceptor``, the transfer pool and
+the data port's servicers; they only post into the inbox (a ``SimpleQueue`` plus a non-blocking wake pipe in the
+loop's ``wait`` list) or read snapshots the loop publishes. The loop never blocks on the network and reads only
+connections ``wait`` reported ready.
 """
 
 from __future__ import annotations
@@ -92,6 +110,7 @@ import grpc
 from colosseum.net.proto import colosseum_v1_pb2 as pb
 from colosseum.net.security import Token
 from colosseum.node.books import CellTracker, ResultBuffer
+from colosseum.node.fetch import BlobFetched, LatestFetched, LatestFetchFailed, NodeFetcher, rpc_text
 from colosseum.node.learners import LearnerBlobsDone, NodeLearners
 from colosseum.node.procs import ChildSpec, ChildSupervisor
 from colosseum.utils.process import SHUTDOWN_GRACE_SEC
@@ -116,7 +135,7 @@ EXIT_DRAIN_SEC = 1.0            # an exited child's control connection is read t
 FIXED_RETRY_SEC = 2.0           # a failed fetch of a Welcome.fixed blob is retried after this
 TRANSFER_THREADS = 4
 TRANSFER_JOIN_SEC = 1.0         # at the end, cancelled transfers are waited for this long before the cache cleanup
-DOWNLOAD_TIMEOUT_SEC = 300.0
+FETCH_PUMP_SEC = 0.1            # the fetch planner is asked for due latest transfers at most this often
 UPLOAD_TIMEOUT_SEC = 300.0
 _UPLOAD_KINDS = {"periodic": "checkpoint", "final": "final", "recovery": "recovery"}
 REGISTER_TIMEOUT_SEC = 30.0
@@ -153,6 +172,7 @@ class NodeOptions:
     log_dir: Path | None = None
     local: bool = False                # train's local node (R12): unlimited learner slots, no Bootstrap, hub's sys.path
     data_port: int | None = None       # None: no data port; 0 ephemeral; -1 distributed.data_port (A23; T3.1)
+    data_addresses: tuple[str, ...] | None = None    # announced instead of the probed ones (port forwards; T3.1)
     credentials: tuple[str, int, str] | None = None   # the local node's (node_id, number, node_secret) from the hub
     shutdown_grace_sec: float | None = None           # None: LOCAL_CHILD_GRACE_SEC / shutdown_grace_sec - 5
 
@@ -161,13 +181,6 @@ class NodeOptions:
 class _Accepted:
     conn: mpc.Connection
     hello: Any
-
-
-@dataclass
-class _FetchDone:
-    key: Any
-    error: str | None
-    generation: int                    # the run this fetch belongs to (a fetch of an older run is ignored)
 
 
 @dataclass
@@ -232,6 +245,7 @@ class _Run:
     grace: float
     started: bool = False
     fixed_retry_at: dict = field(default_factory=dict)
+    fixed_done: set = field(default_factory=set)       # Welcome.fixed keys in the cache (they stay for the run)
     closed: bool = False                # torn down: transfers of this run put nothing into the cache
 
 
@@ -245,10 +259,7 @@ def _split_address(address: str) -> tuple[str, int]:
     return host.strip("[]") or "127.0.0.1", int(port)
 
 
-def _rpc_text(e: BaseException) -> str:
-    if isinstance(e, grpc.RpcError) and hasattr(e, "code"):
-        return f"{e.code().name}: {e.details() if hasattr(e, 'details') else ''}".rstrip(": ")
-    return f"{type(e).__name__}: {e}"
+_rpc_text = rpc_text
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -284,7 +295,7 @@ class NodeAgent:
         self._hw: Any = None
         self._connected = False
         self._pool = ThreadPoolExecutor(max_workers=TRANSFER_THREADS, thread_name_prefix="node-transfer")
-        self._fetching: dict[Any, Future] = {}
+        self.fetches = NodeFetcher(submit=self._pool.submit, post=self._post)   # downloads (node.fetch, A25)
         self._fetch_warned: set = set()
         self._refused_players: set = set()        # (agent, network) of refused grants (warned once)
         self._cached: set = set()                   # snapshot keys this node put into the cache
@@ -316,6 +327,14 @@ class NodeAgent:
         self._ack_deadline = 0.0
         self._done = False
         self._exit_code = 0
+        self._node_identity: Any = None             # NodeIdentity of a registered node (data-port certificates)
+        self._data_server: Any = None               # node.dataport.DataServer (item 11)
+        self._data_addresses: tuple[str, ...] = ()
+        self._banned: frozenset[str] = frozenset()  # node ids the data port refuses (Welcome / Announce)
+        self._own_learners: frozenset[str] = frozenset()   # agents whose learner runs here (the data port reads it)
+        self._next_fetch_pump = 0.0
+        self._published_counters: dict[str, int] = {}
+        self._published_history: dict[str, list[int]] = {}
 
     # ---- public ---------------------------------------------------------------------------------------------
 
@@ -337,6 +356,21 @@ class NodeAgent:
     @property
     def cache_prefix(self) -> str | None:
         return None if self._run is None else self._run.prefix
+
+    def counters(self) -> dict[str, int]:
+        """The node's cumulative counters as the last ``Heartbeat`` carries them (a copy the loop publishes every
+        pass; any thread)."""
+        return dict(self._published_counters)
+
+    def fetch_history(self) -> dict[str, list[int]]:
+        """The versions of latest weights this node downloaded from other machines, per agent, in order (a copy the
+        loop publishes every pass; any thread)."""
+        return {agent: list(versions) for agent, versions in self._published_history.items()}
+
+    def data_port(self) -> int | None:
+        """The bound data port (None: none)."""
+        server = self._data_server
+        return None if server is None else server.port
 
     def run(self) -> int:
         """The node's loop until its stop; returns the exit code (0 after a stop, 1 after a refusal or a failure)."""
@@ -415,6 +449,7 @@ class NodeAgent:
                         f"{identity.node_id[:8]})")
         self._number = int(identity.number)
         self._name = opts.name or identity.name or self._name
+        self._node_identity = identity
         if self._plain():
             return identity.node_id, identity.secret, None
         return identity.node_id, identity.secret, hub_channel_credentials((identity.path / "ca.crt").read_bytes())
@@ -490,6 +525,9 @@ class NodeAgent:
         else:
             self._channel = grpc.secure_channel(self.options.hub_address, credentials,
                                                 options=channel_options(self._max_mb, server_name=HUB_SERVER_NAME))
+        from colosseum.net.grpc_util import node_metadata
+
+        self.fetches.set_hub(self._channel, node_metadata(node_id, secret))
         self._session = HubSession(self.options.hub_address, credentials=credentials, node_id=node_id,
                                    node_secret=secret, hello=self._hello, inbox=self._post,
                                    max_message_mb=self._max_mb)
@@ -547,7 +585,7 @@ class NodeAgent:
             run_id, live, env_steps, last_acked, _envs, learners = self._hello_state
         return pb.Hello(node_id=self._node_id, session_id=self.session_id, protocol_major=PROTOCOL_VERSION[0],
                         protocol_minor=PROTOCOL_VERSION[1], code_hash="", hardware=self._hardware(),
-                        slots=self._slots(), data_addresses=[], run_id=run_id,
+                        slots=self._slots(), data_addresses=list(self._data_addresses), run_id=run_id,
                         live_cells=[pb.LiveCell(worker=w, env=e, epoch=ep, incarnation=i) for w, e, ep, i in live],
                         env_steps=env_steps, last_acked_seq=last_acked,
                         learners=[pb.RunningLearner(agent_id=a, generation=g, version=v) for a, g, v in learners],
@@ -589,6 +627,16 @@ class NodeAgent:
             self._on_exit(name, code)
         self._tick(time.monotonic())
         self._update_hello_state()
+        self._publish_views()
+
+    def _publish_views(self) -> None:
+        """Copies other threads read: the counters and fetch history (accessors), the agents whose learner runs here
+        (the data port)."""
+        self._published_counters = self._node_counters(self._run)
+        history = self.fetches.stats.history
+        if sum(map(len, history.values())) != sum(map(len, self._published_history.values())):
+            self._published_history = {agent: list(versions) for agent, versions in history.items()}
+        self._own_learners = frozenset(self.learners.agents())
 
     def _drain_wake(self) -> None:
         try:
@@ -607,8 +655,12 @@ class NodeAgent:
                 self._on_hub_message(item)
             elif isinstance(item, _Accepted):
                 self._on_child_hello(item.conn, item.hello)
-            elif isinstance(item, _FetchDone):
+            elif isinstance(item, BlobFetched):
                 self._on_fetch_done(item)
+            elif isinstance(item, LatestFetched):
+                self._on_latest_fetched(item)
+            elif isinstance(item, LatestFetchFailed):
+                self._on_latest_fetch_failed(item)
             elif isinstance(item, _StopRequested):
                 self._begin_stop(item.reason)
             elif isinstance(item, LearnerBlobsDone):
@@ -647,12 +699,16 @@ class NodeAgent:
             if self._run is not run:                 # released in this pass: nothing of the old run is sent
                 return
         elif run is not None:
+            self._fetch_fixed(run, now)
             if not run.started:
-                self._maybe_start_workers(run, now)
+                self._maybe_start_workers(run)
             self.learners.start_pending(run)
             self._request_lineups()
             self._expire_waiting()
             self._deliver(run)
+            if now >= self._next_fetch_pump:
+                self._next_fetch_pump = now + FETCH_PUMP_SEC
+                self._pump_fetches(run, now)
             if now >= self._next_prune:
                 self._next_prune = now + CACHE_PRUNE_SEC
                 self._prune_cache(run, now)
@@ -710,6 +766,8 @@ class NodeAgent:
                 logger.exception(f"node: cannot serve run {welcome.run_id[:8]} ({type(e).__name__}: {e})")
                 self._exit_code = 1
                 self._begin_stop("the run could not start on this node")
+                return
+            self._absorb(welcome.versions, welcome.agents, welcome.evictions, welcome.banned_node_ids, welcome=True)
             return
         if welcome.run_id != run.run_id:
             logger.warning(f"node: the hub now runs {welcome.run_id[:8]}, this node serves {run.run_id[:8]}; "
@@ -721,6 +779,31 @@ class NodeAgent:
             self.learners.stop(agent, "the hub no longer assigns it here")
         for la in welcome.learners:
             self.learners.assign(run, la)
+        self._absorb(welcome.versions, welcome.agents, welcome.evictions, welcome.banned_node_ids, welcome=True)
+
+    def _absorb(self, versions: Any, agents: Any, evictions: Any, banned: Any, *, welcome: bool) -> None:
+        """What a ``Welcome`` or an ``Announce`` says beyond its own fields: versions (where each agent's newest
+        weights are) and removed agents for the fetch planner, evicted snapshots for the workers (``WorkerEvict``;
+        after a reconnect too: the hub keeps them while the node is away), banned node ids for the data port (a
+        ``Welcome`` replaces the list; an ``Announce`` only when it carries one, T6.3)."""
+        from colosseum.net.local import WorkerEvict
+        from colosseum.net.messages import version_from_proto
+        from colosseum.node.weights import CacheKey
+
+        if welcome or len(banned):
+            self._banned = frozenset(str(b) for b in banned)
+        planner = self.fetches.planner
+        if planner is not None:
+            for v in versions:
+                planner.on_version(version_from_proto(v))
+            for state in agents:
+                if state.status == "removed":
+                    planner.forget(state.agent_id)
+        keys = [CacheKey("snapshot", ev.agent_id, ev.checkpoint_id) for ev in evictions]
+        if keys and self._run is not None:
+            for name, conn in list(self._control.items()):
+                if self.supervisor.role(name) == "worker":
+                    self._child_send(name, conn, WorkerEvict(keys))
 
     def _start_run(self, welcome: pb.Welcome) -> None:
         from colosseum.core.config import ColosseumConfig
@@ -807,19 +890,67 @@ class NodeAgent:
             raise
         self._run_serial += 1
         self._run = run
+        self.fetches.start_run(number=number, sync_interval_sec=float(config.rollout.weight_sync_interval_sec),
+                               link=NodeFetcher.link(insecure=self.options.insecure,
+                                                     token_secret=self.options.token.secret,
+                                                     identity=self._node_identity,
+                                                     max_message_mb=int(dist.max_message_mb),
+                                                     connect_timeout_sec=float(dist.connect_timeout_sec)))
+        self._start_data_port(run)
         for la in welcome.learners:
             self.learners.assign(run, la)
         logger.info(f"node {number} ({self._name}): serving run {run_id[:8]} with {workers} workers; "
-                    f"{len(fixed_keys)} fixed blobs to fetch; logs in {log_dir}")
-        self._maybe_start_workers(run, time.monotonic())
+                    f"{len(fixed_keys)} fixed blobs; logs in {log_dir}")
+        self._fetch_fixed(run, time.monotonic())
+        self._maybe_start_workers(run)
 
-    def _maybe_start_workers(self, run: _Run, now: float) -> None:
-        """Fetch the missing ``Welcome.fixed`` blobs; once all are cached, start the workers."""
-        missing = [k for k in run.fixed_keys if not self._has(run, k)]
-        for key in missing:
-            if key not in self._fetching and now >= run.fixed_retry_at.get(key, 0.0):
-                self._fetch(run, key)
-        if not missing:
+    def _start_data_port(self, run: _Run) -> None:
+        """Item 11: bind the data port once per node process (a later run only points it at its cache) and announce
+        its addresses (``node.dataport.open_data_port``; without one, other machines reach this node's learners only
+        through the hub, T3.2)."""
+        from colosseum.node.dataport import open_data_port
+
+        opts = self.options
+        if self._data_server is not None:
+            self._data_server.set_cache(run.reader)
+            self._data_server.set_node(run.number)
+            return
+        if opts.data_port is None:
+            return
+        dist = run.config.distributed
+        opened = open_data_port(
+            port=int(dist.data_port) if int(opts.data_port) == -1 else int(opts.data_port),
+            hub_host=_split_address(opts.hub_address)[0], insecure=opts.insecure, token_secret=opts.token.secret,
+            identity=self._node_identity, cache=run.reader, own_agents=lambda: self._own_learners,
+            banned=lambda: self._banned, max_message_mb=int(dist.max_message_mb), node=run.number,
+            announced=opts.data_addresses)
+        if opened is None:
+            return
+        self._data_server, addresses = opened
+        with self._hello_lock:
+            self._data_addresses = addresses
+        self._send(pb.NodeMessage(addresses=pb.DataAddresses(data_addresses=list(addresses))))
+
+    def _needed_fixed(self, run: _Run) -> list:
+        """The ``Welcome.fixed`` blobs this node needs: frozen and teacher weights always, an agent's ``init`` weights
+        only while its learner runs (or is about to run) here (spec 4.6: "или назначенному лёрнеру")."""
+        learners = set(self.learners.agents())
+        return [k for k, kind in run.fixed_keys.items() if kind != "init" or k.agent_id in learners]
+
+    def _fetch_fixed(self, run: _Run, now: float) -> None:
+        """Fetch the needed ``Welcome.fixed`` blobs that are not cached (a failed one again after
+        ``FIXED_RETRY_SEC``)."""
+        for key in self._needed_fixed(run):
+            if key in run.fixed_done or self.fetches.blob_in_flight(key) or now < run.fixed_retry_at.get(key, 0.0):
+                continue
+            if run.reader.has(key):
+                run.fixed_done.add(key)
+                continue
+            self.fetches.fetch_blob(run, key)
+
+    def _maybe_start_workers(self, run: _Run) -> None:
+        """Start the workers once every frozen and teacher blob is cached (``init`` blobs are the learners')."""
+        if all(k in run.fixed_done for k, kind in run.fixed_keys.items() if kind != "init"):
             self._start_workers(run)
 
     def _start_workers(self, run: _Run) -> None:
@@ -910,22 +1041,15 @@ class NodeAgent:
             logger.info(f"node: command {cmd.kind!r} is not handled by this node yet; ignored")
 
     def _on_announce(self, announce: pb.Announce) -> None:
-        from colosseum.net.local import WorkerEvict
-        from colosseum.node.weights import CacheKey
-
         self.learners.forward_env_steps(int(announce.env_steps), self._env_steps())
-        keys = [CacheKey("snapshot", ev.agent_id, ev.checkpoint_id) for ev in announce.evictions]
-        if keys and self._run is not None:
-            for name, conn in list(self._control.items()):
-                if self.supervisor.role(name) == "worker":
-                    self._child_send(name, conn, WorkerEvict(keys))
+        self._absorb(announce.versions, announce.agents, announce.evictions, announce.banned_node_ids, welcome=False)
 
     # ---- lineups and the cache --------------------------------------------------------------------------------
 
     def _has(self, run: _Run, key: Any) -> bool:
         if key.kind == "latest":
             return run.reader.latest_version(key.agent_id) is not None
-        return key in self._cached or run.reader.has(key)
+        return key in run.fixed_done or key in self._cached or run.reader.has(key)
 
     def _request_lineups(self) -> None:
         if not self._connected:
@@ -952,8 +1076,8 @@ class NodeAgent:
         for worker, env, _lineup, keys in self.cells.waiting():
             missing = [k for k in set(keys.values()) if not self._has(run, k)]
             for key in missing:
-                if key.kind != "latest" and key not in self._fetching:
-                    self._fetch(run, key)
+                if key.kind != "latest" and not self.fetches.blob_in_flight(key):
+                    self.fetches.fetch_blob(run, key)     # latest weights: _pump_fetches (item 11)
             if missing or f"worker-{worker}" not in self._control:
                 continue
             lineup, keys = self.cells.deliver(worker, env)
@@ -962,59 +1086,15 @@ class NodeAgent:
             name = f"worker-{worker}"
             self._child_send(name, self._control[name], WorkerLineups(cells))
 
-    def _fetch(self, run: _Run, key: Any) -> None:
-        future = self._pool.submit(self._download, run, key)
-        self._fetching[key] = future
-        serial = run.serial
-
-        def done(f: Future) -> None:
-            error = None
-            if f.cancelled():
-                error = "cancelled"
-            elif f.exception() is not None:
-                error = _rpc_text(f.exception())
-            self._post(_FetchDone(key, error, serial))
-
-        future.add_done_callback(done)
-
-    def _download_bytes(self, run: _Run, kind: str, agent_id: str, ident: str) -> bytes:
-        """A transfer-pool thread: one ``Download`` (checked: size, offsets, digest; capped)."""
-        from colosseum.net.frame import payload_byte_cap
-        from colosseum.net.grpc_util import node_metadata, receive_parts
-        from colosseum.net.proto import colosseum_v1_pb2_grpc as pb_grpc
-
-        parts = pb_grpc.HubStub(self._channel).Download(
-            pb.BlobRequest(kind=kind, agent_id=agent_id, ident=ident),
-            metadata=node_metadata(self._node_id, self._node_secret), timeout=DOWNLOAD_TIMEOUT_SEC)
-        data, _meta = receive_parts(parts, cap=payload_byte_cap(run.config.distributed.max_message_mb))
-        if data is None:
-            raise ValueError("the hub answered not_modified")
-        return data
-
-    def _download(self, run: _Run, key: Any) -> None:
-        """A transfer-pool thread: ``Download`` the key's frame, check it, put it into the cache."""
-        from colosseum.net.chunks import decode_weights
-        from colosseum.node.weights import split_blob_key
-
-        if key.kind == "snapshot":
-            kind, ident = "snapshot", key.ident
-        else:
-            kind, ident = split_blob_key(key)
-        data = self._download_bytes(run, kind, key.agent_id, ident)
-        _state, meta = decode_weights(data, cap=len(data))
-        if meta.agent_id != key.agent_id:
-            raise ValueError(f"the frame holds weights of {meta.agent_id!r}")
-        if run.closed:
-            raise RuntimeError("the run was torn down (stopped or released) meanwhile")
-        run.writer.put(key, data)
-
-    def _on_fetch_done(self, done: _FetchDone) -> None:
-        self._fetching.pop(done.key, None)
+    def _on_fetch_done(self, done: BlobFetched) -> None:
+        self.fetches.blob_done(done)
         run = self._run
-        if run is None or run.serial != done.generation:
+        if run is None or run.serial != done.serial:
             return
         if done.error is None:
-            if done.key not in run.fixed_keys:
+            if done.key in run.fixed_keys:
+                run.fixed_done.add(done.key)
+            else:
                 self._cached.add(done.key)
             self._fetch_warned.discard(done.key)
             if not self._stopping:
@@ -1029,6 +1109,43 @@ class NodeAgent:
             self.cells.failed(worker, env)
             self._counters["lineup_fetch_failed"] += 1
         self._warn_fetch(done.key, f"{done.error}; {len(failed)} lineups keep their old one")
+
+    def _pump_fetches(self, run: _Run, now: float) -> None:
+        """Item 11: the latest transfers the planner wants now (the agents named by latest seats of this node's live
+        and waiting lineups are refreshed; never the agents whose learner runs here)."""
+        referenced = {k.agent_id for k in self.cells.referenced() if k.kind == "latest"}
+        self.fetches.pump(run, now, referenced=referenced, local=self.learners.agents(), hub_online=self._connected)
+
+    def _on_latest_fetched(self, ev: LatestFetched) -> None:
+        run = self._run
+        if run is None or run.serial != ev.serial or run.closed:
+            return
+        outcome = self.fetches.latest_done(run, ev)
+        if outcome == "published":
+            if not self._stopping:
+                self._deliver(run)
+        elif outcome == "failed":
+            self._fail_latest_grants(run, ev.agent_id)
+
+    def _on_latest_fetch_failed(self, ev: LatestFetchFailed) -> None:
+        run = self._run
+        if run is None or run.serial != ev.serial:
+            return
+        self.fetches.latest_failed(ev)
+        self._fail_latest_grants(run, ev.agent_id)
+
+    def _fail_latest_grants(self, run: _Run, agent: str) -> None:
+        """A latest transfer of ``agent`` failed and nothing of it is cached: the grants waiting for it keep their old
+        lineups, count ``lineup_fetch_failed`` and are requested again (spec 4.2; R11)."""
+        from colosseum.node.weights import CacheKey
+
+        key = CacheKey("latest", agent)
+        if self._has(run, key):
+            return
+        for worker, env, _lineup, keys in self.cells.waiting():
+            if key in keys.values():
+                self.cells.failed(worker, env)
+                self._counters["lineup_fetch_failed"] += 1
 
     def _warn_fetch(self, key: Any, why: str) -> None:
         if key in self._fetch_warned:
@@ -1049,7 +1166,7 @@ class NodeAgent:
         with sending the replacing lineup). The delay is a margin, not what makes it safe."""
         referenced = self.cells.referenced()
         for key in list(self._cached):
-            if key in referenced or key in self._fetching:
+            if key in referenced or self.fetches.blob_in_flight(key):
                 self._unref_since.pop(key, None)
                 continue
             since = self._unref_since.setdefault(key, now)
@@ -1312,8 +1429,12 @@ class NodeAgent:
     def _node_counters(self, run: _Run | None) -> dict[str, int]:
         """The A2 node counters, cumulative per session (a released run's drops are carried)."""
         dropped = self._dropped_carry + (0 if run is None else int(run.results.dropped))
-        return {"lineup_fetch_failed": int(self._counters["lineup_fetch_failed"]),
-                "dropped_results_node_buffer": dropped, "worker_restarts": int(self._counters["worker_restarts"])}
+        out = {"lineup_fetch_failed": int(self._counters["lineup_fetch_failed"]),
+               "dropped_results_node_buffer": dropped, "worker_restarts": int(self._counters["worker_restarts"]),
+               **self.fetches.counters()}
+        if self._data_server is not None:
+            out.update({f"data_port.{k}": int(v) for k, v in self._data_server.counters_snapshot().items()})
+        return out
 
     def _send_heartbeat(self, run: _Run) -> None:
         try:
@@ -1414,8 +1535,8 @@ class NodeAgent:
         self.supervisor = ChildSupervisor()
         self.cells = CellTracker(retry_sec=LINEUP_RETRY_SEC, clock=time.monotonic)
         self.learners.clear()
-        for book in (self._learner_routes, self._uploads, self._fetching, self._unref_since, self._control,
-                     self._child_conns):
+        self.fetches.clear_run()
+        for book in (self._learner_routes, self._uploads, self._unref_since, self._control, self._child_conns):
             book.clear()
         for book in (self._cached, self._route_conns, self._reported, self._disabled):
             book.clear()
@@ -1435,9 +1556,12 @@ class NodeAgent:
             self._session.close()
         if self._channel is not None:
             self._channel.close()                    # cancels the downloads and uploads in flight
+        self.fetches.close_channels()                # cancels the data-port transfers in flight
         self._pool.shutdown(wait=False, cancel_futures=True)
         if self._run is not None:
             self._teardown_run(self._run)
+        if self._data_server is not None:
+            self._data_server.stop(0.5)
         for fd in (self._wake_r, self._wake_w):
             try:
                 os.close(fd)
@@ -1458,7 +1582,7 @@ class NodeAgent:
         for conn in list(self._child_conns):
             self._close_conn(conn)
         run.closed = True                            # a download still running puts nothing any more
-        in_flight = [*self._fetching.values(), *(u[0] for u in self._uploads.values())]
+        in_flight = [*self.fetches.futures(), *(u[0] for u in self._uploads.values())]
         for future in in_flight:
             future.cancel()                          # not started yet: never runs
         if in_flight:
@@ -1516,10 +1640,10 @@ class _LearnerHost:
         return self._agent._pool.submit(fn, *args)
 
     def download_bytes(self, run: Any, kind: str, agent_id: str, ident: str) -> bytes:
-        return self._agent._download_bytes(run, kind, agent_id, ident)
+        return self._agent.fetches.download_bytes(run, kind, agent_id, ident)
 
     def fixed_cached(self, run: Any) -> bool:
-        return all(self._agent._has(run, k) for k in run.fixed_keys)
+        return all(self._agent._has(run, k) for k in self._agent._needed_fixed(run))
 
     def rpc_text(self, error: BaseException) -> str:
         return _rpc_text(error)

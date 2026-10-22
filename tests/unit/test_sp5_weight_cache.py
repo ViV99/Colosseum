@@ -478,3 +478,24 @@ def test_a_held_directory_lock_is_waited_for_with_a_bound_and_named(tmp_path, mo
         assert acquire_node_lock(root, cache_prefix(CA, RUN, 1)).exists()   # free again: taken at once
     finally:
         os.close(fd)
+
+
+def test_open_latest_returns_the_current_frame_and_survives_a_concurrent_replace(tmp_path):
+    """SP5 T3.1 (A18): ``open_latest`` gives the pointer's segment as an open file (the data port streams it); the open
+    file keeps v1's bytes while the writer replaces and prunes it."""
+    writer, reader = _pair(tmp_path)
+    v1 = _frame("a", 1, 1.0)
+    writer.publish_latest("a", v1, version=1, generation=1, teacher_active=True)
+    opened = reader.open_latest("a")
+    assert opened is not None
+    f, pointer = opened
+    with f:
+        assert pointer["version"] == 1 and pointer["teacher_active"] is True and pointer["digest"] == frame_digest(v1)
+        for v in (2, 3):                                      # v1's segment is pruned while it is open
+            writer.publish_latest("a", _frame("a", v, float(v)), version=v, generation=1, teacher_active=False)
+        assert f"{writer.prefix}-a-v1" not in _files(tmp_path)
+        assert f.read() == v1
+    f3, pointer3 = reader.open_latest("a")
+    with f3:
+        assert pointer3["version"] == 3 and f3.read() == _frame("a", 3, 3.0)
+    assert reader.open_latest("unknown") is None

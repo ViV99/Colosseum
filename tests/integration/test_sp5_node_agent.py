@@ -402,6 +402,23 @@ def test_evictions_reach_the_workers_and_leave_the_cache(hub_factory, node_facto
     assert node.stop() == 0
 
 
+def test_evictions_in_a_welcome_reach_the_workers(hub_factory, node_factory, tmp_path):
+    """SP5 T3.1 (carried item of T2.5 (a2)): the hub keeps evictions while a node is away and hands them out with its
+    next ``Welcome``; the node applies them like an ``Announce``'s."""
+    config = _config()
+    hub = hub_factory(config)
+    _serve_snapshot(hub, config, 5)
+    hub.grant(lambda worker, env: SNAP5 if env == 0 else FIXED)
+    node = node_factory(hub)
+    wait_for(lambda: _results_with(hub, "ckpt_v5"))
+    hub.grant(lambda worker, env: FIXED)
+    hub.welcome(evictions=[pb.Eviction(agent_id="a", checkpoint_id="ckpt_v5")])
+    hub.close_session()                                         # the node comes back; its Welcome carries them
+    log = tmp_path / "node-logs" / "worker-0.log"
+    wait_for(lambda: log.exists() and "unloaded evicted snapshot ckpt_v5" in log.read_text())
+    assert node.stop() == 0
+
+
 def test_frozen_players_come_from_the_hubs_blobs(hub_factory, node_factory, tmp_path):
     import threading
 

@@ -12,13 +12,15 @@ replies through futures or a session's outbound queue. The main loop (``_main_lo
 
 1. drains the inbox (``_drain_inbox``): every event goes to its handler (``_on_session_opened``,
    ``_on_session_closed``, ``_on_message`` -> ``_on_heartbeat`` / ``_on_lineup_request`` / ``_on_result_batch`` /
-   ``_on_metrics_batch`` / ``_on_version`` / ``_on_event``, ``_on_upload``, ``_on_register``, ``_on_admin``); a
-   handler's failure is one ERROR per handler (nothing a node sends stops the hub);
+   ``_on_metrics_batch`` / ``_on_version`` / ``_on_event`` / ``_on_data_addresses``, ``_on_upload``,
+   ``_on_register``, ``_on_admin``); a handler's failure is one ERROR per handler (nothing a node sends stops the
+   hub);
 2. accounts the journal writer's commits (``_drain_commits``, R8: the coordinator and the metrics hub get a result
    once, after its commit; then the batch is acked);
 3. reruns retention after a live refit, feeds the pulse, marks silent nodes lost, broadcasts the periodic
-   ``Announce`` (env steps for the learners' LR progress, new versions, evicted snapshots), ticks the metrics (and
-   writes ``league_state.json`` / ``hub_state.json``);
+   ``Announce`` (env steps for the learners' LR progress, new versions with the learner node's data addresses, so
+   every node fetches them once per machine (spec 4.5, T3.1), evicted snapshots), ticks the metrics (and writes
+   ``league_state.json`` / ``hub_state.json``);
 4. stops at a failure (``_fail_run``: a node's reported child error or a failed learner, also when reported during
    the shutdown; the supervisor: a dead local node or pulse child), a signal, ``request_stop`` or the budget (the
    hub is the only budget authority, spec 4.4).
@@ -82,7 +84,7 @@ from colosseum.hub.setup import (  # re-exported: the contract names colosseum.h
     validate_run_config,
     warn_static_ownership_skew,
 )
-from colosseum.hub.state import CellKey, restrict_collecting
+from colosseum.hub.state import CellKey, restrict_collecting, version_source
 from colosseum.metrics.counters import CounterBook
 from colosseum.metrics.wandb_logger import WandBLogger
 from colosseum.net.messages import lineup_to_proto, version_from_proto, version_to_proto
@@ -113,6 +115,8 @@ _CHECKPOINT_KIND = {"checkpoint": "periodic", "final": "final"}   # UploadHeader
 _LOOPBACK_OF = {"[::]": "[::1]", "0.0.0.0": "127.0.0.1", "127.0.0.1": "127.0.0.1", "localhost": "localhost",
                 "[::1]": "[::1]"}
 PENDING_EVICTIONS_MAX = 10_000            # evictions kept per node while its stream is down (oldest dropped)
+DATA_ADDRESSES_MAX = 16                   # a node announces at most this many data-port addresses (T3.1)
+DATA_ADDRESS_CHARS_MAX = 255
 
 
 @dataclass(frozen=True)
@@ -659,6 +663,7 @@ class Hub(RunSinks):
                                       serial=handle.serial)
         if kind == "returned":
             self._cells.drop_node(record.number)
+        self._resource_versions(self._registry.by_id(handle.node_id))     # Hello.data_addresses (T3.1)
         self._intake.open(handle.node_id, hello.session_id, int(hello.last_acked_seq))
         self._budget.report(handle.node_id, hello.session_id, int(hello.env_steps))
         placed = self._place_learners(record.number, node_hello)
@@ -758,6 +763,8 @@ class Hub(RunSinks):
             self._on_version(entry, message.version.info)
         elif kind == "event":
             self._on_event(entry, message.event)
+        elif kind == "addresses":
+            self._on_data_addresses(entry, message.addresses)
         elif kind == "hello":
             self._warn_once(("hello", entry.number), f"node {entry.number} ({entry.name}) sent a second Hello on its "
                                                      f"stream; ignored")
@@ -855,7 +862,9 @@ class Hub(RunSinks):
         else:
             outcome = self._versions.announce(info)
         if outcome == "accepted":
-            self._new_versions[info.agent_id] = info
+            sourced = version_source(info, entry)          # where the other nodes fetch it (spec 4.5, T3.1)
+            self._versions.replace_latest(sourced)
+            self._new_versions[info.agent_id] = sourced
             if info.agent_id not in self._announced_once:
                 self._announced_once.add(info.agent_id)
                 logger.info(f"agent {info.agent_id}: first weights (v{info.version}) published on node "
@@ -863,6 +872,31 @@ class Hub(RunSinks):
             return
         self._count_drop(entry.number, "dropped_announcements", outcome, f"version announcements of "
                          f"{info.agent_id!r} (v{info.version}, generation {info.generation})")
+
+    def _on_data_addresses(self, entry: Any, msg: Any) -> None:
+        """A node's ``DataAddresses`` (its data port was bound after its ``Welcome``; spec 3.1, T3.1): kept in its
+        registry entry, and the latest version of every agent whose learner runs there is announced again at once
+        with the new addresses. More than ``DATA_ADDRESSES_MAX`` entries, or an empty or overlong one, is dropped
+        (``node_messages.invalid``)."""
+        addresses = tuple(str(a) for a in msg.data_addresses)
+        if len(addresses) > DATA_ADDRESSES_MAX or any(not a or len(a) > DATA_ADDRESS_CHARS_MAX for a in addresses):
+            self._count_drop(entry.number, "node_messages", "invalid", "data address announcements")
+            return
+        entry.data_addresses = addresses
+        self._resource_versions(entry)
+
+    def _resource_versions(self, entry: Any) -> None:
+        """Re-store the latest version of every agent whose learner runs on ``entry``'s node with that node's current
+        data addresses (``version_source``); a changed one goes out with the next ``Announce``."""
+        if entry is None:
+            return
+        for agent in self._agent_ids:
+            latest = self._versions.latest(agent)
+            if latest is None or latest.node != entry.number:
+                continue
+            sourced = version_source(latest, entry)
+            if sourced != latest and self._versions.replace_latest(sourced):
+                self._new_versions[agent] = sourced
 
     def _on_event(self, entry: Any, event: Any) -> None:
         """A node's ``Event`` (A1 kinds). A reported child error and a failed learner stop the run (A12, until
@@ -1122,12 +1156,13 @@ class Hub(RunSinks):
 
     def _broadcast_announce(self) -> None:
         """The periodic ``Announce`` to every live session: the hub's env steps (the learners' LR progress), the
-        versions accepted since the last one and the snapshots evicted since the node's last ``Announce`` or
-        ``Welcome`` (kept per online node while its stream is down, at most ``PENDING_EVICTIONS_MAX``)."""
+        versions accepted (or re-sourced, T3.1) since the last one, with where to fetch them, and the snapshots
+        evicted since the node's last ``Announce`` or ``Welcome`` (kept per online or lost node while its stream is
+        down, at most ``PENDING_EVICTIONS_MAX``: a lost node that comes back gets them with its ``Welcome``)."""
         new = [(a, c) for a, ids in sorted(self._coordinator.take_evictions().items()) for c in ids]
         if new:
             for entry in self._registry.all():
-                if entry.state == "online":
+                if entry.state in ("online", "lost"):
                     pending = self._pending_evictions.setdefault(entry.node_id, [])
                     pending.extend(new)
                     del pending[:-PENDING_EVICTIONS_MAX]

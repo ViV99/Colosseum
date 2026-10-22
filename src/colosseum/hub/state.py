@@ -25,7 +25,8 @@ appear here, only durations (``ttl_sec``).
 - ``VersionInfo`` (defined in ``colosseum.net.messages``, amendment A7) is re-exported here.
 - ``VersionRegistry``: per agent the current learner generation, the highest accepted version, the version cap of
   every superseded generation and the latest announcement (spec 4.5, 7.2; R16: a superseded generation ``g`` is
-  stale only above ``cap(g)``).
+  stale only above ``cap(g)``); ``version_source`` fills a latest announcement with where to fetch it (the learner
+  node's number and data addresses, T3.1).
 - ``ResultIntake``: checks of every match result a node sends (spec 4.3, 3.4: never raises) and the batch dedup / ack
   bookkeeping per (node, session, seq) (R8), with drop counters by reason and one WARNING per (node, reason).
 - ``HubStateData`` / ``save_hub_state`` / ``load_hub_state``: ``runs/<name>/hub_state.json`` (amendment A3).
@@ -50,7 +51,7 @@ __all__ = [
     "DROP_REASONS", "EPOCH_BLOCK", "EVICTED_HOLD_FACTOR", "HUB_STATE_FILE", "HUB_STATE_VERSION", "BudgetCounter",
     "CellEntry", "CellKey", "CellTable", "EpochAllocator", "HubStateData", "NodeEntry", "NodeHello", "NodeRegistry",
     "OwnerRotation", "ResultIntake", "VersionInfo", "VersionRegistry", "load_hub_state", "restrict_collecting",
-    "save_hub_state",
+    "save_hub_state", "version_source",
 ]
 
 EPOCH_BLOCK = 1024                   # R7: epochs reserved per hub_state.json write
@@ -437,6 +438,16 @@ class VersionRegistry:
         a = self._agents.get(agent_id)
         return None if a is None else a.latest
 
+    def replace_latest(self, info: VersionInfo) -> bool:
+        """Replace the stored latest announcement by ``info`` of the same agent, generation and version (where to
+        fetch it: ``version_source``, SP5 T3.1); False (nothing changed) for any other version."""
+        a = self._agents.get(info.agent_id)
+        if a is None or a.latest is None or (a.latest.generation, a.latest.version) != (info.generation,
+                                                                                        info.version):
+            return False
+        a.latest = info
+        return True
+
     def version_floor(self, agent_id: str) -> int:
         """The first version a newly assigned learner may publish: max accepted + 1 (0 without any; R9)."""
         a = self._agents.get(agent_id)
@@ -471,6 +482,15 @@ class VersionRegistry:
                 gen_max=int(s.get("gen_max", -1)), caps={int(g): int(c) for g, c in s.get("caps", {}).items()},
                 latest=None if s.get("latest") is None else VersionInfo.from_dict(s["latest"]))
         return reg
+
+
+def version_source(info: VersionInfo, entry: NodeEntry) -> VersionInfo:
+    """``info`` as announced to the other nodes (spec 4.5 "где взять"; SP5 T3.1): the announcing node's number and data
+    addresses, whatever the node wrote itself; ``relay_only`` when it has no data address (``train``'s local node
+    without ``--listen``, a node whose data port could not be bound, a node whose ``DataAddresses`` did not arrive
+    yet)."""
+    return replace(info, node=int(entry.number), addresses=tuple(entry.data_addresses),
+                   relay_only=not entry.data_addresses)
 
 
 # ---------------------------------------------------------------------------------------------------------------

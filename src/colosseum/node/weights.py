@@ -61,7 +61,7 @@ from collections.abc import Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import BinaryIO, Literal
 
 import numpy as np
 
@@ -379,6 +379,28 @@ class WeightCacheReader:
                                             f"v{pointer['version']}; ignored")
                 return None
             return cached
+        return None
+
+    def open_latest(self, agent_id: str) -> tuple[BinaryIO, dict] | None:
+        """The current latest segment of ``agent_id`` opened read-only, with its pointer dict (``segment``,
+        ``version``, ``generation``, ``size``, ``digest``, ``teacher_active``); None when the cache holds no latest
+        weights of the agent (or they cannot be read). A pointer whose segment was deleted between the two reads is
+        read again (``READ_RETRIES``, as ``read_latest``). The caller owns the file object; the open descriptor keeps
+        the bytes readable when the writer deletes the segment afterwards (POSIX). Used by the data port
+        (``GetLatest``, SP5 T3.1) and the relay upload (T3.2): they stream the frame without decoding it."""
+        for _ in range(READ_RETRIES):
+            pointer = self._pointer(agent_id)
+            if pointer is None:
+                return None
+            name = pointer["segment"]
+            try:
+                f = open(self.root / name, "rb")      # noqa: SIM115 - handed to the caller, who closes it
+            except FileNotFoundError:
+                continue                              # replaced and pruned since the pointer was read
+            except OSError as e:
+                self._io_error(name, e)
+                return None
+            return f, dict(pointer)
         return None
 
     def get(self, key: CacheKey) -> CachedWeights | None:

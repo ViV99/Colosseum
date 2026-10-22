@@ -563,6 +563,16 @@ class RecordingHandle:
         return [s for ack in self.of("ack") for s in ack.seqs]
 
 
+def make_node_entry(**kw: Any):
+    """A ``hub.state.NodeEntry`` with neutral defaults (an online node 1 without data addresses); ``kw`` override."""
+    from colosseum.hub.state import NodeEntry
+
+    fields: dict[str, Any] = dict(node_id="n" * 32, number=1, name="n", session_id="s", state="online", hardware={},
+                                  slots={}, tags=(), data_addresses=(), data_path="relay", last_heartbeat=0.0)
+    fields.update(kw)
+    return NodeEntry(**fields)
+
+
 def lineup_hub(config, tmp_path: Path, *, mode: str = "hub", sinks: bool = False, name: str = "hub-run"):
     """A ``Hub`` (``hub`` mode, no local node) after ``launch``'s setup steps (``_prepare``: the coordinator, the
     identity under ``tmp_path``, the pure hub state); ``sinks``: the metrics hub, the journal writer and the live
