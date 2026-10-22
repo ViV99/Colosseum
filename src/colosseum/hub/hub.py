@@ -1093,7 +1093,8 @@ class Hub(RunSinks):
         steps (R9) and answered. A refused upload is counted and answered; a snapshot that passes the checks but
         cannot be saved (a full disk) is answered and fails the run (``_fail_run``, as in SP4). The spool file may have
         vanished (the servicer's timeout or a cancel deleted it and told the node so): then nothing is saved (carried
-        item of T2.3)."""
+        item of T2.3). A periodic upload of a version whose current-run final is stored is not saved (ruling R35):
+        answered as accepted with reason ``not_newer`` and counted ``dropped_uploads.not_newer``."""
         from colosseum.net.chunks import decode_checkpoint
         from colosseum.net.frame import payload_byte_cap
 
@@ -1143,6 +1144,14 @@ class Hub(RunSinks):
                                  f"match the header ({', '.join(mismatch)})")
                 reply(False, f"invalid: {', '.join(mismatch)}")
                 return
+            if header.kind != "final" and (stored := self._stored_final(agent, int(header.version))) is not None:
+                # ruling R35: the node uploads a periodic and the final of one version concurrently; a periodic that
+                # arrives second never replaces the current run's final (the node is told the version is stored)
+                self._book.add("dropped_uploads.not_newer", 1)
+                logger.info(f"node {number}: the hub already stores the final snapshot v{header.version} of "
+                            f"{agent!r}; its periodic upload is ignored (dropped_uploads.not_newer)")
+                reply(True, "not_newer", checkpoint_id=stored)
+                return
             try:
                 checkpoint_id = self._save_checkpoint(payload)
             except Exception as e:  # noqa: BLE001 - the node is answered; the run fails after its teardown
@@ -1162,6 +1171,17 @@ class Hub(RunSinks):
         finally:
             claimed.unlink(missing_ok=True)
             ev.path.unlink(missing_ok=True)
+
+    def _stored_final(self, agent_id: str, version: int) -> str | None:
+        """The checkpoint id of the current run's stored final snapshot ``ckpt_v<version>`` of ``agent_id`` (its
+        ``meta.json`` ``final`` and this run's ``run_id``), else None: a final imported from an earlier run is not
+        the current run's (ruling R35)."""
+        manager = self._coordinator.checkpoint_manager
+        checkpoint_id = f"ckpt_v{int(version)}"
+        info = next((c for c in manager.list_checkpoints(agent_id) if c.checkpoint_id == checkpoint_id), None)
+        if info is None or info.meta.get("final") is not True or info.meta.get("run_id") != manager.run_id:
+            return None
+        return checkpoint_id
 
     def _on_register(self, ev: Any) -> None:
         """``Register`` with the token (T6.3 adds the version / platform checks before it)."""

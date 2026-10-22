@@ -2,6 +2,7 @@
 rulings P-PF2-1 (c), P-PF2-9 (b); amendments A6, A12; SP4 ruling R3-08): driven in-process through ``hub_kit``."""
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from concurrent.futures import Future
@@ -24,9 +25,11 @@ def _config(tmp_path, **sections):
                             **sections)
 
 
-def _frame(agent="a", version=20, *, kind="periodic", generation=1, final=False) -> bytes:
-    payload = {"agent_id": agent, "policy_version": version, "model_state": {"w": np.arange(4, dtype=np.float32)},
-               "trainer_state_bytes": None, "final": final}
+def _frame(agent="a", version=20, *, kind="periodic", generation=1, final=False, w: float = 0.0,
+           trainer: bytes | None = None) -> bytes:
+    payload = {"agent_id": agent, "policy_version": version,
+               "model_state": {"w": np.arange(4, dtype=np.float32) + np.float32(w)},
+               "trainer_state_bytes": trainer, "final": final}
     return encode_checkpoint(payload, kind=kind, generation=generation)
 
 
@@ -59,6 +62,60 @@ def test_accepted_periodic_and_final_uploads_are_saved_with_the_hubs_env_steps(t
     assert _stored(hub) == ["ckpt_v20", "ckpt_v25"]
     metas = {c.checkpoint_id: c.meta for c in hub._coordinator.checkpoint_manager.list_checkpoints("a")}
     assert metas["ckpt_v20"]["env_steps"] == 777 and metas["ckpt_v25"]["final"] is True
+
+
+def _files(hub, checkpoint_id: str, agent="a") -> tuple[dict, bytes, bytes]:
+    """``(meta, model.pt bytes, trainer_state.pt bytes)`` of a stored snapshot."""
+    info = next(c for c in hub._coordinator.checkpoint_manager.list_checkpoints(agent)
+                if c.checkpoint_id == checkpoint_id)
+    meta = json.loads((info.path / "meta.json").read_text())
+    return meta, (info.path / "model.pt").read_bytes(), (info.path / "trainer_state.pt").read_bytes()
+
+
+def test_a_late_periodic_of_a_stored_final_version_is_ignored_and_counted(tmp_path, caplog):
+    """Ruling R35 (FX4): the node's transfer pool uploads the periodic and the final snapshot of the same version
+    concurrently; when the periodic arrives second, the stored final of the current run stays (meta, model,
+    trainer state) and the periodic is counted as ``dropped_uploads.not_newer``."""
+    hub = lineup_hub(_config(tmp_path), tmp_path)
+    node = open_node(hub)
+    final = _upload(hub, node, _frame(version=310, kind="final", final=True, w=1.0, trainer=b"final-state"),
+                    kind="final", version=310).result(1)
+    assert (final.accepted, final.checkpoint_id) == (True, "ckpt_v310")
+    before = _files(hub, "ckpt_v310")
+    with caplog.at_level(logging.INFO, logger="colosseum.hub.hub"):
+        late = _upload(hub, node, _frame(version=310, w=2.0, trainer=b"periodic-state"), version=310).result(1)
+    assert (late.accepted, late.checkpoint_id, late.reason) == (True, "ckpt_v310", "not_newer")
+    after = _files(hub, "ckpt_v310")
+    assert after == before and after[0]["final"] is True
+    assert _stored(hub) == ["ckpt_v310"]
+    assert hub._book.get("dropped_uploads.not_newer") == 1
+    assert "already stores the final snapshot v310" in caplog.text
+
+
+def test_a_final_replaces_a_periodic_of_the_same_version(tmp_path):
+    hub = lineup_hub(_config(tmp_path), tmp_path)
+    node = open_node(hub)
+    assert _upload(hub, node, _frame(version=310, trainer=b"periodic-state"), version=310).result(1).accepted
+    assert _files(hub, "ckpt_v310")[0]["final"] is False
+    final = _upload(hub, node, _frame(version=310, kind="final", final=True, w=1.0, trainer=b"final-state"),
+                    kind="final", version=310).result(1)
+    assert (final.accepted, final.checkpoint_id) == (True, "ckpt_v310")
+    meta, _, trainer = _files(hub, "ckpt_v310")
+    assert meta["final"] is True and trainer == b"final-state"
+    assert hub._book.get("dropped_uploads.not_newer") == 0
+
+
+def test_a_periodic_replaces_an_earlier_runs_final_of_the_same_version(tmp_path):
+    """A final imported from an earlier run (another ``run_id``) is not the current run's: R35 does not apply."""
+    hub = lineup_hub(_config(tmp_path), tmp_path)
+    node = open_node(hub)
+    hub._coordinator.checkpoint_manager.save("a", 310, {"w": np.zeros(4, dtype=np.float32)},
+                                             meta_extra={"final": True, "run_id": "an-earlier-run"})
+    reply = _upload(hub, node, _frame(version=310, trainer=b"periodic-state"), version=310).result(1)
+    assert (reply.accepted, reply.reason) == (True, "")
+    meta, _, trainer = _files(hub, "ckpt_v310")
+    assert meta["final"] is False and meta["run_id"] == hub._coordinator.checkpoint_manager.run_id
+    assert trainer == b"periodic-state" and hub._book.get("dropped_uploads.not_newer") == 0
 
 
 @pytest.mark.parametrize("case, expected", [
