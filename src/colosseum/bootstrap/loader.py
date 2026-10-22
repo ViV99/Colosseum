@@ -636,7 +636,7 @@ def close_inherited_locks(text: str | None) -> None:
             st = os.fstat(fd)
             if (st.st_dev, st.st_ino) == (dev, ino):
                 os.close(fd)
-        except OSError:
+        except (OSError, OverflowError):               # closed, or a number beyond a C int
             continue
 
 

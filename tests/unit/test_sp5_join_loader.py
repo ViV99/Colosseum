@@ -434,13 +434,14 @@ def test_reexec_closes_the_inherited_in_use_locks(hub, tmp_path, monkeypatch):
     env, py = _env(tmp_path, COLOSSEUM_TOKEN=hub.token)
     env[L.NODE_PYTHON_ENV] = str(py)
     monkeypatch.setattr(T, "probe_nvidia", lambda **kw: [])
-    inherited = []
+    inherited, recorded = [], []
 
     def exec_keeping_locks(path, args, agent_env):          # what exec does: the descriptions stay locked
         entries = []
         for entry in agent_env[L.IN_USE_FDS_ENV].split(","):
             fd, dev, ino = entry.split(":")
             inherited.append(os.dup(int(fd)))                  # same open file: same device and inode
+            recorded.append((int(dev), int(ino)))
             entries.append(f"{inherited[-1]}:{dev}:{ino}")
         agent_env[L.IN_USE_FDS_ENV] = ",".join(entries)
         exec_keeping_locks.env = agent_env
@@ -455,9 +456,12 @@ def test_reexec_closes_the_inherited_in_use_locks(hub, tmp_path, monkeypatch):
     code = L.loader_main([f"127.0.0.1:{second_port}"], environ=agent_env,
                          exec_fn=lambda p, a, e: calls.append(e))
     assert code == 0 and calls
-    for fd in inherited:                                                   # closed by the re-exec'd loader
-        with pytest.raises(OSError):
-            os.fstat(fd)
+    for fd, (dev, ino) in zip(inherited, recorded, strict=True):          # closed by the re-exec'd loader
+        try:                                                               # (gRPC threads may reuse the number)
+            st = os.fstat(fd)
+        except OSError:
+            continue
+        assert (st.st_dev, st.st_ino) != (dev, ino)
     assert first_hash in L.prune(root, 0, root / "none")
 
 
@@ -471,7 +475,7 @@ def test_close_inherited_locks_checks_the_file_and_ignores_bad_entries(tmp_path)
         reused = f"{other.fileno()}:{st.st_dev}:{st.st_ino}"            # the number now names another file
         L.close_inherited_locks(",".join([
             "x", "", "0:1:2", "1:1:1", f"{lock.fileno()}", "\u00b2:1:1", f"{lock.fileno()}:\u00b2:1", "-3:1:1",
-            f"{lock.fileno()}:{st.st_dev}", "999999:1:1", reused]))
+            f"{lock.fileno()}:{st.st_dev}", "999999:1:1", "3000000000:1:1", "99999999999999999999:1:1", reused]))
         os.fstat(lock.fileno())                                         # nothing closed so far
         os.fstat(other.fileno())
         L.close_inherited_locks(f"{lock.fileno()}:{st.st_dev}:{st.st_ino}")
