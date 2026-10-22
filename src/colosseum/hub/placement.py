@@ -228,6 +228,7 @@ class LearnerEntry:
     lost_since: float | None = None     # hub monotonic: the last heartbeat of the slot's node (relocating only)
     reason: str = ""                    # why pending / relocating / failed
     assignments: int = 0                # assignments in this hub incarnation (learner_restarts = sum - 1 each)
+    lost_slot: LearnerSlot | None = None  # the slot a relocation gave up (R42: its node may still bring the learner)
 
 
 @dataclass(frozen=True)
@@ -285,7 +286,7 @@ class LearnerTable:
         if generation <= entry.generation:
             raise ValueError(f"generation {generation} of {agent!r} is not above {entry.generation}")
         entry.status, entry.slot, entry.generation = "starting", slot, int(generation)
-        entry.lost_since, entry.reason = None, ""
+        entry.lost_since, entry.reason, entry.lost_slot = None, "", None
         entry.assignments += 1
 
     def announced(self, agent: str, generation: int) -> bool:
@@ -314,6 +315,7 @@ class LearnerTable:
         due = []
         for agent, entry in self._entries.items():
             if entry.status == "relocating" and entry.lost_since is not None and now - entry.lost_since >= after_sec:
+                entry.lost_slot = entry.slot
                 entry.status, entry.slot, entry.lost_since = "pending", None, None
                 entry.reason = f"relocating: its node stayed away {after_sec:g} s"
                 due.append(agent)
@@ -324,7 +326,10 @@ class LearnerTable:
         ``announced`` = {agent: generation of the newest accepted version} (``VersionRegistry``).
 
         - a learner of the agent's current generation on its slot's node is adopted: ``running`` when a version of
-          that generation was accepted, else ``starting`` (a ``relocating`` one is back);
+          that generation was accepted, else ``starting`` (a ``relocating`` one is back); so is one of a ``pending``
+          agent whose relocation gave up this node's slot while no newer generation was assigned (controller ruling
+          R42: the returning node offers that slot again; the learner keeps running instead of a restart from the
+          recovery point);
         - any other learner (a stale generation, an agent placed elsewhere, failed or unknown) is stopped;
         - an agent whose learner this node should run (starting / running / relocating here) but does not becomes
           ``pending`` (``gone``): the caller places it again with a new generation."""
@@ -333,7 +338,11 @@ class LearnerTable:
             entry = self._entries.get(agent)
             ours = (entry is not None and entry.slot is not None and entry.slot.node == node
                     and entry.generation == generation and entry.status in ("starting", "running", "relocating"))
-            if not ours:
+            back = (entry is not None and entry.status == "pending" and entry.slot is None
+                    and entry.lost_slot is not None and entry.lost_slot.node == node and entry.generation == generation)
+            if back:                                # R42: its relocation found no slot; the learner is still there
+                entry.slot, entry.lost_slot = entry.lost_slot, None
+            elif not ours:
                 out.stop.append((agent, int(generation)))
                 continue
             entry.status = "running" if announced.get(agent) == generation else "starting"
@@ -342,9 +351,12 @@ class LearnerTable:
         for agent in self.on_node(node):
             if agent not in out.adopted:
                 entry = self._entries[agent]
-                entry.status, entry.slot, entry.lost_since = "pending", None, None
+                entry.status, entry.slot, entry.lost_since, entry.lost_slot = "pending", None, None, None
                 entry.reason = f"node {node} came back without it"
                 out.gone.append(agent)
+        for agent, entry in self._entries.items():   # R42: a node back without the learner it held
+            if agent not in out.adopted and entry.lost_slot is not None and entry.lost_slot.node == node:
+                entry.lost_slot = None
         return out
 
     def died(self, agent: str, generation: int) -> LearnerSlot | None:
@@ -359,6 +371,7 @@ class LearnerTable:
         """The restart limit is spent (spec 7.1): ``failed``, slot released, never placed again."""
         entry = self._entries[agent]
         entry.status, entry.slot, entry.lost_since, entry.reason = "failed", None, None, reason
+        entry.lost_slot = None
 
     def failed(self) -> list[str]:
         return [a for a, e in self._entries.items() if e.status == "failed"]

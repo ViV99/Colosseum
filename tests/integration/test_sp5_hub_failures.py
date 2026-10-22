@@ -255,8 +255,7 @@ def _lost(hub, node, config, agent="a"):
     frame = _frame(config, agent, 4, 1, "recovery")
     assert _upload(node, agent, 4, 1, frame).accepted
     node.pause_heartbeats()
-    poll_until(lambda: read_hub_state(hub).get("nodes_lost") == 1 and _learner(hub, agent).get("status") ==
-               "relocating", timeout=20)
+    poll_until(lambda: hub.hub._nodes_lost == 1 and hub.hub._learners[agent].status == "relocating", timeout=20)
     return frame
 
 
@@ -308,7 +307,8 @@ def test_relocation_after_the_wait_moves_the_learner(hubs):
 def test_a_node_back_before_the_wait_keeps_its_learner(hubs):
     import time
 
-    config = _config(dist=LOSS)
+    dist = {**LOSS, "learner_relocate_after_sec": 4.0}                  # room for the reopen and the reconcile
+    config = _config(dist=dist)
     hub = hubs(config)
     n1 = _node(hub, "n1")
     _starts(n1)
@@ -319,8 +319,8 @@ def test_a_node_back_before_the_wait_keeps_its_learner(hubs):
     welcome = n1.messages("welcome")[0]
     assert [(la.agent_id, la.generation) for la in welcome.learners] == [("a", 1)]
     assert [(v.generation, v.version, v.node) for v in welcome.versions if v.agent_id == "a"] == [(1, 4, n1.number)]
-    poll_until(lambda: _learner(hub, "a").get("status") == "running")
-    while time.monotonic() < lost_at + LOSS["learner_relocate_after_sec"] + 1.0:   # past the relocation deadline
+    poll_until(lambda: hub.hub._learners["a"].status == "running")
+    while time.monotonic() < lost_at + dist["learner_relocate_after_sec"] + 1.0:   # past the relocation deadline
         time.sleep(0.1)
     assert hub.hub._versions.generation("a") == 1 and hub.hub._versions.parked("a") is None
     assert not [c for c in n1.messages("command") if c.kind in ("start_learner", "stop_learner")]
@@ -367,5 +367,36 @@ def test_a_disabled_slot_releases_its_cells(hubs, caplog):
     assert "worker-1 of node 1 (n1) is disabled after 3 restarts within 600 s (see /logs/worker-1.log)" in caplog.text
     n1.pause_heartbeats()
     n1.send(event=pb.Event(kind="proc_died", proc="worker-0", exit_code=-9))
-    n1.send(heartbeat=pb.Heartbeat(env_steps=0, counters={"worker_restarts": 1}))    # A2: the node counts restarts
+    with caplog.at_level(logging.WARNING, logger="colosseum.hub.hub"):
+        poll_until(lambda: "worker-0 of node 1 (n1) died with exit code -9; restarted" in caplog.text)
+    assert hub.hub._book.totals().get("worker_restarts", 0) == 0               # A2: the hub never counts the event
+    n1.send(heartbeat=pb.Heartbeat(env_steps=0, counters={"worker_restarts": 1}))    # the node's own count
     poll_until(lambda: hub.hub._book.totals().get("worker_restarts") == 1)
+    n1.send(heartbeat=pb.Heartbeat(env_steps=0, counters={"worker_restarts": 1}))    # cumulative: no double count
+    _announce(n1, "a", 1, 0)                                                         # same stream, after it
+    poll_until(lambda: hub.hub._versions.accepted("a") is not None)
+    assert hub.hub._book.totals()["worker_restarts"] == 1
+
+
+def test_a_pending_agent_s_node_back_with_its_learner_adopts_it(hubs):
+    """Controller ruling R42: a strict agent whose node stayed away past learner_relocate_after_sec is pending (no
+    newer generation assigned); the node returns with its generation-1 learner still running: adopted (no stop, no
+    generation 2, parked weights withdrawn). Once a newer generation was assigned the old one is stopped instead
+    (``test_relocation_after_the_wait_moves_the_learner``)."""
+    config = _config({"a": {"learner": {"placement": {"node": "n1", "strict": True}}}}, dist=LOSS)
+    hub = hubs(config)
+    n1 = _node(hub, "n1")
+    _starts(n1)
+    _node(hub, "n2")
+    _lost(hub, n1, config)
+    poll_until(lambda: hub.hub._learners["a"].status == "pending", timeout=20)
+    assert hub.hub._versions.parked("a") is not None
+    n1 = _node(hub, "n1", node=n1, learners=[("a", 1, 4)])
+    welcome = n1.messages("welcome")[0]
+    assert [(la.agent_id, la.generation) for la in welcome.learners] == [("a", 1)]
+    poll_until(lambda: hub.hub._learners["a"].status == "running")
+    _announce(n1, "a", 1, 5)                                             # its stream goes on: handled in order
+    poll_until(lambda: hub.hub._versions.version_floor("a") == 6)
+    assert hub.hub._versions.generation("a") == 1 and hub.hub._versions.parked("a") is None
+    assert hub.hub._learners["a"].slot.node == n1.number
+    assert not [c for c in n1.messages("command") if c.kind in ("start_learner", "stop_learner")]

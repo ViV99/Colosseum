@@ -276,3 +276,26 @@ def test_table_state_round_trip_on_resume_waits_for_remote_nodes_only():
     assert resumed.to_place() == ["b", "c", "d", "e"]
     out = resumed.reconcile(2, {"a": 4}, announced={"a": 4})
     assert out.adopted == ["a"] and resumed["a"].status == "running"
+
+
+def test_a_pending_agent_s_node_returning_with_its_learner_gets_it_back():
+    """Controller ruling R42: a relocation that found no slot leaves the agent pending; its old node returning with the
+    same generation's learner is adopted; returning without it (or after a newer generation) is not."""
+    table = LearnerTable(["a"])
+    table.assign("a", LearnerSlot(1, "cpu"), 1)
+    table.node_lost(1, 0.0)
+    assert table.relocation_due(10.0, 5.0) == ["a"] and table["a"].status == "pending"
+    out = table.reconcile(1, {"a": 1}, announced={"a": 1})
+    assert (out.adopted, out.stop) == (["a"], []) and table["a"].status == "running"
+    assert table["a"].slot == LearnerSlot(1, "cpu") and table["a"].lost_slot is None
+
+    table.node_lost(1, 20.0)
+    table.relocation_due(30.0, 5.0)
+    assert table.reconcile(1, {}, announced={}).adopted == [] and table["a"].lost_slot is None
+    assert table.reconcile(1, {"a": 1}, announced={}).stop == [("a", 1)]    # it came back without it before
+
+    table.assign("a", LearnerSlot(2, "cpu"), 2)
+    table.node_lost(2, 40.0)
+    table.relocation_due(50.0, 5.0)
+    table.assign("a", LearnerSlot(3, "cpu"), 3)                             # a newer generation was assigned
+    assert table.reconcile(2, {"a": 2}, announced={}).stop == [("a", 2)]
