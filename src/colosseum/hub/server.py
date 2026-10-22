@@ -547,8 +547,8 @@ class HubServicer(pb_grpc.HubServicer):
         if not _valid_agent_id(request.agent_id):
             context.abort(grpc.StatusCode.INVALID_ARGUMENT, "invalid agent id")
         since = int(request.since_version)
-        parked = self._blobs.parked_path(request.agent_id)
-        if parked is not None and _is_file(parked):
+        parked = self._blobs.parked_file(request.agent_id)
+        if parked is not None:
             try:
                 yield from _serve_parked(parked, request.agent_id, since)
                 return
@@ -744,6 +744,7 @@ class BlobStore:
     def __init__(self, run_dir: RunDir) -> None:
         self.run_dir = run_dir
         self._registered: set[tuple[str, str, str]] = set()
+        self._parked: set[str] = set()                   # agents whose parked frame the main loop wrote (T4.1)
         self._lock = threading.Lock()
         self._convert_locks: dict[tuple[str, str], threading.Lock] = {}
         self._forgets: dict[tuple[str, str, str], int] = {}     # (kind, agent, ident) -> times forgotten
@@ -846,19 +847,40 @@ class BlobStore:
             return None
         return self.dir / blob_file_name("latest", agent_id, PARKED_IDENT)
 
+    def parked_file(self, agent_id: str) -> Path | None:
+        """The parked frame ``Download(kind="latest")`` serves (servicer threads): only for an agent the main loop
+        parked in this process (``write_parked``) and while the file exists; else None."""
+        path = self.parked_path(agent_id)
+        with self._lock:
+            marked = agent_id in self._parked
+        return path if marked and path is not None and _is_file(path) else None
+
     def write_parked(self, agent_id: str, frame: bytes) -> Path:
-        """Write the agent's parked weights frame atomically (a servicer reading the old file keeps reading it)."""
+        """Write the agent's parked weights frame atomically (a servicer reading the old file keeps reading it) and
+        mark it served."""
         path = self.parked_path(agent_id)
         if path is None:
             raise ValueError(f"invalid agent id {agent_id!r} for a blob")
         self.dir.mkdir(parents=True, exist_ok=True)
         _write_atomic(path, bytes(frame))
+        with self._lock:
+            self._parked.add(agent_id)
         return path
 
     def drop_parked(self, agent_id: str) -> None:
+        with self._lock:
+            self._parked.discard(agent_id)
         path = self.parked_path(agent_id)
         if path is not None:
             path.unlink(missing_ok=True)
+
+    def clear_parked(self) -> None:
+        """Remove every parked frame (``latest-*-parked.frame``) an earlier hub process left (hub start; main loop)."""
+        with self._lock:
+            self._parked.clear()
+        if self.dir.is_dir():
+            for path in self.dir.glob(f"latest-*-{PARKED_IDENT}.frame"):
+                path.unlink(missing_ok=True)
 
     def start_path(self, agent_id: str, ident: str) -> Path | None:
         """``blobs/start-<agent digest>-<ident>.frame``: a learner start point (one checkpoint frame; A28) for

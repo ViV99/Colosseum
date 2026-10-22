@@ -249,6 +249,7 @@ class Hub(RunSinks, HubLearners):
         self._unplayable: set[str] = set()        # pending agents without any weights (not drawn into lineups)
         self._pending_reasons: dict[str, str] = {}
         self._start_sources: dict[str, tuple[str, int, str]] = {}   # agent -> (weights_blob, version, description)
+        self._start_checkpoints: dict[str, tuple[str, str | None]] = {}   # agent -> its start point's (ckpt id, run id)
         self._hello_floors: dict[str, int] = {}   # agent -> RunningLearner.version + 1 seen in a Hello (P-PF3-3)
         self._journal_floors: dict[str, int] | None = None   # P-PF3-3: read once per hub start
         self._stops_sent: set[tuple[int, str, int]] = set()  # (stream serial, agent, generation) told to stop
@@ -425,6 +426,7 @@ class Hub(RunSinks, HubLearners):
         self._identity = HubIdentity.load_or_create(self._options.identity_dir)
         self._blobs = BlobStore(self._run_dir)
         shutil.rmtree(self._blobs.incoming, ignore_errors=True)    # upload spools of a crashed hub
+        self._blobs.clear_parked()                    # parked frames of an earlier hub process (it parks again)
         self._build_relay()
         self._wire_snapshot_holds(coordinator)
         self._register_blobs(setup)
@@ -706,7 +708,7 @@ class Hub(RunSinks, HubLearners):
             if self._hub.maybe_tick(env_steps=env_steps, ratings=self._coordinator.ratings_snapshot,
                                     queue_depths=self._hub.intake_queue_depths(), match_log=self._match_log_stats(),
                                     bt=self._live_snapshot()):
-                self._place_learners()               # cheap and idempotent (T4.1); T4.2's relocations go here too
+                self._tick_placement()               # cheap and idempotent (T4.1); T4.2's relocations go here too
                 self._save_league_state()
                 self._save_hub_state(fsync=False)
             if self._failure is not None:
@@ -726,6 +728,15 @@ class Hub(RunSinks, HubLearners):
                 logger.error(failure.message())
                 self._reported_failures.add(failure.name)
                 return 1
+
+    def _tick_placement(self) -> None:
+        """The metrics tick's placement pass: a failure (e.g. ``hub_state.json`` cannot be written with fsync: a full
+        disk) is one ERROR and fails the run (exit 1), never a traceback out of the main loop."""
+        try:
+            self._place_learners()
+        except Exception as e:  # noqa: BLE001 - the run stops through _fail_run
+            logger.error(f"A learner placement pass failed ({type(e).__name__}: {e})", exc_info=True)
+            self._fail_run(f"a learner placement pass failed ({type(e).__name__}: {e})")
 
     def _drain_inbox(self, timeout: float) -> int:
         """Handle the inbox's events: wait up to ``timeout`` for the first, then take what is there (at most
@@ -845,10 +856,6 @@ class Hub(RunSinks, HubLearners):
         """A node silent for ``node_lost_after_sec`` (or removed: ``reason``): its cells go (their unfinished
         matches are never reported), its stream is closed, its learners wait for it (``relocating``: they do not
         collect and play with parked weights; T4.2 relocates them after ``learner_relocate_after_sec``)."""
-        if self._learners is not None:
-            for agent in self._learners.node_lost(entry.number, entry.last_heartbeat):
-                self._park(agent)
-            self._update_pending_value()
         self._cells.drop_node(entry.number)
         self._holds.drop_node(entry.number)
         self._paths.pop(entry.number, None)
@@ -856,6 +863,10 @@ class Hub(RunSinks, HubLearners):
         handle = self._sessions.pop(entry.node_id, None)
         if handle is not None:
             handle.close(reason)
+        if self._learners is not None:               # after the pop: parking announces, never to the lost stream
+            for agent in self._learners.node_lost(entry.number, entry.last_heartbeat):
+                self._park(agent)
+            self._update_pending_value()
         self._nodes_lost += 1
         why = ""
         if reason == "lost":                          # it may come back and resend its unacked batches

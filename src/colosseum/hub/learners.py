@@ -66,10 +66,13 @@ class HubLearners:
         return None if slot is None else slot.node
 
     def _node_capacities(self) -> list:
-        """The learner slots of every online node (``hub.placement.capacity_from_hello``); train's local node
-        (``data_path == "local"``) is unlimited (R18)."""
+        """The learner slots of every online node whose stream is open (``hub.placement.capacity_from_hello``; a node
+        between a cut and its reconnect gets no new learner: its ``start_learner`` could not be sent); train's local
+        node (``data_path == "local"``) is unlimited (R18). Kept slots come from the table, not from here."""
         out = []
         for entry in self._registry.online():
+            if not entry.connected:
+                continue
             kinds = {int(g.get("index", 0)): str(g.get("kind", "")) for g in (entry.hardware or {}).get("gpus", ())}
             out.append(capacity_from_hello(entry.number, entry.name, entry.tags, entry.slots or {}, kinds,
                                            unlimited=entry.data_path == "local"))
@@ -115,8 +118,8 @@ class HubLearners:
         except Exception:
             self._learners.set_pending(agent, "hub_state.json could not be written")
             raise
-        blob, version, what = self._learner_start_source(agent)
-        floor = self._version_floor(agent, start=(blob, version))
+        blob, _version, what = self._learner_start_source(agent)
+        floor = self._version_floor(agent, start=self._start_checkpoints.get(agent) if blob else None)
         assignment = pb.LearnerAssignment(agent_id=agent, generation=generation, version_floor=floor,
                                           device=slot.device, weights_blob=blob, trainer_state_blob="",
                                           env_steps=self._budget.value)
@@ -137,23 +140,23 @@ class HubLearners:
         (``_resume_start_sources``; T4.2 puts the newest recovery point in front)."""
         return self._start_sources.get(agent, ("", 0, "factory weights"))
 
-    def _version_floor(self, agent: str, *, start: tuple[str, int] | None = None) -> int:
+    def _version_floor(self, agent: str, *, start: tuple[str, str | None] | None = None) -> int:
         """The first version a new learner of ``agent`` may publish (R9, W04-7, P-PF3-3): above every version the
         registry accepted, the newest stored snapshot, the journal's newest seats of the agent (read once per hub
         start) and every learner version a node reported in a ``Hello``. T4.2 adds the recovery point.
 
-        ``start`` = the start point ``(weights_blob, version)``: a start point that IS the newest stored snapshot (a
-        run-dir ``training.resume_from`` resumes the parent's newest snapshot, which the pool import stored here; an
-        in-place resume's ``start:ckpt_v<N>``, T4.3) may publish its own version again (the same weights), so the
-        stored snapshot then bounds the floor at its version, not above it (SP2's "versions continue from the
-        resumed ``ckpt_v<N>``")."""
+        ``start`` = the checkpoint identity ``(checkpoint_id, run_id)`` of the start point when it is a stored
+        checkpoint (``_start_checkpoints``). Controller ruling R38: a start point that IS the newest stored snapshot
+        (the same checkpoint id and run id: a run-dir ``training.resume_from`` resumes the parent's newest snapshot,
+        which the pool import stored here; an in-place resume's ``start:ckpt_v<N>``, T4.3) may publish its own
+        version again (the same weights), so that snapshot bounds the floor at its version, not above it (SP2's
+        "versions continue from the resumed ``ckpt_v<N>``")."""
         floors = [self._versions.version_floor(agent), self._hello_floors.get(agent, 0),
                   self._journal_version_floors().get(agent, 0)]
         latest = self._coordinator.checkpoint_manager.latest(agent) if self._coordinator is not None else None
         if latest is not None:
             stored = int(latest.policy_version)
-            same = start is not None and int(start[1]) == stored and start[0] in ("start:resume",
-                                                                                  f"start:ckpt_v{stored}")
+            same = start is not None and start == (latest.checkpoint_id, latest.meta.get("run_id"))
             floors.append(stored if same else stored + 1)
         return max(floors)
 
@@ -330,8 +333,9 @@ class HubLearners:
         """The hub-start source of every trainable agent's learner (A28; T4.3 replaces it for an in-place resume):
         ``(weights_blob, version, description)``. A ``training.resume_from`` state becomes the start point
         ``start:resume`` (one checkpoint frame: weights plus trainer-state bytes, none = weights only, as SP3's
-        ``.pt`` resume) written once to ``BlobStore.start_path(agent, "resume")``; else ``init`` (the ``Welcome.fixed``
-        blob); else factory weights."""
+        ``.pt`` resume) written once to ``BlobStore.start_path(agent, "resume")``, its checkpoint identity (a
+        checkpoint dir's id and ``meta.json`` run id, R38) in ``_start_checkpoints``; else ``init`` (the
+        ``Welcome.fixed`` blob); else factory weights."""
         from colosseum.net.chunks import encode_checkpoint
 
         out: dict[str, tuple[str, int, str]] = {}
@@ -347,8 +351,27 @@ class HubLearners:
                                            "final": False}, kind="recovery", generation=0)
                 self._blobs.write_start(agent, "resume", frame)
                 out[agent] = ("start:resume", version, f"{state['source']} (policy_version {version})")
+                identity = _checkpoint_identity(state["source"])
+                if identity is not None:
+                    self._start_checkpoints[agent] = identity
             elif init is not None:
                 out[agent] = ("init", 0, f"init {init.source}")
             else:
                 out[agent] = ("", 0, "factory weights")
         return out
+
+
+def _checkpoint_identity(source: str) -> tuple[str, str | None] | None:
+    """``(checkpoint_id, run_id)`` of a resume source that is a checkpoint dir (``meta.json`` read), else None (a
+    ``.pt`` file, an unreadable dir)."""
+    from pathlib import Path
+
+    from colosseum.coordinator.checkpoint_manager import read_checkpoint_meta
+
+    path = Path(source)
+    try:
+        if not path.is_dir():
+            return None
+        return path.name, read_checkpoint_meta(path).get("run_id")
+    except Exception:  # noqa: BLE001 - no identity: the floor is above the stored snapshot (the safe side)
+        return None

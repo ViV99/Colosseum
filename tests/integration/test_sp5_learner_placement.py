@@ -74,6 +74,12 @@ def _commands(node, kind):
     return [c for c in node.messages("command") if c.kind == kind]
 
 
+def _started(node):
+    """The node's ``start_learner`` commands once one arrived (a start on a node being welcomed follows its
+    ``Welcome``)."""
+    return poll_until(lambda: _commands(node, "start_learner"))
+
+
 def _learner(hub, agent):
     return ((read_hub_state(hub).get("learners") or {}).get("agents") or {}).get(agent) or {}
 
@@ -123,7 +129,7 @@ def test_devices_and_slots_decide_where_learners_start(hubs):
     n1 = _node(hub, "n1", gpus=(0,))
     n2 = _node(hub, "n2", cpu=1)
     poll_until(lambda: _learner(hub, "b").get("status") == "starting")
-    (s1,), (s2,) = _commands(n1, "start_learner"), _commands(n2, "start_learner")
+    (s1,), (s2,) = _started(n1), _started(n2)
     la = s1.learner
     assert (la.agent_id, la.generation, la.device, la.version_floor, la.weights_blob, la.env_steps) == \
         ("a", 1, "cuda:0", 0, "", 0)
@@ -140,10 +146,10 @@ def test_an_agent_without_a_slot_is_pending_then_starts_when_a_slot_appears(hubs
         n1 = _node(hub, "n1", cpu=1)
         poll_until(lambda: any(r.get("pending_agents") == ["b"] for r in _records(hub, "system")))
         assert "Learner of b: pending (no free CPU learner slot (learner.device cpu))" in caplog.text
-        assert [c.learner.agent_id for c in _commands(n1, "start_learner")] == ["a"]
+        assert [c.learner.agent_id for c in _started(n1)] == ["a"]
         seen = len(_records(hub, "system"))
         n2 = _node(hub, "n2", cpu=1)
-        (start,) = _commands(n2, "start_learner")
+        (start,) = _started(n2)
         assert (start.learner.agent_id, start.learner.generation) == ("b", 1)
         poll_until(lambda: any(r.get("pending_agents") == [] for r in _records(hub, "system")[seen:]))
         assert any(s.agent_id == "b" and s.status == "active" for m in n2.messages("welcome") for s in m.agents)
@@ -244,7 +250,7 @@ def _replaced_on_n1(hub):
 def test_a_late_announcement_of_an_old_generation_is_fenced(hubs):
     hub = hubs(_config({"a": {}}))
     n1, session = _replaced_on_n1(hub)
-    (start,) = _commands(n1, "start_learner")
+    (start,) = _started(n1)
     assert (start.learner.generation, start.learner.version_floor) == (2, 6)
     assert [(x.agent_id, x.generation) for x in n1.messages("welcome")[0].learners] == [("a", 2)]
     _announce(n1, "a", 1, 9)
@@ -257,7 +263,7 @@ def test_a_late_announcement_of_an_old_generation_is_fenced(hubs):
     n1 = _node(hub, "n1", node=n1, session=session, cpu=1, learners=[("a", 7, 30)])   # an unknown generation
     stops = poll_until(lambda: _commands(n1, "stop_learner"))
     assert [(c.learner.agent_id, c.learner.generation) for c in stops] == [("a", 7)]
-    (start,) = _commands(n1, "start_learner")                            # generation 2 is gone as well
+    (start,) = _started(n1)                            # generation 2 is gone as well
     assert start.learner.generation == 3 and start.learner.version_floor >= 31      # P-PF3-3: Hello's version
 
 
@@ -291,7 +297,7 @@ def test_version_floor_continues_above_announced_and_stored_versions(hubs):
     assert reply.accepted, reply.reason
     assert (hub.root / "checkpoints" / "a" / "ckpt_v20").is_dir()
     n1 = _node(hub, "n1", node=n1, session=session, cpu=1)
-    (start,) = _commands(n1, "start_learner")
+    (start,) = _started(n1)
     assert (start.learner.generation, start.learner.version_floor) == (2, 21)
 
 
@@ -299,7 +305,7 @@ def test_a_generation_is_durable_before_its_start_learner_is_sent(hubs):
     """P-PF3-2: hub_state.json names the new generation (fsync) before the start_learner command leaves."""
     hub = hubs(_config({"a": {}}, metrics={"console_interval_sec": 3600.0}))
     n1 = _node(hub, "n1", cpu=1)
-    _commands(n1, "start_learner")
+    _started(n1)
     state = read_hub_state(hub)
     assert state["versions"]["a"]["generation"] == 1
     assert state["learners"]["agents"]["a"]["status"] == "starting"
@@ -333,7 +339,7 @@ def test_a_resume_state_is_the_start_point_start_resume(hubs, tmp_path):
     torch.save(model.state_dict(), pt)
     hub = hubs(_config({"a": {}}, training={"resume_from": str(pt)}))
     n1 = _node(hub, "n1", cpu=1)
-    (start,) = _commands(n1, "start_learner")
+    (start,) = _started(n1)
     assert (start.learner.weights_blob, start.learner.trainer_state_blob) == ("start:resume", "")
     frame, _meta = n1.download("start", "a", "resume")
     payload, meta = decode_checkpoint(bytearray(frame), cap=len(frame))
