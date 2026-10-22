@@ -18,6 +18,7 @@ script embeds it next to the loader (T6.2), which unpacks bundles before any col
 from __future__ import annotations
 
 import ast
+import contextlib
 import fnmatch
 import gzip
 import hashlib
@@ -465,26 +466,39 @@ def unpack_bundle(archive: Path, code_hash: str, *, cache_root: Path) -> Path:
     return target
 
 
+def cache_lock_path(directory: Path) -> Path:
+    """The lock file of a node cache directory (``bundles`` / ``envs``): next to it, so its listing stays clean."""
+    directory = Path(directory)
+    return directory.with_name(directory.name + ".lock")
+
+
+@contextlib.contextmanager
+def cache_lock(directory: Path):
+    """An exclusive ``flock`` on ``cache_lock_path(directory)``. Held while an entry is placed (``_place``), while
+    the loader marks a complete entry in use and while it prunes (T6.2), so a marker check and the rename or
+    removal that follows it never interleave with another loader's placement, use or pruning."""
+    import fcntl  # POSIX only: nodes run on Linux / macOS
+
+    path = cache_lock_path(directory)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "a+") as f:
+        fcntl.flock(f, fcntl.LOCK_EX)
+        yield
+
+
 def _place(tmp: Path, target: Path) -> None:
-    """Rename the complete ``tmp`` dir to ``target``. Losing the race to another loader is fine; a ``target``
-    without the completion marker is a stale partial dir (renames are atomic, so no loader is writing it): it is
-    moved away and removed, and the rename is retried once."""
-    for attempt in range(2):
-        try:
-            os.rename(tmp, target)
+    """Rename the complete ``tmp`` dir to ``target`` under the cache lock. A complete ``target`` (another loader won
+    the race) is kept; a ``target`` without the completion marker is a stale partial dir (placements hold the lock,
+    so no loader is writing it): it is moved away and removed first."""
+    with cache_lock(target.parent):
+        if (target / COMPLETE_MARKER).is_file():
             return
-        except OSError:
-            if (target / COMPLETE_MARKER).is_file():       # another loader won the race
-                return
-            if attempt or not target.is_dir():
-                raise
+        if target.is_dir():
             stale = target.parent / f".stale-{target.name[:16]}-{uuid.uuid4().hex[:8]}"
             logger.warning("code bundle: removing the incomplete directory %s (no %s)", target, COMPLETE_MARKER)
-            try:
-                os.rename(target, stale)
-            except FileNotFoundError:
-                pass                                        # removed meanwhile by another loader
+            os.rename(target, stale)
             shutil.rmtree(stale, ignore_errors=True)
+        os.rename(tmp, target)
 
 
 def bundle_python_path(unpacked: Path) -> list[Path]:

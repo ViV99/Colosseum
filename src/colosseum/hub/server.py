@@ -21,7 +21,7 @@ Lifecycle: a servicer that waits for the main loop's reply (``Register``, ``Uplo
 ``POLL_SEC`` slices while its RPC is active, so ``server.stop`` (which cancels every RPC) ends it at once even when
 the main loop no longer drains the inbox.
 
-``RelaySend`` / ``RelayInbox`` answer ``UNIMPLEMENTED`` until T3.2; ``Bootstrap`` is registered by T6.2.
+``RelaySend`` / ``RelayInbox`` answer ``UNIMPLEMENTED`` until T3.2; ``Bootstrap`` (T6.2): ``add_bootstrap``.
 """
 
 from __future__ import annotations
@@ -36,7 +36,7 @@ import re
 import threading
 import time
 import uuid
-from collections.abc import Callable, Sequence
+from collections.abc import Sequence
 from concurrent.futures import Future, ThreadPoolExecutor
 from concurrent.futures import wait as wait_futures
 from dataclasses import dataclass
@@ -45,6 +45,7 @@ from typing import Any
 
 import grpc
 
+from colosseum.bootstrap.installer import BootstrapService
 from colosseum.coordinator.checkpoint_manager import read_weights_file
 from colosseum.core.config import check_agent_id
 from colosseum.core.errors import ConfigError
@@ -612,6 +613,42 @@ class BlobStore:
 
 
 # ---------------------------------------------------------------------------------------------------------------
+# Bootstrap (T6.2)
+# ---------------------------------------------------------------------------------------------------------------
+
+BOOTSTRAP_SERVICE = "colosseum.v1.Bootstrap"
+
+
+class BootstrapServicer(pb_grpc.BootstrapServicer):
+    """``Bootstrap/Info`` (open) and ``Bootstrap/Bundle`` (token secret: ``AuthInterceptor``); read-only, served
+    by the servicer threads from the immutable ``BootstrapService`` (spec 2.3)."""
+
+    def __init__(self, service: BootstrapService) -> None:
+        self._service = service
+        self._info = service.info()
+
+    def Info(self, request, context):  # noqa: N802 (gRPC method name)
+        return self._info
+
+    def Bundle(self, request, context):  # noqa: N802
+        if request.code_hash != self._service.bundle.code_hash:
+            context.abort(grpc.StatusCode.NOT_FOUND, f"code {request.code_hash[:12]} is not served by this hub "
+                                                     f"(current: {self._service.bundle.code_hash[:12]})")
+        yield from send_parts(self._service.archive)
+
+
+def add_bootstrap(server: grpc.Server, service: BootstrapService) -> None:
+    """Register Info / Bundle (generated) and ``Script`` (raw bytes both ways, R2: the curl one-liner reads the
+    script after the 5-byte gRPC prefix) on ``server``."""
+    pb_grpc.add_BootstrapServicer_to_server(BootstrapServicer(service), server)
+    script = service.script
+    server.add_generic_rpc_handlers((grpc.method_handlers_generic_handler(BOOTSTRAP_SERVICE, {
+        "Script": grpc.unary_unary_rpc_method_handler(lambda request, context: script,
+                                                      request_deserializer=None, response_serializer=None),
+    }),))
+
+
+# ---------------------------------------------------------------------------------------------------------------
 # The server
 # ---------------------------------------------------------------------------------------------------------------
 
@@ -629,17 +666,17 @@ def _bind(server: grpc.Server, address: str, credentials: grpc.ServerCredentials
 
 def build_server(*, inbox: queue.SimpleQueue, identity: HubIdentity, insecure: bool, listen: Sequence[str],
                  loopback_plain: bool, blobs: BlobStore, max_message_mb: int,
-                 bootstrap: Callable[[grpc.Server], None] | None = None) -> tuple[grpc.Server, dict[str, int]]:
+                 bootstrap: BootstrapService | None = None) -> tuple[grpc.Server, dict[str, int]]:
     """The hub's gRPC server (unstarted) and ``{address or LOOPBACK_KEY: bound port}``. Every address of ``listen``
     is TLS with the hub identity's certificate, or plain with ``insecure``; ``loopback_plain`` adds a plain
     ``127.0.0.1:0`` port (``train``'s local node, R12). The token / node secrets are required in every mode (R1).
-    ``bootstrap`` registers the Bootstrap service on the server (T6.2). OSError names an address it cannot bind."""
+    ``bootstrap``: the Bootstrap service to serve (``add_bootstrap``). OSError names an address it cannot bind."""
     server = grpc.server(ThreadPoolExecutor(max_workers=SERVER_THREADS, thread_name_prefix="hub-rpc"),
                          interceptors=[AuthInterceptor(lambda: identity.token.secret, identity.nodes)],
                          options=server_options(max_message_mb))
     pb_grpc.add_HubServicer_to_server(HubServicer(inbox, blobs, max_message_mb), server)
     if bootstrap is not None:
-        bootstrap(server)
+        add_bootstrap(server, bootstrap)
     ports: dict[str, int] = {}
     try:
         for address in listen:
