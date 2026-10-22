@@ -66,7 +66,7 @@ def test_journaled_seats_carry_versions_and_uids_the_run_id(tmp_path):
     run_id = json.loads((run.root / "run.json").read_text())["run_id"]
     reader = MatchLogReader(run.root / MATCH_LOG_FILE)
     rows = reader.matches(limit=100_000)
-    assert rows and all(r.uid.startswith(f"{run_id}/train/w0_e") and r.source == "train" for r in rows)
+    assert rows and all(r.uid.startswith(f"{run_id}/train/n0/w0_e") and r.source == "train" for r in rows)
     steps = [r.env_steps for r in sorted(rows, key=lambda r: r.id)]
     assert steps == sorted(steps) and steps[-1] > 0                   # stamped on arrival, in arrival order
     interval = load_config(run.root / "config.resolved.yaml").checkpoint.interval   # 20 (cli_runner.TINY)

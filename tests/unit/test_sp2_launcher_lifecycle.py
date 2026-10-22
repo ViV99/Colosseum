@@ -508,7 +508,7 @@ def test_ctrl_c_stops_serve_weight_store_with_exit_130(monkeypatch, restore_root
 
 
 @pytest.mark.parametrize(("args", "target"), [
-    (["train"], "colosseum.launcher.run_training"),
+    (["train"], "colosseum.hub.hub.run_training"),
     (["run-learner", "--weight-store", "localhost:1"], "colosseum.distributed.run_distributed_learner"),
     (["run-workers", "--weight-store", "localhost:1", "-l", "agent_0=localhost:2"],
      "colosseum.distributed.run_distributed_workers"),
@@ -524,7 +524,7 @@ def test_ctrl_c_before_the_run_handles_signals_exits_130(args, target, tmp_path,
 
 
 @pytest.mark.parametrize(("args", "target"), [
-    (["train"], "colosseum.launcher.run_training"),
+    (["train"], "colosseum.hub.hub.run_training"),
     (["run-learner", "--weight-store", "localhost:1"], "colosseum.distributed.run_distributed_learner"),
     (["run-workers", "--weight-store", "localhost:1", "-l", "agent_0=localhost:2"],
      "colosseum.distributed.run_distributed_workers"),

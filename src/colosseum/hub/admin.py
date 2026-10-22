@@ -90,13 +90,20 @@ def _local_token_for(address: str, host: str, *, insecure: bool) -> Token:
     identity = _local_identity(hub_identity_dir())
     if identity is None:
         return resolve_token(None, None)               # raises "no token"
-    if insecure and not _is_loopback(host) and not any(
-            info.ca_fingerprint == identity.fingerprint and address in (info.loopback, *info.addresses)
-            for info in running_hubs(identity.path)):
+    if insecure and not _plain_local_ok(address, identity):
         raise SecurityError(f"no token for the insecure hub at {address}: this machine's hub token is sent in clear "
                             f"only to a loopback address or to a hub running here; pass --token, --token-file or "
                             f"set {TOKEN_ENV}")
     return identity.token
+
+
+def _plain_local_ok(address: str, identity: HubIdentity) -> bool:
+    """The ``--hub`` rule for a plain address: the owner token goes in clear only to a loopback address or to an
+    address of a live hub of this machine with this identity."""
+    host, _port = _split(address)
+    return _is_loopback(host) or any(info.ca_fingerprint == identity.fingerprint
+                                     and address in (info.loopback, *info.addresses)
+                                     for info in running_hubs(identity.path))
 
 
 def _given_token(token: str | None, token_file: str | None) -> Token | None:
@@ -116,8 +123,13 @@ def _from_info(info: HubInfo, token: Token | None, where: str) -> HubTarget:
     else:
         raise SecurityError(f"{where}: the hub records no address")
     identity = _local_identity(Path(info.identity_dir))
-    if identity is not None and identity.fingerprint == info.ca_fingerprint:
+    if identity is not None and identity.fingerprint == info.ca_fingerprint and (
+            tls or _plain_local_ok(address, identity)):
         return HubTarget(address, tls, identity.ca_pem if tls else None, identity.token)
+    if identity is not None and identity.fingerprint == info.ca_fingerprint and token is None:
+        raise SecurityError(f"{where}: the hub at {address} runs without TLS and is neither on a loopback address nor "
+                            f"a hub running here; this machine's hub token is not sent there in clear; pass --token, "
+                            f"--token-file or set {TOKEN_ENV}")
     if token is None:
         why = (f"the hub's identity {info.identity_dir} is not on this machine" if identity is None else
                f"the identity {info.identity_dir} now has fingerprint {identity.fingerprint[:16]}..., the hub "

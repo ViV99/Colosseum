@@ -121,6 +121,17 @@ class ContractBreakingGame(TurnTakingGame):
         return result
 
 
+class WorkerContractBreakingGame(ContractBreakingGame):
+    """``ContractBreakingGame`` only inside a worker process (``COLOSSEUM_PROCESS_NAME`` ``worker-<i>``); elsewhere
+    (``colosseum validate``, the startup check of ``train``) a plain ``TurnTakingGame``: a contract error that only
+    a running worker finds (SP5 T2.5)."""
+
+    def step(self, actions: dict[int, Any]) -> StepResult:
+        if os.environ.get("COLOSSEUM_PROCESS_NAME", "").startswith("worker-"):
+            return super().step(actions)
+        return TurnTakingGame.step(self, actions)
+
+
 class SimultaneousGame(MultiAgentEnv):
     """Matching pennies: both seats act every step for ``length`` steps. Obs ``[t / length, seat]``;
     ``Discrete(2)``; seat 0 gets +1 if the actions match, else -1; seat 1 the opposite."""

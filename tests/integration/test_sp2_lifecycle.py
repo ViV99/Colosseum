@@ -86,24 +86,36 @@ def test_normal_finish_exit_0_and_final_checkpoint(tmp_path):
     assert any(m["final"] for m in metas)
 
 
-def test_killed_worker_gives_exit_1_and_points_to_its_log(tmp_path):
+def test_a_killed_worker_is_restarted_by_its_node_and_the_run_goes_on(tmp_path):
+    """SP5 (amendment A12, ruling W04-25; an SP4 behaviour change listed by A15): a worker that dies without reporting
+    an error (here SIGKILL) is restarted by its node with a new incarnation, the hub logs a WARNING pointing to its
+    log and the run goes on; SIGTERM then stops every process within 10 s. (SP2-SP4: exit 1 naming the worker.)"""
     with training_process(TTT_CONFIG, tmp_path, name="killw", overrides=FOREVER) as (proc, root):
         assert wait_for(lambda: logged_pid(root, "worker-0") is not None and training_started(root), 120)
-        kids = descendants(proc.pid)
         os.kill(logged_pid(root, "worker-0"), signal.SIGKILL)
-        assert proc.wait(60) == 1
-        assert wait_for(lambda: not any(pid_alive(k) for k in kids), 10)
+        node_log = root / "logs" / "node.log"
+        assert wait_for(lambda: "restarted worker-0 (incarnation 2)" in node_log.read_text(), 60)
+        assert wait_for(lambda: (root / "logs" / "worker-0.log").read_text().count("worker-0 started (pid") == 2, 60)
+        assert proc.poll() is None
+        kids = descendants(proc.pid)
+        t0 = time.monotonic()
+        proc.send_signal(signal.SIGTERM)
+        assert proc.wait(15) == 143
+        assert wait_for(lambda: not any(pid_alive(k) for k in kids), max(0.0, 10 - (time.monotonic() - t0)))
     stderr = (tmp_path / "killw.stderr").read_text()
-    assert f"worker-0 died (exit -9), see {root / 'logs' / 'worker-0.log'}" in stderr
+    assert (f"worker-0 died (exit -9) without reporting an error; the node restarts it; see "
+            f"{root / 'logs' / 'worker-0.log'}") in stderr
 
 
 def test_learner_crash_in_train_step_gives_exit_1(tmp_path):
-    """train_step raising mid-training fails the run with an error naming the learner (T2.5 item b)."""
+    """train_step raising mid-training fails the run with an error naming the learner (T2.5 item b); SP5: the
+    learner reports its crash to its node, the hub fails the run with the reason and the learner's log."""
     run = run_train(TTT_CONFIG, tmp_path, name="crash", overrides={
         **FOREVER, "algorithm.algorithm_class": "game_helpers.CrashingAPPO"},
         env={"PYTHONPATH": os.pathsep.join(filter(None, [str(TESTS_DIR), os.environ.get("PYTHONPATH")]))})
     assert run.returncode == 1, run.stderr[-3000:]
-    assert f"learner-agent_0 died (exit 1), see {run.root / 'logs' / 'learner-agent_0.log'}" in run.stderr
+    assert "learner-agent_0 failed (crash): RuntimeError: injected train_step failure" in run.stderr
+    assert f"see {run.root / 'logs' / 'learner-agent_0.log'}" in run.stderr
     learner_log = run.log("learner-agent_0")
     assert "learner-agent_0 crashed" in learner_log and "injected train_step failure" in learner_log
 

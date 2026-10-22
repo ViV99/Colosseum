@@ -110,20 +110,49 @@ def _parse_overrides(overrides: tuple[str, ...]) -> dict:
 
 @main.command()
 @click.option("--config", "-c", required=True, type=click.Path(exists=True), help="Path to config YAML file")
+@click.option("--listen", "listen", is_flag=False, flag_value="0.0.0.0", default=None, metavar="[ADDR]",
+              help="Also accept other machines' nodes on ADDR:distributed.port (TLS); without ADDR all interfaces")
 @click.option("--set", "overrides", multiple=True,
               help="Override config values (e.g., --set rollout.num_workers=8)." + _SET_HELP_YAML)
-def train(config: str, overrides: tuple[str, ...]) -> None:
-    """Train the config's agents (single machine).
+def train(config: str, listen: str | None, overrides: tuple[str, ...]) -> None:
+    """Train the config's agents: a hub and a local node on this machine (other machines join with --listen).
 
-    Exit code: 0 budget reached, 1 config error or a child process died, 130 SIGINT, 143 SIGTERM.
+    Exit code: 0 budget reached, 1 config error or a failure (a child error, a dead process), 130 SIGINT, 143 SIGTERM.
     """
     from colosseum.utils.process import limit_main_blas_threads
 
     limit_main_blas_threads()   # first: numpy is imported below; this process's BLAS gets one thread (SP4)
     with _config_errors():
-        from colosseum.launcher import run_training  # imports torch: about a second
+        from colosseum.hub.hub import run_training  # imports torch: about a second
 
-        code = run_training(config, overrides=_parse_overrides(overrides) or None)
+        code = run_training(config, overrides=_parse_overrides(overrides) or None, listen=listen)
+    sys.exit(code)
+
+
+@main.group("hub", invoke_without_command=True)
+@click.option("--config", "-c", default=None, type=click.Path(exists=True), help="Path to config YAML file")
+@click.option("--listen", "listen", default=None, metavar="ADDR",
+              help="Listen only on ADDR (default: all interfaces)")
+@click.option("--port", default=None, type=click.IntRange(0, 65535),
+              help="The hub's port (default distributed.port; 0: an ephemeral port, see runs/<name>/hub.json)")
+@click.option("--insecure", is_flag=True, default=False, help="No TLS (trusted LAN only); the token stays required")
+@click.option("--set", "overrides", multiple=True, help="Override config values." + _SET_HELP_YAML)
+@click.pass_context
+def hub_group(ctx: click.Context, config: str | None, listen: str | None, port: int | None, insecure: bool,
+              overrides: tuple[str, ...]) -> None:
+    """Run a hub that machines join (colosseum join, T6.3); exit 0 at the budget, 1 on errors, 130 / 143 on signals."""
+    if ctx.invoked_subcommand is not None:
+        return
+    if config is None:
+        raise click.UsageError("colosseum hub needs --config / -c")
+    from colosseum.utils.process import limit_main_blas_threads
+
+    limit_main_blas_threads()   # first: numpy is imported below (as for train)
+    with _config_errors():
+        from colosseum.hub.hub import run_hub  # imports torch: about a second
+
+        code = run_hub(config, overrides=_parse_overrides(overrides) or None, listen=listen, port=port,
+                       insecure=insecure)
     sys.exit(code)
 
 

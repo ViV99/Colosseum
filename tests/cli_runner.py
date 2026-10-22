@@ -158,3 +158,61 @@ def wait_for(predicate: Callable[[], bool], timeout: float, interval: float = 0.
             return True
         time.sleep(interval)
     return predicate()
+
+
+# ---- colosseum hub (SP5 T2.5; amendment A4) ------------------------------------------------------------------------
+
+
+def hub_cmd(config: Path, run_parent: Path, name: str, overrides: Mapping[str, object] | None = None, *,
+            port: int | None = 0, insecure: bool = True, listen: str | None = "127.0.0.1",
+            args: tuple[str, ...] | list[str] = ()) -> list[str]:
+    """``python -m colosseum hub -c <config>`` with ``overrides`` (no ``TINY``) and the run dir; a ``None`` / ``False``
+    keyword emits no flag; ``args`` are appended."""
+    sets = {**(overrides or {}), "run.dir": str(run_parent), "run.name": name}
+    cmd = [sys.executable, "-m", "colosseum", "hub", "-c", str(config)]
+    if listen is not None:
+        cmd += ["--listen", str(listen)]
+    if port is not None:
+        cmd += ["--port", str(port)]
+    if insecure:
+        cmd.append("--insecure")
+    for key, value in sets.items():
+        cmd += ["--set", f"{key}={value}"]
+    return cmd + list(args)
+
+
+def start_hub(config: Path, run_parent: Path, name: str, overrides: Mapping[str, object] | None = None, *,
+              port: int | None = 0, insecure: bool = True, listen: str | None = "127.0.0.1",
+              args: tuple[str, ...] | list[str] = (), cwd: Path | None = None,
+              env: dict[str, str] | None = None) -> tuple[subprocess.Popen, Path]:
+    """Start ``colosseum hub`` in its own session (stdout / stderr into ``<run_parent>/<name>.stdout|stderr``);
+    returns the process and the run dir. The caller waits for it (``wait_for_hub_json``) and reaps it."""
+    run_parent = Path(run_parent)
+    run_parent.mkdir(parents=True, exist_ok=True)
+    with open(run_parent / f"{name}.stdout", "w") as out, open(run_parent / f"{name}.stderr", "w") as err:
+        proc = subprocess.Popen(hub_cmd(config, run_parent, name, overrides, port=port, insecure=insecure,
+                                        listen=listen, args=args),
+                                cwd=cwd or REPO_ROOT, env={**child_env(), **(env or {})}, stdout=out, stderr=err,
+                                text=True, start_new_session=True)
+    return proc, run_parent / name
+
+
+def wait_for_hub_json(run_root: Path, timeout: float):
+    """The ``HubInfo`` of ``run_root/hub.json`` once the hub wrote it (AssertionError after ``timeout``)."""
+    from colosseum.hub.registry import read_hub_json
+
+    deadline = time.monotonic() + timeout
+    while True:
+        info = read_hub_json(run_root)
+        if info is not None:
+            return info
+        if time.monotonic() > deadline:
+            raise AssertionError(f"no hub.json in {run_root} within {timeout} s")
+        time.sleep(0.1)
+
+
+def hub_address(run_root: Path, timeout: float = 30.0) -> str:
+    """The address a client on this machine uses for the hub of ``run_root`` (its loopback, else its first
+    listen address)."""
+    info = wait_for_hub_json(run_root, timeout)
+    return info.loopback or info.addresses[0]

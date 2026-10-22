@@ -180,3 +180,16 @@ def test_tree_config_needs_the_tree_on_the_python_path(tmp_path):
     assert callable(bench.load_tree_config(REPO_ROOT))   # this checkout's colosseum is the imported one
     with pytest.raises(SystemExit, match="PYTHONPATH"):
         bench.load_tree_config(tmp_path)
+
+
+def test_benchmark_runs_the_hub_with_quarter_second_heartbeats(tmp_path):
+    """SP5 T2.5: the bench measures ``train``'s path (a ``Hub`` with its local node); the hub's env-step counter moves
+    with the node's heartbeats, so the workload pins ``distributed.heartbeat_sec`` 0.25."""
+    from colosseum.core.run_dir import RunDir
+    from colosseum.hub.hub import Hub
+
+    cfg = bench._make_config(1, str(tmp_path))
+    assert cfg.distributed.heartbeat_sec == 0.25
+    runner, stop = bench._runner(cfg, RunDir.create(cfg))
+    assert isinstance(runner, Hub) and stop == runner.request_stop and runner.env_steps_done == 0
+    assert runner._options.mode == "train" and runner._options.local_node.workers == 1

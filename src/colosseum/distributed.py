@@ -471,7 +471,7 @@ def _dist_worker_main(
 ) -> None:
     """Worker process body: gRPC clients in, rollout_worker_process unchanged."""
     from colosseum.core.registry import build_model
-    from colosseum.launcher import _create_env
+    from colosseum.node.worker_main import create_env
     from colosseum.transport.grpc_transport import GRPCTransport
     from colosseum.weight_store.grpc_store import GRPCWeightStore
     from colosseum.worker.rollout_worker import rollout_worker_process
@@ -486,7 +486,7 @@ def _dist_worker_main(
 
     rollout_worker_process(
         worker_id=worker_id,
-        env_fn=partial(_create_env, config.env.env_class, config.env.kwargs),
+        env_fn=partial(create_env, config.env.env_class, config.env.kwargs),
         num_envs=config.rollout.envs_per_worker,
         chunk_length=config.rollout.chunk_length,
         agent_ids=agent_ids,

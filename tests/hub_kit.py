@@ -8,9 +8,12 @@ server).
   are told apart by their ``SessionHandle`` serial). Test support only: T2.5's ``Hub`` implements the same handlers
   on the real coordinator.
 - ``make_result``: a 1v1 training ``MatchResult`` of the toy game ``turns`` as a node sends it.
+- T2.5: ``lineup_hub`` (a real ``Hub`` after its setup steps), ``open_node`` / ``RecordingHandle``, ``accept_version``,
+  ``request_cells``, ``result_batch``, ``hub_results``, ``node_message``: the real hub's handlers driven in-process.
 """
 from __future__ import annotations
 
+import itertools
 import json
 import queue
 import threading
@@ -524,3 +527,115 @@ def serve(tmp_path: Path, *, insecure: bool = False, max_message_mb: int = MAX_M
     port = ports["127.0.0.1:0"]
     return ServedHub(server=server, port=port, address=f"127.0.0.1:{port}", identity=identity, blobs=blobs,
                      run_dir=run_dir, inbox=inbox, loop=loop, insecure=insecure)
+
+
+# ---------------------------------------------------------------------------------------------------------------
+# The real Hub's handlers, driven in-process (T2.5)
+# ---------------------------------------------------------------------------------------------------------------
+
+
+_handle_serials = itertools.count(1_000_000)
+
+
+class RecordingHandle:
+    """A ``SessionHandle`` stand-in that records what the hub sends (``sent``) and whether it was closed."""
+
+    def __init__(self, node_id: str, session_id: str) -> None:
+        self.node_id, self.session_id = node_id, session_id
+        self.serial = next(_handle_serials)
+        self.sent: list[pb.HubMessage] = []
+        self.closed_reason: str | None = None
+
+    def send(self, msg: pb.HubMessage) -> None:
+        self.sent.append(msg)
+
+    def close(self, reason: str) -> None:
+        self.closed_reason = reason
+
+    def of(self, kind: str) -> list:
+        """The payloads of the sent messages of oneof ``kind``, in order."""
+        return [getattr(m, kind) for m in self.sent if m.WhichOneof("m") == kind]
+
+    def grants(self) -> list[pb.Grant]:
+        return [g for batch in self.of("grants") for g in batch.grants]
+
+    def acks(self) -> list[int]:
+        return [s for ack in self.of("ack") for s in ack.seqs]
+
+
+def lineup_hub(config, tmp_path: Path, *, mode: str = "hub", sinks: bool = False, name: str = "hub-run"):
+    """A ``Hub`` (``hub`` mode, no local node) after ``launch``'s setup steps (``_prepare``: the coordinator, the
+    identity under ``tmp_path``, the pure hub state); ``sinks``: the metrics hub, the journal writer and the live
+    ratings too (``_open_sinks``; the caller ends them with ``hub._finish_metrics()``). Nothing listens."""
+    from colosseum.hub.hub import Hub, HubOptions
+    from game_helpers import make_test_run_dir
+
+    run_dir = make_test_run_dir(config, tmp_path, name=name)
+    hub = Hub(config, run_dir, options=HubOptions(mode=mode, local_node=None,
+                                                  identity_dir=Path(tmp_path) / "hub-identity"))
+    hub._prepare()
+    if sinks:
+        hub._open_sinks()
+    return hub
+
+
+def open_node(hub, *, name: str = "n", workers: int = 2, envs: int | None = None, cpu_learners: int = 1,
+              no_learners: bool = False, session_id: str | None = None, last_acked: int = 0,
+              node_id: str | None = None) -> RecordingHandle:
+    """Register a node in the hub's node book (unless ``node_id`` names one) and open a session on the real
+    ``Hub._on_session_opened``; returns its recording handle."""
+    import uuid
+
+    from colosseum.hub.server import SessionOpened
+
+    if node_id is None:
+        record, _secret = hub.identity.nodes.register(machine_id=uuid.uuid4().hex, name=name, tags=[], node_id=None)
+        node_id = record.node_id
+    handle = RecordingHandle(node_id, session_id or uuid.uuid4().hex)
+    envs = hub._config.rollout.envs_per_worker if envs is None else envs
+    hello = pb.Hello(node_id=node_id, session_id=handle.session_id, protocol_major=PROTOCOL_VERSION[0],
+                     protocol_minor=PROTOCOL_VERSION[1], last_acked_seq=last_acked,
+                     slots=pb.Slots(workers=workers, cpu_learners=cpu_learners, no_learners=no_learners,
+                                    envs_per_worker=envs))
+    hub._on_session_opened(SessionOpened(handle, hello))
+    return handle
+
+
+def accept_version(hub, agent: str, version: int = 0) -> str:
+    """An accepted ``VersionAnnounce`` of ``agent``'s learner (from its node): the agent can collect."""
+    from colosseum.net.messages import VersionInfo
+
+    number = hub._learner_node[agent]
+    info = VersionInfo(agent_id=agent, generation=hub._versions.generation(agent), version=version, size=10,
+                       digest="d" * 32, node=number)
+    return hub._versions.announce(info)
+
+
+def node_message(handle: RecordingHandle, **oneof) -> NodeMessageIn:
+    """A ``NodeMessageIn`` of ``handle``'s stream; a ``results`` batch carries its converted results."""
+    from colosseum.net.messages import results_from_batch
+
+    message = pb.NodeMessage(**oneof)
+    results = results_from_batch(message.results) if message.WhichOneof("m") == "results" else None
+    return NodeMessageIn(handle.node_id, handle.session_id, message, results=results, serial=handle.serial)
+
+
+def request_cells(hub, handle: RecordingHandle, cells: Sequence[tuple[int, int, int, int]]) -> list[pb.Grant]:
+    """A ``LineupRequest`` of ``(worker, env, epoch, incarnation)`` cells; returns the grants of this request."""
+    before = len(handle.grants())
+    hub._on_message(node_message(handle, lineup_request=pb.LineupRequest(cells=[
+        pb.CellRequest(worker=w, env=e, epoch=ep, incarnation=i) for w, e, ep, i in cells])))
+    return handle.grants()[before:]
+
+
+def result_batch(hub, handle: RecordingHandle, results: Sequence, *, seq: int) -> None:
+    """A ``ResultBatch`` of ``results`` (``MatchResult``) through ``Hub._on_message``."""
+    from colosseum.net.messages import results_to_batch
+
+    hub._on_message(node_message(handle, results=results_to_batch(seq, results)))
+
+
+def hub_results(hub, number: int, n: int, *, first: int = 0, agents: Sequence[str] = ("a", "random")) -> list:
+    """``n`` results of node ``number`` with uids under the hub's run id (``make_result``)."""
+    return [make_result(node=number, worker=0, env=k % 4, epoch=1, k=k, run_id=hub.run_id, agents=agents)
+            for k in range(first, first + n)]

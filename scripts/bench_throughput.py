@@ -1,9 +1,9 @@
 """Throughput benchmark: tic-tac-toe self-play training for a fixed wall-clock time.
 
-For every worker count the real ``Launcher`` runs (spawned worker and learner
-processes) with a pinned tic-tac-toe workload (``_make_config``: every value
-that affects the workload is set here, not inherited from the example yaml, so
-"before" and "after" runs measure the same work). After the run the script reads
+For every worker count the real ``train`` path runs (SP5: a ``Hub`` and its local node, which spawns the
+worker and learner processes; for a ``--tree`` without the hub, the SP4 ``Launcher``) with a pinned
+tic-tac-toe workload (``_make_config``: every value that affects the workload is set here, not inherited
+from the example yaml, so "before" and "after" runs measure the same work). After the run the script reads
 the run's ``metrics.jsonl`` (T6.3): ``train`` records of ``agent_0`` (one per
 learner train step, ``metrics.log_interval=1``) and ``system`` records (one per
 ``metrics.console_interval_sec``). Rates use the clock of ``--clock`` (below). After a
@@ -23,7 +23,7 @@ warm-up period the script measures, over ``--duration`` seconds:
 
 Checkpoints are disabled, so every slot plays the latest policy and collects data.
 
-Clocks (``--clock``): ``counters`` (default since SP4) samples the launcher's global env-step counter and
+Clocks (``--clock``): ``counters`` (default since SP4) samples the hub's (launcher's) global env-step counter and
 the newest ``train`` / ``system`` records on ``time.monotonic()`` in this process (``CounterSampler``);
 ``ts`` uses the records' wall-clock ``ts`` as before SP4. On machines whose wall clock jumps (WSL2: GPU
 checks report §8) only ``counters`` works. ``--tree PATH`` measures another checkout (for example a ``main``
@@ -82,7 +82,7 @@ class CounterSampler:
     """Measurement by counters on ``time.monotonic()`` (GPU checks report §8: WSL2 wall clocks jump by ~9 s,
     so windows over the records' ``ts`` fail). Every ``interval`` seconds it records:
 
-    - ``system``: ``(t, env_steps, queue_depth)``: the launcher's global env-step counter and the learner
+    - ``system``: ``(t, env_steps, queue_depth)``: the hub's (launcher's) global env-step counter and the learner
       queue depth of the newest ``system`` record (-1 = unknown);
     - ``train``: ``(t, train_step, chunks_received)`` of the newest ``train`` record of ``agent_id``, once
       per new train step.
@@ -278,10 +278,10 @@ def _make_config(num_workers: int, run_parent: str):
         ratings={"anchor": None, "refit_interval_sec": 60.0, "bootstrap_samples": 200},
         evaluation={"enabled": False, "agents": None, "field": None, "layouts": None, "every": 1, "blocks": 25,
                     "num_envs": 8, "deterministic": False, "max_backlog": 4},   # criterion 3.6: pulse off
-        # SP5 (spec 9.1): every key pinned. The hub and the local node talk over loopback; heartbeat_sec 0.25 is set
-        # by T2.5 (counter quantization < 1 % of the window), until then the default.
+        # SP5 (spec 9.1): every key pinned. The hub and the local node talk over loopback; heartbeat_sec 0.25: the
+        # hub's env-step counter (sampled by CounterSampler) moves in heartbeats, quantized < 1 % of the window (T2.5).
         distributed={
-            "port": 47100, "data_port": 47102, "insecure": False, "heartbeat_sec": 1.0, "node_lost_after_sec": 10.0,
+            "port": 47100, "data_port": 47102, "insecure": False, "heartbeat_sec": 0.25, "node_lost_after_sec": 10.0,
             "learner_relocate_after_sec": 120.0, "hub_lost_timeout_sec": 1800.0, "hub_lost_collect_sec": 300.0,
             "shutdown_grace_sec": 20.0, "connect_timeout_sec": 5.0, "block_lease_sec": 600.0, "relay": True,
             "results_batch": 256, "results_flush_sec": 0.25, "node_result_buffer_mb": 256.0, "max_message_mb": 64,
@@ -336,11 +336,26 @@ def compute_rates(train: list[tuple[float, int, int]], system: list[tuple[float,
     }
 
 
+def _runner(config, run_dir):
+    """``(runner, stop)``: SP5's ``Hub`` with its local node (``train``'s path; ``stop`` = ``request_stop``), or, for a
+    measured tree without ``colosseum.hub.hub`` (``--tree`` of ``main``), the SP4 ``Launcher`` (``stop`` sets its
+    stop event). Both expose ``env_steps_done`` (the global budget counter) and ``launch()``."""
+    try:
+        from colosseum.hub.hub import Hub, HubOptions, LocalNodeOptions
+    except ImportError:                       # documented --tree fallback: the measured checkout predates the hub
+        from colosseum.launcher import Launcher
+
+        launcher = Launcher(config, run_dir)
+        return launcher, launcher._stop_event.set
+    hub = Hub(config, run_dir, options=HubOptions(mode="train", local_node=LocalNodeOptions.from_config(config,
+                                                                                                        run_dir)))
+    return hub, hub.request_stop
+
+
 def run_one(num_workers: int, duration: float, warmup: float, *, clock: str = "counters",
             make_config=None) -> dict:
     """Run one configuration; raises RuntimeError if the window is incomplete."""
     from colosseum.core.run_dir import RunDir
-    from colosseum.launcher import Launcher
 
     if clock not in CLOCKS:
         raise ValueError(f"clock {clock!r} is not one of {CLOCKS}")
@@ -348,15 +363,15 @@ def run_one(num_workers: int, duration: float, warmup: float, *, clock: str = "c
     with tempfile.TemporaryDirectory(prefix="bench-") as tmp:
         config = make_config(num_workers, tmp)
         run_dir = RunDir.create(config)
-        launcher = Launcher(config, run_dir)
-        sampler = CounterSampler(lambda: launcher.env_steps_done, run_dir.metrics_path) if clock == "counters" else None
+        runner, stop = _runner(config, run_dir)
+        sampler = CounterSampler(lambda: runner.env_steps_done, run_dir.metrics_path) if clock == "counters" else None
         started = time.monotonic() if sampler is not None else time.time()  # ts mode: metrics.jsonl ``ts`` is Unix time
-        timer = threading.Timer(warmup + duration, launcher._stop_event.set)
+        timer = threading.Timer(warmup + duration, stop)
         timer.start()
         if sampler is not None:
             sampler.start()
         try:
-            launcher.launch()
+            runner.launch()
         finally:
             timer.cancel()
             if sampler is not None:

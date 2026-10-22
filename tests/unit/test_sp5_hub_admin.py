@@ -1,9 +1,11 @@
 """Admin clients find their hub (SP5 T2.5; spec 3.3, amendment A5): ``--hub ADDR`` (+ token) > ``--run RUN``
-(``hub.json``) > the single running hub of this machine; several running hubs are an error that lists them.
-(``test_admin_status_answers_on_a_running_hub`` needs the hub process and comes with it, T2.5 (a2).)"""
+(``hub.json``) > the single running hub of this machine; several running hubs are an error that lists them. An
+in-process ``Hub`` answers ``hub.status`` (T2.5 (a2))."""
 from __future__ import annotations
 
 import os
+import threading
+import time
 
 import pytest
 
@@ -167,3 +169,49 @@ def test_leaving_a_stream_early_closes_its_channel(tmp_path, monkeypatch):
         assert closed == [True]
     finally:
         hub.stop()
+
+
+def test_the_run_path_sends_the_local_token_in_clear_only_to_loopback_or_a_live_local_hub(tmp_path, monkeypatch):
+    """Carried item of T2.5 (a1): ``--run RUN`` of a plain hub (``tls: false``) without a loopback address applies
+    the ``--hub`` rule: the owner token goes to ``addresses[0]`` only when a hub with this identity runs there."""
+    monkeypatch.delenv("COLOSSEUM_TOKEN", raising=False)
+    identity = HubIdentity.load_or_create(hub_identity_dir())
+    run = tmp_path / "run"
+    run.mkdir()
+    info = _info(identity, run, mode="hub", tls=False, addresses=("10.1.2.3:47100",), loopback=None)
+    write_hub_json(run, info)
+    with pytest.raises(SecurityError, match="without TLS"):
+        resolve_hub(run=str(run))
+    other = HubIdentity.load_or_create(tmp_path / "other")
+    assert resolve_hub(run=str(run), token=str(other.token)).token == other.token     # a given token: the user's call
+    register_running(identity.path, info)                                         # the hub runs here
+    target = resolve_hub(run=str(run))
+    assert (target.address, target.tls, target.token) == ("10.1.2.3:47100", False, identity.token)
+
+
+def test_admin_status_answers_on_a_running_hub(tmp_path):
+    from colosseum.hub.hub import Hub, HubOptions
+    from game_helpers import make_test_config, make_test_run_dir
+
+    config = make_test_config("turns", training={"total_timesteps": 10**12})
+    run_dir = make_test_run_dir(config, tmp_path)
+    hub = Hub(config, run_dir, options=HubOptions(mode="hub", listen="127.0.0.1", port=0, insecure=True,
+                                                  identity_dir=tmp_path / "hub-identity"))
+    codes = []
+    thread = threading.Thread(target=lambda: codes.append(hub.launch()), name="hub", daemon=True)
+    thread.start()
+    try:
+        deadline = time.monotonic() + 60
+        while not hub.ports and time.monotonic() < deadline:
+            time.sleep(0.05)
+        (port,) = hub.ports.values()
+        target = admin.HubTarget(f"127.0.0.1:{port}", False, None, hub.identity.token)
+        reply = call(target, "hub.status")
+        assert reply["code"] == 0
+        assert reply["data"] == {"run_id": hub.run_id, "mode": "hub", "env_steps": 0, "nodes": []}
+        unknown = call(target, "no.such")
+        assert unknown["code"] == 2 and "unknown command" in unknown["text"]
+    finally:
+        hub.request_stop()
+        thread.join(60)
+    assert codes == [0] and not thread.is_alive()

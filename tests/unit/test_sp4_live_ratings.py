@@ -388,12 +388,12 @@ def test_the_ratings_section_its_validation_and_the_random_bot_rule():
 
 
 def test_train_limits_the_main_process_blas_before_numpy(monkeypatch):
-    import colosseum.launcher
+    import colosseum.hub.hub
     import colosseum.utils.process as process
 
     calls = []
     monkeypatch.setattr(process, "limit_main_blas_threads", lambda: calls.append("blas") or False)
-    monkeypatch.setattr(colosseum.launcher, "run_training", lambda *a, **k: calls.append("train") or 0)
+    monkeypatch.setattr(colosseum.hub.hub, "run_training", lambda *a, **k: calls.append("train") or 0)
     from colosseum.cli import main
 
     result = CliRunner().invoke(main, ["train", "-c", os.devnull])

@@ -492,6 +492,8 @@ class NodeAgent:
         self._session = HubSession(self.options.hub_address, credentials=credentials, node_id=node_id,
                                    node_secret=secret, hello=self._hello, inbox=self._post,
                                    max_message_mb=self._max_mb)
+        logger.info(f"node: session with the hub at {self.options.hub_address} "
+                    f"({'plain' if credentials is None else 'TLS'})")
         self._session.start()
 
     def _probe_hardware(self) -> Any:
@@ -1576,13 +1578,38 @@ def _scripted_teachers(config: Any) -> dict[str, Any]:
     return out
 
 
+KILL_NODE_AFTER_ENV = "COLOSSEUM_TEST_KILL_NODE_AFTER"
+
+
+def _arm_kill_hook(agent: NodeAgent, passes: int) -> None:
+    """Test hook: ``os._exit(9)`` after ``passes`` loop passes once the node's workers started (read only when the
+    environment variable is set; the hub must then fail the run naming ``node.log``)."""
+    original = agent._pass
+    count = [0]
+
+    def counting_pass() -> None:
+        original()
+        run = agent._run
+        if run is not None and run.started:
+            count[0] += 1
+            if count[0] >= passes:
+                logger.warning(f"node: {KILL_NODE_AFTER_ENV}={passes}: exiting at once (test hook)")
+                os._exit(9)
+
+    agent._pass = counting_pass              # type: ignore[method-assign]
+
+
 def local_node_target(*, options: NodeOptions, log_dir: str) -> None:
     """The hub's spawn target for ``train``'s local node (R12): process logging, the child signal policy (it dies
     with the hub), then the node until its stop."""
     from colosseum.utils.process import run_child
 
     def body() -> None:
-        code = NodeAgent(options).run()
+        agent = NodeAgent(options)
+        kill_after = os.environ.get(KILL_NODE_AFTER_ENV)
+        if kill_after:                       # test hook (SP5 T2.5): the node dies N loop passes after its workers start
+            _arm_kill_hook(agent, int(kill_after))
+        code = agent.run()
         if code:
             sys.exit(code)
 
