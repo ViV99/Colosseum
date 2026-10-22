@@ -3,6 +3,7 @@ the bundle by hash, the uv environment (fake uv), the exec of the node agent (re
 from __future__ import annotations
 
 import ast
+import dataclasses
 import fcntl
 import hashlib
 import json
@@ -35,11 +36,12 @@ def hub(tmp_path):
 
     def start(*, tls=True, service="default", **kw):
         svc = join_kit.tiny_service(tmp_path, insecure=not tls, **kw) if service == "default" else service
-        server, port = join_kit.bootstrap_server(svc, identity, tls=tls)
+        server, port = join_kit.bootstrap_server(svc, identity, tls=tls, seen=hub.seen)
         servers.append(server)
         hub.service = svc
         return port
-    hub = type("Hub", (), {"identity": identity, "token": str(identity.token), "start": staticmethod(start)})
+    hub = type("Hub", (), {"identity": identity, "token": str(identity.token), "start": staticmethod(start),
+                           "seen": []})
     yield hub
     for s in servers:
         s.stop(0)
@@ -64,7 +66,8 @@ def _run(argv, env, monkeypatch, gpus=()):
 
 def _uv_calls(tmp_path):
     p = tmp_path / "uv.jsonl"
-    return [json.loads(line)["args"] for line in p.read_text().splitlines()] if p.exists() else []
+    calls = [json.loads(line)["args"] for line in p.read_text().splitlines()] if p.exists() else []
+    return [c for c in calls if c != ["--version"]]                          # the loader's uv version probes
 
 
 # --- codec and certificate --------------------------------------------------------------------------------------
@@ -160,7 +163,8 @@ def test_join_builds_env_and_execs_the_agent(hub, tmp_path, monkeypatch):
     assert pip_call[:2] == ["pip", "install"] and pip_call[-2:] == ["--torch-backend", "cpu"]   # no GPU here
     req = (env_dir / "colosseum-requirements.txt").read_text().splitlines()
     assert req == [*join_kit.REQUIREMENTS, "torch==2.14.1"]
-    uv_env = json.loads((tmp_path / "uv.jsonl").read_text().splitlines()[0])["env"]
+    uv_env = [json.loads(line) for line in (tmp_path / "uv.jsonl").read_text().splitlines()
+              if json.loads(line)["args"] != ["--version"]][0]["env"]
     assert uv_env["UV_CACHE_DIR"] == str(cache / "uv-cache")
     assert uv_env["UV_PYTHON_INSTALL_DIR"] == str(cache / "python")
 
@@ -224,6 +228,8 @@ def test_node_python_override_skips_the_env(hub, tmp_path, monkeypatch):
     ("tls_hub_insecure_node", "drop --insecure"),
     ("no_bootstrap", "colosseum train --listen"),
     ("down", "cannot reach the hub"),
+    ("down_insecure", "cannot reach the hub"),
+    ("protocol", "this loader is from another Colosseum version"),
 ])
 def test_refusals(hub, tmp_path, monkeypatch, capsys, case, needle):
     env, _ = _env(tmp_path)
@@ -242,17 +248,27 @@ def test_refusals(hub, tmp_path, monkeypatch, capsys, case, needle):
     elif case == "no_bootstrap":                                   # a plain `train` hub: no Bootstrap service
         port = hub.start(tls=False, service=None)
         argv = ["--insecure"]
+    elif case == "protocol":
+        port = hub.start(service=dataclasses.replace(join_kit.tiny_service(tmp_path), protocol=(2, 0)))
     else:                                   # P-PF4-23: a bound, non-listening socket (ECONNREFUSED, no reuse race)
         closed = socket.socket()
         closed.bind(("127.0.0.1", 0))
         port = closed.getsockname()[1]
+        argv = ["--insecure"] if case == "down_insecure" else []
     try:
         code, calls = _run([f"127.0.0.1:{port}", *argv], {**env, "COLOSSEUM_TOKEN": token}, monkeypatch)
     finally:
         if closed is not None:
             closed.close()
     assert code == 1 and not calls
-    assert needle in capsys.readouterr().err
+    err = capsys.readouterr().err
+    assert needle in err
+    if case.startswith("down"):
+        assert "WSL2" in err and "drop --insecure" not in err
+    if case == "fingerprint":                     # nothing reached the server: the key is checked before any RPC
+        assert hub.seen == []
+    if case == "protocol":                        # refused at Info: the token secret was never sent
+        assert [m for m, _ in hub.seen] == ["/colosseum.v1.Bootstrap/Info"]
 
 
 def test_prune_keeps_recent_and_in_use(tmp_path):
@@ -404,3 +420,101 @@ def test_loader_module_is_standalone():
                           "print(*(n in sys.modules for n in ('torch', 'colosseum', 'grpc')))", L.__file__],
                          capture_output=True, text=True, timeout=60)
     assert out.stdout.split() == ["False", "False", "False"], out.stderr
+
+
+# --- review round 1 ---------------------------------------------------------------------------------------------
+
+def test_reexec_closes_the_inherited_in_use_locks(hub, tmp_path, monkeypatch):
+    """The agent inherits the .in-use locks through exec; when it re-execs the loader (new code hash, T6.3), the
+    loader closes them first, so the old bundle becomes prunable (a new descriptor of the same process could not
+    take the exclusive prune lock against them)."""
+    first_port = hub.start()
+    first_hash = hub.service.bundle.code_hash
+    env, py = _env(tmp_path, COLOSSEUM_TOKEN=hub.token)
+    env[L.NODE_PYTHON_ENV] = str(py)
+    monkeypatch.setattr(T, "probe_nvidia", lambda **kw: [])
+    inherited = []
+
+    def exec_keeping_locks(path, args, agent_env):          # what exec does: the descriptions stay locked
+        for fd in agent_env[L.IN_USE_FDS_ENV].split(","):
+            inherited.append(os.dup(int(fd)))
+        agent_env[L.IN_USE_FDS_ENV] = ",".join(map(str, inherited))
+        exec_keeping_locks.env = agent_env
+
+    assert L.loader_main([f"127.0.0.1:{first_port}"], environ=env, exec_fn=exec_keeping_locks) == 0
+    root = B.bundles_dir(tmp_path / "cache")
+    assert L.prune(root, 0, root / "none") == []                            # held by the "agent"
+    second_port = hub.start(extra_files={"examples/new.py": b"Y = 2\n"})
+    assert hub.service.bundle.code_hash != first_hash
+    calls = []
+    agent_env = {**env, **{k: v for k, v in exec_keeping_locks.env.items() if k == L.IN_USE_FDS_ENV}}
+    code = L.loader_main([f"127.0.0.1:{second_port}"], environ=agent_env,
+                         exec_fn=lambda p, a, e: calls.append(e))
+    assert code == 0 and calls
+    for fd in inherited:                                                   # closed by the re-exec'd loader
+        with pytest.raises(OSError):
+            os.fstat(fd)
+    assert first_hash in L.prune(root, 0, root / "none")
+
+
+def test_close_inherited_locks_ignores_bad_numbers():
+    r, w = os.pipe()
+    try:
+        L.close_inherited_locks(f"x,,0,1,2,-3,{r},999999")
+        with pytest.raises(OSError):
+            os.fstat(r)
+        os.fstat(w)                                                        # not listed: untouched
+    finally:
+        os.close(w)
+
+
+def test_token_reaches_only_the_agent(hub, tmp_path, monkeypatch):
+    """No third-party subprocess (uv, its installer, nvidia-smi, the torch check) sees COLOSSEUM_TOKEN."""
+    port = hub.start()
+    env, _ = _env(tmp_path, COLOSSEUM_TOKEN=hub.token)
+    seen, real = [], subprocess.run
+
+    def run(cmd, *a, **kw):
+        seen.append((cmd, kw.get("env")))
+        return real(cmd, *a, **kw)
+
+    monkeypatch.setattr(L.subprocess, "run", run)
+    probes = []
+    monkeypatch.setattr(T, "probe_nvidia", lambda **kw: probes.append(kw["environ"]) or [])
+    monkeypatch.setattr(T, "probe_platform", lambda: T.NodePlatform("Linux", "x86_64"))
+    calls = []
+    assert L.loader_main([f"127.0.0.1:{port}"], environ=env, exec_fn=lambda p, a, e: calls.append(e)) == 0
+    assert len(seen) >= 4 and all(e is not None and L.TOKEN_ENV not in e for _, e in seen), seen
+    assert probes and L.TOKEN_ENV not in probes[0]
+    assert calls[0][L.TOKEN_ENV] == hub.token
+
+
+def test_prune_treats_a_fresh_entry_as_recent(tmp_path):
+    """An entry without .in-use yet (just built / unpacked) sorts by its own mtime, not as the oldest."""
+    root = tmp_path / "envs"
+    (root / "old").mkdir(parents=True)
+    (root / "old" / L.IN_USE).write_text("")
+    os.utime(root / "old" / L.IN_USE, (100, 100))
+    (root / "fresh").mkdir()
+    assert L.prune(root, 1, root / "none") == ["old"]
+
+
+def test_unexpected_wire_type_is_a_value_error():
+    with pytest.raises(ValueError, match="wire type"):
+        L.decode_message(b"\x18\x05", L.INFO_FIELDS)                       # code_hash (3) as a varint
+    with pytest.raises(ValueError, match="wire type"):
+        L.decode_message(b"\x0a\x01x", L.INFO_FIELDS)                      # protocol_major (1) as bytes
+    assert L.PROTOCOL_MAJOR == PROTOCOL_VERSION[0]
+
+
+def test_os_errors_end_with_a_message(hub, tmp_path, monkeypatch, capsys):
+    port = hub.start()
+    env, py = _env(tmp_path, COLOSSEUM_TOKEN=hub.token)
+    env[L.NODE_PYTHON_ENV] = str(py)
+
+    def failing_exec(path, args, agent_env):
+        raise PermissionError(13, "Permission denied", path)
+
+    monkeypatch.setattr(T, "probe_nvidia", lambda **kw: [])
+    assert L.loader_main([f"127.0.0.1:{port}"], environ=env, exec_fn=failing_exec) == 1
+    assert "colosseum join: failed: [Errno 13] Permission denied" in capsys.readouterr().err

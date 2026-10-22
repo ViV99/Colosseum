@@ -31,6 +31,7 @@ import json
 import os
 import re
 import shutil
+import socket
 import ssl
 import subprocess
 import sys
@@ -44,6 +45,8 @@ DEFAULT_PORT = 47100
 TOKEN_ENV = "COLOSSEUM_TOKEN"
 NODE_PYTHON_ENV = "COLOSSEUM_NODE_PYTHON"     # use this interpreter instead of building an environment
 UV_ENV = "COLOSSEUM_UV"                       # the uv binary to use
+IN_USE_FDS_ENV = "COLOSSEUM_IN_USE_FDS"       # the agent's inherited .in-use lock fds, closed by a re-exec'd loader
+PROTOCOL_MAJOR = 1                            # colosseum.net.messages.PROTOCOL_VERSION[0] (checked by a test)
 TOKEN_RE = re.compile(r"^cst1\.([A-Za-z0-9_-]{43})\.([0-9a-f]{64})$")
 UV_VERSION = "0.13.1"
 MIN_UV = (0, 7, 14)                           # --torch-backend without --preview
@@ -159,6 +162,8 @@ def decode_message(buf: bytes, fields: Mapping[int, tuple[str, str]]) -> dict:
         if number not in fields:
             continue
         name, kind = fields[number]
+        if wire != (0 if kind in ("int", "bool") else 2):
+            raise ValueError(f"field {number} ({name}) has wire type {wire}")
         if kind == "int":
             out[name] = value - (1 << 64) if value >= 1 << 63 else value
         elif kind == "bool":
@@ -254,6 +259,11 @@ def curl_pin(fingerprint: str) -> str:
     return "sha256//" + base64.b64encode(bytes.fromhex(fingerprint)).decode()
 
 
+def _unreachable(host: str, port: int, error: BaseException) -> LoaderError:
+    return LoaderError(f"cannot reach the hub at {host}:{port} ({error}); is it running, is the port open "
+                       "(WSL2 hubs: docs/DISTRIBUTED_GUIDE.md, WSL2)?")
+
+
 def fetch_hub_ca(host: str, port: int, fingerprint: str, *, timeout: float) -> bytes:
     """The hub's certificate (R15: the CA itself) from an unverified handshake, accepted only when its key
     matches the token's fingerprint."""
@@ -263,8 +273,7 @@ def fetch_hub_ca(host: str, port: int, fingerprint: str, *, timeout: float) -> b
         raise LoaderError(f"TLS handshake with {host}:{port} failed ({e.reason or e}); if the hub runs with "
                           "--insecure, add --insecure here") from e
     except (TimeoutError, OSError) as e:
-        raise LoaderError(f"cannot reach the hub at {host}:{port} ({e}); is it running, is the port open "
-                          "(WSL2 hubs: docs/DISTRIBUTED_GUIDE.md, WSL2)?") from e
+        raise _unreachable(host, port, e) from e
     actual = spki_sha256(ssl.PEM_cert_to_DER_cert(pem))
     if actual != fingerprint:
         raise LoaderError(f"the hub at {host}:{port} does not have the key of this token (fingerprint "
@@ -280,6 +289,10 @@ def open_channel(host: str, port: int, *, fingerprint: str, insecure: bool, max_
     options = [("grpc.max_receive_message_length", max_message_mb << 20),
                ("grpc.max_send_message_length", max_message_mb << 20)]
     if insecure:
+        try:                                           # a hub that is down is not "a TLS hub" (_rpc_error)
+            socket.create_connection((host, port), timeout=CONNECT_TIMEOUT_SEC).close()
+        except OSError as e:
+            raise _unreachable(host, port, e) from e
         return grpc.insecure_channel(target, options=options)
     ca = fetch_hub_ca(host, port, fingerprint, timeout=CONNECT_TIMEOUT_SEC)
     options.append(("grpc.ssl_target_name_override", HUB_SERVER_NAME))
@@ -298,8 +311,8 @@ def _rpc_error(e, what: str, *, insecure: bool = False) -> LoaderError:
         return LoaderError(f"{what}: the hub serves no code to nodes (a plain `colosseum train` listens on "
                            "loopback only: start `colosseum hub` or `colosseum train --listen`)")
     if code == grpc.StatusCode.UNAVAILABLE:
-        hint = ("unless the hub runs with --insecure, drop --insecure here" if insecure
-                else "is the hub running and its port open?")
+        hint = ("the port answers but not plain gRPC: unless the hub runs with --insecure, drop --insecure here"
+                if insecure else "is the hub running and its port open?")
         return LoaderError(f"{what}: the hub is not reachable ({e.details()}); {hint}")
     return LoaderError(f"{what} failed: {code} {e.details() if hasattr(e, 'details') else e}")
 
@@ -341,6 +354,16 @@ def _hold(path: Path, *, exclusive: bool, blocking: bool = True):
     return f
 
 
+def _last_used(entry: Path) -> float:
+    """The mtime of the entry's ``.in-use`` file; the directory's own mtime before its first use (just built)."""
+    for path in (entry / IN_USE, entry):
+        try:
+            return path.stat().st_mtime
+        except OSError:
+            continue
+    return 0.0
+
+
 def prune(directory: Path, keep: int, current: Path) -> list[str]:
     """Remove all but the ``keep`` most recently used entries of ``directory`` (by their ``.in-use`` file's
     mtime), under the cache lock; an entry another process holds (shared lock on ``.in-use``), an environment
@@ -350,7 +373,7 @@ def prune(directory: Path, keep: int, current: Path) -> list[str]:
         return removed
     with _sibling("bundle").cache_lock(directory):
         entries = [p for p in directory.iterdir() if p.is_dir() and not p.name.startswith(".")]
-        entries.sort(key=lambda p: (p / IN_USE).stat().st_mtime if (p / IN_USE).exists() else 0.0, reverse=True)
+        entries.sort(key=_last_used, reverse=True)
         for entry in entries[keep:]:
             if entry == current:
                 continue
@@ -428,9 +451,16 @@ def ensure_bundle(channel, info: dict, token: str, cache: Path) -> Path:
         part.unlink(missing_ok=True)
 
 
-def _uv_version(uv: str) -> tuple[int, ...] | None:
+def _child_environ(environ: Mapping[str, str]) -> dict[str, str]:
+    """``environ`` for third-party subprocesses (uv, its installer, build backends, nvidia-smi, the torch check):
+    without the token (only the node agent gets it), the inherited lock fds and the Python path variables."""
+    return {k: v for k, v in environ.items() if k not in CLEAN_ENV and k not in (TOKEN_ENV, IN_USE_FDS_ENV)}
+
+
+def _uv_version(uv: str, environ: Mapping[str, str]) -> tuple[int, ...] | None:
     try:
-        out = subprocess.run([uv, "--version"], capture_output=True, text=True, timeout=30)
+        out = subprocess.run([uv, "--version"], capture_output=True, text=True, timeout=30,
+                             env=_child_environ(environ))
     except (OSError, subprocess.SubprocessError):
         return None
     match = re.search(r"(\d+)\.(\d+)\.(\d+)", out.stdout)
@@ -441,15 +471,18 @@ def ensure_uv(explicit: str | None, environ: Mapping[str, str], cache: Path) -> 
     """``COLOSSEUM_UV`` > ``--uv`` > ``<cache>/colosseum/uv/uv`` > ``uv`` on PATH (>= 0.7.14) > a private uv
     installed with the pinned astral.sh installer (``UV_UNMANAGED_INSTALL``: no profile edits, no receipt)."""
     private = cache / "colosseum" / "uv" / "uv"
-    for candidate in (environ.get(UV_ENV), explicit, str(private), shutil.which("uv", path=environ.get("PATH"))):
-        if candidate and Path(candidate).exists() and (_uv_version(candidate) or (0,)) >= MIN_UV:
+    path = environ.get("PATH")
+    for candidate in (environ.get(UV_ENV), explicit, str(private), shutil.which("uv", path=path)):
+        if candidate and Path(candidate).exists() and (_uv_version(candidate, environ) or (0,)) >= MIN_UV:
             return candidate
     _say(f"installing uv {UV_VERSION} into {private.parent}")
     url = UV_INSTALL_URL.format(version=UV_VERSION)
-    fetch = f"curl -LsSf {url}" if shutil.which("curl") else f"wget -qO- {url}" if shutil.which("wget") else None
+    fetch = (f"curl -LsSf {url}" if shutil.which("curl", path=path)
+             else f"wget -qO- {url}" if shutil.which("wget", path=path) else None)
     if fetch is None:
         raise LoaderError("uv is not installed and neither curl nor wget is available to install it")
-    env = {**environ, "UV_UNMANAGED_INSTALL": str(private.parent), "UV_NO_MODIFY_PATH": "1"}
+    env = {k: v for k, v in _child_environ(environ).items() if k != "UV_INSTALL_DIR"}
+    env.update(UV_UNMANAGED_INSTALL=str(private.parent), UV_NO_MODIFY_PATH="1")
     if subprocess.run(["sh", "-c", f"{fetch} | sh"], env=env).returncode != 0 or not private.exists():
         raise LoaderError(f"installing uv from {url} failed (install uv yourself and retry)")
     return str(private)
@@ -462,7 +495,7 @@ def env_key(info: dict, backend: str | None) -> str:
 
 def _uv_environ(environ: Mapping[str, str], cache: Path, driver: str | None) -> dict[str, str]:
     torch_select = _sibling("torch_select")
-    env = {k: v for k, v in torch_select.nvidia_smi_environ(environ).items() if k not in CLEAN_ENV}
+    env = _child_environ(torch_select.nvidia_smi_environ(environ))
     env.setdefault("UV_CACHE_DIR", str(cache / "colosseum" / "uv-cache"))
     env.setdefault("UV_PYTHON_INSTALL_DIR", str(cache / "colosseum" / "python"))
     if driver:
@@ -566,14 +599,29 @@ def agent_args(ns: argparse.Namespace) -> list[str]:
     return out
 
 
-def agent_environ(environ: Mapping[str, str], bundle_dir: Path, token: str) -> dict[str, str]:
+def agent_environ(environ: Mapping[str, str], bundle_dir: Path, token: str,
+                  in_use_fds: Sequence[int] = ()) -> dict[str, str]:
+    """The node agent's environment: the bundle's ``PYTHONPATH``, the token, and (``COLOSSEUM_IN_USE_FDS``) the
+    numbers of the ``.in-use`` lock descriptors it inherits, so a loader it re-execs closes them first."""
     bundle = _sibling("bundle")
     torch_select = _sibling("torch_select")
-    env = {k: v for k, v in torch_select.nvidia_smi_environ(environ).items() if k not in CLEAN_ENV}
+    env = _child_environ(torch_select.nvidia_smi_environ(environ))
     env["PYTHONPATH"] = os.pathsep.join(str(p) for p in bundle.bundle_python_path(bundle_dir))
     env["PYTHONNOUSERSITE"] = "1"
     env[TOKEN_ENV] = token
+    if in_use_fds:
+        env[IN_USE_FDS_ENV] = ",".join(str(fd) for fd in in_use_fds)
     return env
+
+
+def close_inherited_locks(text: str | None) -> None:
+    """Close the ``.in-use`` lock descriptors a node agent inherited (``COLOSSEUM_IN_USE_FDS``) when it re-execs
+    the loader (T6.3): otherwise they pin its old bundle and environment for its lifetime (a new descriptor of the
+    same process cannot take the exclusive prune lock against them). Bad or closed numbers are ignored."""
+    for item in (text or "").split(","):
+        if item.strip().isdigit() and int(item) > 2:
+            with contextlib.suppress(OSError):
+                os.close(int(item))
 
 
 def _in_use(make: Callable[[], Path], marker: str, locks: list, what: str) -> Path:
@@ -592,6 +640,7 @@ def _in_use(make: Callable[[], Path], marker: str, locks: list, what: str) -> Pa
 def loader_main(argv: Sequence[str], *, environ: Mapping[str, str] | None = None,
                 exec_fn: Callable[[str, list[str], dict[str, str]], object] | None = None) -> int:
     environ = dict(os.environ if environ is None else environ)
+    close_inherited_locks(environ.pop(IN_USE_FDS_ENV, None))   # before any new lock is taken
     exec_fn = exec_fn or os.execve
     try:
         ns = build_parser().parse_args(list(argv))
@@ -610,6 +659,10 @@ def loader_main(argv: Sequence[str], *, environ: Mapping[str, str] | None = None
         channel = open_channel(host, port, fingerprint=fingerprint, insecure=ns.insecure)
         with contextlib.closing(channel):
             info = fetch_info(channel, insecure=ns.insecure)
+            if info["protocol_major"] != PROTOCOL_MAJOR:
+                raise LoaderError(f"the hub speaks protocol {info['protocol_major']}.{info['protocol_minor']}, this "
+                                  f"loader {PROTOCOL_MAJOR}.x: run the hub's one-liner (this loader is from another "
+                                  "Colosseum version)")
             if not re.fullmatch(r"\d+\.\d+", info["python"]) or not info["torch_version"]:
                 raise LoaderError(f"the hub announced Python {info['python']!r} and torch {info['torch_version']!r}: "
                                   "a hub of another colosseum version? run the hub's one-liner instead")
@@ -618,7 +671,7 @@ def loader_main(argv: Sequence[str], *, environ: Mapping[str, str] | None = None
         prune(bundle.bundles_dir(cache), KEEP_BUNDLES, bundle_dir)
         python = environ.get(NODE_PYTHON_ENV)
         if not python:
-            gpus = torch_select.probe_nvidia(environ=environ)
+            gpus = torch_select.probe_nvidia(environ=_child_environ(environ))
             try:
                 choice = torch_select.torch_spec(info["torch_version"], info["torch_build"],
                                                  platform=torch_select.probe_platform(), gpus=gpus)
@@ -637,11 +690,14 @@ def loader_main(argv: Sequence[str], *, environ: Mapping[str, str] | None = None
                 "--bundle", str(bundle_dir)]
         os.chdir(bundle.project_dir(bundle_dir))
         _say(f"starting the node agent (code {info['code_hash'][:12]})")
-        exec_fn(python, args, agent_environ(environ, bundle_dir, token))
+        exec_fn(python, args, agent_environ(environ, bundle_dir, token, [lock.fileno() for lock in locks]))
         return 0
     except LoaderError as e:
         _say(str(e))
         return e.code
+    except OSError as e:                               # disk full, an unwritable cache, a failing exec ...
+        _say(f"failed: {e}")
+        return 1
     except KeyboardInterrupt:
         _say("interrupted")
         return 130

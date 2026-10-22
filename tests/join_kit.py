@@ -96,11 +96,25 @@ def tiny_service(tmp_path: Path, *, insecure: bool = False, torch_build: str = "
                             PROTOCOL_VERSION, bundle.path.read_bytes())
 
 
-def bootstrap_server(service: BootstrapService | None, identity, *, tls: bool = True) -> tuple[grpc.Server, int]:
+class _Recorder(grpc.ServerInterceptor):
+    def __init__(self, seen: list) -> None:
+        self._seen = seen
+
+    def intercept_service(self, continuation, handler_call_details):
+        self._seen.append((handler_call_details.method, dict(handler_call_details.invocation_metadata)))
+        return continuation(handler_call_details)
+
+
+def bootstrap_server(service: BootstrapService | None, identity, *, tls: bool = True,
+                     seen: list | None = None) -> tuple[grpc.Server, int]:
     """A started gRPC server on 127.0.0.1:<free port> with the hub's AuthInterceptor and (unless ``service`` is
-    None) the Bootstrap service; TLS with the hub identity's certificate, or plain."""
+    None) the Bootstrap service; TLS with the hub identity's certificate, or plain. ``seen`` receives
+    ``(method, metadata)`` of every RPC that reaches the server."""
+    interceptors = [AuthInterceptor(lambda: identity.token.secret, identity.nodes)]
+    if seen is not None:
+        interceptors.insert(0, _Recorder(seen))
     server = grpc.server(futures.ThreadPoolExecutor(max_workers=4), options=server_options(64),
-                         interceptors=[AuthInterceptor(lambda: identity.token.secret, identity.nodes)])
+                         interceptors=interceptors)
     if service is not None:
         add_bootstrap(server, service)
     if tls:

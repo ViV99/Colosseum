@@ -3,6 +3,7 @@ files, the uv / loader chain with a fake uv, and the real curl against a real gR
 from __future__ import annotations
 
 import json
+import shlex
 import shutil
 import subprocess
 from pathlib import Path
@@ -26,7 +27,7 @@ def _script(insecure=False) -> bytes:
 def test_script_shape_and_embedded_files(tmp_path):
     text = _script().decode()
     assert text.startswith("#!/bin/sh\n")
-    assert text.endswith('_colosseum_install "$@" # colosseum-installer-end\n')
+    assert text.endswith('{ _colosseum_install "$@"; } # colosseum-installer-end\n')
     assert text.count("_colosseum_install") == 2                         # the definition and the one call
     assert 'run --no-project --python 3.12 --with "grpcio==1.84.0" --' in text
     assert "https://astral.sh/uv/0.13.1/install.sh" in text and "UV_UNMANAGED_INSTALL" in text
@@ -34,6 +35,8 @@ def test_script_shape_and_embedded_files(tmp_path):
         return script.rsplit('exec "$uv" run', 1)[1]
     assert "--insecure" not in tail(text) and "--insecure " in tail(_script(True).decode())
     assert _script() == _script()                                          # deterministic (served bytes)
+    for module in (L, B, T):                                               # embedded verbatim (no substitution)
+        assert Path(module.__file__).read_text() in text
 
 
 def _env(tmp_path, port, token, **extra):
@@ -71,17 +74,22 @@ def test_script_runs_the_loader_and_passes_join_flags(hub, tmp_path, shell):
     boot = next((tmp_path / "cache" / "colosseum" / "loader").iterdir())
     for module in (L, B, T):
         assert (boot / Path(module.__file__).name).read_bytes() == Path(module.__file__).read_bytes()
+    assert not [p.name for p in boot.iterdir() if ".py." in p.name]          # no temp copies left
 
 
-LAST_LINE = b'_colosseum_install "$@" # colosseum-installer-end\n'
+LAST_LINE = b'{ _colosseum_install "$@"; } # colosseum-installer-end\n'
+IN_CALL = {"in-name": b"{ _colosseum_ins", "after-name": b"{ _colosseum_install",
+           "after-name-space": b"{ _colosseum_install ", "after-args": b'{ _colosseum_install "$@"',
+           "after-semicolon": b'{ _colosseum_install "$@";'}
 
 
-@pytest.mark.parametrize("cut", [0.05, 0.3, 0.5, 0.8, 0.99, "in-call", "before-call"])
+@pytest.mark.parametrize("cut", [0.05, 0.3, 0.5, 0.8, 0.99, "before-call", *IN_CALL])
 def test_truncated_script_does_nothing(tmp_path, cut):
-    """Every cut before the last line (the call) runs nothing: the function body is parsed whole first."""
+    """Every cut before the end of the call runs nothing: the function body is parsed whole first, and the braces
+    make a cut call a syntax error (never a call without the join flags)."""
     script = _script()
-    if cut == "in-call":
-        end = len(script) - len(LAST_LINE) + len(b"_colosseum_ins")
+    if cut in IN_CALL:
+        end = len(script) - len(LAST_LINE) + len(IN_CALL[cut])
     elif cut == "before-call":
         end = len(script) - len(LAST_LINE)
     else:
@@ -134,9 +142,65 @@ def test_one_liner_with_a_wrong_pin_runs_nothing(hub, tmp_path):
 def test_one_liner_and_join_command_text():
     token = "cst1." + "A" * 43 + "." + "0" * 64
     line = I.one_liner("10.0.0.5:47100", token, insecure=False)
-    assert line == ("printf '\\0\\0\\0\\0\\0' | curl -fsS --http2 -k --pinnedpubkey 'sha256//" + "A" * 43 + "=' "
+    assert line == ("printf '\\0\\0\\0\\0\\0' | curl -fsSg --http2 -k --pinnedpubkey 'sha256//" + "A" * 43 + "=' "
                     "-H 'content-type: application/grpc' -H 'te: trailers' --data-binary @- "
-                    "https://10.0.0.5:47100/colosseum.v1.Bootstrap/Script | tail -c +6 | "
+                    "'https://10.0.0.5:47100/colosseum.v1.Bootstrap/Script' | tail -c +6 | "
                     f"COLOSSEUM_HUB='10.0.0.5:47100' COLOSSEUM_TOKEN='{token}' sh")
     assert I.join_command("10.0.0.5:47100", token, insecure=True) == \
-        f"colosseum join 10.0.0.5:47100 --token '{token}' --insecure"
+        f"colosseum join '10.0.0.5:47100' --token '{token}' --insecure"
+    # a bracketed IPv6 address is neither a shell glob nor a curl glob
+    v6 = I.one_liner("[::1]:47100", token, insecure=True)
+    assert " -fsSg " in v6 and "'http://[::1]:47100/colosseum.v1.Bootstrap/Script'" in v6
+    assert I.join_command("[::1]:47100", token, insecure=False) == f"colosseum join '[::1]:47100' --token '{token}'"
+    assert shlex.split(I.join_command("[::1]:47100", token, insecure=False))[2] == "[::1]:47100"
+
+
+FAKE_CURL = """#!/bin/sh
+# Fake curl: serves a fake uv install.sh that records its environment and installs the fake uv (no network).
+echo "$*" >> "$FAKE_CURL_LOG"
+cat <<'FAKE_INSTALL_SH'
+mkdir -p "$UV_UNMANAGED_INSTALL"
+env | grep '^UV_' > "$FAKE_INSTALL_ENV"
+cp "$FAKE_UV_SOURCE" "$UV_UNMANAGED_INSTALL/uv"
+FAKE_INSTALL_SH
+"""
+
+
+def _fake_curl(tmp_path) -> tuple[Path, dict[str, str]]:
+    uv, _ = join_kit.write_fakes(tmp_path / "fakes")
+    fake_bin = tmp_path / "fake-bin"
+    fake_bin.mkdir()
+    (fake_bin / "curl").write_text(FAKE_CURL)
+    (fake_bin / "curl").chmod(0o755)
+    assert shutil.which("uv", path="/usr/bin:/bin") is None
+    return fake_bin, {"PATH": f"{fake_bin}:/usr/bin:/bin", "FAKE_CURL_LOG": str(tmp_path / "curl.log"),
+                      "FAKE_INSTALL_ENV": str(tmp_path / "install-env"), "FAKE_UV_SOURCE": str(uv),
+                      "UV_INSTALL_DIR": "/nowhere"}
+
+
+def test_script_installs_a_private_uv_when_none_is_usable(hub, tmp_path):
+    """No uv anywhere: the installer fetches the pinned astral.sh script (fake curl) and runs it with
+    UV_UNMANAGED_INSTALL (no profile edits, no receipt: never UV_INSTALL_DIR), then runs the loader with it."""
+    port = hub.start()
+    _, extra = _fake_curl(tmp_path)
+    env = _env(tmp_path, port, hub.token, **extra)
+    del env["COLOSSEUM_UV"]
+    out = subprocess.run(["sh"], input=_script(), env=env, capture_output=True, timeout=60)
+    assert out.returncode == 0, out.stderr.decode()
+    private = tmp_path / "cache" / "colosseum" / "uv"
+    assert "https://astral.sh/uv/0.13.1/install.sh" in (tmp_path / "curl.log").read_text()
+    installed = dict(line.split("=", 1) for line in (tmp_path / "install-env").read_text().splitlines())
+    assert installed["UV_UNMANAGED_INSTALL"] == str(private) and "UV_INSTALL_DIR" not in installed
+    assert (private / "uv").is_file() and (tmp_path / "record.jsonl").is_file()
+
+
+def test_loader_installs_a_private_uv_when_none_is_usable(tmp_path):
+    _, extra = _fake_curl(tmp_path)
+    env = {**extra, "HOME": str(tmp_path / "home"), "COLOSSEUM_TOKEN": "cst1.secret"}
+    cache = tmp_path / "cache"
+    found = L.ensure_uv(None, env, cache)
+    private = cache / "colosseum" / "uv"
+    assert found == str(private / "uv") and Path(found).is_file()
+    assert "https://astral.sh/uv/0.13.1/install.sh" in (tmp_path / "curl.log").read_text()
+    installed = dict(line.split("=", 1) for line in (tmp_path / "install-env").read_text().splitlines())
+    assert installed["UV_UNMANAGED_INSTALL"] == str(private) and "UV_INSTALL_DIR" not in installed

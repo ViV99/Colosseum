@@ -60,6 +60,8 @@ def test_service_leaves_out_the_identity_cache_and_shm_dirs(tmp_path, monkeypatc
     identity = HubIdentity.load_or_create()
     assert identity.path.resolve().is_relative_to(project.resolve())
     (project / "xdg-data" / "notes.txt").write_text("kept")
+    (project / "xdg-data" / "colosseum" / "node" / ("f" * 64)).mkdir(parents=True)        # a node identity too
+    (project / "xdg-data" / "colosseum" / "node" / ("f" * 64) / "node.key").write_text("secret")
     (project / "xdg-cache" / "colosseum" / "bundles" / "x").mkdir(parents=True)
     (project / "xdg-cache" / "colosseum" / "bundles" / "x" / "f.py").write_text("")
     (project / "xdg-cache" / "other.txt").write_text("kept")

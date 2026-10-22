@@ -1,13 +1,15 @@
 """The installer script and the join commands a hub prints (SP5 spec 2.2).
 
 ``installer_script`` is what ``Bootstrap/Script`` serves (raw bytes, R2): a POSIX ``sh`` script whose whole body is
-the function ``_colosseum_install``, called by its last line (``... # colosseum-installer-end``), so a script cut
-anywhere does nothing. It writes the embedded ``loader.py``, ``bundle.py`` and ``torch_select.py`` into
-``<cache>/colosseum/loader/<id>/``, finds or installs uv (``COLOSSEUM_UV``, the private
-``<cache>/colosseum/uv/uv``, ``uv`` on PATH, else the pinned astral.sh installer with ``UV_UNMANAGED_INSTALL``) and
-runs the loader with the hub's Python and grpcio through ``uv run``. The hub address and the token come from the
-environment (``COLOSSEUM_HUB``, ``COLOSSEUM_TOKEN``) set by the one-liner, extra arguments are ``join`` flags
-(``sh -s -- --workers 4``), so one script serves every address of the hub and the SSH mode (T8.1).
+the function ``_colosseum_install``, called by its last line (``{ _colosseum_install "$@"; } #
+colosseum-installer-end``: the braces make a cut inside the call a syntax error, never a call without the join
+flags), so a script cut anywhere does nothing. It writes the embedded ``loader.py``, ``bundle.py`` and
+``torch_select.py`` into ``<cache>/colosseum/loader/<id>/`` (a temp name, then ``mv``), finds or installs uv
+(``COLOSSEUM_UV``, the private ``<cache>/colosseum/uv/uv``, ``uv`` on PATH, else the pinned astral.sh installer with
+``UV_UNMANAGED_INSTALL``) and runs the loader with the hub's Python and grpcio through ``uv run``. The hub address
+and the token come from the environment (``COLOSSEUM_HUB``, ``COLOSSEUM_TOKEN``) set by the one-liner, extra
+arguments are ``join`` flags (``sh -s -- --workers 4``), so one script serves every address of the hub and the SSH
+mode (T8.1).
 """
 
 from __future__ import annotations
@@ -53,10 +55,10 @@ _colosseum_install() {
         echo "colosseum: installing uv @UV@ into $cache/uv" >&2
         if command -v curl >/dev/null 2>&1; then
             curl -LsSf "https://astral.sh/uv/@UV@/install.sh" \
-                | env UV_UNMANAGED_INSTALL="$cache/uv" UV_NO_MODIFY_PATH=1 sh
+                | env -u UV_INSTALL_DIR UV_UNMANAGED_INSTALL="$cache/uv" UV_NO_MODIFY_PATH=1 sh
         elif command -v wget >/dev/null 2>&1; then
             wget -qO- "https://astral.sh/uv/@UV@/install.sh" \
-                | env UV_UNMANAGED_INSTALL="$cache/uv" UV_NO_MODIFY_PATH=1 sh
+                | env -u UV_INSTALL_DIR UV_UNMANAGED_INSTALL="$cache/uv" UV_NO_MODIFY_PATH=1 sh
         else
             echo "colosseum: neither curl nor wget is available to install uv" >&2; return 1
         fi
@@ -68,7 +70,7 @@ _colosseum_install() {
     exec "$uv" run --no-project --python @PYTHON@ --with "grpcio==@GRPCIO@" -- \
         python -I "$boot/loader.py" --uv "$uv" @INSECURE@"$hub" "$@"
 }
-_colosseum_install "$@" @END@
+{ _colosseum_install "$@"; } @END@
 """
 
 
@@ -85,11 +87,13 @@ def installer_script(*, insecure: bool, python: str, grpcio: str, uv_version: st
         tag = "COLOSSEUM_EOF_" + hashlib.sha256(text.encode()).hexdigest()[:12].upper()
         if tag in text or not text.endswith("\n"):
             raise ValueError(f"{name} cannot be embedded in the installer (heredoc tag inside, or no final newline)")
-        blocks.append(f"    cat > \"$boot/{name}\" <<'{tag}'\n{text}{tag}\n")
-    script = (_TEMPLATE.replace("@FILES@", "".join(blocks).rstrip("\n"))
-              .replace("@ID@", ident).replace("@UV@", uv_version).replace("@PYTHON@", python)
+        # a temp name + mv: another installer may be running python on the same (content-addressed) copy
+        blocks.append(f"    cat > \"$boot/{name}.$$\" <<'{tag}'\n{text}{tag}\n"
+                      f"    mv -f \"$boot/{name}.$$\" \"$boot/{name}\"\n")
+    script = (_TEMPLATE.replace("@ID@", ident).replace("@UV@", uv_version).replace("@PYTHON@", python)
               .replace("@GRPCIO@", grpcio).replace("@INSECURE@", "--insecure " if insecure else "")
-              .replace("@END@", END_MARKER))
+              .replace("@END@", END_MARKER)
+              .replace("@FILES@", "".join(blocks).rstrip("\n")))     # last: the embedded text is never substituted
     return script.encode()
 
 
@@ -110,13 +114,14 @@ def one_liner(address: str, token: str, *, insecure: bool) -> str:
         transport, url = "--http2-prior-knowledge", f"http://{address}{SCRIPT_PATH}"
     else:
         transport, url = f"--http2 -k --pinnedpubkey {_sq(curl_pin(fingerprint))}", f"https://{address}{SCRIPT_PATH}"
-    return (f"printf '\\0\\0\\0\\0\\0' | curl -fsS {transport} -H 'content-type: application/grpc' "
-            f"-H 'te: trailers' --data-binary @- {url} | tail -c +6 | "
+    # -g: no curl URL globbing (a bracketed IPv6 address); the URL quoted (no shell globbing either)
+    return (f"printf '\\0\\0\\0\\0\\0' | curl -fsSg {transport} -H 'content-type: application/grpc' "
+            f"-H 'te: trailers' --data-binary @- {_sq(url)} | tail -c +6 | "
             f"COLOSSEUM_HUB={_sq(address)} COLOSSEUM_TOKEN={_sq(str(token))} sh")
 
 
 def join_command(address: str, token: str, *, insecure: bool) -> str:
-    return f"colosseum join {address} --token {_sq(str(token))}" + (" --insecure" if insecure else "")
+    return f"colosseum join {_sq(address)} --token {_sq(str(token))}" + (" --insecure" if insecure else "")
 
 
 # ---------------------------------------------------------------------------------------------------------------
@@ -154,14 +159,15 @@ def make_bootstrap_service(*, project_dir: Path, include: Sequence[str], exclude
     import sys
 
     from colosseum.bootstrap.requirements import node_requirements
-    from colosseum.net.security import cache_home, hub_identity_dir
+    from colosseum.net.security import cache_home, data_home
     from colosseum.node.weights import shm_dir
 
     project = Path(project_dir).resolve()
     extra = []
     # Never shipped when inside the project: the run dir (unless runs/ already leaves it out), and (P-PF4-24) the
-    # hub identity (CA key, token secret), the colosseum cache and the shared-memory weight segments.
-    for path in (run_dir, hub_identity_dir(), cache_home() / "colosseum", shm_dir()):
+    # hub and node identities (CA key, token secret, node keys), the colosseum cache and the shared-memory weight
+    # segments.
+    for path in (run_dir, data_home() / "colosseum", cache_home() / "colosseum", shm_dir()):
         try:
             rel = Path(path).resolve().relative_to(project).as_posix()
         except ValueError:
