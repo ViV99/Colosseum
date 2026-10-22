@@ -245,13 +245,15 @@ class DataServer(pbg.NodeDataServicer):
                 return
             mapping = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             try:
-                yield from send_parts(mapping, meta_json=meta, digest=str(pointer["digest"]))
+                for part in send_parts(mapping, meta_json=meta, digest=str(pointer["digest"])):
+                    if part.last:            # counted now: the client stops at the last part and drops the call, so
+                        self._count("latest_served")   # the generator may never resume after it (FX6)
+                    yield part
             finally:
                 try:
                     mapping.close()
                 except BufferError:          # a part view still alive (a cancelled stream): freed with it
                     pass
-        self._count("latest_served")
 
     def Chunks(self, request_iterator: Iterable[pb.ChunkFrame], context: grpc.ServicerContext) -> pb.ChunkSummary:  # noqa: N802
         """Frames for this node's learners (spec 4.7): each goes to its learner's chunk connection undecoded

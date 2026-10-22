@@ -84,6 +84,25 @@ def test_get_latest_streams_the_cached_frame_and_answers_not_modified(tmp_path, 
         srv.stop()
 
 
+def test_a_transfer_is_counted_when_its_last_part_is_handed_over(tmp_path):
+    """The client stops reading at the part marked ``last`` and drops the call, so the servicer's generator may never
+    resume after it: ``latest_served`` counts when the last part is handed over (FX6: a count after the stream ended
+    was lost when the cancellation won the race, under load)."""
+    from colosseum.net.proto import colosseum_v1_pb2 as pb
+
+    srv = DataServer(cache=_cache(tmp_path), own_agents=lambda: {"main"}, max_message_mb=MAX_MB, insecure=False,
+                     token_secret="", node=3)
+    parts = srv.GetLatest(pb.LatestRequest(agent_id="main", since_version=-1), context=None)
+    seen = []
+    for part in parts:
+        seen.append(part)
+        if part.last:
+            break                                                # as receive_parts: the stream is not drained
+    assert len(seen) > 1 and srv.counters["latest_served"] == 1
+    parts.close()                                                # the cancelled call: the generator is closed
+    assert srv.counters["latest_served"] == 1
+
+
 def test_peers_without_a_certificate_of_the_ca_or_banned_are_refused(tmp_path, pki):
     srv = _server(tmp_path, pki, banned={pki["b"].node_id})
     try:

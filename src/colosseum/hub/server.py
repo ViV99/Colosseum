@@ -570,13 +570,15 @@ class HubServicer(pb_grpc.HubServicer):
         with f:
             mapping = mmap.mmap(f.fileno(), 0, access=mmap.ACCESS_READ)
             try:
-                yield from send_parts(mapping, meta_json=meta, digest=relayed.digest or None)
+                for part in send_parts(mapping, meta_json=meta, digest=relayed.digest or None):
+                    if part.last:            # counted now: the client stops at the last part and drops the call (FX6)
+                        latest.count_bytes(relayed.size)
+                    yield part
             finally:
                 try:
                     mapping.close()
                 except BufferError:          # a part view still alive (a cancelled stream): freed with it
                     pass
-        latest.count_bytes(relayed.size)
 
     def _relay_upload_caller(self, header: pb.UploadHeader, node_id: str) -> str | None:
         """A ``relay_latest`` upload comes from the agent's learner node (else ``not_learner_node``)."""
